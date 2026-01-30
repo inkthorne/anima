@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
 use serde_json::Value;
@@ -5,6 +6,7 @@ use serde_json::Value;
 #[derive(Debug)]
 pub struct AddTool;
 
+#[async_trait]
 impl Tool for AddTool {
     fn name(&self) -> &str {
         "add"
@@ -14,7 +16,7 @@ impl Tool for AddTool {
         "Adds two numbers from input.a and input.b"
     }
 
-    fn execute(&self, input: Value) -> Result<Value, ToolError> {
+    async fn execute(&self, input: Value) -> Result<Value, ToolError> {
         let a = input
             .get("a")
             .and_then(|v| v.as_f64())

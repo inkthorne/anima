@@ -21,11 +21,11 @@ impl Agent {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
-    pub fn call_tool(&self, name: &str, input: &str) -> Result<String, ToolError> {
+    pub async fn call_tool(&self, name: &str, input: &str) -> Result<String, ToolError> {
         if let Some(tool) = self.tools.get(name) {
             let input_value: Value =
                 serde_json::from_str(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-            let result = tool.execute(input_value)?;
+            let result = tool.execute(input_value).await?;
             Ok(result.to_string())
         } else {
             Err(ToolError::ExecutionFailed(format!(

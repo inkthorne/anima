@@ -1,7 +1,8 @@
 use anima::tools::{AddTool, EchoTool};
-use anima::{Agent, Runtime};
+use anima::{Runtime};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Creating Runtime...");
     let mut runtime = Runtime::new();
 
@@ -13,11 +14,11 @@ fn main() {
     agent.register_tool(Box::new(AddTool {}));
 
     println!("Calling echo tool with input: {{\"message\": \"Hello, Anima!\"}}");
-    let echo_result = agent.call_tool("echo", r#"{"message": "Hello, Anima!"}"#);
+    let echo_result = agent.call_tool("echo", r#"{"message": "Hello, Anima!"}"#).await;
     println!("Echo result: {:?}", echo_result);
 
     println!("Calling add tool with input: {{\"a\": 5, \"b\": 3}}");
-    let add_result = agent.call_tool("add", r#"{"a": 5, "b": 3}"#);
+    let add_result = agent.call_tool("add", r#"{"a": 5, "b": 3}"#).await;
     println!("Add result: {:?}", add_result);
 
     println!("Listing all tools on the agent:");

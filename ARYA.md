@@ -4,15 +4,15 @@ Build: `cargo build`
 
 ## Steps
 
-- [ ] 1. [Cargo.toml] Add tokio dependency with rt-multi-thread and macros features
-- [ ] 2. [src/error.rs] Add AgentError enum for agent-level errors
-- [ ] 3. [src/tool.rs] Make Tool::execute async (return BoxFuture)
-- [ ] 4. [src/tools/echo.rs] Update EchoTool for async execute
-- [ ] 5. [src/tools/add.rs] Update AddTool for async execute
+- [x] 1. [Cargo.toml] Add tokio dependency with rt-multi-thread and macros features
+- [x] 2. [src/error.rs] Add AgentError enum for agent-level errors
+- [x] 3. [src/tool.rs] Make Tool::execute async (used async-trait)
+- [x] 4. [src/tools/echo.rs] Update EchoTool for async execute
+- [x] 5. [src/tools/add.rs] Update AddTool for async execute
 - [ ] 6. [src/message.rs] Create Message enum for agent communication
-- [ ] 7. [src/agent.rs] Add inbox (channel receiver), make call_tool async
+- [x] 7. [src/agent.rs] Add inbox (channel receiver), make call_tool async (partial - call_tool async done)
 - [ ] 8. [src/runtime.rs] Add message routing, make methods async
-- [ ] 9. [src/main.rs] Update demo to use async (tokio::main)
+- [x] 9. [src/main.rs] Update demo to use async (tokio::main)
 - [ ] 10. Test and verify everything works
 
 ## Plan

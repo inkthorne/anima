@@ -1,4 +1,4 @@
-pub mod echo;
 pub mod add;
-pub use echo::EchoTool;
+pub mod echo;
 pub use add::AddTool;
+pub use echo::EchoTool;

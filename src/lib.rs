@@ -1,11 +1,11 @@
-pub mod error;
-pub mod tool;
 pub mod agent;
+pub mod error;
 pub mod runtime;
+pub mod tool;
 pub mod tools;
 
 // Re-export main types for convenience
-pub use error::ToolError;
-pub use tool::{Tool, ToolInfo};
 pub use agent::Agent;
+pub use error::{AgentError, ToolError};
 pub use runtime::Runtime;
+pub use tool::{Tool, ToolInfo};
