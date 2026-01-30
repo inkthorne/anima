@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 
 use crate::error::ToolError;
-use crate::tool::{Tool, ToolInfo};
+use crate::tool::Tool;
 use crate::message::Message;
 use crate::memory::{Memory, MemoryError};
 use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
 use tokio::sync::mpsc;
 use serde_json::Value;
+use crate::supervision::{ChildHandle, ChildConfig, ChildStatus};
+use tokio::sync::oneshot;
 
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
@@ -31,6 +33,7 @@ pub struct Agent {
     inbox: mpsc::Receiver<Message>,
     memory: Option<Box<dyn Memory>>,
     llm: Option<Box<dyn LLM>>,
+    pub children: HashMap<String, ChildHandle>,
 }
 
 impl Agent {
@@ -41,6 +44,7 @@ impl Agent {
             inbox,
             memory: None,
             llm: None,
+            children: HashMap::new(),
         }
     }
 
@@ -165,5 +169,62 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
     pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
         self.think_with_options(task, ThinkOptions::default()).await
+    }
+
+    /// Spawn a child agent for a subtask
+    pub fn spawn_child(&mut self, config: ChildConfig) -> String {
+        let child_id = format!("{}-child-{}", self.id, self.children.len());
+        let (tx, rx) = oneshot::channel();
+        
+        let handle = ChildHandle::new(child_id.clone(), config.task.clone(), rx);
+        self.children.insert(child_id.clone(), handle);
+        
+        // Note: actual task execution happens via runtime.run_child_task()
+        // The tx sender is stored for later use
+        child_id
+    }
+
+    /// Wait for a specific child to complete
+    pub async fn wait_for_child(&mut self, child_id: &str) -> Result<String, String> {
+        let handle = self.children.get_mut(child_id)
+            .ok_or_else(|| format!("Child {} not found", child_id))?;
+        
+        if let Some(rx) = handle.result_rx.take() {
+            match rx.await {
+                Ok(Ok(result)) => {
+                    handle.status = ChildStatus::Completed(result.clone());
+                    Ok(result)
+                }
+                Ok(Err(e)) => {
+                    handle.status = ChildStatus::Failed(e.clone());
+                    Err(e)
+                }
+                Err(_) => {
+                    handle.status = ChildStatus::Failed("Channel closed".to_string());
+                    Err("Channel closed".to_string())
+                }
+            }
+        } else {
+            match &handle.status {
+                ChildStatus::Completed(r) => Ok(r.clone()),
+                ChildStatus::Failed(e) => Err(e.clone()),
+                ChildStatus::Running => Err("Already waiting".to_string()),
+            }
+        }
+    }
+
+    /// Non-blocking check of child status
+    pub fn poll_child(&self, child_id: &str) -> Option<&ChildStatus> {
+        self.children.get(child_id).map(|h| &h.status)
+    }
+
+    /// Wait for all children to complete
+    pub async fn wait_for_all_children(&mut self) -> Vec<Result<String, String>> {
+        let child_ids: Vec<String> = self.children.keys().cloned().collect();
+        let mut results = Vec::new();
+        for id in child_ids {
+            results.push(self.wait_for_child(&id).await);
+        }
+        results
     }
 }

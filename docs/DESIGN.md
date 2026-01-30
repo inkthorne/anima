@@ -186,3 +186,39 @@ Incremental complexity. Synchronous code is easier to reason about and debug. We
 - **Clawdbot** — Tool-first agent architecture, practical experience
 - **Bevy ECS** — Clean Rust API design, component composition
 - **Axum** — Ergonomic builder patterns, tower middleware model
+
+## v0.7: Agent Supervision
+
+### Parent-Child Relationships
+
+Agents can spawn child agents to delegate subtasks:
+
+```rust
+// Parent spawns a child
+let child_config = ChildConfig::new("Calculate 5 + 3");
+let child_id = parent.spawn_child(child_config);
+
+// Wait for result
+let result = parent.wait_for_child(&child_id).await?;
+
+// Or poll status without blocking
+if let Some(status) = parent.poll_child(&child_id) {
+    println!("Status: {:?}", status);
+}
+
+// Wait for all children
+let results = parent.wait_for_all_children().await;
+```
+
+### Key Types
+
+- `ChildConfig` - Configuration for spawning a child (task, inherit_llm, inherit_memory)
+- `ChildHandle` - Handle to track child status and get results
+- `ChildStatus` - Running, Completed(result), or Failed(error)
+
+### Runtime Support
+
+- `Runtime::get_parent(child_id)` - Get parent of a child
+- `Runtime::get_children(parent_id)` - Get all children of a parent
+- `Runtime::terminate_child(id)` - Remove a child
+- `Runtime::terminate_children(id)` - Recursively remove all descendants

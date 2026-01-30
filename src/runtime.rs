@@ -3,10 +3,12 @@ use crate::message::Message;
 use crate::memory::Memory;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 pub struct Runtime {
     agents: HashMap<String, Agent>,
     senders: HashMap<String, mpsc::Sender<Message>>,
+    parent_map: HashMap<String, String>,
 }
 
 impl Runtime {
@@ -14,6 +16,7 @@ impl Runtime {
         Runtime {
             agents: HashMap::new(),
             senders: HashMap::new(),
+            parent_map: HashMap::new(),
         }
     }
 
@@ -62,6 +65,49 @@ impl Runtime {
     /// Get the number of agents
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// Get the parent of an agent
+    pub fn get_parent(&self, agent_id: &str) -> Option<&str> {
+        self.parent_map.get(agent_id).map(|s| s.as_str())
+    }
+
+    /// Get the children of an agent
+    pub fn get_children(&self, agent_id: &str) -> Vec<&str> {
+        self.parent_map.iter()
+            .filter(|(_, parent)| *parent == agent_id)
+            .map(|(child, _)| child.as_str())
+            .collect()
+    }
+
+    /// Run a child agent task asynchronously
+    pub async fn run_child_task(
+        agent: &mut crate::agent::Agent,
+        task: &str,
+        result_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    ) {
+        let result = agent.think(task).await;
+        let _ = result_tx.send(result.map_err(|e| e.to_string()));
+    }
+
+    /// Terminate a specific child agent
+    pub fn terminate_child(&mut self, child_id: &str) {
+        self.agents.remove(child_id);
+        self.parent_map.remove(child_id);
+    }
+
+    /// Terminate all children of an agent (recursive)
+    pub fn terminate_children(&mut self, parent_id: &str) {
+        let children: Vec<String> = self.parent_map
+            .iter()
+            .filter(|(_, p)| *p == parent_id)
+            .map(|(c, _)| c.clone())
+            .collect();
+        
+        for child_id in children {
+            self.terminate_children(&child_id); // Recursive
+            self.terminate_child(&child_id);
+        }
     }
 
     /// Send a message to an agent

@@ -6,6 +6,7 @@ pub mod runtime;
 pub mod tool;
 pub mod tools;
 pub mod llm;
+pub mod supervision;
 
 // Re-export main types for convenience
 pub use agent::Agent;
@@ -15,3 +16,4 @@ pub use message::Message;
 pub use runtime::Runtime;
 pub use tool::{Tool, ToolInfo};
 pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient};
+pub use supervision::{ChildHandle, ChildConfig, ChildStatus};
