@@ -478,13 +478,8 @@ impl Repl {
         let from_entry = self.agents.get(from_agent).unwrap();
         match from_entry.agent.send_message(to_agent, question).await {
             Ok(_) => {
-                println!("\x1b[32m✓ Message sent\x1b[0m");
-
-                // Now the receiving agent needs to process the message
-                // In a real implementation, agents would run in background loops
-                // For the REPL, we'll note that message was queued
-                println!("\x1b[33m(Note: The receiving agent needs to process incoming messages.\x1b[0m");
-                println!("\x1b[33m Send a task to '{}' to have it check its inbox.)\x1b[0m", to_agent);
+                println!("\x1b[32m✓ Message sent to {}\x1b[0m", to_agent);
+                println!("\x1b[33m(Send a task to '{}' and they'll see the message)\x1b[0m", to_agent);
             }
             Err(e) => {
                 println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
