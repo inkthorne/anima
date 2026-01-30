@@ -21,6 +21,8 @@ pub struct ThinkOptions {
     pub reflection: Option<ReflectionConfig>,
     /// Optional auto-memory configuration for injecting memories into context
     pub auto_memory: Option<AutoMemoryConfig>,
+    /// Enable streaming output (default: false)
+    pub stream: bool,
 }
 
 impl Default for ThinkOptions {
@@ -30,6 +32,7 @@ impl Default for ThinkOptions {
             system_prompt: None,
             reflection: None,
             auto_memory: None,
+            stream: false,
         }
     }
 }
@@ -305,6 +308,97 @@ pub async fn forget(&mut self, key: &str) -> bool {
         self.think_with_options(task, ThinkOptions::default()).await
     }
 
+    /// Think with streaming output, sending tokens through the channel as they arrive.
+    /// Note: Streaming does not support reflection or tool calls mid-stream well,
+    /// so this is best used for simple query/response patterns.
+    pub async fn think_streaming(
+        &mut self,
+        task: &str,
+        token_tx: mpsc::Sender<String>,
+    ) -> Result<String, crate::error::AgentError> {
+        self.think_streaming_with_options(task, ThinkOptions::default(), token_tx).await
+    }
+
+    /// Think with streaming output and custom options.
+    pub async fn think_streaming_with_options(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+        token_tx: mpsc::Sender<String>,
+    ) -> Result<String, crate::error::AgentError> {
+        let llm = self.llm.as_ref().ok_or_else(||
+            crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+
+        let tools = self.list_tools_for_llm();
+
+        // Build auto-memory context if configured
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+
+        // Combine memory context with system prompt
+        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
+            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
+            (Some(mem), None) => Some(mem.clone()),
+            (None, Some(sys)) => Some(sys.clone()),
+            (None, None) => None,
+        };
+
+        // Build initial messages
+        let mut messages: Vec<ChatMessage> = Vec::new();
+
+        if let Some(system) = &effective_system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(task.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        // Agentic loop with streaming
+        for _iteration in 0..options.max_iterations {
+            let response = llm.chat_complete_stream(
+                messages.clone(),
+                Some(tools.clone()),
+                token_tx.clone(),
+            ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+
+            // If no tool calls, we have a final response
+            if response.tool_calls.is_empty() {
+                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+            }
+
+            // Add assistant message with tool calls
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: response.content.clone(),
+                tool_call_id: None,
+                tool_calls: Some(response.tool_calls.clone()),
+            });
+
+            // Execute each tool and add results
+            for tool_call in &response.tool_calls {
+                let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
+                    .unwrap_or_else(|e| format!("Error: {}", e));
+
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(result),
+                    tool_call_id: Some(tool_call.id.clone()),
+                    tool_calls: None,
+                });
+            }
+        }
+
+        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
+    }
+
     /// Reflect on a response and potentially revise it
     async fn reflect_and_revise(
         &mut self,
@@ -361,6 +455,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 system_prompt: options.system_prompt.clone(),
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
+                stream: false, // Reflection doesn't use streaming
             };
             
             current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
@@ -749,6 +844,7 @@ mod tests {
             system_prompt: Some("Be helpful".to_string()),
             reflection: None,
             auto_memory: Some(AutoMemoryConfig::default()),
+            stream: false,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);

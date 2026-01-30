@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
 
 #[async_trait]
 pub trait LLM: Send + Sync {
@@ -9,6 +10,15 @@ pub trait LLM: Send + Sync {
         &self,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError>;
+
+    /// Stream chat completion, sending tokens through the channel as they arrive.
+    /// Returns the final complete response when done.
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
     ) -> Result<LLMResponse, LLMError>;
 }
 
@@ -133,7 +143,7 @@ impl LLM for OpenAIClient {
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/chat/completions", self.base_url);
-        
+
         // Transform messages to fix tool_calls serialization for API compatibility
         let mut formatted_messages = Vec::new();
         for message in messages {
@@ -146,12 +156,12 @@ impl LLM for OpenAIClient {
             }
             formatted_messages.push(formatted_message);
         }
-        
+
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": formatted_messages
         });
-        
+
          if let Some(tool_list) = tools {
              let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
                  serde_json::json!({
@@ -166,7 +176,7 @@ impl LLM for OpenAIClient {
              request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
              request_body["tool_choice"] = serde_json::json!("auto");
          }
-        
+
         let response = self
             .client
             .post(&url)
@@ -178,23 +188,23 @@ impl LLM for OpenAIClient {
             .map_err(|e| LLMError {
                 message: format!("Failed to send request: {}", e),
             })?;
-            
+
         let response_text = response
             .text()
             .await
             .map_err(|e| LLMError {
                 message: format!("Failed to read response: {}", e),
             })?;
-            
+
         let openai_response: serde_json::Value = serde_json::from_str(&response_text)
             .map_err(|e| LLMError {
                 message: format!("Failed to parse response: {}", e),
             })?;
-            
+
         let content = openai_response["choices"][0]["message"]["content"]
             .as_str()
             .map(|s| s.to_string());
-            
+
          let tool_calls = openai_response["choices"][0]["message"]["tool_calls"]
              .as_array()
              .map(|tool_calls_array| {
@@ -210,9 +220,140 @@ impl LLM for OpenAIClient {
                      .collect()
              })
              .unwrap_or_default();
-            
+
         Ok(LLMResponse {
             content,
+            tool_calls,
+        })
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/chat/completions", self.base_url);
+
+        // Transform messages for API compatibility
+        let mut formatted_messages = Vec::new();
+        for message in messages {
+            let mut formatted_message = serde_json::to_value(&message).unwrap();
+            if let Some(tool_calls) = message.tool_calls {
+                if !tool_calls.is_empty() {
+                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
+                }
+            }
+            formatted_messages.push(formatted_message);
+        }
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages,
+            "stream": true
+        });
+
+        if let Some(tool_list) = tools {
+            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            }).collect();
+            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError {
+                message: format!("Failed to send request: {}", e),
+            })?;
+
+        let mut stream = response.bytes_stream();
+        let mut full_content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new(); // index -> (id, name, arguments)
+        let mut buffer = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| LLMError {
+                message: format!("Failed to read stream chunk: {}", e),
+            })?;
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE lines
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                if line == "data: [DONE]" {
+                    break;
+                }
+
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                        // Handle content delta
+                        if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                            full_content.push_str(content);
+                            let _ = tx.send(content.to_string()).await;
+                        }
+
+                        // Handle tool calls delta
+                        if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
+                            for tc in tc_array {
+                                let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                                let entry = tool_call_builders.entry(index)
+                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+
+                                if let Some(id) = tc["id"].as_str() {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(name) = tc["function"]["name"].as_str() {
+                                    entry.1.push_str(name);
+                                }
+                                if let Some(args) = tc["function"]["arguments"].as_str() {
+                                    entry.2.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Convert tool call builders to final tool calls
+        let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
+        indices.sort();
+        for index in indices {
+            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index) {
+                if let Ok(arguments) = serde_json::from_str(&arguments_str) {
+                    tool_calls.push(ToolCall { id, name, arguments });
+                }
+            }
+        }
+
+        Ok(LLMResponse {
+            content: if full_content.is_empty() { None } else { Some(full_content) },
             tool_calls,
         })
     }
@@ -310,6 +451,159 @@ impl LLM for AnthropicClient {
         
         Ok(LLMResponse {
             content: if content_text.is_empty() { None } else { Some(content_text) },
+            tool_calls,
+        })
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/v1/messages", self.base_url);
+
+        // Separate system prompt from messages
+        let system_prompt = messages
+            .iter()
+            .find(|msg| msg.role == "system")
+            .and_then(|msg| msg.content.as_ref())
+            .cloned();
+
+        let filtered_messages: Vec<ChatMessage> = messages
+            .into_iter()
+            .filter(|msg| msg.role != "system")
+            .collect();
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": filtered_messages,
+            "stream": true
+        });
+
+        if let Some(system) = system_prompt {
+            request_body["system"] = serde_json::Value::String(system);
+        }
+
+        if let Some(tool_list) = tools {
+            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters
+                })
+            }).collect();
+            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", self.api_key.clone())
+            .header("Content-Type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError {
+                message: format!("Failed to send request: {}", e),
+            })?;
+
+        let mut stream = response.bytes_stream();
+        let mut full_content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        // Track tool_use blocks being built: index -> (id, name, input_json_str)
+        let mut current_tool_use: Option<(String, String, String)> = None;
+        let mut buffer = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| LLMError {
+                message: format!("Failed to read stream chunk: {}", e),
+            })?;
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            // Process complete SSE lines
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                // Anthropic uses "event:" lines followed by "data:" lines
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                        let event_type = parsed["type"].as_str().unwrap_or("");
+
+                        match event_type {
+                            "content_block_start" => {
+                                // Check if this is a tool_use block
+                                if let Some(content_block) = parsed["content_block"].as_object() {
+                                    if content_block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                                        let id = content_block.get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let name = content_block.get("name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        current_tool_use = Some((id, name, String::new()));
+                                    }
+                                }
+                            }
+                            "content_block_delta" => {
+                                if let Some(delta) = parsed["delta"].as_object() {
+                                    // Text delta
+                                    if delta.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
+                                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                            full_content.push_str(text);
+                                            let _ = tx.send(text.to_string()).await;
+                                        }
+                                    }
+                                    // Input JSON delta for tool_use
+                                    if delta.get("type").and_then(|v| v.as_str()) == Some("input_json_delta") {
+                                        if let Some(partial_json) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                            if let Some((_, _, ref mut input_str)) = current_tool_use {
+                                                input_str.push_str(partial_json);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            "content_block_stop" => {
+                                // Finalize tool_use if we were building one
+                                if let Some((id, name, input_str)) = current_tool_use.take() {
+                                    if !id.is_empty() && !name.is_empty() {
+                                        if let Ok(arguments) = serde_json::from_str(&input_str) {
+                                            tool_calls.push(ToolCall { id, name, arguments });
+                                        } else if input_str.is_empty() {
+                                            // Empty input is valid (tool with no parameters)
+                                            tool_calls.push(ToolCall {
+                                                id,
+                                                name,
+                                                arguments: serde_json::json!({}),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            "message_stop" => {
+                                // End of message
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(LLMResponse {
+            content: if full_content.is_empty() { None } else { Some(full_content) },
             tool_calls,
         })
     }

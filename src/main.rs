@@ -6,6 +6,7 @@ use anima::config::AgentConfig;
 use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
+use std::io::{self, Write};
 
 #[derive(Parser)]
 #[command(name = "anima", about = "The animating spirit - AI agent runtime")]
@@ -22,6 +23,9 @@ enum Commands {
         config: String,
         /// Task for the agent
         task: String,
+        /// Enable streaming output
+        #[arg(long)]
+        stream: bool,
     },
 }
 
@@ -29,8 +33,8 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { config, task } => {
-            if let Err(e) = run_agent(&config, &task).await {
+        Commands::Run { config, task, stream } => {
+            if let Err(e) = run_agent(&config, &task, stream).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -38,7 +42,7 @@ async fn main() {
     }
 }
 
-async fn run_agent(config_path: &str, task: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_agent(config_path: &str, task: &str, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = AgentConfig::from_file(config_path)?;
 
@@ -116,13 +120,35 @@ async fn run_agent(config_path: &str, task: &str) -> Result<(), Box<dyn std::err
         system_prompt: config.agent.system_prompt,
         auto_memory,
         reflection,
+        stream,
     };
 
-    // 6. Run agent.think_with_options(task, options)
-    let result = agent.think_with_options(task, options).await?;
+    // 6. Run agent with streaming or non-streaming based on flag
+    if stream {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
 
-    // 7. Print result
-    println!("{}", result);
+        // Spawn a task to print tokens as they arrive
+        let print_task = tokio::spawn(async move {
+            while let Some(token) = rx.recv().await {
+                print!("{}", token);
+                // Flush stdout to ensure real-time display
+                let _ = io::stdout().flush();
+            }
+            println!(); // Final newline after streaming completes
+        });
+
+        // Run the streaming agent
+        let result = agent.think_streaming_with_options(task, options, tx).await?;
+
+        // Wait for print task to complete
+        let _ = print_task.await;
+
+        // Note: result contains the full response, already printed via streaming
+        let _ = result;
+    } else {
+        let result = agent.think_with_options(task, options).await?;
+        println!("{}", result);
+    }
 
     Ok(())
 }
