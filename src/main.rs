@@ -4,6 +4,7 @@ use anima::{
 };
 use anima::config::AgentConfig;
 use anima::observe::ConsoleObserver;
+use anima::repl::Repl;
 use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -31,6 +32,8 @@ enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Interactive REPL for exploring anima
+    Repl,
 }
 
 #[tokio::main]
@@ -40,6 +43,13 @@ async fn main() {
         Commands::Run { config, task, stream, verbose } => {
             if let Err(e) = run_agent(&config, &task, stream, verbose).await {
                 eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Repl => {
+            let mut repl = Repl::new();
+            if let Err(e) = repl.run().await {
+                eprintln!("REPL error: {}", e);
                 std::process::exit(1);
             }
         }

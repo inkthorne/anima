@@ -1,16 +1,17 @@
 pub mod agent;
 pub mod config;
 pub mod error;
+pub mod llm;
 pub mod memory;
 pub mod message;
 pub mod messaging;
 pub mod observe;
+pub mod repl;
 pub mod retry;
 pub mod runtime;
+pub mod supervision;
 pub mod tool;
 pub mod tools;
-pub mod llm;
-pub mod supervision;
 
 // Re-export main types for convenience
 pub use agent::{Agent, ThinkOptions, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
