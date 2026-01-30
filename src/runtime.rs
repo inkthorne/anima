@@ -81,14 +81,14 @@ impl Runtime {
     }
 
     /// Run a child agent task asynchronously
-    pub async fn run_child_task(
-        agent: &mut crate::agent::Agent,
-        task: &str,
-        result_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
-    ) {
-        let result = agent.think(task).await;
-        let _ = result_tx.send(result.map_err(|e| e.to_string()));
-    }
+    // pub async fn run_child_task(
+    //     agent: &mut crate::agent::Agent,
+    //     task: &str,
+    //     result_tx: tokio::sync::oneshot::Sender<Result<String, String>>,
+    // ) {
+    //     let result = agent.think(task).await;
+    //     let _ = result_tx.send(result.map_err(|e| e.to_string()));
+    // }
 
     /// Terminate a specific child agent
     pub fn terminate_child(&mut self, child_id: &str) {

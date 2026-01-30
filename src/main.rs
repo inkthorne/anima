@@ -1,11 +1,12 @@
 use anima::{Runtime, OpenAIClient};
 use anima::tools::{AddTool, EchoTool};
 use anima::supervision::ChildConfig;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    println!("=== Anima v0.7 Demo: Agent Supervision ===");
-    println!("This demo shows how a parent agent delegates tasks to child agents\n");
+    println!("=== Anima v0.8 Demo: Concurrent Child Execution ===");
+    println!("This demo shows how a parent agent can spawn multiple child agents concurrently\n");
     
     let llm = OpenAIClient::new("ollama")
         .with_base_url("http://100.67.222.97:11434/v1")
@@ -13,11 +14,11 @@ async fn main() {
     
     let mut runtime = Runtime::new();
     
-    // Create parent agent with tools
-    let mut parent = runtime.spawn_agent("parent".to_string());
-    parent.register_tool(Box::new(AddTool));
-    parent.register_tool(Box::new(EchoTool));
-    parent = parent.with_llm(Box::new(llm));
+     // Create parent agent with tools
+     let mut parent = runtime.spawn_agent("parent".to_string());
+     parent.register_tool(Arc::new(AddTool));
+     parent.register_tool(Arc::new(EchoTool));
+     parent = parent.with_llm(Arc::new(llm));
     
     println!("Parent agent created: {}", parent.id);
     println!("Parent tools registered: add, echo\n");
@@ -30,7 +31,7 @@ async fn main() {
     println!("Parent task: {}", complex_task);
     
     // Parent starts by spawning children for subtasks
-    println!("\n--- Spawning child agents ---");
+    println!("\n--- Spawning child agents concurrently ---");
     
     // Spawn child 1: Add 5 + 3
     let child_config1 = ChildConfig::new("Calculate 5 + 3");
@@ -42,18 +43,27 @@ async fn main() {
     let child_id2 = parent.spawn_child(child_config2);
     println!("Child 2 spawned: {}", child_id2);
     
-    // Wait for first child to complete
-    println!("\n--- Waiting for first child to complete ---");
-    match parent.wait_for_child(&child_id1).await {
-        Ok(result) => println!("Child 1 result: {}", result),
-        Err(e) => println!("Child 1 failed: {}", e),
-    }
+    // Spawn child 3: Echo Hello World
+    let child_config3 = ChildConfig::new("Echo 'Hello World'");
+    let child_id3 = parent.spawn_child(child_config3);
+    println!("Child 3 spawned: {}", child_id3);
     
-    // Wait for second child to complete
-    println!("\n--- Waiting for second child to complete ---");
-    match parent.wait_for_child(&child_id2).await {
-        Ok(result) => println!("Child 2 result: {}", result),
-        Err(e) => println!("Child 2 failed: {}", e),
+    // Wait for all children to complete concurrently
+    println!("\n--- Waiting for all children to complete concurrently ---");
+    println!("Note: Children are completed in the order they finish, not in the order they were spawned");
+    
+    // Wait for children to complete (this shows concurrent execution)
+    let mut results = Vec::new();
+    results.push(parent.wait_for_child(&child_id1).await);
+    results.push(parent.wait_for_child(&child_id2).await);
+    results.push(parent.wait_for_child(&child_id3).await);
+    
+    // Print all results
+    for (i, result) in results.iter().enumerate() {
+        match result {
+            Ok(r) => println!("Child {} result: {}", i+1, r),
+            Err(e) => println!("Child {} failed: {}", i+1, e),
+        }
     }
     
     // Show that all children are completed
@@ -64,9 +74,9 @@ async fn main() {
     println!("Parent using child results to form final response...");
     
     println!("\n=== Demo complete ===");
-    println!("This demonstration shows the key supervision flow:");
+    println!("This demonstration shows concurrent child execution:");
     println!("1. Parent agent creates runtime and registers tools");
-    println!("2. Parent delegates complex tasks by spawning child agents"); 
+    println!("2. Parent spawns multiple child agents concurrently"); 
     println!("3. Parent waits for child results with wait_for_child()");
     println!("4. Parent uses child results in its own response");
 }

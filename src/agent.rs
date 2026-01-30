@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::error::ToolError;
 use crate::tool::Tool;
@@ -29,10 +30,10 @@ impl Default for ThinkOptions {
 
 pub struct Agent {
     pub id: String,
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
     inbox: mpsc::Receiver<Message>,
     memory: Option<Box<dyn Memory>>,
-    llm: Option<Box<dyn LLM>>,
+    llm: Option<Arc<dyn LLM>>,
     pub children: HashMap<String, ChildHandle>,
 }
 
@@ -48,7 +49,7 @@ impl Agent {
         }
     }
 
-    pub fn register_tool(&mut self, tool: Box<dyn Tool>) {
+    pub fn register_tool(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
     }
 
@@ -56,7 +57,7 @@ impl Agent {
         if let Some(tool) = self.tools.get(name) {
             let input_value: Value =
                 serde_json::from_str(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-            let result = tool.execute(input_value).await?;
+            let result = (*tool).execute(input_value).await?;
             Ok(result.to_string())
         } else {
             Err(ToolError::ExecutionFailed(format!(
@@ -71,7 +72,7 @@ impl Agent {
         self
     }
 
-    pub fn with_llm(mut self, llm: Box<dyn LLM>) -> Self {
+    pub fn with_llm(mut self, llm: Arc<dyn LLM>) -> Self {
         self.llm = Some(llm);
         self
     }
@@ -167,20 +168,43 @@ pub async fn forget(&mut self, key: &str) -> bool {
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
-    pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
+     pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
         self.think_with_options(task, ThinkOptions::default()).await
+    }
+
+    /// Helper to create a child agent with cloned tools/LLM
+    fn create_child_agent(parent: &Agent, child_id: String) -> Agent {
+        let (_, rx) = tokio::sync::mpsc::channel(32);
+        let mut child = Agent {
+            id: child_id,
+            tools: parent.tools.clone(),  // Arc clones are cheap
+            inbox: rx,
+            memory: None,
+            llm: parent.llm.clone(),  // Arc clone
+            children: std::collections::HashMap::new(),
+        };
+        child
     }
 
     /// Spawn a child agent for a subtask
     pub fn spawn_child(&mut self, config: ChildConfig) -> String {
         let child_id = format!("{}-child-{}", self.id, self.children.len());
-        let (tx, rx) = oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         
-        let handle = ChildHandle::new(child_id.clone(), config.task.clone(), rx);
+        // Create child agent with inherited tools/LLM
+        let mut child = Self::create_child_agent(self, child_id.clone());
+        let task = config.task.clone();
+        
+        // Spawn the child task in background
+        tokio::spawn(async move {
+            let result = child.think(&task).await;
+            let _ = result_tx.send(result.map_err(|e| e.to_string()));
+        });
+        
+        // Store handle for parent to wait on
+        let handle = ChildHandle::new(child_id.clone(), config.task, result_rx);
         self.children.insert(child_id.clone(), handle);
         
-        // Note: actual task execution happens via runtime.run_child_task()
-        // The tx sender is stored for later use
         child_id
     }
 
