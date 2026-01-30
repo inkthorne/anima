@@ -788,4 +788,24 @@ mod tests {
         // Just verify it doesn't panic
         repl.cmd_help();
     }
+
+    #[test]
+    fn test_repl_running_agents_empty() {
+        let repl = Repl::new();
+        assert!(repl.running_agents.is_empty());
+    }
+
+    #[test]
+    fn test_cmd_agent_status_empty() {
+        let repl = Repl::new();
+        // Just verify it doesn't panic with no agents
+        repl.cmd_agent_status();
+    }
+
+    #[test]
+    fn test_cmd_agent_stop_not_running() {
+        let mut repl = Repl::new();
+        // Stopping a non-existent agent should not panic
+        repl.cmd_agent_stop("nonexistent");
+    }
 }
