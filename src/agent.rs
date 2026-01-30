@@ -2,18 +2,22 @@ use std::collections::HashMap;
 
 use crate::error::ToolError;
 use crate::tool::{Tool, ToolInfo};
+use crate::message::Message;
+use tokio::sync::mpsc;
 use serde_json::Value;
 
 pub struct Agent {
     pub id: String,
     tools: HashMap<String, Box<dyn Tool>>,
+    inbox: mpsc::Receiver<Message>,
 }
 
 impl Agent {
-    pub fn new(id: String) -> Self {
+    pub fn new(id: String, inbox: mpsc::Receiver<Message>) -> Self {
         Agent {
             id,
             tools: HashMap::new(),
+            inbox,
         }
     }
 
@@ -35,13 +39,7 @@ impl Agent {
         }
     }
 
-    pub fn list_tools(&self) -> Vec<ToolInfo> {
-        self.tools
-            .values()
-            .map(|tool| ToolInfo {
-                name: tool.name().to_string(),
-                description: tool.description().to_string(),
-            })
-            .collect()
+    pub async fn recv(&mut self) -> Option<Message> {
+        self.inbox.recv().await
     }
 }

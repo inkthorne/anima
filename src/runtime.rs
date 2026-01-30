@@ -1,23 +1,27 @@
 use crate::agent::Agent;
+use crate::message::Message;
 use std::collections::HashMap;
+use tokio::sync::mpsc;
 
 pub struct Runtime {
     agents: HashMap<String, Agent>,
+    senders: HashMap<String, mpsc::Sender<Message>>,
 }
 
 impl Runtime {
     pub fn new() -> Self {
         Runtime {
             agents: HashMap::new(),
+            senders: HashMap::new(),
         }
     }
 
     /// Spawn a new agent with the given ID
     pub fn spawn_agent(&mut self, id: String) -> &mut Agent {
-        // Create the agent with the provided ID, then insert it
-        let agent = Agent::new(id.clone());
+        let (tx, rx) = mpsc::channel(32);
+        let agent = Agent::new(id.clone(), rx);
         self.agents.insert(id.clone(), agent);
-        // Get the mutable reference by using the same key (String is Copy for the HashMap lookup)
+        self.senders.insert(id.clone(), tx);
         self.agents.get_mut(&id).unwrap()
     }
 
@@ -49,5 +53,14 @@ impl Runtime {
     /// Get the number of agents
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// Send a message to an agent
+    pub async fn send_message(&self, msg: Message) -> Result<(), String> {
+        if let Some(sender) = self.senders.get(&msg.to) {
+            sender.send(msg).await.map_err(|e| e.to_string())
+        } else {
+            Err(format!("Agent not found: {}", msg.to))
+        }
     }
 }

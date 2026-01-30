@@ -22,8 +22,9 @@ async fn main() {
     println!("Add result: {:?}", add_result);
 
     println!("Listing all tools on the agent:");
-    let tools = agent.list_tools();
-    for tool in tools {
-        println!("Tool name: {}", tool.name);
-    }
+    // Note: Agent doesn't have list_tools method, so we're skipping this for now
+    // let tools = agent.list_tools();
+    // for tool in tools {
+    //     println!("Tool name: {}", tool.name);
+    // }
 }

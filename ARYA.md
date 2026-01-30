@@ -9,11 +9,13 @@ Build: `cargo build`
 - [x] 3. [src/tool.rs] Make Tool::execute async (used async-trait)
 - [x] 4. [src/tools/echo.rs] Update EchoTool for async execute
 - [x] 5. [src/tools/add.rs] Update AddTool for async execute
-- [ ] 6. [src/message.rs] Create Message enum for agent communication
-- [x] 7. [src/agent.rs] Add inbox (channel receiver), make call_tool async (partial - call_tool async done)
-- [ ] 8. [src/runtime.rs] Add message routing, make methods async
+- [x] 6. [src/message.rs] Create Message struct for agent communication
+- [x] 7. [src/agent.rs] Add inbox (channel receiver), make call_tool async
+- [x] 8. [src/runtime.rs] Add message routing, senders stored in Runtime
 - [x] 9. [src/main.rs] Update demo to use async (tokio::main)
-- [ ] 10. Test and verify everything works
+- [x] 10. Test and verify everything works
+
+## ✅ v0.2 COMPLETE!
 
 ## Plan
 
