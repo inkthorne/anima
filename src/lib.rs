@@ -9,7 +9,7 @@ pub mod llm;
 pub mod supervision;
 
 // Re-export main types for convenience
-pub use agent::{Agent, ThinkOptions, ReflectionConfig, ReflectionResult};
+pub use agent::{Agent, ThinkOptions, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
 pub use error::{AgentError, ToolError};
 pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory};
 pub use message::Message;

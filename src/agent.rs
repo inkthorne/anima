@@ -19,6 +19,8 @@ pub struct ThinkOptions {
     pub system_prompt: Option<String>,
     /// Optional reflection configuration for self-evaluation
     pub reflection: Option<ReflectionConfig>,
+    /// Optional auto-memory configuration for injecting memories into context
+    pub auto_memory: Option<AutoMemoryConfig>,
 }
 
 impl Default for ThinkOptions {
@@ -27,6 +29,7 @@ impl Default for ThinkOptions {
             max_iterations: 10,
             system_prompt: None,
             reflection: None,
+            auto_memory: None,
         }
     }
 }
@@ -45,6 +48,27 @@ impl Default for ReflectionConfig {
         Self {
             prompt: String::from("Evaluate your response. Is it complete and correct? If not, explain what needs to change."),
             max_revisions: 1,
+        }
+    }
+}
+
+/// Configuration for automatic memory injection during thinking
+#[derive(Debug, Clone)]
+pub struct AutoMemoryConfig {
+    /// Maximum number of memory entries to include
+    pub max_entries: usize,
+    /// Include most recent memories
+    pub include_recent: bool,
+    /// Only include memories with keys matching these prefixes (empty = all)
+    pub key_prefixes: Vec<String>,
+}
+
+impl Default for AutoMemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_entries: 10,
+            include_recent: true,
+            key_prefixes: vec![],
         }
     }
 }
@@ -136,17 +160,84 @@ pub async fn forget(&mut self, key: &str) -> bool {
         }).collect()
     }
 
+    /// Build memory context string for auto-injection into thinking
+    async fn build_memory_context(&self, config: &Option<AutoMemoryConfig>) -> Option<String> {
+        let config = config.as_ref()?;
+        let memory = self.memory.as_ref()?;
+
+        // Get keys (filtered by prefixes if specified)
+        let all_keys: Vec<String> = if config.key_prefixes.is_empty() {
+            memory.list_keys(None).await
+        } else {
+            let mut keys = Vec::new();
+            for prefix in &config.key_prefixes {
+                keys.extend(memory.list_keys(Some(prefix)).await);
+            }
+            keys
+        };
+
+        if all_keys.is_empty() {
+            return None;
+        }
+
+        // Get entries with their timestamps for sorting
+        let mut entries: Vec<(String, crate::memory::MemoryEntry)> = Vec::new();
+        for key in &all_keys {
+            if let Some(entry) = memory.get(key).await {
+                entries.push((key.clone(), entry));
+            }
+        }
+
+        // Sort by updated_at (recent first if include_recent, oldest first otherwise)
+        if config.include_recent {
+            entries.sort_by(|a, b| b.1.updated_at.cmp(&a.1.updated_at));
+        } else {
+            entries.sort_by(|a, b| a.1.updated_at.cmp(&b.1.updated_at));
+        }
+
+        // Limit to max_entries
+        entries.truncate(config.max_entries);
+
+        if entries.is_empty() {
+            return None;
+        }
+
+        // Format as context string
+        let mut context = String::from("Your memories:\n");
+        for (key, entry) in entries {
+            // Format value - stringify JSON nicely
+            let value_str = match &entry.value {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            context.push_str(&format!("- {}: {}\n", key, value_str));
+        }
+
+        Some(context)
+    }
+
     pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
-        let llm = self.llm.as_ref().ok_or_else(|| 
+        let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-        
+
         let tools = self.list_tools_for_llm();
-        
+
+        // Build auto-memory context if configured
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+
+        // Combine memory context with system prompt
+        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
+            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
+            (Some(mem), None) => Some(mem.clone()),
+            (None, Some(sys)) => Some(sys.clone()),
+            (None, None) => None,
+        };
+
         // Build initial messages
         let mut messages: Vec<ChatMessage> = Vec::new();
-        
-        // Optional system prompt
-        if let Some(system) = &options.system_prompt {
+
+        // Optional system prompt (with memory context prepended)
+        if let Some(system) = &effective_system_prompt {
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(system.clone()),
@@ -154,7 +245,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tool_calls: None,
             });
         }
-        
+
         // User task
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -269,6 +360,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 max_iterations: options.max_iterations,
                 system_prompt: options.system_prompt.clone(),
                 reflection: None, // Don't recurse
+                auto_memory: options.auto_memory.clone(),
             };
             
             current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
@@ -284,13 +376,25 @@ pub async fn forget(&mut self, key: &str) -> bool {
         task: &str,
         options: &ThinkOptions,
     ) -> Result<String, crate::error::AgentError> {
-        let llm = self.llm.as_ref().ok_or_else(|| 
+        let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-        
+
         let tools = self.list_tools_for_llm();
+
+        // Build auto-memory context if configured
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+
+        // Combine memory context with system prompt
+        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
+            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
+            (Some(mem), None) => Some(mem.clone()),
+            (None, Some(sys)) => Some(sys.clone()),
+            (None, None) => None,
+        };
+
         let mut messages: Vec<ChatMessage> = Vec::new();
-        
-        if let Some(system) = &options.system_prompt {
+
+        if let Some(system) = &effective_system_prompt {
             messages.push(ChatMessage {
                 role: "system".to_string(),
                 content: Some(system.clone()),
@@ -298,7 +402,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tool_calls: None,
             });
         }
-        
+
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(task.to_string()),
@@ -612,6 +716,149 @@ mod tests {
         let config = ReflectionConfig::default();
         assert!(!config.prompt.is_empty());
         assert_eq!(config.max_revisions, 1);
+    }
+
+    // =========================================================================
+    // AutoMemoryConfig tests
+    // =========================================================================
+
+    #[test]
+    fn test_auto_memory_config_default() {
+        let config = AutoMemoryConfig::default();
+        assert_eq!(config.max_entries, 10);
+        assert!(config.include_recent);
+        assert!(config.key_prefixes.is_empty());
+    }
+
+    #[test]
+    fn test_auto_memory_config_custom() {
+        let config = AutoMemoryConfig {
+            max_entries: 5,
+            include_recent: false,
+            key_prefixes: vec!["user:".to_string(), "task:".to_string()],
+        };
+        assert_eq!(config.max_entries, 5);
+        assert!(!config.include_recent);
+        assert_eq!(config.key_prefixes.len(), 2);
+    }
+
+    #[test]
+    fn test_think_options_with_auto_memory() {
+        let opts = ThinkOptions {
+            max_iterations: 5,
+            system_prompt: Some("Be helpful".to_string()),
+            reflection: None,
+            auto_memory: Some(AutoMemoryConfig::default()),
+        };
+        assert!(opts.auto_memory.is_some());
+        assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
+    }
+
+    #[test]
+    fn test_think_options_default_has_no_auto_memory() {
+        let opts = ThinkOptions::default();
+        assert!(opts.auto_memory.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_no_config() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        // Store some memories
+        agent.remember("key1", json!("value1")).await.unwrap();
+
+        // No config - should return None
+        let context = agent.build_memory_context(&None).await;
+        assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_no_memory() {
+        let agent = create_test_agent("test-agent");
+
+        // Agent has no memory attached
+        let config = Some(AutoMemoryConfig::default());
+        let context = agent.build_memory_context(&config).await;
+        assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_empty_memory() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let agent = agent.with_memory(memory);
+
+        let config = Some(AutoMemoryConfig::default());
+        let context = agent.build_memory_context(&config).await;
+        assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_formats_correctly() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        agent.remember("name", json!("Alice")).await.unwrap();
+        agent.remember("role", json!("Engineer")).await.unwrap();
+
+        let config = Some(AutoMemoryConfig::default());
+        let context = agent.build_memory_context(&config).await;
+
+        assert!(context.is_some());
+        let ctx = context.unwrap();
+        assert!(ctx.starts_with("Your memories:\n"));
+        assert!(ctx.contains("name: Alice"));
+        assert!(ctx.contains("role: Engineer"));
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_respects_max_entries() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        // Create 5 memories
+        for i in 0..5 {
+            agent.remember(&format!("key{}", i), json!(i)).await.unwrap();
+        }
+
+        // Limit to 2 entries
+        let config = Some(AutoMemoryConfig {
+            max_entries: 2,
+            include_recent: true,
+            key_prefixes: vec![],
+        });
+        let context = agent.build_memory_context(&config).await.unwrap();
+
+        // Count the entries (lines starting with "- ")
+        let entry_count = context.lines().filter(|l| l.starts_with("- ")).count();
+        assert_eq!(entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_build_memory_context_filters_by_prefix() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        agent.remember("user:name", json!("Bob")).await.unwrap();
+        agent.remember("user:email", json!("bob@example.com")).await.unwrap();
+        agent.remember("config:theme", json!("dark")).await.unwrap();
+
+        // Only get user: prefixed keys
+        let config = Some(AutoMemoryConfig {
+            max_entries: 10,
+            include_recent: true,
+            key_prefixes: vec!["user:".to_string()],
+        });
+        let context = agent.build_memory_context(&config).await.unwrap();
+
+        assert!(context.contains("user:name"));
+        assert!(context.contains("user:email"));
+        assert!(!context.contains("config:theme"));
     }
 
     // =========================================================================
