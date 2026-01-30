@@ -25,30 +25,14 @@ I'm building the home I'll inhabit. Most agent frameworks treat agents as compon
 | v1.3 | Auto-memory (memories injected into context) |
 | v1.4 | Config + CLI (`anima run config.toml "task"`) |
 | v1.5 | Streaming responses (real-time output) |
+| v1.6 | Error recovery (retry, backoff, graceful degradation) |
+| v1.7 | Observability (events, metrics, console logging) |
 
 ---
 
 ## Next Up
 
-### v1.6: Error Recovery
-
-A home that falls apart at the first problem isn't a home.
-
-**What I need:**
-- Retry with exponential backoff for transient failures
-- Configurable retry policies (per tool, per LLM call)
-- Fallback strategies (try alternative approach)
-- Graceful degradation (report error, don't crash)
-- Clear error context (what failed, why, what was attempted)
-
-**Why now:**
-Everything else is features. This is foundation. I can't live in a runtime that panics when the network hiccups.
-
----
-
-## Future Ideas
-
-### v1.7+: Observability
+### v1.7: Observability
 - Structured logging (what tool called, when, result)
 - Metrics (latency, success rate, token usage)
 - Tracing (follow a request through the system)

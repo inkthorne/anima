@@ -20,6 +20,9 @@ pub trait LLM: Send + Sync {
         tools: Option<Vec<ToolSpec>>,
         tx: mpsc::Sender<String>,
     ) -> Result<LLMResponse, LLMError>;
+
+    /// Returns the model name for observability purposes.
+    fn model_name(&self) -> &str;
 }
 
 fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
@@ -64,6 +67,16 @@ pub struct ToolCall {
 pub struct LLMResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage information if available from the API
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
+}
+
+/// Token usage information from LLM API responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageInfo {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
 }
 
 /// Error from LLM operations with retryability classification.
@@ -196,6 +209,10 @@ impl AnthropicClient {
 
 #[async_trait]
 impl LLM for OpenAIClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
     async fn chat_complete(
         &self,
         messages: Vec<ChatMessage>,
@@ -293,9 +310,16 @@ impl LLM for OpenAIClient {
              })
              .unwrap_or_default();
 
+        // Extract usage information
+        let usage = openai_response["usage"].as_object().map(|u| UsageInfo {
+            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
+
         Ok(LLMResponse {
             content,
             tool_calls,
+            usage,
         })
     }
 
@@ -433,12 +457,16 @@ impl LLM for OpenAIClient {
         Ok(LLMResponse {
             content: if full_content.is_empty() { None } else { Some(full_content) },
             tool_calls,
+            usage: None, // Streaming typically doesn't provide usage info
         })
     }
 }
 
 #[async_trait]
 impl LLM for AnthropicClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
     async fn chat_complete(
         &self,
         messages: Vec<ChatMessage>,
@@ -537,9 +565,16 @@ impl LLM for AnthropicClient {
             }
         }
         
+        // Extract usage information (Anthropic format)
+        let usage = anthropic_response["usage"].as_object().map(|u| UsageInfo {
+            prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
+
         Ok(LLMResponse {
             content: if content_text.is_empty() { None } else { Some(content_text) },
             tool_calls,
+            usage,
         })
     }
 
@@ -699,6 +734,7 @@ impl LLM for AnthropicClient {
         Ok(LLMResponse {
             content: if full_content.is_empty() { None } else { Some(full_content) },
             tool_calls,
+            usage: None, // Streaming typically doesn't provide usage info
         })
     }
 }

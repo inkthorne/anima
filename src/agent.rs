@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::error::ToolError;
 use crate::tool::Tool;
 use crate::message::Message;
 use crate::memory::{Memory, MemoryError};
 use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
+use crate::observe::{Observer, Event};
 use crate::retry::{RetryPolicy, with_retry};
 use tokio::sync::mpsc;
 use serde_json::Value;
@@ -96,6 +98,7 @@ pub struct Agent {
     memory: Option<Box<dyn Memory>>,
     llm: Option<Arc<dyn LLM>>,
     pub children: HashMap<String, ChildHandle>,
+    observer: Option<Arc<dyn Observer>>,
 }
 
 impl Agent {
@@ -107,6 +110,20 @@ impl Agent {
             memory: None,
             llm: None,
             children: HashMap::new(),
+            observer: None,
+        }
+    }
+
+    /// Attach an observer for monitoring agent activity.
+    pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Emit an event to the observer if one is attached.
+    async fn emit(&self, event: Event) {
+        if let Some(obs) = &self.observer {
+            obs.observe(event).await;
         }
     }
 
@@ -115,16 +132,48 @@ impl Agent {
     }
 
     pub async fn call_tool(&self, name: &str, input: &str) -> Result<String, ToolError> {
+        let start = Instant::now();
+
         if let Some(tool) = self.tools.get(name) {
             let input_value: Value =
-                serde_json::from_str(input).map_err(|e| ToolError::InvalidInput(e.to_string()))?;
-            let result = (*tool).execute(input_value).await?;
-            Ok(result.to_string())
+                serde_json::from_str(input).map_err(|e| {
+                    let err = ToolError::InvalidInput(e.to_string());
+                    // Note: We can't emit here since it's sync context within map_err
+                    err
+                })?;
+
+            let result = (*tool).execute(input_value).await;
+            let duration_ms = start.elapsed().as_millis() as u64;
+
+            match &result {
+                Ok(val) => {
+                    self.emit(Event::ToolCall {
+                        tool_name: name.to_string(),
+                        duration_ms,
+                        success: true,
+                        error: None,
+                    }).await;
+                    Ok(val.to_string())
+                }
+                Err(e) => {
+                    self.emit(Event::ToolCall {
+                        tool_name: name.to_string(),
+                        duration_ms,
+                        success: false,
+                        error: Some(e.to_string()),
+                    }).await;
+                    result.map(|v| v.to_string())
+                }
+            }
         } else {
-            Err(ToolError::ExecutionFailed(format!(
-                "Tool '{}' not found",
-                name
-            )))
+            let err = ToolError::ExecutionFailed(format!("Tool '{}' not found", name));
+            self.emit(Event::ToolCall {
+                tool_name: name.to_string(),
+                duration_ms: 0,
+                success: false,
+                error: Some(err.to_string()),
+            }).await;
+            Err(err)
         }
     }
 
@@ -224,6 +273,36 @@ pub async fn forget(&mut self, key: &str) -> bool {
     }
 
     pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
+        let agent_start = Instant::now();
+
+        // Emit agent start event
+        self.emit(Event::AgentStart {
+            agent_id: self.id.clone(),
+            task: task.to_string(),
+        }).await;
+
+        let result = self.think_with_options_inner(task, options).await;
+
+        // Emit agent complete event
+        let duration_ms = agent_start.elapsed().as_millis() as u64;
+        self.emit(Event::AgentComplete {
+            agent_id: self.id.clone(),
+            duration_ms,
+            success: result.is_ok(),
+        }).await;
+
+        if let Err(ref e) = result {
+            self.emit(Event::Error {
+                context: format!("agent:{}", self.id),
+                message: e.to_string(),
+            }).await;
+        }
+
+        result
+    }
+
+    /// Inner implementation of think_with_options (without event wrapper).
+    async fn think_with_options_inner(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
@@ -260,14 +339,16 @@ pub async fn forget(&mut self, key: &str) -> bool {
             tool_call_id: None,
             tool_calls: None,
         });
-        
+
         // Agentic loop
-        for iteration in 0..options.max_iterations {
+        for _iteration in 0..options.max_iterations {
             // Call LLM with retry if policy is configured
+            let llm_start = Instant::now();
             let response = if let Some(ref policy) = options.retry_policy {
                 let llm_ref = llm.clone();
                 let msgs = messages.clone();
                 let tls = tools.clone();
+                let observer = self.observer.clone();
                 let result = with_retry(
                     policy,
                     || {
@@ -278,16 +359,40 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     },
                     |e: &LLMError| e.is_retryable,
                 ).await;
+
+                // Emit retry events if attempts > 1
+                if result.attempts > 1 {
+                    if let Some(obs) = &observer {
+                        for attempt in 1..result.attempts {
+                            let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
+                            obs.observe(Event::Retry {
+                                operation: "llm_call".to_string(),
+                                attempt,
+                                delay_ms,
+                            }).await;
+                        }
+                    }
+                }
+
                 result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
                 llm.chat_complete(messages.clone(), Some(tools.clone())).await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
-            
+
+            // Emit LLM call event
+            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+            self.emit(Event::LlmCall {
+                model: llm.model_name().to_string(),
+                tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
+                tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
+                duration_ms: llm_duration_ms,
+            }).await;
+
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
                 let final_response = response.content.unwrap_or_else(|| "No response".to_string());
-                
+
                 // Apply reflection if configured
                 if let Some(ref config) = options.reflection {
                     return self.reflect_and_revise(
@@ -297,10 +402,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         &options,
                     ).await;
                 }
-                
+
                 return Ok(final_response);
             }
-            
+
             // Add assistant message with tool calls
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -308,12 +413,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             });
-            
+
             // Execute each tool and add results
             for tool_call in &response.tool_calls {
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
                     .unwrap_or_else(|e| format!("Error: {}", e));
-                
+
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
@@ -322,7 +427,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 });
             }
         }
-        
+
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
@@ -343,6 +448,41 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
     /// Think with streaming output and custom options.
     pub async fn think_streaming_with_options(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+        token_tx: mpsc::Sender<String>,
+    ) -> Result<String, crate::error::AgentError> {
+        let agent_start = Instant::now();
+
+        // Emit agent start event
+        self.emit(Event::AgentStart {
+            agent_id: self.id.clone(),
+            task: task.to_string(),
+        }).await;
+
+        let result = self.think_streaming_with_options_inner(task, options, token_tx).await;
+
+        // Emit agent complete event
+        let duration_ms = agent_start.elapsed().as_millis() as u64;
+        self.emit(Event::AgentComplete {
+            agent_id: self.id.clone(),
+            duration_ms,
+            success: result.is_ok(),
+        }).await;
+
+        if let Err(ref e) = result {
+            self.emit(Event::Error {
+                context: format!("agent:{}", self.id),
+                message: e.to_string(),
+            }).await;
+        }
+
+        result
+    }
+
+    /// Inner implementation of streaming think (without event wrapper).
+    async fn think_streaming_with_options_inner(
         &mut self,
         task: &str,
         options: ThinkOptions,
@@ -387,11 +527,13 @@ pub async fn forget(&mut self, key: &str) -> bool {
         for _iteration in 0..options.max_iterations {
             // Call LLM with retry if policy is configured
             // Note: streaming with retry will restart the entire stream on failure
+            let llm_start = Instant::now();
             let response = if let Some(ref policy) = options.retry_policy {
                 let llm_ref = llm.clone();
                 let msgs = messages.clone();
                 let tls = tools.clone();
                 let tx = token_tx.clone();
+                let observer = self.observer.clone();
                 let result = with_retry(
                     policy,
                     || {
@@ -403,6 +545,21 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     },
                     |e: &LLMError| e.is_retryable,
                 ).await;
+
+                // Emit retry events if attempts > 1
+                if result.attempts > 1 {
+                    if let Some(obs) = &observer {
+                        for attempt in 1..result.attempts {
+                            let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
+                            obs.observe(Event::Retry {
+                                operation: "llm_call_stream".to_string(),
+                                attempt,
+                                delay_ms,
+                            }).await;
+                        }
+                    }
+                }
+
                 result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
                 llm.chat_complete_stream(
@@ -411,6 +568,15 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     token_tx.clone(),
                 ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
+
+            // Emit LLM call event
+            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+            self.emit(Event::LlmCall {
+                model: llm.model_name().to_string(),
+                tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
+                tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
+                duration_ms: llm_duration_ms,
+            }).await;
 
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
@@ -614,18 +780,18 @@ pub async fn forget(&mut self, key: &str) -> bool {
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
-    /// Helper to create a child agent with cloned tools/LLM
+    /// Helper to create a child agent with cloned tools/LLM/observer
     fn create_child_agent(parent: &Agent, child_id: String) -> Agent {
         let (_, rx) = tokio::sync::mpsc::channel(32);
-        let mut child = Agent {
+        Agent {
             id: child_id,
             tools: parent.tools.clone(),  // Arc clones are cheap
             inbox: rx,
             memory: None,
             llm: parent.llm.clone(),  // Arc clone
             children: std::collections::HashMap::new(),
-        };
-        child
+            observer: parent.observer.clone(),  // Inherit observer
+        }
     }
 
     /// Spawn a child agent for a subtask
@@ -1078,5 +1244,65 @@ mod tests {
         let mut agent = create_test_agent("test-agent");
         let results = agent.wait_for_all_children().await;
         assert!(results.is_empty());
+    }
+
+    // =========================================================================
+    // Observer tests
+    // =========================================================================
+
+    #[test]
+    fn test_agent_with_observer() {
+        use crate::observe::MetricsCollector;
+        let agent = create_test_agent("test-agent");
+        let observer = Arc::new(MetricsCollector::new());
+        let agent = agent.with_observer(observer.clone());
+        assert!(agent.observer.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_observer_receives_tool_call_events() {
+        use crate::observe::MetricsCollector;
+        let mut agent = create_test_agent("test-agent");
+        let observer = Arc::new(MetricsCollector::new());
+        agent = agent.with_observer(observer.clone());
+        agent.register_tool(Arc::new(AddTool));
+
+        // Call tool successfully
+        let _ = agent.call_tool("add", r#"{"a": 2, "b": 3}"#).await;
+
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.tool_calls, 1);
+        assert_eq!(snapshot.errors, 0);
+    }
+
+    #[tokio::test]
+    async fn test_observer_receives_tool_error_events() {
+        use crate::observe::MetricsCollector;
+        let mut agent = create_test_agent("test-agent");
+        let observer = Arc::new(MetricsCollector::new());
+        agent = agent.with_observer(observer.clone());
+        agent.register_tool(Arc::new(AddTool));
+
+        // Call tool with invalid input
+        let _ = agent.call_tool("add", r#"{"a": "not a number", "b": 3}"#).await;
+
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.tool_calls, 1);
+        assert_eq!(snapshot.errors, 1); // Should count the error
+    }
+
+    #[tokio::test]
+    async fn test_observer_receives_tool_not_found_events() {
+        use crate::observe::MetricsCollector;
+        let mut agent = create_test_agent("test-agent");
+        let observer = Arc::new(MetricsCollector::new());
+        agent = agent.with_observer(observer.clone());
+
+        // Call nonexistent tool
+        let _ = agent.call_tool("nonexistent", "{}").await;
+
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.tool_calls, 1);
+        assert_eq!(snapshot.errors, 1);
     }
 }

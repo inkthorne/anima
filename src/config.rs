@@ -40,6 +40,8 @@ pub struct AgentConfig {
     pub think: ThinkSection,
     #[serde(default)]
     pub retry: RetrySection,
+    #[serde(default)]
+    pub observe: ObserveSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +143,19 @@ impl RetrySection {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ObserveSection {
+    /// Print all events when true, only errors/completions when false
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+impl Default for ObserveSection {
+    fn default() -> Self {
+        Self { verbose: false }
+    }
+}
+
 impl AgentConfig {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
@@ -173,6 +188,8 @@ model = "gpt-4o"
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_delay_ms, 100);
         assert_eq!(config.retry.max_delay_ms, 5000);
+        // Observe defaults
+        assert!(!config.observe.verbose);
     }
 
     #[test]
@@ -205,6 +222,9 @@ max_retries = 5
 initial_delay_ms = 200
 max_delay_ms = 10000
 exponential_base = 3.0
+
+[observe]
+verbose = true
 "#;
         let config: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.name, "full-agent");
@@ -222,6 +242,8 @@ exponential_base = 3.0
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 200);
         assert_eq!(config.retry.max_delay_ms, 10000);
+        // Observe config
+        assert!(config.observe.verbose);
         assert!((config.retry.exponential_base - 3.0).abs() < f64::EPSILON);
     }
 }

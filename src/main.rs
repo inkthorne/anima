@@ -3,6 +3,7 @@ use anima::{
     InMemoryStore, SqliteMemory, LLM,
 };
 use anima::config::AgentConfig;
+use anima::observe::ConsoleObserver;
 use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
@@ -26,6 +27,9 @@ enum Commands {
         /// Enable streaming output
         #[arg(long)]
         stream: bool,
+        /// Enable verbose observability output (all events, not just errors/completions)
+        #[arg(long, short)]
+        verbose: bool,
     },
 }
 
@@ -33,8 +37,8 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Run { config, task, stream } => {
-            if let Err(e) = run_agent(&config, &task, stream).await {
+        Commands::Run { config, task, stream, verbose } => {
+            if let Err(e) = run_agent(&config, &task, stream, verbose).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -42,9 +46,13 @@ async fn main() {
     }
 }
 
-async fn run_agent(config_path: &str, task: &str, stream: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_agent(config_path: &str, task: &str, stream: bool, verbose_cli: bool) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = AgentConfig::from_file(config_path)?;
+
+    // 2. Create observer (CLI flag overrides config)
+    let verbose = verbose_cli || config.observe.verbose;
+    let observer = Arc::new(ConsoleObserver::new(verbose));
 
     // 2. Create LLM from config (check env for API key)
     let llm: Arc<dyn LLM> = match config.llm.provider.as_str() {
@@ -97,6 +105,7 @@ async fn run_agent(config_path: &str, task: &str, stream: bool) -> Result<(), Bo
 
     agent = agent.with_llm(llm);
     agent = agent.with_memory(memory);
+    agent = agent.with_observer(observer);
 
     // 5. Build ThinkOptions from config
     let auto_memory = if config.think.auto_memory {
