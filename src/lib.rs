@@ -14,4 +14,4 @@ pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore};
 pub use message::Message;
 pub use runtime::Runtime;
 pub use tool::{Tool, ToolInfo};
-pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient};
+pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient};
