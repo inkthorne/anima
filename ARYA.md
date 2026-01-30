@@ -13,7 +13,9 @@ Build: `cargo build`
 - [x] 7. [src/tools/mod.rs] Create tools module with re-exports
 - [x] 8. [src/tools/echo.rs] Implement Echo tool
 - [x] 9. [src/tools/add.rs] Implement Add tool
-- [ ] 10. [src/main.rs] Demo: create runtime, spawn agent, register tools, call them
+- [x] 10. [src/main.rs] Demo: create runtime, spawn agent, register tools, call them
+
+## ✅ v0.1 COMPLETE!
 
 ## Plan
 
