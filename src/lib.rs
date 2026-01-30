@@ -24,5 +24,5 @@ pub use retry::{RetryPolicy, RetryResult, with_retry};
 pub use runtime::Runtime;
 pub use tool::{Tool, ToolInfo};
 pub use tools::{SendMessageTool, ListAgentsTool};
-pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient, UsageInfo};
+pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient, OllamaClient, UsageInfo};
 pub use supervision::{ChildHandle, ChildConfig, ChildStatus};

@@ -98,7 +98,7 @@ async fn run_agent(config_path: &str, task: &str, stream: bool, verbose_cli: boo
 
     // 4. Create agent, register enabled tools
     let mut runtime = Runtime::new();
-    let mut agent = runtime.spawn_agent(config.agent.name.clone());
+    let mut agent = runtime.spawn_agent(config.agent.name.clone()).await;
 
     // Register enabled tools
     for tool_name in &config.tools.enabled {

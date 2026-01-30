@@ -11,7 +11,7 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
 
-use crate::llm::{LLM, OpenAIClient, AnthropicClient};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
 use crate::memory::{Memory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
@@ -205,7 +205,7 @@ impl Repl {
         } else if input == "agent list" {
             self.cmd_agent_list();
         } else if input.starts_with("agent remove ") {
-            self.cmd_agent_remove(&input[13..]);
+            self.cmd_agent_remove(&input[13..]).await;
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
         } else if input.starts_with("set llm ") {
@@ -267,7 +267,7 @@ impl Repl {
         };
 
         // Create agent with runtime (registers with message router)
-        let mut agent = self.runtime.spawn_agent(name.clone());
+        let mut agent = self.runtime.spawn_agent(name.clone()).await;
 
         // Register default tools
         agent.register_tool(Arc::new(AddTool));
@@ -328,7 +328,14 @@ impl Repl {
                 }
                 Ok(Arc::new(client))
             }
-            _ => Err(format!("Unknown provider: {} (use 'openai' or 'anthropic')", provider).into()),
+            "ollama" => {
+                let mut client = OllamaClient::new();
+                if let Some(m) = model {
+                    client = client.with_model(m);
+                }
+                Ok(Arc::new(client))
+            }
+            _ => Err(format!("Unknown provider: {} (use 'openai', 'anthropic', or 'ollama')", provider).into()),
         }
     }
 
@@ -344,10 +351,10 @@ impl Repl {
         }
     }
 
-    fn cmd_agent_remove(&mut self, name: &str) {
+    async fn cmd_agent_remove(&mut self, name: &str) {
         let name = name.trim();
         if self.agents.remove(name).is_some() {
-            self.runtime.remove_agent(name);
+            self.runtime.remove_agent(name).await;
             println!("\x1b[32m✓ Removed agent '{}'\x1b[0m", name);
         } else {
             println!("\x1b[31mAgent '{}' not found\x1b[0m", name);
@@ -497,8 +504,8 @@ impl Repl {
         // Validate the spec
         let parts: Vec<&str> = spec.splitn(2, '/').collect();
         let provider = parts[0];
-        if provider != "openai" && provider != "anthropic" {
-            println!("\x1b[31mUnknown provider '{}'. Use 'openai' or 'anthropic'.\x1b[0m", provider);
+        if provider != "openai" && provider != "anthropic" && provider != "ollama" {
+            println!("\x1b[31mUnknown provider '{}'. Use 'openai', 'anthropic', or 'ollama'.\x1b[0m", provider);
             return;
         }
 
@@ -529,7 +536,8 @@ impl Repl {
         println!();
         println!("  \x1b[36mset llm <provider/model>\x1b[0m");
         println!("      Set default LLM for new agents");
-        println!("      Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514");
+        println!("      Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3");
+        println!("      Ollama: set OLLAMA_HOST env var (default: http://localhost:11434)");
         println!();
         println!("  \x1b[36mhelp\x1b[0m");
         println!("      Show this help message");
@@ -537,7 +545,7 @@ impl Repl {
         println!("  \x1b[36mexit\x1b[0m / \x1b[36mquit\x1b[0m");
         println!("      Exit the REPL");
         println!();
-        println!("\x1b[33mNote: Set OPENAI_API_KEY or ANTHROPIC_API_KEY environment variables.\x1b[0m");
+        println!("\x1b[33mNote: Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or OLLAMA_HOST environment variables.\x1b[0m");
     }
 }
 

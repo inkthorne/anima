@@ -739,6 +739,286 @@ impl LLM for AnthropicClient {
     }
 }
 
+/// Ollama client using OpenAI-compatible API.
+/// Configure with OLLAMA_HOST env var (defaults to http://localhost:11434)
+pub struct OllamaClient {
+    client: Client,
+    base_url: String,
+    model: String,
+}
+
+impl OllamaClient {
+    pub fn new() -> Self {
+        let base_url = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        Self {
+            client: Client::new(),
+            base_url,
+            model: "llama3".to_string(),
+        }
+    }
+
+    pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
+        self.base_url = url.into();
+        self
+    }
+
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+}
+
+impl Default for OllamaClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl LLM for OllamaClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        // Transform messages for API compatibility
+        let mut formatted_messages = Vec::new();
+        for message in messages {
+            let mut formatted_message = serde_json::to_value(&message).unwrap();
+            if let Some(tool_calls) = message.tool_calls {
+                if !tool_calls.is_empty() {
+                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
+                }
+            }
+            formatted_messages.push(formatted_message);
+        }
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages
+        });
+
+        if let Some(tool_list) = tools {
+            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            }).collect();
+            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to send request: {}", e))
+            })?;
+
+        let status = response.status().as_u16();
+
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to read response: {}", e))
+            })?;
+
+        if status >= 400 {
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", response_text),
+            ));
+        }
+
+        let ollama_response: serde_json::Value = serde_json::from_str(&response_text)
+            .map_err(|e| {
+                LLMError::permanent(format!("Failed to parse response: {}", e))
+            })?;
+
+        let content = ollama_response["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.to_string());
+
+        let tool_calls = ollama_response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(|tool_calls_array| {
+                tool_calls_array
+                    .iter()
+                    .filter_map(|tool_call| {
+                        let id = tool_call["id"].as_str().map(|s| s.to_string())?;
+                        let name = tool_call["function"]["name"].as_str().map(|s| s.to_string())?;
+                        let arguments_str = tool_call["function"]["arguments"].as_str()?;
+                        let arguments: serde_json::Value = serde_json::from_str(arguments_str).ok()?;
+                        Some(ToolCall { id, name, arguments })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let usage = ollama_response["usage"].as_object().map(|u| UsageInfo {
+            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        });
+
+        Ok(LLMResponse {
+            content,
+            tool_calls,
+            usage,
+        })
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/v1/chat/completions", self.base_url);
+
+        // Transform messages for API compatibility
+        let mut formatted_messages = Vec::new();
+        for message in messages {
+            let mut formatted_message = serde_json::to_value(&message).unwrap();
+            if let Some(tool_calls) = message.tool_calls {
+                if !tool_calls.is_empty() {
+                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
+                }
+            }
+            formatted_messages.push(formatted_message);
+        }
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages,
+            "stream": true
+        });
+
+        if let Some(tool_list) = tools {
+            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.parameters
+                    }
+                })
+            }).collect();
+            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to send request: {}", e))
+            })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut full_content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
+        let mut buffer = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| {
+                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
+            })?;
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                if line == "data: [DONE]" {
+                    break;
+                }
+
+                if let Some(data) = line.strip_prefix("data: ") {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                            full_content.push_str(content);
+                            let _ = tx.send(content.to_string()).await;
+                        }
+
+                        if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
+                            for tc in tc_array {
+                                let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                                let entry = tool_call_builders.entry(index)
+                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+
+                                if let Some(id) = tc["id"].as_str() {
+                                    entry.0 = id.to_string();
+                                }
+                                if let Some(name) = tc["function"]["name"].as_str() {
+                                    entry.1.push_str(name);
+                                }
+                                if let Some(args) = tc["function"]["arguments"].as_str() {
+                                    entry.2.push_str(args);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
+        indices.sort();
+        for index in indices {
+            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index) {
+                if let Ok(arguments) = serde_json::from_str(&arguments_str) {
+                    tool_calls.push(ToolCall { id, name, arguments });
+                }
+            }
+        }
+
+        Ok(LLMResponse {
+            content: if full_content.is_empty() { None } else { Some(full_content) },
+            tool_calls,
+            usage: None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

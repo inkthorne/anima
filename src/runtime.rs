@@ -31,12 +31,12 @@ impl Runtime {
     }
 
     /// Spawn a new agent with the given ID (auto-registers with message router)
-    pub fn spawn_agent(&mut self, id: String) -> Agent {
+    pub async fn spawn_agent(&mut self, id: String) -> Agent {
         let (tx, rx) = mpsc::channel(32);
 
         // Register with message router
         let message_rx = {
-            let mut router = self.router.blocking_lock();
+            let mut router = self.router.lock().await;
             router.register(&id)
         };
 
@@ -47,12 +47,12 @@ impl Runtime {
     }
 
     /// Spawn a new agent with the given ID and memory (auto-registers with message router)
-    pub fn spawn_agent_with_memory(&mut self, id: String, memory: Box<dyn Memory>) -> &mut Agent {
+    pub async fn spawn_agent_with_memory(&mut self, id: String, memory: Box<dyn Memory>) -> &mut Agent {
         let (tx, rx) = mpsc::channel::<Message>(32);
 
         // Register with message router
         let message_rx = {
-            let mut router = self.router.blocking_lock();
+            let mut router = self.router.lock().await;
             router.register(&id)
         };
 
@@ -75,10 +75,10 @@ impl Runtime {
     }
 
     /// Remove an agent by ID and return it if it existed
-    pub fn remove_agent(&mut self, id: &str) -> Option<Agent> {
+    pub async fn remove_agent(&mut self, id: &str) -> Option<Agent> {
         // Unregister from message router
         {
-            let mut router = self.router.blocking_lock();
+            let mut router = self.router.lock().await;
             router.unregister(id);
         }
         self.agents.remove(id)
@@ -123,10 +123,10 @@ impl Runtime {
     // }
 
     /// Terminate a specific child agent
-    pub fn terminate_child(&mut self, child_id: &str) {
+    pub async fn terminate_child(&mut self, child_id: &str) {
         // Unregister from message router
         {
-            let mut router = self.router.blocking_lock();
+            let mut router = self.router.lock().await;
             router.unregister(child_id);
         }
         self.agents.remove(child_id);
@@ -134,7 +134,7 @@ impl Runtime {
     }
 
     /// Terminate all children of an agent (recursive)
-    pub fn terminate_children(&mut self, parent_id: &str) {
+    pub async fn terminate_children(&mut self, parent_id: &str) {
         let children: Vec<String> = self.parent_map
             .iter()
             .filter(|(_, p)| *p == parent_id)
@@ -142,8 +142,8 @@ impl Runtime {
             .collect();
         
         for child_id in children {
-            self.terminate_children(&child_id); // Recursive
-            self.terminate_child(&child_id);
+            Box::pin(self.terminate_children(&child_id)).await; // Recursive
+            self.terminate_child(&child_id).await;
         }
     }
 
