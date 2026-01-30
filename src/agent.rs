@@ -17,6 +17,8 @@ pub struct ThinkOptions {
     pub max_iterations: usize,
     /// Optional system prompt to set agent behavior
     pub system_prompt: Option<String>,
+    /// Optional reflection configuration for self-evaluation
+    pub reflection: Option<ReflectionConfig>,
 }
 
 impl Default for ThinkOptions {
@@ -24,8 +26,36 @@ impl Default for ThinkOptions {
         Self {
             max_iterations: 10,
             system_prompt: None,
+            reflection: None,
         }
     }
+}
+
+/// Configuration for self-reflection after generating a response
+#[derive(Debug, Clone)]
+pub struct ReflectionConfig {
+    /// Prompt to use when asking the LLM to evaluate its response
+    pub prompt: String,
+    /// Maximum number of revision cycles allowed
+    pub max_revisions: usize,
+}
+
+impl Default for ReflectionConfig {
+    fn default() -> Self {
+        Self {
+            prompt: String::from("Evaluate your response. Is it complete and correct? If not, explain what needs to change."),
+            max_revisions: 1,
+        }
+    }
+}
+
+/// Result of a reflection evaluation
+#[derive(Debug, Clone)]
+pub struct ReflectionResult {
+    /// Whether the response was accepted as-is
+    pub accepted: bool,
+    /// Feedback for revision if not accepted
+    pub feedback: Option<String>,
 }
 
 pub struct Agent {
@@ -138,9 +168,21 @@ pub async fn forget(&mut self, key: &str) -> bool {
             let response = llm.chat_complete(messages.clone(), Some(tools.clone())).await
                 .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
             
-            // If no tool calls, we're done - return the response
+            // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
-                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+                let final_response = response.content.unwrap_or_else(|| "No response".to_string());
+                
+                // Apply reflection if configured
+                if let Some(ref config) = options.reflection {
+                    return self.reflect_and_revise(
+                        task,
+                        &final_response,
+                        config,
+                        &options,
+                    ).await;
+                }
+                
+                return Ok(final_response);
             }
             
             // Add assistant message with tool calls
@@ -170,6 +212,129 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
      pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
         self.think_with_options(task, ThinkOptions::default()).await
+    }
+
+    /// Reflect on a response and potentially revise it
+    async fn reflect_and_revise(
+        &mut self,
+        original_task: &str,
+        response: &str,
+        config: &ReflectionConfig,
+        options: &ThinkOptions,
+    ) -> Result<String, crate::error::AgentError> {
+        let mut current_response = response.to_string();
+        
+        for _revision in 0..config.max_revisions {
+            // Clone LLM for this scope to avoid borrow issues
+            let llm = self.llm.clone().ok_or_else(|| 
+                crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+            
+            // Ask LLM to reflect on the response
+            let reflection_prompt = format!(
+                "{}\n\nOriginal task: {}\n\nResponse to evaluate:\n{}\n\nRespond with either:\n- ACCEPTED: if the response is complete and correct\n- REVISE: <feedback> if changes are needed",
+                config.prompt, original_task, current_response
+            );
+            
+            let reflection_messages = vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(reflection_prompt),
+                tool_call_id: None,
+                tool_calls: None,
+            }];
+            
+            let reflection = llm.chat_complete(reflection_messages, None).await
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            
+            let reflection_text = reflection.content.unwrap_or_default();
+            
+            // Parse reflection result
+            if reflection_text.to_uppercase().starts_with("ACCEPTED") {
+                return Ok(current_response);
+            }
+            
+            // Extract feedback and revise
+            let feedback = if reflection_text.to_uppercase().starts_with("REVISE:") {
+                reflection_text[7..].trim().to_string()
+            } else {
+                reflection_text.clone()
+            };
+            
+            // Generate revised response
+            let revision_prompt = format!(
+                "Original task: {}\n\nYour previous response:\n{}\n\nFeedback:\n{}\n\nPlease provide an improved response.",
+                original_task, current_response, feedback
+            );
+            
+            let revision_options = ThinkOptions {
+                max_iterations: options.max_iterations,
+                system_prompt: options.system_prompt.clone(),
+                reflection: None, // Don't recurse
+            };
+            
+            current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
+        }
+        
+        // Return final response after max revisions
+        Ok(current_response)
+    }
+    
+    /// Core agentic loop extracted for reuse
+    async fn run_agentic_loop(
+        &mut self,
+        task: &str,
+        options: &ThinkOptions,
+    ) -> Result<String, crate::error::AgentError> {
+        let llm = self.llm.as_ref().ok_or_else(|| 
+            crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        
+        let tools = self.list_tools_for_llm();
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        
+        if let Some(system) = &options.system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(task.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        
+        for _iteration in 0..options.max_iterations {
+            let response = llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            
+            if response.tool_calls.is_empty() {
+                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+            }
+            
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: response.content.clone(),
+                tool_call_id: None,
+                tool_calls: Some(response.tool_calls.clone()),
+            });
+            
+            for tool_call in &response.tool_calls {
+                let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
+                    .unwrap_or_else(|e| format!("Error: {}", e));
+                
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(result),
+                    tool_call_id: Some(tool_call.id.clone()),
+                    tool_calls: None,
+                });
+            }
+        }
+        
+        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
     /// Helper to create a child agent with cloned tools/LLM

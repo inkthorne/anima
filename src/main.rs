@@ -1,115 +1,57 @@
-use anima::{Memory, SqliteMemory};
+use anima::{Runtime, OpenAIClient, ThinkOptions, ReflectionConfig};
+use anima::tools::{AddTool, EchoTool};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    println!("=== Anima v0.9 Demo: Persistent Memory ===\n");
+    println!("=== Anima v0.10 Demo: Self-Reflection ===\n");
     
-    let db_path = "/tmp/anima_demo.db";
-    let agent_id = "demo-agent";
+    let llm = OpenAIClient::new("ollama")
+        .with_base_url("http://100.67.222.97:11434/v1")
+        .with_model("qwen3-coder-32k");
     
-    // First run: Create memories
-    {
-        println!("--- First Session ---");
-        let mut memory = SqliteMemory::open(db_path, agent_id)
-            .expect("Failed to open database");
-        
-        // Store some memories
-        memory.set("name", serde_json::json!("Arya")).await.unwrap();
-        memory.set("count", serde_json::json!(42)).await.unwrap();
-        memory.set("facts:rust", serde_json::json!("Rust is memory safe")).await.unwrap();
-        memory.set("facts:anima", serde_json::json!("Anima means soul")).await.unwrap();
-        
-        println!("Stored memories: name, count, facts:rust, facts:anima");
-        
-        // Read them back
-        if let Some(entry) = memory.get("name").await {
-            println!("  name = {} (created: {})", entry.value, entry.created_at);
-        }
-        if let Some(entry) = memory.get("count").await {
-            println!("  count = {} (created: {})", entry.value, entry.created_at);
-        }
-        
-        // List keys with prefix
-        let fact_keys = memory.list_keys(Some("facts:")).await;
-        println!("  Keys starting with 'facts:': {:?}", fact_keys);
-        
-        println!("Session 1 complete. Memory closed.\n");
+    let mut runtime = Runtime::new();
+    let mut agent = runtime.spawn_agent("reflective-agent".to_string());
+    agent.register_tool(Arc::new(AddTool));
+    agent.register_tool(Arc::new(EchoTool));
+    agent = agent.with_llm(Arc::new(llm));
+    
+    println!("Agent created with tools: add, echo\n");
+    
+    // Demo 1: Without reflection
+    println!("--- Without Reflection ---");
+    let task = "What is 15 + 27?";
+    println!("Task: {}", task);
+    
+    let options_no_reflect = ThinkOptions::default();
+    match agent.think_with_options(task, options_no_reflect).await {
+        Ok(response) => println!("Response: {}\n", response),
+        Err(e) => println!("Error: {}\n", e),
     }
     
-    // Second run: Memories persist!
-    {
-        println!("--- Second Session (same agent) ---");
-        let memory = SqliteMemory::open(db_path, agent_id)
-            .expect("Failed to open database");
-        
-        // Memories still there!
-        if let Some(entry) = memory.get("name").await {
-            println!("  name = {} (still here!)", entry.value);
-        }
-        if let Some(entry) = memory.get("count").await {
-            println!("  count = {} (persisted!)", entry.value);
-        }
-        
-        let all_keys = memory.list_keys(None).await;
-        println!("  All keys: {:?}", all_keys);
-        
-        println!("Session 2 complete. Agent remembers!\n");
+    // Demo 2: With reflection
+    println!("--- With Reflection ---");
+    let task2 = "Calculate 15 + 27 and also 100 - 58. Report both results.";
+    println!("Task: {}", task2);
+    
+    let options_with_reflect = ThinkOptions {
+        max_iterations: 10,
+        system_prompt: None,
+        reflection: Some(ReflectionConfig {
+            prompt: "Check: Did you calculate BOTH numbers? Did you report BOTH results clearly?".to_string(),
+            max_revisions: 2,
+        }),
+    };
+    
+    match agent.think_with_options(task2, options_with_reflect).await {
+        Ok(response) => println!("Response: {}\n", response),
+        Err(e) => println!("Error: {}\n", e),
     }
     
-    // Third run: Different agent, different memories
-    {
-        println!("--- Third Session (different agent) ---");
-        let other_agent = "other-agent";
-        let mut memory = SqliteMemory::open(db_path, other_agent)
-            .expect("Failed to open database");
-        
-        // This agent has no memories yet
-        let keys = memory.list_keys(None).await;
-        println!("  {} has keys: {:?}", other_agent, keys);
-        
-        // But can create its own
-        memory.set("name", serde_json::json!("Other")).await.unwrap();
-        println!("  Stored name = 'Other' for {}", other_agent);
-        
-        // Original agent's memories are isolated
-        let original = SqliteMemory::open(db_path, agent_id)
-            .expect("Failed to open database");
-        if let Some(entry) = original.get("name").await {
-            println!("  {} still has name = {}", agent_id, entry.value);
-        }
-        
-        println!("Session 3 complete. Agents are isolated!\n");
-    }
-    
-    // Episodic memory demo
-    {
-        println!("--- Episodic Memory Demo ---");
-        let mut memory = SqliteMemory::open(db_path, agent_id)
-            .expect("Failed to open database");
-        
-        // Add a new memory
-        memory.set("recent", serde_json::json!("Just happened")).await.unwrap();
-        
-        // Query by time (last hour)
-        let one_hour_ago = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() - 3600;
-        
-        let recent = memory.query_by_time(one_hour_ago, None).await.unwrap();
-        println!("  Memories from last hour:");
-        for (key, entry) in recent {
-            println!("    {} = {} (at {})", key, entry.value, entry.updated_at);
-        }
-    }
-    
-    // Cleanup for demo reproducibility
-    std::fs::remove_file(db_path).ok();
-    
-    println!("\n=== Demo Complete ===");
-    println!("Persistent memory enables:");
-    println!("  • Agent identity across sessions");
-    println!("  • Isolated memory per agent");
-    println!("  • Episodic queries (what happened when?)");
-    println!("  • Memory is identity. 🧠");
+    println!("=== Demo Complete ===");
+    println!("Self-reflection enables:");
+    println!("  • Think → Evaluate → Revise loops");
+    println!("  • Configurable reflection prompts");
+    println!("  • Bounded revision cycles");
+    println!("  • More complete, accurate responses");
 }
