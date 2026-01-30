@@ -1,0 +1,25 @@
+# Basic Anima Agent Configuration
+# Usage: anima run examples/basic.toml "your task here"
+
+[agent]
+name = "basic-agent"
+# system_prompt = "You are a helpful assistant."
+
+[llm]
+provider = "openai"
+model = "gpt-4o"
+# base_url = "http://localhost:11434/v1"  # For local Ollama
+
+[tools]
+enabled = ["echo", "add"]
+
+[memory]
+backend = "in_memory"
+# backend = "sqlite"
+# path = "agent.db"
+
+[think]
+max_iterations = 10
+auto_memory = false
+max_memory_entries = 10
+reflection = false
