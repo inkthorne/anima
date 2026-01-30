@@ -417,3 +417,243 @@ pub async fn forget(&mut self, key: &str) -> bool {
         results
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{AddTool, EchoTool};
+    use crate::memory::InMemoryStore;
+    use serde_json::json;
+
+    fn create_test_agent(id: &str) -> Agent {
+        let (_tx, rx) = mpsc::channel(32);
+        Agent::new(id.to_string(), rx)
+    }
+
+    // =========================================================================
+    // Tool registration tests
+    // =========================================================================
+
+    #[test]
+    fn test_agent_new() {
+        let agent = create_test_agent("test-agent");
+        assert_eq!(agent.id, "test-agent");
+        assert!(agent.tools.is_empty());
+        assert!(agent.memory.is_none());
+        assert!(agent.llm.is_none());
+        assert!(agent.children.is_empty());
+    }
+
+    #[test]
+    fn test_register_tool() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(AddTool));
+
+        assert_eq!(agent.tools.len(), 1);
+        assert!(agent.tools.contains_key("add"));
+    }
+
+    #[test]
+    fn test_register_multiple_tools() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(AddTool));
+        agent.register_tool(Arc::new(EchoTool));
+
+        assert_eq!(agent.tools.len(), 2);
+        assert!(agent.tools.contains_key("add"));
+        assert!(agent.tools.contains_key("echo"));
+    }
+
+    #[test]
+    fn test_list_tools_for_llm() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(AddTool));
+        agent.register_tool(Arc::new(EchoTool));
+
+        let specs = agent.list_tools_for_llm();
+        assert_eq!(specs.len(), 2);
+
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"add"));
+        assert!(names.contains(&"echo"));
+    }
+
+    // =========================================================================
+    // Tool calling tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_call_tool_success() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(AddTool));
+
+        let result = agent.call_tool("add", r#"{"a": 2, "b": 3}"#).await.unwrap();
+        assert!(result.contains("5"));
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_not_found() {
+        let agent = create_test_agent("test-agent");
+
+        let result = agent.call_tool("nonexistent", "{}").await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("not found"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_tool_invalid_json() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(AddTool));
+
+        let result = agent.call_tool("add", "not valid json").await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_call_echo_tool() {
+        let mut agent = create_test_agent("test-agent");
+        agent.register_tool(Arc::new(EchoTool));
+
+        let result = agent.call_tool("echo", r#"{"message": "hello"}"#).await.unwrap();
+        assert!(result.contains("hello"));
+    }
+
+    // =========================================================================
+    // Memory tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_agent_with_memory() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let agent = agent.with_memory(memory);
+
+        assert!(agent.memory.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_remember_and_recall() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        agent.remember("key1", json!("value1")).await.unwrap();
+
+        let value = agent.recall("key1").await;
+        assert_eq!(value, Some(json!("value1")));
+    }
+
+    #[tokio::test]
+    async fn test_recall_nonexistent() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let agent = agent.with_memory(memory);
+
+        let value = agent.recall("nonexistent").await;
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_recall_without_memory() {
+        let agent = create_test_agent("test-agent");
+        let value = agent.recall("key").await;
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_remember_without_memory() {
+        let mut agent = create_test_agent("test-agent");
+        let result = agent.remember("key", json!("value")).await;
+        assert!(matches!(result, Err(MemoryError::StorageError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_forget() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        agent.remember("key1", json!("value1")).await.unwrap();
+        assert!(agent.forget("key1").await);
+        assert!(agent.recall("key1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_forget_nonexistent() {
+        let agent = create_test_agent("test-agent");
+        let memory = Box::new(InMemoryStore::new());
+        let mut agent = agent.with_memory(memory);
+
+        assert!(!agent.forget("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_forget_without_memory() {
+        let mut agent = create_test_agent("test-agent");
+        assert!(!agent.forget("key").await);
+    }
+
+    // =========================================================================
+    // ThinkOptions tests
+    // =========================================================================
+
+    #[test]
+    fn test_think_options_default() {
+        let opts = ThinkOptions::default();
+        assert_eq!(opts.max_iterations, 10);
+        assert!(opts.system_prompt.is_none());
+        assert!(opts.reflection.is_none());
+    }
+
+    #[test]
+    fn test_reflection_config_default() {
+        let config = ReflectionConfig::default();
+        assert!(!config.prompt.is_empty());
+        assert_eq!(config.max_revisions, 1);
+    }
+
+    // =========================================================================
+    // Think without LLM (error case)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_think_without_llm() {
+        let mut agent = create_test_agent("test-agent");
+        let result = agent.think("do something").await;
+        assert!(matches!(result, Err(crate::error::AgentError::LlmError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_think_with_options_without_llm() {
+        let mut agent = create_test_agent("test-agent");
+        let result = agent.think_with_options("do something", ThinkOptions::default()).await;
+        assert!(matches!(result, Err(crate::error::AgentError::LlmError(_))));
+    }
+
+    // =========================================================================
+    // Child agent tests
+    // =========================================================================
+
+    #[test]
+    fn test_poll_child_nonexistent() {
+        let agent = create_test_agent("test-agent");
+        assert!(agent.poll_child("nonexistent").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_child_nonexistent() {
+        let mut agent = create_test_agent("test-agent");
+        let result = agent.wait_for_child("nonexistent").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_all_children_empty() {
+        let mut agent = create_test_agent("test-agent");
+        let results = agent.wait_for_all_children().await;
+        assert!(results.is_empty());
+    }
+}

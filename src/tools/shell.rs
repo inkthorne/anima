@@ -87,3 +87,95 @@ impl Tool for ShellTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_shell_tool_name() {
+        let tool = ShellTool::new();
+        assert_eq!(tool.name(), "shell");
+    }
+
+    #[test]
+    fn test_shell_tool_description() {
+        let tool = ShellTool::new();
+        assert!(tool.description().contains("shell"));
+    }
+
+    #[test]
+    fn test_shell_tool_schema() {
+        let tool = ShellTool::new();
+        let schema = tool.schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["command"].is_object());
+        assert!(schema["required"].as_array().unwrap().contains(&json!("command")));
+    }
+
+    #[test]
+    fn test_shell_tool_default() {
+        let tool = ShellTool::default();
+        assert_eq!(tool.timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_shell_tool_with_timeout() {
+        let tool = ShellTool::with_timeout(Duration::from_secs(60));
+        assert_eq!(tool.timeout, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn test_shell_simple_command() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({"command": "echo hello"})).await.unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
+        assert_eq!(result["exit_code"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_shell_exit_code() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({"command": "exit 42"})).await.unwrap();
+        assert_eq!(result["exit_code"], 42);
+    }
+
+    #[tokio::test]
+    async fn test_shell_stderr() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({"command": "echo error >&2"})).await.unwrap();
+        assert!(result["stderr"].as_str().unwrap().contains("error"));
+    }
+
+    #[tokio::test]
+    async fn test_shell_missing_command_field() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({})).await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_shell_timeout() {
+        let tool = ShellTool::with_timeout(Duration::from_millis(100));
+        let result = tool.execute(json!({"command": "sleep 10"})).await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("timed out"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shell_command_with_args() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({"command": "printf '%s' test"})).await.unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap(), "test");
+    }
+
+    #[tokio::test]
+    async fn test_shell_piped_command() {
+        let tool = ShellTool::new();
+        let result = tool.execute(json!({"command": "echo hello world | tr a-z A-Z"})).await.unwrap();
+        assert_eq!(result["stdout"].as_str().unwrap().trim(), "HELLO WORLD");
+    }
+}

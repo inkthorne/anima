@@ -120,3 +120,80 @@ impl Tool for HttpTool {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_http_tool_name() {
+        let tool = HttpTool::new();
+        assert_eq!(tool.name(), "http");
+    }
+
+    #[test]
+    fn test_http_tool_description() {
+        let tool = HttpTool::new();
+        assert!(tool.description().contains("HTTP"));
+    }
+
+    #[test]
+    fn test_http_tool_schema() {
+        let tool = HttpTool::new();
+        let schema = tool.schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["url"].is_object());
+        assert!(schema["properties"]["method"].is_object());
+        assert!(schema["properties"]["body"].is_object());
+        assert!(schema["required"].as_array().unwrap().contains(&json!("url")));
+    }
+
+    #[test]
+    fn test_http_tool_default() {
+        let tool = HttpTool::default();
+        assert_eq!(tool.name(), "http");
+    }
+
+    #[tokio::test]
+    async fn test_http_missing_url() {
+        let tool = HttpTool::new();
+        let result = tool.execute(json!({})).await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_http_invalid_url() {
+        let tool = HttpTool::new();
+        let result = tool.execute(json!({"url": "not-a-valid-url"})).await;
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_http_unsupported_method() {
+        let tool = HttpTool::new();
+        let result = tool.execute(json!({"url": "https://example.com", "method": "CONNECT"})).await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    // Network-dependent tests are marked #[ignore]
+    #[tokio::test]
+    #[ignore]
+    async fn test_http_get_request() {
+        let tool = HttpTool::new();
+        let result = tool.execute(json!({"url": "https://httpbin.org/get"})).await.unwrap();
+        assert_eq!(result["status"], 200);
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_http_post_request() {
+        let tool = HttpTool::new();
+        let result = tool.execute(json!({
+            "url": "https://httpbin.org/post",
+            "method": "POST",
+            "body": "test data"
+        })).await.unwrap();
+        assert_eq!(result["status"], 200);
+    }
+}

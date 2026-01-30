@@ -301,3 +301,299 @@ impl Memory for SqliteMemory {
         }).await.unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // =========================================================================
+    // InMemoryStore tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_in_memory_new() {
+        let store = InMemoryStore::new();
+        assert!(store.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_default() {
+        let store = InMemoryStore::default();
+        assert!(store.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_set_and_get() {
+        let mut store = InMemoryStore::new();
+        store.set("key1", json!("value1")).await.unwrap();
+
+        let entry = store.get("key1").await.unwrap();
+        assert_eq!(entry.value, json!("value1"));
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_get_nonexistent() {
+        let store = InMemoryStore::new();
+        assert!(store.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_delete() {
+        let mut store = InMemoryStore::new();
+        store.set("key1", json!("value1")).await.unwrap();
+
+        assert!(store.delete("key1").await);
+        assert!(store.get("key1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_delete_nonexistent() {
+        let mut store = InMemoryStore::new();
+        assert!(!store.delete("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_list_keys_all() {
+        let mut store = InMemoryStore::new();
+        store.set("alpha", json!(1)).await.unwrap();
+        store.set("beta", json!(2)).await.unwrap();
+        store.set("gamma", json!(3)).await.unwrap();
+
+        let keys = store.list_keys(None).await;
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&"alpha".to_string()));
+        assert!(keys.contains(&"beta".to_string()));
+        assert!(keys.contains(&"gamma".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_list_keys_with_prefix() {
+        let mut store = InMemoryStore::new();
+        store.set("user:1", json!(1)).await.unwrap();
+        store.set("user:2", json!(2)).await.unwrap();
+        store.set("config:theme", json!("dark")).await.unwrap();
+
+        let keys = store.list_keys(Some("user:")).await;
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"user:1".to_string()));
+        assert!(keys.contains(&"user:2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_preserves_created_at() {
+        let mut store = InMemoryStore::new();
+        store.set("key", json!("v1")).await.unwrap();
+
+        let entry1 = store.get("key").await.unwrap();
+        let created = entry1.created_at;
+
+        // Update the key
+        store.set("key", json!("v2")).await.unwrap();
+
+        let entry2 = store.get("key").await.unwrap();
+        assert_eq!(entry2.created_at, created);
+        assert_eq!(entry2.value, json!("v2"));
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_complex_values() {
+        let mut store = InMemoryStore::new();
+        let complex = json!({
+            "nested": {"deep": [1, 2, 3]},
+            "list": ["a", "b"],
+            "number": 42
+        });
+        store.set("complex", complex.clone()).await.unwrap();
+
+        let entry = store.get("complex").await.unwrap();
+        assert_eq!(entry.value, complex);
+    }
+
+    // =========================================================================
+    // SqliteMemory tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_sqlite_open_in_memory() {
+        let mem = SqliteMemory::open_in_memory("test-agent").unwrap();
+        assert_eq!(mem.agent_id, "test-agent");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_set_and_get() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("key1", json!("value1")).await.unwrap();
+
+        let entry = mem.get("key1").await.unwrap();
+        assert_eq!(entry.value, json!("value1"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_get_nonexistent() {
+        let mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        assert!(mem.get("nonexistent").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_delete() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("key1", json!("value1")).await.unwrap();
+
+        assert!(mem.delete("key1").await);
+        assert!(mem.get("key1").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_delete_nonexistent() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        assert!(!mem.delete("nonexistent").await);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_list_keys_all() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("alpha", json!(1)).await.unwrap();
+        mem.set("beta", json!(2)).await.unwrap();
+        mem.set("gamma", json!(3)).await.unwrap();
+
+        let keys = mem.list_keys(None).await;
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&"alpha".to_string()));
+        assert!(keys.contains(&"beta".to_string()));
+        assert!(keys.contains(&"gamma".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_list_keys_with_prefix() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("user:1", json!(1)).await.unwrap();
+        mem.set("user:2", json!(2)).await.unwrap();
+        mem.set("config:theme", json!("dark")).await.unwrap();
+
+        let keys = mem.list_keys(Some("user:")).await;
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"user:1".to_string()));
+        assert!(keys.contains(&"user:2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_agent_isolation() {
+        // Two agents sharing the same database shouldn't see each other's data
+        let conn = Connection::open_in_memory().unwrap();
+        let conn = Arc::new(Mutex::new(conn));
+
+        let mut mem1 = SqliteMemory {
+            conn: conn.clone(),
+            agent_id: "agent1".to_string(),
+        };
+        mem1.init_schema().unwrap();
+
+        let mut mem2 = SqliteMemory {
+            conn: conn.clone(),
+            agent_id: "agent2".to_string(),
+        };
+
+        mem1.set("shared_key", json!("agent1_value")).await.unwrap();
+        mem2.set("shared_key", json!("agent2_value")).await.unwrap();
+
+        let entry1 = mem1.get("shared_key").await.unwrap();
+        let entry2 = mem2.get("shared_key").await.unwrap();
+
+        assert_eq!(entry1.value, json!("agent1_value"));
+        assert_eq!(entry2.value, json!("agent2_value"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_preserves_created_at() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("key", json!("v1")).await.unwrap();
+
+        let entry1 = mem.get("key").await.unwrap();
+        let created = entry1.created_at;
+
+        // Small delay to ensure timestamp changes
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        mem.set("key", json!("v2")).await.unwrap();
+
+        let entry2 = mem.get("key").await.unwrap();
+        assert_eq!(entry2.created_at, created);
+        assert_eq!(entry2.value, json!("v2"));
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_complex_values() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        let complex = json!({
+            "nested": {"deep": [1, 2, 3]},
+            "list": ["a", "b"],
+            "number": 42
+        });
+        mem.set("complex", complex.clone()).await.unwrap();
+
+        let entry = mem.get("complex").await.unwrap();
+        assert_eq!(entry.value, complex);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_query_by_time() {
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+
+        // Set some values
+        mem.set("key1", json!("v1")).await.unwrap();
+        let time_after_first = now();
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mem.set("key2", json!("v2")).await.unwrap();
+
+        // Query all
+        let all = mem.query_by_time(0, None).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        // Query since a specific time
+        let recent = mem.query_by_time(time_after_first, None).await.unwrap();
+        assert!(recent.len() >= 1); // At least key2 should be there
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_persistence_same_connection() {
+        // Test that data persists when reopening with same connection
+        let mut mem = SqliteMemory::open_in_memory("agent1").unwrap();
+        mem.set("persistent", json!("data")).await.unwrap();
+
+        // Get again - should still be there
+        let entry = mem.get("persistent").await.unwrap();
+        assert_eq!(entry.value, json!("data"));
+    }
+
+    // =========================================================================
+    // MemoryError tests
+    // =========================================================================
+
+    #[test]
+    fn test_memory_error_display() {
+        let storage_err = MemoryError::StorageError("disk full".to_string());
+        assert!(storage_err.to_string().contains("disk full"));
+
+        let serial_err = MemoryError::SerializationError("invalid json".to_string());
+        assert!(serial_err.to_string().contains("invalid json"));
+    }
+
+    // =========================================================================
+    // MemoryEntry tests
+    // =========================================================================
+
+    #[test]
+    fn test_memory_entry_clone() {
+        let entry = MemoryEntry {
+            value: json!("test"),
+            created_at: 100,
+            updated_at: 200,
+        };
+        let cloned = entry.clone();
+        assert_eq!(cloned.value, entry.value);
+        assert_eq!(cloned.created_at, entry.created_at);
+        assert_eq!(cloned.updated_at, entry.updated_at);
+    }
+}
