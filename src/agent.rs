@@ -9,7 +9,9 @@ use crate::memory::{Memory, MemoryError};
 use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
 use crate::observe::{Observer, Event};
 use crate::retry::{RetryPolicy, with_retry};
+use crate::messaging::{AgentMessage, MessageRouter, MessagingError};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use serde_json::Value;
 use crate::supervision::{ChildHandle, ChildConfig, ChildStatus};
 use tokio::sync::oneshot;
@@ -99,6 +101,10 @@ pub struct Agent {
     llm: Option<Arc<dyn LLM>>,
     pub children: HashMap<String, ChildHandle>,
     observer: Option<Arc<dyn Observer>>,
+    /// Receiver for agent-to-agent messages
+    message_rx: Option<mpsc::Receiver<AgentMessage>>,
+    /// Router for sending messages to other agents
+    router: Option<Arc<Mutex<MessageRouter>>>,
 }
 
 impl Agent {
@@ -111,6 +117,8 @@ impl Agent {
             llm: None,
             children: HashMap::new(),
             observer: None,
+            message_rx: None,
+            router: None,
         }
     }
 
@@ -185,6 +193,123 @@ impl Agent {
     pub fn with_llm(mut self, llm: Arc<dyn LLM>) -> Self {
         self.llm = Some(llm);
         self
+    }
+
+    /// Attach a message router and register this agent for messaging
+    pub fn with_router(mut self, router: Arc<Mutex<MessageRouter>>) -> Self {
+        // Register with router and get the message receiver
+        let rx = {
+            let mut router_guard = router.blocking_lock();
+            router_guard.register(&self.id)
+        };
+        self.message_rx = Some(rx);
+        self.router = Some(router);
+        self
+    }
+
+    /// Attach a message router and receiver (for when receiver is created externally)
+    pub fn with_router_and_rx(
+        mut self,
+        router: Arc<Mutex<MessageRouter>>,
+        rx: mpsc::Receiver<AgentMessage>,
+    ) -> Self {
+        self.message_rx = Some(rx);
+        self.router = Some(router);
+        self
+    }
+
+    /// Get a reference to the router if attached
+    pub fn router(&self) -> Option<&Arc<Mutex<MessageRouter>>> {
+        self.router.as_ref()
+    }
+
+    /// Send a message to another agent (fire and forget)
+    pub async fn send_message(&self, to: &str, content: &str) -> Result<(), MessagingError> {
+        let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
+        let msg = AgentMessage::new(&self.id, to, content);
+        let router_guard = router.lock().await;
+        router_guard.send(msg).await
+    }
+
+    /// Send a message and wait for a reply (request-response pattern)
+    pub async fn ask(&self, to: &str, content: &str) -> Result<String, MessagingError> {
+        let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
+
+        // Create a oneshot channel for the reply
+        let (tx, rx) = oneshot::channel();
+
+        // Generate a unique reply ID and register the pending reply
+        let reply_id = {
+            let mut router_guard = router.lock().await;
+            let reply_id = router_guard.generate_reply_id();
+            router_guard.register_reply(reply_id.clone(), tx);
+            reply_id
+        };
+
+        // Send the message with reply_to set
+        let msg = AgentMessage {
+            from: self.id.clone(),
+            to: to.to_string(),
+            content: content.to_string(),
+            reply_to: Some(reply_id),
+        };
+
+        {
+            let router_guard = router.lock().await;
+            router_guard.send(msg).await?;
+        }
+
+        // Wait for the reply
+        rx.await.map(|m| m.content).map_err(|_| MessagingError::ChannelClosed)
+    }
+
+    /// Receive the next message (non-blocking)
+    pub async fn receive_message(&mut self) -> Option<AgentMessage> {
+        if let Some(rx) = &mut self.message_rx {
+            rx.try_recv().ok()
+        } else {
+            None
+        }
+    }
+
+    /// Receive a message with timeout
+    pub async fn receive_message_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Option<AgentMessage> {
+        if let Some(rx) = &mut self.message_rx {
+            tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+        } else {
+            None
+        }
+    }
+
+    /// Reply to a message (used for request-response pattern)
+    pub async fn reply_to(&self, original: &AgentMessage, content: &str) -> Result<(), MessagingError> {
+        let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
+
+        if let Some(reply_id) = &original.reply_to {
+            // This is a request that expects a reply - complete it directly
+            let reply_msg = AgentMessage::new(&self.id, &original.from, content);
+            let mut router_guard = router.lock().await;
+            if router_guard.complete_reply(reply_id, reply_msg) {
+                Ok(())
+            } else {
+                // Reply channel was already used or expired, send as regular message
+                drop(router_guard);
+                self.send_message(&original.from, content).await
+            }
+        } else {
+            // No reply_to, just send as regular message
+            self.send_message(&original.from, content).await
+        }
+    }
+
+    /// List all agents registered with the router
+    pub async fn list_peers(&self) -> Result<Vec<String>, MessagingError> {
+        let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
+        let router_guard = router.lock().await;
+        Ok(router_guard.list_agents())
     }
 
     pub async fn remember(&mut self, key: &str, value: serde_json::Value) -> Result<(), MemoryError> {
@@ -783,6 +908,18 @@ pub async fn forget(&mut self, key: &str) -> bool {
     /// Helper to create a child agent with cloned tools/LLM/observer
     fn create_child_agent(parent: &Agent, child_id: String) -> Agent {
         let (_, rx) = tokio::sync::mpsc::channel(32);
+
+        // If parent has a router, register the child agent with it
+        let (message_rx, router) = if let Some(router) = &parent.router {
+            let rx = {
+                let mut router_guard = router.blocking_lock();
+                router_guard.register(&child_id)
+            };
+            (Some(rx), Some(router.clone()))
+        } else {
+            (None, None)
+        };
+
         Agent {
             id: child_id,
             tools: parent.tools.clone(),  // Arc clones are cheap
@@ -791,6 +928,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
             llm: parent.llm.clone(),  // Arc clone
             children: std::collections::HashMap::new(),
             observer: parent.observer.clone(),  // Inherit observer
+            message_rx,
+            router,
         }
     }
 
@@ -1304,5 +1443,183 @@ mod tests {
         let snapshot = observer.snapshot();
         assert_eq!(snapshot.tool_calls, 1);
         assert_eq!(snapshot.errors, 1);
+    }
+
+    // =========================================================================
+    // Agent-to-Agent Messaging tests
+    // =========================================================================
+
+    async fn create_test_agent_with_router(id: &str, router: Arc<Mutex<MessageRouter>>) -> Agent {
+        let (_tx, rx) = mpsc::channel(32);
+        let message_rx = {
+            let mut router_guard = router.lock().await;
+            router_guard.register(id)
+        };
+        Agent::new(id.to_string(), rx)
+            .with_router_and_rx(router, message_rx)
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_message() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+        let mut agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
+
+        // Agent 1 sends message to Agent 2
+        agent1.send_message("agent-2", "hello from agent 1").await.unwrap();
+
+        // Agent 2 receives the message
+        let msg = agent2.receive_message().await;
+        assert!(msg.is_some());
+        let msg = msg.unwrap();
+        assert_eq!(msg.from, "agent-1");
+        assert_eq!(msg.to, "agent-2");
+        assert_eq!(msg.content, "hello from agent 1");
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_message_not_found() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+
+        // Try to send to non-existent agent
+        let result = agent1.send_message("nonexistent", "hello").await;
+        assert!(matches!(result, Err(MessagingError::AgentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_agent_send_message_not_registered() {
+        let agent = create_test_agent("test-agent");
+
+        // Try to send without being registered with a router
+        let result = agent.send_message("other", "hello").await;
+        assert!(matches!(result, Err(MessagingError::NotRegistered)));
+    }
+
+    #[tokio::test]
+    async fn test_agent_receive_message_empty() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let mut agent = create_test_agent_with_router("agent-1", router.clone()).await;
+
+        // No messages in inbox
+        let msg = agent.receive_message().await;
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agent_receive_message_without_router() {
+        let mut agent = create_test_agent("test-agent");
+
+        // No router attached
+        let msg = agent.receive_message().await;
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agent_list_peers() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+        let _agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
+        let _agent3 = create_test_agent_with_router("agent-3", router.clone()).await;
+
+        let peers = agent1.list_peers().await.unwrap();
+        assert_eq!(peers.len(), 3);
+        assert!(peers.contains(&"agent-1".to_string()));
+        assert!(peers.contains(&"agent-2".to_string()));
+        assert!(peers.contains(&"agent-3".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_agent_list_peers_not_registered() {
+        let agent = create_test_agent("test-agent");
+        let result = agent.list_peers().await;
+        assert!(matches!(result, Err(MessagingError::NotRegistered)));
+    }
+
+    #[tokio::test]
+    async fn test_agent_ask_and_reply() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+        let mut agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
+
+        // Spawn a task to handle the request
+        let handle = tokio::spawn(async move {
+            // Wait for the message
+            let msg = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                async {
+                    loop {
+                        if let Some(m) = agent2.receive_message().await {
+                            return m;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+            ).await.unwrap();
+
+            assert_eq!(msg.content, "what is 2+2?");
+            assert!(msg.reply_to.is_some());
+
+            // Reply to the message
+            agent2.reply_to(&msg, "4").await.unwrap();
+        });
+
+        // Agent 1 asks and waits for reply
+        let response = agent1.ask("agent-2", "what is 2+2?").await.unwrap();
+        assert_eq!(response, "4");
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_agent_receive_message_timeout() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let mut agent = create_test_agent_with_router("agent-1", router.clone()).await;
+
+        // Should timeout since no messages
+        let msg = agent.receive_message_timeout(std::time::Duration::from_millis(50)).await;
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_agent_receive_message_timeout_success() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+        let mut agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
+
+        // Send a message in a background task
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            agent1.send_message("agent-2", "hello").await.unwrap();
+        });
+
+        // Should receive the message within timeout
+        let msg = agent2.receive_message_timeout(std::time::Duration::from_secs(1)).await;
+        assert!(msg.is_some());
+        assert_eq!(msg.unwrap().content, "hello");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_messages_between_agents() {
+        let router = Arc::new(Mutex::new(MessageRouter::new()));
+        let agent1 = create_test_agent_with_router("agent-1", router.clone()).await;
+        let mut agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
+
+        // Send multiple messages
+        agent1.send_message("agent-2", "message 1").await.unwrap();
+        agent1.send_message("agent-2", "message 2").await.unwrap();
+        agent1.send_message("agent-2", "message 3").await.unwrap();
+
+        // Receive all messages
+        let msg1 = agent2.receive_message().await.unwrap();
+        let msg2 = agent2.receive_message().await.unwrap();
+        let msg3 = agent2.receive_message().await.unwrap();
+
+        assert_eq!(msg1.content, "message 1");
+        assert_eq!(msg2.content, "message 2");
+        assert_eq!(msg3.content, "message 3");
+
+        // No more messages
+        assert!(agent2.receive_message().await.is_none());
     }
 }

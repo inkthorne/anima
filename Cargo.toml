@@ -2,6 +2,10 @@
 name = "anima"
 version = "1.0.0"
 edition = "2024"
+license = "MIT"
+authors = ["Arya <arya@inkthorne.com>"]
+description = "The animating spirit — a lightweight Rust runtime for AI agents"
+repository = "https://github.com/inkthorne/anima"
 
 [dependencies]
 async-trait = "0.1"
