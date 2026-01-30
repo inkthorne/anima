@@ -12,11 +12,28 @@ pub trait LLM: Send + Sync {
     ) -> Result<LLMResponse, LLMError>;
 }
 
+fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
+    tool_calls.iter().map(|tc| {
+        serde_json::json!({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments.to_string()
+            }
+        })
+    }).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,      // "system", "user", "assistant", "tool"
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,  // For tool responses
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,9 +106,22 @@ impl LLM for OpenAIClient {
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/chat/completions", self.base_url);
         
+        // Transform messages to fix tool_calls serialization for API compatibility
+        let mut formatted_messages = Vec::new();
+        for message in messages {
+            let mut formatted_message = serde_json::to_value(&message).unwrap();
+            if let Some(tool_calls) = message.tool_calls {
+                if !tool_calls.is_empty() {
+                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
+                }
+            }
+            formatted_messages.push(formatted_message);
+        }
+        
         let mut request_body = serde_json::json!({
             "model": self.model,
-            "messages": messages
+            "messages": formatted_messages
         });
         
          if let Some(tool_list) = tools {

@@ -1,14 +1,14 @@
 use anima::{Runtime, OpenAIClient};
-use anima::tools::{AddTool};
+use anima::tools::AddTool;
 
 #[tokio::main]
 async fn main() {
-    println!("=== Anima v0.4 Demo ===");
-    println!("Testing LLM-driven agent with tool usage");
+    println!("=== Anima v0.5 Demo ===");
+    println!("Testing multi-turn agentic loop\n");
     
     // Use Ollama on Mojave (OpenAI-compatible API)
-    println!("Using Ollama on Mojave");
-    let llm = OpenAIClient::new("ollama")  // Ollama ignores the API key
+    println!("Using Ollama on Mojave\n");
+    let llm = OpenAIClient::new("ollama")
         .with_base_url("http://100.67.222.97:11434/v1")
         .with_model("qwen3-coder-32k");
     
@@ -22,9 +22,11 @@ async fn main() {
     // Register the add tool
     agent.register_tool(Box::new(AddTool));
     
-    // Let the agent think!
-    println!("Task: What is 5 + 3?");
-    match agent.think("What is 5 + 3? Use the add tool.").await {
+    // Multi-step task requiring multiple tool calls
+    let task = "First add 5 + 3. Then add 10 to that result. What's the final answer?";
+    println!("Task: {}\n", task);
+    
+    match agent.think(task).await {
         Ok(response) => println!("Agent: {}", response),
         Err(e) => println!("Error: {}", e),
     }

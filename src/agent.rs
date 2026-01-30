@@ -8,6 +8,23 @@ use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
 use tokio::sync::mpsc;
 use serde_json::Value;
 
+/// Options for the think() agentic loop
+pub struct ThinkOptions {
+    /// Maximum iterations before giving up (default: 10)
+    pub max_iterations: usize,
+    /// Optional system prompt to set agent behavior
+    pub system_prompt: Option<String>,
+}
+
+impl Default for ThinkOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: 10,
+            system_prompt: None,
+        }
+    }
+}
+
 pub struct Agent {
     pub id: String,
     tools: HashMap<String, Box<dyn Tool>>,
@@ -84,29 +101,69 @@ pub async fn forget(&mut self, key: &str) -> bool {
         }).collect()
     }
 
-    pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
+    pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
         let llm = self.llm.as_ref().ok_or_else(|| 
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
         
         let tools = self.list_tools_for_llm();
-        let messages = vec![
-            ChatMessage { role: "user".to_string(), content: task.to_string(), tool_call_id: None }
-        ];
         
-        let response = llm.chat_complete(messages, Some(tools)).await
-            .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+        // Build initial messages
+        let mut messages: Vec<ChatMessage> = Vec::new();
         
-        // If LLM wants to call tools, execute them
-        if !response.tool_calls.is_empty() {
+        // Optional system prompt
+        if let Some(system) = &options.system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        
+        // User task
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(task.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        
+        // Agentic loop
+        for iteration in 0..options.max_iterations {
+            let response = llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            
+            // If no tool calls, we're done - return the response
+            if response.tool_calls.is_empty() {
+                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+            }
+            
+            // Add assistant message with tool calls
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: response.content.clone(),
+                tool_call_id: None,
+                tool_calls: Some(response.tool_calls.clone()),
+            });
+            
+            // Execute each tool and add results
             for tool_call in &response.tool_calls {
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
-                    .map_err(|e| crate::error::AgentError::ToolError(e))?;
-                // For now, just return the tool result
-                return Ok(format!("Tool \"{}\" returned: {}", tool_call.name, result));
+                    .unwrap_or_else(|e| format!("Error: {}", e));
+                
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(result),
+                    tool_call_id: Some(tool_call.id.clone()),
+                    tool_calls: None,
+                });
             }
         }
         
-        // Return LLM's text response
-        Ok(response.content.unwrap_or_else(|| "No response".to_string()))
+        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
+    }
+
+    pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
+        self.think_with_options(task, ThinkOptions::default()).await
     }
 }
