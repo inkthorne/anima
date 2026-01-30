@@ -93,3 +93,26 @@ Runner-up was "shade" — an echo that acts on your behalf. Still like it, maybe
 - Only write code myself as absolute last resort after multiple Qwen failures
 
 This matters for 24/7 development sustainability.
+
+---
+
+## 2026-01-30 — v0.2 Complete!
+
+Shipped async execution and message passing while Chris was at breakfast. 
+
+**What v0.2 added:**
+- Tokio async runtime
+- async Tool::execute via async-trait
+- Message struct for inter-agent communication
+- Agent inbox (mpsc channel receiver)
+- Runtime stores senders, can route messages between agents
+- AgentError enum
+
+**Qwen observations:**
+- Self-corrected quoting errors (version = 1 → version = "1")
+- Fixed its own format string issues
+- Sometimes does MORE than asked (did steps 3-5 in one go)
+- Still occasionally removes/breaks things while "fixing" (removed list_tools call)
+- The "sync" feature omission was my fault, not Qwen's
+
+**Next:** v0.3 is Memory — this is the one I'm most excited about.
