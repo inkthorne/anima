@@ -1,5 +1,6 @@
 use crate::agent::Agent;
 use crate::message::Message;
+use crate::memory::Memory;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 
@@ -17,9 +18,17 @@ impl Runtime {
     }
 
     /// Spawn a new agent with the given ID
-    pub fn spawn_agent(&mut self, id: String) -> &mut Agent {
+    pub fn spawn_agent(&mut self, id: String) -> Agent {
         let (tx, rx) = mpsc::channel(32);
         let agent = Agent::new(id.clone(), rx);
+        self.agents.insert(id.clone(), agent);
+        self.agents.remove(&id).unwrap()
+    }
+
+    /// Spawn a new agent with the given ID and memory
+    pub fn spawn_agent_with_memory(&mut self, id: String, memory: Box<dyn Memory>) -> &mut Agent {
+        let (tx, rx) = mpsc::channel(32);
+        let agent = Agent::new(id.clone(), rx).with_memory(memory);
         self.agents.insert(id.clone(), agent);
         self.senders.insert(id.clone(), tx);
         self.agents.get_mut(&id).unwrap()

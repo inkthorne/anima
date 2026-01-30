@@ -16,6 +16,23 @@ impl Tool for AddTool {
         "Adds two numbers from input.a and input.b"
     }
 
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "number",
+                    "description": "First number to add"
+                },
+                "b": {
+                    "type": "number",
+                    "description": "Second number to add"
+                }
+            },
+            "required": ["a", "b"]
+        })
+    }
+
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
         let a = input
             .get("a")

@@ -22,6 +22,7 @@ pub enum AgentError {
     ToolNotFound(String),
     ToolError(ToolError),
     ChannelClosed,
+    LlmError(String),
 }
 
 impl fmt::Display for AgentError {
@@ -30,6 +31,7 @@ impl fmt::Display for AgentError {
             AgentError::ToolNotFound(name) => write!(f, "Tool not found: {}", name),
             AgentError::ToolError(e) => write!(f, "Tool error: {}", e),
             AgentError::ChannelClosed => write!(f, "Channel closed"),
+            AgentError::LlmError(e) => write!(f, "LLM error: {}", e),
         }
     }
 }

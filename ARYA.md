@@ -1,28 +1,26 @@
-# Task: Implement anima v0.2 - Async & Messages
+# Task: Implement v0.4 - LLM Integration
 
 Build: `cargo build`
 
 ## Steps
 
-- [x] 1. [Cargo.toml] Add tokio dependency with rt-multi-thread and macros features
-- [x] 2. [src/error.rs] Add AgentError enum for agent-level errors
-- [x] 3. [src/tool.rs] Make Tool::execute async (used async-trait)
-- [x] 4. [src/tools/echo.rs] Update EchoTool for async execute
-- [x] 5. [src/tools/add.rs] Update AddTool for async execute
-- [x] 6. [src/message.rs] Create Message struct for agent communication
-- [x] 7. [src/agent.rs] Add inbox (channel receiver), make call_tool async
-- [x] 8. [src/runtime.rs] Add message routing, senders stored in Runtime
-- [x] 9. [src/main.rs] Update demo to use async (tokio::main)
-- [x] 10. Test and verify everything works
-
-## ✅ v0.2 COMPLETE!
+- [x] 1. [src/error.rs] Add `LlmError` — done in llm.rs as simple struct (good enough for now)
+- [x] 2. [src/llm.rs] Create `Llm` trait with async `chat_complete()` method
+- [x] 3. [src/llm.rs] Define message types: `ChatMessage`, `ToolCall`, `LlmResponse`
+- [x] 4. [src/llm/mod.rs] Convert to module directory — SKIPPED, flat structure works
+- [x] 5. [src/llm.rs] Implement `OpenAIClient` struct with reqwest HTTP client
+- [x] 6. [src/llm.rs] Implement `Llm` trait for `OpenAIClient`
+- [x] 7. [src/tool.rs] Add `schema()` method to `Tool` trait returning JSON Schema
+- [x] 8. [src/tools/echo.rs] Implement `schema()` for EchoTool
+- [x] 9. [src/tools/add.rs] Implement `schema()` for AddTool with properties a, b
+- [x] 10. [src/agent.rs] Add `llm: Option<Box<dyn Llm>>` field and `with_llm()` builder method
+- [x] 11. [src/agent.rs] Add `list_tools_for_llm()` method returning Vec<ToolSpec>
+- [x] 12. [src/lib.rs] Exports — already done
+- [x] 13. [src/agent.rs] Implement `think(&mut self, task: &str) -> Result<String, AgentError>` - agentic loop
+- [x] 14. [src/main.rs] Update demo: create OpenAIClient, attach to agent, call `think("What is 5 + 3?")`
 
 ## Plan
 
-v0.2 adds:
-- Async tool execution using Tokio
-- Message type for inter-agent communication
-- Basic inbox for agents to receive messages
-- Runtime message routing
-
-Keep backwards compatible where possible.
+Claude Code analyzed the codebase and designed a modular approach.
+Early Qwen run completed LLM trait + OpenAIClient before being killed.
+Remaining: Tool schema(), Agent LLM integration, think() loop, demo.

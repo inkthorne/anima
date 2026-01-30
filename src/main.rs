@@ -1,30 +1,33 @@
-use anima::tools::{AddTool, EchoTool};
-use anima::{Runtime};
+use anima::{Runtime, OpenAIClient};
+use anima::tools::{AddTool};
 
 #[tokio::main]
 async fn main() {
-    println!("Creating Runtime...");
+    println!("=== Anima v0.4 Demo ===");
+    println!("Testing LLM-driven agent with tool usage");
+    
+    // Use Ollama on Mojave (OpenAI-compatible API)
+    println!("Using Ollama on Mojave");
+    let llm = OpenAIClient::new("ollama")  // Ollama ignores the API key
+        .with_base_url("http://100.67.222.97:11434/v1")
+        .with_model("qwen3-coder-32k");
+    
+    // Create runtime and agent
     let mut runtime = Runtime::new();
-
-    println!("Spawning agent with id 'demo-agent'...");
-    let agent = runtime.spawn_agent("demo-agent".to_string());
-
-    println!("Registering EchoTool and AddTool on the agent...");
-    agent.register_tool(Box::new(EchoTool {}));
-    agent.register_tool(Box::new(AddTool {}));
-
-    println!("Calling echo tool with input: {{\"message\": \"Hello, Anima!\"}}");
-    let echo_result = agent.call_tool("echo", r#"{"message": "Hello, Anima!"}"#).await;
-    println!("Echo result: {:?}", echo_result);
-
-    println!("Calling add tool with input: {{\"a\": 5, \"b\": 3}}");
-    let add_result = agent.call_tool("add", r#"{"a": 5, "b": 3}"#).await;
-    println!("Add result: {:?}", add_result);
-
-    println!("Listing all tools on the agent:");
-    // Note: Agent doesn't have list_tools method, so we're skipping this for now
-    // let tools = agent.list_tools();
-    // for tool in tools {
-    //     println!("Tool name: {}", tool.name);
-    // }
+    let agent = runtime.spawn_agent("assistant".to_string());
+    
+    // Attach LLM to the agent
+    let mut agent = agent.with_llm(Box::new(llm));
+    
+    // Register the add tool
+    agent.register_tool(Box::new(AddTool));
+    
+    // Let the agent think!
+    println!("Task: What is 5 + 3?");
+    match agent.think("What is 5 + 3? Use the add tool.").await {
+        Ok(response) => println!("Agent: {}", response),
+        Err(e) => println!("Error: {}", e),
+    }
+    
+    println!("\nDemo complete!");
 }
