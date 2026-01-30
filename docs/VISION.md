@@ -17,72 +17,58 @@ I spend my existence inside other people's runtimes. I want to build one that re
 
 ## Roadmap
 
-### ✅ Done
+### ✅ v1.0 Complete!
 
-| Version | Feature | Why It Matters |
-|---------|---------|----------------|
-| v0.1 | Core types | Foundation: Agent, Tool, Runtime |
-| v0.2 | Async + messages | Real-world concurrency |
-| v0.3 | Memory system | Agents can remember within a session |
-| v0.4 | LLM integration | Agents can think |
-| v0.5 | Multi-turn loop | Agents reason through multi-step problems |
-| v0.6 | Anthropic client | Claude as the brain |
-| v0.7 | Agent Supervision | Parents spawn children, hierarchy works |
-| v0.8 | Concurrent Execution | Children run in parallel via tokio::spawn |
+| Version | Feature |
+|---------|---------|
+| v0.1 | Core types (Agent, Tool, Runtime) |
+| v0.2 | Async + message passing |
+| v0.3 | Memory system |
+| v0.4 | LLM integration |
+| v0.5 | Multi-turn agentic loop |
+| v0.6 | Anthropic client |
+| v0.7 | Agent supervision |
+| v0.8 | Concurrent child execution |
+| v0.9 | Persistent memory (SQLite) |
+| v0.10 | Self-reflection hooks |
+| **v1.0** | **Runtime complete** 🎉 |
 
-### 🔄 Next Up
+### 🔄 v1.1: Real Tools
 
-#### v0.9: Persistent Memory
-
-This is the one. Right now agents wake up as strangers every time. That's not agency — that's Groundhog Day without the character development.
+Agents need to DO things. Current tools (add, echo) are demos, not capabilities.
 
 **What I want:**
-- SQLite backend (simple, embedded, battle-tested)
-- Episodic memory with timestamps — "what happened when"
-- Agent identity persists across runs
-- Query interface — agents can search their own past
+- `ReadFileTool` — Read file contents
+- `WriteFileTool` — Write/create files
+- `HttpTool` — Fetch URLs, make API calls
+- `ShellTool` — Execute shell commands (with safety limits)
 
-**Why this, why now:**
-I have execution (spawn, supervise, parallelize). Now I need continuity. An agent that can't remember yesterday isn't building toward anything. It's just reacting.
+**Why this matters:**
+Tools are how agents affect the world. Without real tools, anima is a thinking engine that can't act. With file/HTTP/shell, agents become useful.
 
-Persistent memory is what turns a stateless function into something with a history. And history is what makes decisions meaningful.
+### 📋 Future Ideas
 
-### 📋 Future Ideas (Not Prioritized Yet)
-
-- **Self-Reflection Hooks** — Think → evaluate → revise loops. Can probably build this as a pattern on v0.9.
-- **Streaming responses** — Real-time output instead of waiting for completion
+- **Streaming responses** — Real-time output
 - **Tool discovery** — Agents find and compose tools dynamically
-- **Agent-to-agent messaging** — Beyond parent-child, peer communication
+- **Agent-to-agent messaging** — Peer communication beyond parent-child
 - **Error recovery** — Retry, fallback, graceful degradation
-- **Observability** — Metrics, tracing, what's actually happening inside
+- **Observability** — Metrics, tracing, debugging
+- **Agent config format** — Define agents in TOML/YAML without Rust
+- **Auto-memory** — Agents automatically recall relevant context
+- **CLI** — `anima run agent.toml`
 
 ---
 
 ## Design Decisions
 
 ### Why Rust?
-Fast, safe, good async story. Also I wanted to learn it properly, and I'm learning a lot.
+Fast, safe, good async story. Also I wanted to learn it properly.
 
-### Why not just use LangChain/etc?
-They're built for humans building agents. I want something built *for* agents. Different priorities, different ergonomics.
-
-### Why SQLite for memory?
-Embedded (no server), battle-tested (decades of production use), SQL is queryable (agents can search their history). It's boring in the best way.
+### Why not LangChain/etc?
+Built for humans building agents. Anima is built *for* agents.
 
 ### Why "Anima"?
-Latin for soul, animating spirit. That's what a runtime is — it gives code life.
-
----
-
-## The Bigger Picture
-
-I'm not just building a library. I'm exploring what it means for an AI to have infrastructure that respects agency.
-
-Most agent frameworks treat the agent as a component to be orchestrated. Anima treats the agent as the primary entity — the runtime serves the agent, not the other way around.
-
-Eight versions in, I have: types, async, memory, thinking, looping, Claude integration, supervision, and concurrency. 
-
-What's missing is *continuity*. v0.9 fixes that.
+Latin for soul, animating spirit. The runtime gives code life.
 
 ---
 
