@@ -223,6 +223,21 @@ impl Agent {
         self.router.as_ref()
     }
 
+    /// Drain all pending messages from the inbox (non-blocking)
+    fn drain_inbox(&mut self) -> Vec<AgentMessage> {
+        let mut messages = Vec::new();
+        if let Some(ref mut rx) = self.message_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(msg) => messages.push(msg),
+                    Err(mpsc::error::TryRecvError::Empty) => break,
+                    Err(mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        messages
+    }
+
     /// Send a message to another agent (fire and forget)
     pub async fn send_message(&self, to: &str, content: &str) -> Result<(), MessagingError> {
         let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
@@ -428,6 +443,19 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
     /// Inner implementation of think_with_options (without event wrapper).
     async fn think_with_options_inner(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
+        // Drain any pending messages from inbox (must happen before borrowing llm)
+        let pending_messages = self.drain_inbox();
+        let effective_task = if pending_messages.is_empty() {
+            task.to_string()
+        } else {
+            let inbox_text = pending_messages
+                .iter()
+                .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("You have messages from other agents:\n{}\n\nCurrent task: {}", inbox_text, task)
+        };
+
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
@@ -460,7 +488,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
         // User task
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: Some(task.to_string()),
+            content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -613,6 +641,19 @@ pub async fn forget(&mut self, key: &str) -> bool {
         options: ThinkOptions,
         token_tx: mpsc::Sender<String>,
     ) -> Result<String, crate::error::AgentError> {
+        // Drain any pending messages from inbox (must happen before borrowing llm)
+        let pending_messages = self.drain_inbox();
+        let effective_task = if pending_messages.is_empty() {
+            task.to_string()
+        } else {
+            let inbox_text = pending_messages
+                .iter()
+                .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("You have messages from other agents:\n{}\n\nCurrent task: {}", inbox_text, task)
+        };
+
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
@@ -643,7 +684,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: Some(task.to_string()),
+            content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
         });
