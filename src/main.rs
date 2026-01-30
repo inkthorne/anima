@@ -121,6 +121,7 @@ async fn run_agent(config_path: &str, task: &str, stream: bool) -> Result<(), Bo
         auto_memory,
         reflection,
         stream,
+        retry_policy: Some(config.retry.to_policy()),
     };
 
     // 6. Run agent with streaming or non-streaming based on flag

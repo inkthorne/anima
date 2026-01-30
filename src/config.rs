@@ -12,6 +12,22 @@ fn default_mem_entries() -> usize {
     10
 }
 
+fn default_max_retries() -> usize {
+    3
+}
+
+fn default_initial_delay_ms() -> u64 {
+    100
+}
+
+fn default_max_delay_ms() -> u64 {
+    5000
+}
+
+fn default_exponential_base() -> f64 {
+    2.0
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
     pub agent: AgentSection,
@@ -22,6 +38,8 @@ pub struct AgentConfig {
     pub memory: MemorySection,
     #[serde(default)]
     pub think: ThinkSection,
+    #[serde(default)]
+    pub retry: RetrySection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +102,45 @@ impl Default for ThinkSection {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RetrySection {
+    /// Maximum number of retry attempts (0 = no retries)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: usize,
+    /// Initial delay before first retry in milliseconds
+    #[serde(default = "default_initial_delay_ms")]
+    pub initial_delay_ms: u64,
+    /// Maximum delay cap in milliseconds
+    #[serde(default = "default_max_delay_ms")]
+    pub max_delay_ms: u64,
+    /// Base for exponential backoff (typically 2.0)
+    #[serde(default = "default_exponential_base")]
+    pub exponential_base: f64,
+}
+
+impl Default for RetrySection {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            initial_delay_ms: default_initial_delay_ms(),
+            max_delay_ms: default_max_delay_ms(),
+            exponential_base: default_exponential_base(),
+        }
+    }
+}
+
+impl RetrySection {
+    /// Convert to a RetryPolicy
+    pub fn to_policy(&self) -> crate::retry::RetryPolicy {
+        crate::retry::RetryPolicy {
+            max_retries: self.max_retries,
+            initial_delay_ms: self.initial_delay_ms,
+            max_delay_ms: self.max_delay_ms,
+            exponential_base: self.exponential_base,
+        }
+    }
+}
+
 impl AgentConfig {
     pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
@@ -112,6 +169,10 @@ model = "gpt-4o"
         assert!(config.tools.enabled.is_empty());
         assert_eq!(config.memory.backend, "in_memory");
         assert_eq!(config.think.max_iterations, 10);
+        // Retry defaults
+        assert_eq!(config.retry.max_retries, 3);
+        assert_eq!(config.retry.initial_delay_ms, 100);
+        assert_eq!(config.retry.max_delay_ms, 5000);
     }
 
     #[test]
@@ -138,6 +199,12 @@ max_iterations = 5
 auto_memory = true
 max_memory_entries = 20
 reflection = true
+
+[retry]
+max_retries = 5
+initial_delay_ms = 200
+max_delay_ms = 10000
+exponential_base = 3.0
 "#;
         let config: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.name, "full-agent");
@@ -151,5 +218,10 @@ reflection = true
         assert!(config.think.auto_memory);
         assert_eq!(config.think.max_memory_entries, 20);
         assert!(config.think.reflection);
+        // Retry config
+        assert_eq!(config.retry.max_retries, 5);
+        assert_eq!(config.retry.initial_delay_ms, 200);
+        assert_eq!(config.retry.max_delay_ms, 10000);
+        assert!((config.retry.exponential_base - 3.0).abs() < f64::EPSILON);
     }
 }

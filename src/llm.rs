@@ -66,14 +66,73 @@ pub struct LLMResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Error from LLM operations with retryability classification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMError {
     pub message: String,
+    /// HTTP status code if available
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<u16>,
+    /// Whether this error is likely transient and worth retrying
+    #[serde(default)]
+    pub is_retryable: bool,
+}
+
+impl LLMError {
+    /// Create a retryable error (transient failures like timeouts, rate limits)
+    pub fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status_code: None,
+            is_retryable: true,
+        }
+    }
+
+    /// Create a retryable error with status code
+    pub fn retryable_with_status(message: impl Into<String>, status: u16) -> Self {
+        Self {
+            message: message.into(),
+            status_code: Some(status),
+            is_retryable: true,
+        }
+    }
+
+    /// Create a non-retryable error (auth failures, bad requests)
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status_code: None,
+            is_retryable: false,
+        }
+    }
+
+    /// Create a non-retryable error with status code
+    pub fn permanent_with_status(message: impl Into<String>, status: u16) -> Self {
+        Self {
+            message: message.into(),
+            status_code: Some(status),
+            is_retryable: false,
+        }
+    }
+
+    /// Classify an HTTP status code as retryable or not
+    pub fn from_status(status: u16, message: impl Into<String>) -> Self {
+        let is_retryable = matches!(status, 408 | 429 | 500..=599);
+        Self {
+            message: message.into(),
+            status_code: Some(status),
+            is_retryable,
+        }
+    }
 }
 
 impl std::fmt::Display for LLMError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LLMError: {}", self.message)
+        if let Some(status) = self.status_code {
+            write!(f, "LLMError ({}): {}", status, self.message)
+        } else {
+            write!(f, "LLMError: {}", self.message)
+        }
     }
 }
 
@@ -185,20 +244,33 @@ impl LLM for OpenAIClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to send request: {}", e),
+            .map_err(|e| {
+                // Network errors are typically retryable
+                LLMError::retryable(format!("Failed to send request: {}", e))
             })?;
+
+        let status = response.status().as_u16();
 
         let response_text = response
             .text()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to read response: {}", e),
+            .map_err(|e| {
+                // Read errors are retryable
+                LLMError::retryable(format!("Failed to read response: {}", e))
             })?;
 
+        // Check for HTTP errors before parsing
+        if status >= 400 {
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", response_text),
+            ));
+        }
+
         let openai_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| LLMError {
-                message: format!("Failed to parse response: {}", e),
+            .map_err(|e| {
+                // Parse errors are not retryable
+                LLMError::permanent(format!("Failed to parse response: {}", e))
             })?;
 
         let content = openai_response["choices"][0]["message"]["content"]
@@ -279,9 +351,15 @@ impl LLM for OpenAIClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to send request: {}", e),
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to send request: {}", e))
             })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+        }
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
@@ -291,8 +369,8 @@ impl LLM for OpenAIClient {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| LLMError {
-                message: format!("Failed to read stream chunk: {}", e),
+            let chunk = chunk_result.map_err(|e| {
+                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
             })?;
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -410,22 +488,32 @@ impl LLM for AnthropicClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to send request: {}", e),
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to send request: {}", e))
             })?;
-            
+
+        let status = response.status().as_u16();
+
         let response_text = response
             .text()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to read response: {}", e),
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to read response: {}", e))
             })?;
-            
+
+        // Check for HTTP errors before parsing
+        if status >= 400 {
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", response_text),
+            ));
+        }
+
         let anthropic_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| LLMError {
-                message: format!("Failed to parse response: {}", e),
+            .map_err(|e| {
+                LLMError::permanent(format!("Failed to parse response: {}", e))
             })?;
-            
+
         // Extract content (text and tool_use blocks)
         let mut content_text = String::new();
         let mut tool_calls = Vec::new();
@@ -507,9 +595,15 @@ impl LLM for AnthropicClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| LLMError {
-                message: format!("Failed to send request: {}", e),
+            .map_err(|e| {
+                LLMError::retryable(format!("Failed to send request: {}", e))
             })?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+        }
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
@@ -519,8 +613,8 @@ impl LLM for AnthropicClient {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| LLMError {
-                message: format!("Failed to read stream chunk: {}", e),
+            let chunk = chunk_result.map_err(|e| {
+                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
             })?;
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));

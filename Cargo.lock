@@ -21,6 +21,7 @@ dependencies = [
  "async-trait",
  "clap",
  "futures-util",
+ "rand",
  "reqwest",
  "rusqlite",
  "serde",

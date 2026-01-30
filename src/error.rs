@@ -1,5 +1,28 @@
 use std::fmt;
 
+/// Context for errors that occurred during retryable operations.
+#[derive(Debug, Clone)]
+pub struct ErrorContext {
+    /// Description of the operation that failed
+    pub operation: String,
+    /// Number of attempts made before final failure
+    pub attempts: usize,
+    /// The last error message
+    pub last_error: String,
+    /// Whether this error was classified as retryable
+    pub retriable: bool,
+}
+
+impl fmt::Display for ErrorContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} failed after {} attempt(s): {}",
+            self.operation, self.attempts, self.last_error
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ToolError {
     InvalidInput(String),

@@ -6,6 +6,7 @@ use crate::tool::Tool;
 use crate::message::Message;
 use crate::memory::{Memory, MemoryError};
 use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
+use crate::retry::{RetryPolicy, with_retry};
 use tokio::sync::mpsc;
 use serde_json::Value;
 use crate::supervision::{ChildHandle, ChildConfig, ChildStatus};
@@ -23,6 +24,8 @@ pub struct ThinkOptions {
     pub auto_memory: Option<AutoMemoryConfig>,
     /// Enable streaming output (default: false)
     pub stream: bool,
+    /// Optional retry policy for LLM calls (default: RetryPolicy::default())
+    pub retry_policy: Option<RetryPolicy>,
 }
 
 impl Default for ThinkOptions {
@@ -33,6 +36,7 @@ impl Default for ThinkOptions {
             reflection: None,
             auto_memory: None,
             stream: false,
+            retry_policy: Some(RetryPolicy::default()),
         }
     }
 }
@@ -259,8 +263,26 @@ pub async fn forget(&mut self, key: &str) -> bool {
         
         // Agentic loop
         for iteration in 0..options.max_iterations {
-            let response = llm.chat_complete(messages.clone(), Some(tools.clone())).await
-                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            // Call LLM with retry if policy is configured
+            let response = if let Some(ref policy) = options.retry_policy {
+                let llm_ref = llm.clone();
+                let msgs = messages.clone();
+                let tls = tools.clone();
+                let result = with_retry(
+                    policy,
+                    || {
+                        let llm = llm_ref.clone();
+                        let m = msgs.clone();
+                        let t = tls.clone();
+                        async move { llm.chat_complete(m, Some(t)).await }
+                    },
+                    |e: &LLMError| e.is_retryable,
+                ).await;
+                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            } else {
+                llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            };
             
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
@@ -363,11 +385,32 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         // Agentic loop with streaming
         for _iteration in 0..options.max_iterations {
-            let response = llm.chat_complete_stream(
-                messages.clone(),
-                Some(tools.clone()),
-                token_tx.clone(),
-            ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            // Call LLM with retry if policy is configured
+            // Note: streaming with retry will restart the entire stream on failure
+            let response = if let Some(ref policy) = options.retry_policy {
+                let llm_ref = llm.clone();
+                let msgs = messages.clone();
+                let tls = tools.clone();
+                let tx = token_tx.clone();
+                let result = with_retry(
+                    policy,
+                    || {
+                        let llm = llm_ref.clone();
+                        let m = msgs.clone();
+                        let t = tls.clone();
+                        let tx_clone = tx.clone();
+                        async move { llm.chat_complete_stream(m, Some(t), tx_clone).await }
+                    },
+                    |e: &LLMError| e.is_retryable,
+                ).await;
+                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            } else {
+                llm.chat_complete_stream(
+                    messages.clone(),
+                    Some(tools.clone()),
+                    token_tx.clone(),
+                ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            };
 
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
@@ -427,8 +470,24 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tool_calls: None,
             }];
             
-            let reflection = llm.chat_complete(reflection_messages, None).await
-                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
+            // Call with retry if policy configured
+            let reflection = if let Some(ref policy) = options.retry_policy {
+                let llm_ref = llm.clone();
+                let msgs = reflection_messages.clone();
+                let result = with_retry(
+                    policy,
+                    || {
+                        let llm = llm_ref.clone();
+                        let m = msgs.clone();
+                        async move { llm.chat_complete(m, None).await }
+                    },
+                    |e: &LLMError| e.is_retryable,
+                ).await;
+                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            } else {
+                llm.chat_complete(reflection_messages, None).await
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            };
             
             let reflection_text = reflection.content.unwrap_or_default();
             
@@ -456,6 +515,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
                 stream: false, // Reflection doesn't use streaming
+                retry_policy: options.retry_policy.clone(),
             };
             
             current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
@@ -506,24 +566,42 @@ pub async fn forget(&mut self, key: &str) -> bool {
         });
         
         for _iteration in 0..options.max_iterations {
-            let response = llm.chat_complete(messages.clone(), Some(tools.clone())).await
-                .map_err(|e| crate::error::AgentError::LlmError(e.message))?;
-            
+            // Call LLM with retry if policy is configured
+            let response = if let Some(ref policy) = options.retry_policy {
+                let llm_ref = llm.clone();
+                let msgs = messages.clone();
+                let tls = tools.clone();
+                let result = with_retry(
+                    policy,
+                    || {
+                        let llm = llm_ref.clone();
+                        let m = msgs.clone();
+                        let t = tls.clone();
+                        async move { llm.chat_complete(m, Some(t)).await }
+                    },
+                    |e: &LLMError| e.is_retryable,
+                ).await;
+                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            } else {
+                llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
+            };
+
             if response.tool_calls.is_empty() {
                 return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
             }
-            
+
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: response.content.clone(),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             });
-            
+
             for tool_call in &response.tool_calls {
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
                     .unwrap_or_else(|e| format!("Error: {}", e));
-                
+
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
@@ -532,7 +610,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 });
             }
         }
-        
+
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
@@ -804,6 +882,7 @@ mod tests {
         assert_eq!(opts.max_iterations, 10);
         assert!(opts.system_prompt.is_none());
         assert!(opts.reflection.is_none());
+        assert!(opts.retry_policy.is_some()); // Retry enabled by default
     }
 
     #[test]
@@ -845,6 +924,7 @@ mod tests {
             reflection: None,
             auto_memory: Some(AutoMemoryConfig::default()),
             stream: false,
+            retry_policy: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
