@@ -22,8 +22,15 @@ src/
 
 ## Current State
 
-- **v0.1 complete**: Tool trait, Agent, Runtime, example tools, working demo
-- **v0.2 planned**: Async execution (Tokio), message passing between agents
+v0.9 — Persistent Memory (SQLite):
+- Tool trait, Agent, Runtime, example tools
+- Async execution (Tokio), message passing
+- Memory system with InMemoryStore + SqliteMemory
+- LLM integration (OpenAI-compatible, Anthropic)
+- Multi-turn agentic loop
+- Agent supervision (parent/child)
+- Concurrent child execution
+- **NEW: SQLite-backed persistent memory** — agents survive restarts
 
 ## Build Commands
 

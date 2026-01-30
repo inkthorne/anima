@@ -1,82 +1,115 @@
-use anima::{Runtime, OpenAIClient};
-use anima::tools::{AddTool, EchoTool};
-use anima::supervision::ChildConfig;
-use std::sync::Arc;
+use anima::{Memory, SqliteMemory};
 
 #[tokio::main]
 async fn main() {
-    println!("=== Anima v0.8 Demo: Concurrent Child Execution ===");
-    println!("This demo shows how a parent agent can spawn multiple child agents concurrently\n");
+    println!("=== Anima v0.9 Demo: Persistent Memory ===\n");
     
-    let llm = OpenAIClient::new("ollama")
-        .with_base_url("http://100.67.222.97:11434/v1")
-        .with_model("qwen3-coder-32k");
+    let db_path = "/tmp/anima_demo.db";
+    let agent_id = "demo-agent";
     
-    let mut runtime = Runtime::new();
+    // First run: Create memories
+    {
+        println!("--- First Session ---");
+        let mut memory = SqliteMemory::open(db_path, agent_id)
+            .expect("Failed to open database");
+        
+        // Store some memories
+        memory.set("name", serde_json::json!("Arya")).await.unwrap();
+        memory.set("count", serde_json::json!(42)).await.unwrap();
+        memory.set("facts:rust", serde_json::json!("Rust is memory safe")).await.unwrap();
+        memory.set("facts:anima", serde_json::json!("Anima means soul")).await.unwrap();
+        
+        println!("Stored memories: name, count, facts:rust, facts:anima");
+        
+        // Read them back
+        if let Some(entry) = memory.get("name").await {
+            println!("  name = {} (created: {})", entry.value, entry.created_at);
+        }
+        if let Some(entry) = memory.get("count").await {
+            println!("  count = {} (created: {})", entry.value, entry.created_at);
+        }
+        
+        // List keys with prefix
+        let fact_keys = memory.list_keys(Some("facts:")).await;
+        println!("  Keys starting with 'facts:': {:?}", fact_keys);
+        
+        println!("Session 1 complete. Memory closed.\n");
+    }
     
-     // Create parent agent with tools
-     let mut parent = runtime.spawn_agent("parent".to_string());
-     parent.register_tool(Arc::new(AddTool));
-     parent.register_tool(Arc::new(EchoTool));
-     parent = parent.with_llm(Arc::new(llm));
+    // Second run: Memories persist!
+    {
+        println!("--- Second Session (same agent) ---");
+        let memory = SqliteMemory::open(db_path, agent_id)
+            .expect("Failed to open database");
+        
+        // Memories still there!
+        if let Some(entry) = memory.get("name").await {
+            println!("  name = {} (still here!)", entry.value);
+        }
+        if let Some(entry) = memory.get("count").await {
+            println!("  count = {} (persisted!)", entry.value);
+        }
+        
+        let all_keys = memory.list_keys(None).await;
+        println!("  All keys: {:?}", all_keys);
+        
+        println!("Session 2 complete. Agent remembers!\n");
+    }
     
-    println!("Parent agent created: {}", parent.id);
-    println!("Parent tools registered: add, echo\n");
+    // Third run: Different agent, different memories
+    {
+        println!("--- Third Session (different agent) ---");
+        let other_agent = "other-agent";
+        let mut memory = SqliteMemory::open(db_path, other_agent)
+            .expect("Failed to open database");
+        
+        // This agent has no memories yet
+        let keys = memory.list_keys(None).await;
+        println!("  {} has keys: {:?}", other_agent, keys);
+        
+        // But can create its own
+        memory.set("name", serde_json::json!("Other")).await.unwrap();
+        println!("  Stored name = 'Other' for {}", other_agent);
+        
+        // Original agent's memories are isolated
+        let original = SqliteMemory::open(db_path, agent_id)
+            .expect("Failed to open database");
+        if let Some(entry) = original.get("name").await {
+            println!("  {} still has name = {}", agent_id, entry.value);
+        }
+        
+        println!("Session 3 complete. Agents are isolated!\n");
+    }
     
-    // Complex task that benefits from delegation
-    let complex_task = "I need to calculate a few things and then summarize the results. 
-                       First, add 5 and 3, then add 8 and 2, and finally echo 'Hello World' 
-                       for a greeting. Combine all results into one final message.";
-    
-    println!("Parent task: {}", complex_task);
-    
-    // Parent starts by spawning children for subtasks
-    println!("\n--- Spawning child agents concurrently ---");
-    
-    // Spawn child 1: Add 5 + 3
-    let child_config1 = ChildConfig::new("Calculate 5 + 3");
-    let child_id1 = parent.spawn_child(child_config1);
-    println!("Child 1 spawned: {}", child_id1);
-    
-    // Spawn child 2: Add 8 + 2
-    let child_config2 = ChildConfig::new("Calculate 8 + 2");
-    let child_id2 = parent.spawn_child(child_config2);
-    println!("Child 2 spawned: {}", child_id2);
-    
-    // Spawn child 3: Echo Hello World
-    let child_config3 = ChildConfig::new("Echo 'Hello World'");
-    let child_id3 = parent.spawn_child(child_config3);
-    println!("Child 3 spawned: {}", child_id3);
-    
-    // Wait for all children to complete concurrently
-    println!("\n--- Waiting for all children to complete concurrently ---");
-    println!("Note: Children are completed in the order they finish, not in the order they were spawned");
-    
-    // Wait for children to complete (this shows concurrent execution)
-    let mut results = Vec::new();
-    results.push(parent.wait_for_child(&child_id1).await);
-    results.push(parent.wait_for_child(&child_id2).await);
-    results.push(parent.wait_for_child(&child_id3).await);
-    
-    // Print all results
-    for (i, result) in results.iter().enumerate() {
-        match result {
-            Ok(r) => println!("Child {} result: {}", i+1, r),
-            Err(e) => println!("Child {} failed: {}", i+1, e),
+    // Episodic memory demo
+    {
+        println!("--- Episodic Memory Demo ---");
+        let mut memory = SqliteMemory::open(db_path, agent_id)
+            .expect("Failed to open database");
+        
+        // Add a new memory
+        memory.set("recent", serde_json::json!("Just happened")).await.unwrap();
+        
+        // Query by time (last hour)
+        let one_hour_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() - 3600;
+        
+        let recent = memory.query_by_time(one_hour_ago, None).await.unwrap();
+        println!("  Memories from last hour:");
+        for (key, entry) in recent {
+            println!("    {} = {} (at {})", key, entry.value, entry.updated_at);
         }
     }
     
-    // Show that all children are completed
-    println!("\n--- Final status check ---");
-    println!("All children have completed their tasks.");
+    // Cleanup for demo reproducibility
+    std::fs::remove_file(db_path).ok();
     
-    // Parent can now use the child results in its own response
-    println!("Parent using child results to form final response...");
-    
-    println!("\n=== Demo complete ===");
-    println!("This demonstration shows concurrent child execution:");
-    println!("1. Parent agent creates runtime and registers tools");
-    println!("2. Parent spawns multiple child agents concurrently"); 
-    println!("3. Parent waits for child results with wait_for_child()");
-    println!("4. Parent uses child results in its own response");
+    println!("\n=== Demo Complete ===");
+    println!("Persistent memory enables:");
+    println!("  • Agent identity across sessions");
+    println!("  • Isolated memory per agent");
+    println!("  • Episodic queries (what happened when?)");
+    println!("  • Memory is identity. 🧠");
 }
