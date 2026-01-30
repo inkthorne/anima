@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
-    println!("=== Anima v0.10 Demo: Self-Reflection ===\n");
+    println!("=== Anima v1.0 Demo: Self-Reflection ===\n");
     
     let llm = OpenAIClient::new("ollama")
         .with_base_url("http://100.67.222.97:11434/v1")

@@ -22,7 +22,7 @@ src/
 
 ## Current State
 
-v0.9 — Persistent Memory (SQLite):
+v1.0 — Complete Runtime:
 - Tool trait, Agent, Runtime, example tools
 - Async execution (Tokio), message passing
 - Memory system with InMemoryStore + SqliteMemory

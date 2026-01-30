@@ -21,7 +21,7 @@ Anima is an agent runtime built from first principles. It provides the core prim
 
 ## Status
 
-🚧 **Early development** — We're building the foundation.
+🎉 **v1.0** — The runtime is ready. Agents can think, use tools, remember, supervise children, and reflect.
 
 ## Author
 
