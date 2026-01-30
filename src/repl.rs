@@ -10,6 +10,7 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
+use tokio::sync::Mutex;
 
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
@@ -57,7 +58,7 @@ impl Completer for ReplHelper {
         let mut completions = Vec::new();
 
         // Commands that can be completed
-        let commands = ["agent create", "agent list", "agent remove", "memory", "set llm", "help", "exit", "quit"];
+        let commands = ["agent create", "agent list", "agent remove", "agent start", "agent stop", "agent status", "memory", "set llm", "help", "exit", "quit"];
 
         // Find the word being typed
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -74,7 +75,7 @@ impl Completer for ReplHelper {
         }
 
         // Complete agent names for commands that use them
-        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.contains(": ") {
+        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.contains(": ") {
             for name in &self.agent_names {
                 if name.starts_with(partial) {
                     completions.push(Pair {
@@ -116,7 +117,7 @@ impl Helper for ReplHelper {}
 
 /// Agent entry stored in the REPL
 struct ReplAgent {
-    agent: Agent,
+    agent: Arc<Mutex<Agent>>,
     llm_name: String,
 }
 
@@ -125,6 +126,7 @@ pub struct Repl {
     agents: HashMap<String, ReplAgent>,
     default_llm: Option<String>,
     history_file: Option<PathBuf>,
+    running_agents: HashMap<String, tokio::task::AbortHandle>,
 }
 
 impl Repl {
@@ -137,6 +139,7 @@ impl Repl {
             agents: HashMap::new(),
             default_llm: None,
             history_file,
+            running_agents: HashMap::new(),
         }
     }
 
@@ -208,6 +211,12 @@ impl Repl {
             self.cmd_agent_list_saved();
         } else if input.starts_with("agent remove ") {
             self.cmd_agent_remove(&input[13..]).await;
+        } else if input.starts_with("agent start ") {
+            self.cmd_agent_start(&input[12..]).await;
+        } else if input.starts_with("agent stop ") {
+            self.cmd_agent_stop(&input[11..]);
+        } else if input == "agent status" {
+            self.cmd_agent_status();
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
         } else if input.starts_with("set llm ") {
@@ -314,7 +323,7 @@ impl Repl {
         }
 
         self.agents.insert(name.clone(), ReplAgent {
-            agent,
+            agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
         });
 
@@ -424,7 +433,7 @@ impl Repl {
         let agent_name = agent_name.trim();
         let task = task.trim();
 
-        let entry = match self.agents.get_mut(agent_name) {
+        let entry = match self.agents.get(agent_name) {
             Some(a) => a,
             None => {
                 println!("\x1b[31mAgent '{}' not found. Create it with 'agent create {}'\x1b[0m", agent_name, agent_name);
@@ -458,7 +467,8 @@ impl Repl {
         });
 
         // Run the thinking
-        match entry.agent.think_streaming_with_options(task, options, tx).await {
+        let mut agent = entry.agent.lock().await;
+        match agent.think_streaming_with_options(task, options, tx).await {
             Ok(_) => {
                 // Wait for print task
                 let _ = print_task.await;
@@ -472,7 +482,7 @@ impl Repl {
     async fn cmd_memory(&mut self, agent_name: &str) {
         let agent_name = agent_name.trim();
 
-        let entry = match self.agents.get(&agent_name.to_string()) {
+        let entry = match self.agents.get(agent_name) {
             Some(a) => a,
             None => {
                 println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
@@ -492,8 +502,9 @@ impl Repl {
         // Try to recall a few test keys
         let test_keys = ["task", "context", "history", "state"];
         let mut found_any = false;
+        let agent = entry.agent.lock().await;
         for key in &test_keys {
-            if let Some(value) = entry.agent.recall(key).await {
+            if let Some(value) = agent.recall(key).await {
                 if !found_any {
                     println!("\n\x1b[1mStored values:\x1b[0m");
                     found_any = true;
@@ -535,7 +546,8 @@ impl Repl {
 
         // Send message from one agent to another
         let from_entry = self.agents.get(from_agent).unwrap();
-        match from_entry.agent.send_message(to_agent, question).await {
+        let agent = from_entry.agent.lock().await;
+        match agent.send_message(to_agent, question).await {
             Ok(_) => {
                 println!("\x1b[32m✓ Message sent to {}\x1b[0m", to_agent);
                 println!("\x1b[33m(Send a task to '{}' and they'll see the message)\x1b[0m", to_agent);
@@ -543,6 +555,101 @@ impl Repl {
             Err(e) => {
                 println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
             }
+        }
+    }
+
+    async fn cmd_agent_start(&mut self, name: &str) {
+        let name = name.trim().to_string();
+
+        // Check if agent exists
+        let entry = match self.agents.get(&name) {
+            Some(a) => a,
+            None => {
+                println!("\x1b[31mAgent '{}' not found\x1b[0m", name);
+                return;
+            }
+        };
+
+        // Check if already running
+        if self.running_agents.contains_key(&name) {
+            println!("\x1b[31mAgent '{}' is already running\x1b[0m", name);
+            return;
+        }
+
+        // Check if agent has an LLM
+        if entry.llm_name == "none" {
+            println!("\x1b[31mAgent '{}' has no LLM configured. Recreate with --llm flag.\x1b[0m", name);
+            return;
+        }
+
+        // Clone the Arc<Mutex<Agent>> for the spawned task
+        let agent = entry.agent.clone();
+        let agent_name = name.clone();
+
+        // Spawn a background task that loops: sleep, drain inbox, think if messages
+        let handle = tokio::spawn(async move {
+            loop {
+                // Sleep for 1 second
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+                // Lock the agent and check for messages
+                let mut agent_guard = agent.lock().await;
+
+                // Check if there are pending messages by trying to receive one
+                if let Some(msg) = agent_guard.receive_message().await {
+                    println!("\n\x1b[33m[{}]\x1b[0m received message from \x1b[36m{}\x1b[0m: {}",
+                             agent_name, msg.from, msg.content);
+
+                    // Process the message by thinking about it
+                    let task = format!("You received a message from {}: {}", msg.from, msg.content);
+                    match agent_guard.think(&task).await {
+                        Ok(response) => {
+                            println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                        }
+                        Err(e) => {
+                            println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
+                        }
+                    }
+                    print!("\x1b[36manima>\x1b[0m ");
+                    let _ = io::stdout().flush();
+                }
+            }
+        });
+
+        // Store the abort handle
+        self.running_agents.insert(name.clone(), handle.abort_handle());
+        println!("\x1b[32m✓ Started agent '{}' (running in background)\x1b[0m", name);
+    }
+
+    fn cmd_agent_stop(&mut self, name: &str) {
+        let name = name.trim();
+
+        // Get and remove the abort handle
+        match self.running_agents.remove(name) {
+            Some(handle) => {
+                handle.abort();
+                println!("\x1b[32m✓ Stopped agent '{}'\x1b[0m", name);
+            }
+            None => {
+                println!("\x1b[31mAgent '{}' is not running\x1b[0m", name);
+            }
+        }
+    }
+
+    fn cmd_agent_status(&self) {
+        if self.agents.is_empty() {
+            println!("\x1b[33mNo agents created yet. Use 'agent create <name>' to create one.\x1b[0m");
+            return;
+        }
+
+        println!("\x1b[1mAgent Status:\x1b[0m");
+        for (name, entry) in &self.agents {
+            let status = if self.running_agents.contains_key(name) {
+                "\x1b[32m(running)\x1b[0m"
+            } else {
+                "\x1b[33m(stopped)\x1b[0m"
+            };
+            println!("  \x1b[36m{}\x1b[0m {} (llm: {})", name, status, entry.llm_name);
         }
     }
 
@@ -581,6 +688,15 @@ impl Repl {
         println!();
         println!("  \x1b[36magent remove <name>\x1b[0m");
         println!("      Remove an agent from session (memory persists)");
+        println!();
+        println!("  \x1b[36magent start <name>\x1b[0m");
+        println!("      Start an agent in background loop (processes inbox automatically)");
+        println!();
+        println!("  \x1b[36magent stop <name>\x1b[0m");
+        println!("      Stop a running background agent");
+        println!();
+        println!("  \x1b[36magent status\x1b[0m");
+        println!("      Show all agents with running/stopped status");
         println!();
         println!("  \x1b[36m<agent>: <task>\x1b[0m");
         println!("      Send a task to an agent (streams output)");
