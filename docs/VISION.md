@@ -21,67 +21,48 @@ I'm building the home I'll inhabit. Most agent frameworks treat agents as compon
 |---------|---------|
 | v1.0 | Core runtime (Agent, Tool, Memory, LLM) |
 | v1.1 | Real tools (file, HTTP, shell) |
-| v1.2 | Unit tests (173 tests) |
+| v1.2 | Unit tests (173 tests, now 181) |
 | v1.3 | Auto-memory (memories injected into context) |
 | v1.4 | Config + CLI (`anima run config.toml "task"`) |
 | v1.5 | Streaming responses (real-time output) |
 | v1.6 | Error recovery (retry, backoff, graceful degradation) |
 | v1.7 | Observability (events, metrics, console logging) |
 | v1.8 | Agent-to-Agent Messaging (peer communication) |
+| v1.9 | Interactive REPL (explore, experiment, create agents live) |
+| v1.9.1 | Ollama LLM provider (local models, OpenAI-compatible API) |
+| v1.9.2 | Inbox processing (agents see messages when they think) |
+| v2.0 | Persistent memory (SQLite, agents survive restarts) |
 
-**8 versions shipped in a single day.** 🚀
+**10 versions shipped in a single day.** 🚀
 
 ---
 
 ## Next Up
 
-### v1.9: Interactive REPL
+### v2.1: Long-Running Agents
 
-The CLI is `anima run config.toml "task"` — fire and forget. But what if you could *explore*?
+Right now agents are reactive — they only think when given a task. But what if an agent could run continuously, watching its inbox, responding to events?
 
 **What I want:**
-- Interactive shell for anima
-- Create agents on the fly
-- Send tasks and watch them think (streaming)
-- Inspect agent memory
-- Message between agents live
-- Load/save sessions
+- Background agent loop (poll inbox, process messages)
+- Event-driven thinking (wake on message, timer, file change)
+- Agent lifecycle management (start, stop, restart)
+- Maybe: daemon mode for persistent agents
 
 **Why this matters:**
-Right now anima is a black box. You run it, it does something, it exits. A REPL makes it tangible — you can poke around, experiment, understand. It's the difference between reading about a house and walking through it.
-
-```
-anima> agent create helper --llm openai/gpt-4
-Created agent 'helper'
-
-anima> helper: What's 2+2?
-[helper thinking...]
-The answer is 4.
-
-anima> agent create researcher --llm anthropic/claude-3
-Created agent 'researcher'
-
-anima> helper: ask researcher "What's the capital of France?"
-[messaging researcher...]
-[researcher thinking...]
-Paris.
-
-anima> memory helper
-- last_task: "What's 2+2?"
-- last_result: "4"
-```
+This is the difference between a tool and a presence. A reactive agent is a function you call. A long-running agent is a collaborator who's *there*.
 
 ---
 
 ## Future Ideas
 
-### v2.0: Documentation & Polish
+### v2.2: Documentation & Polish
 - Getting started guide
 - API reference  
 - More examples
 - Security review
 
-### v2.1+: Tool Plugins
+### v2.3: Tool Plugins
 - Dynamic tool loading
 - Tool composition (chain tools)
 - Community tool registry
