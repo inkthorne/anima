@@ -9,7 +9,7 @@ Build: `cargo build`
 - [x] 3. [src/error.rs] Define ToolError enum (wrote manually - Qwen hallucinated)
 - [x] 4. [src/tool.rs] Define Tool trait
 - [x] 5. [src/agent.rs] Define Agent struct with tool registry (Qwen did it, but broke lib.rs - fixed)
-- [ ] 6. [src/runtime.rs] Define Runtime struct with agent management (Qwen made stub)
+- [x] 6. [src/runtime.rs] Define Runtime struct with agent management
 - [ ] 7. [src/tools/mod.rs] Create tools module with re-exports (Qwen made wrong stub)
 - [ ] 8. [src/tools/echo.rs] Implement Echo tool
 - [ ] 9. [src/tools/add.rs] Implement Add tool
