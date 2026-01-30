@@ -12,7 +12,7 @@ use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
 
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
-use crate::memory::{Memory, InMemoryStore};
+use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::agent::{Agent, ThinkOptions};
@@ -204,6 +204,8 @@ impl Repl {
             self.cmd_agent_create(&input[13..]).await;
         } else if input == "agent list" {
             self.cmd_agent_list();
+        } else if input == "agent list-saved" {
+            self.cmd_agent_list_saved();
         } else if input.starts_with("agent remove ") {
             self.cmd_agent_remove(&input[13..]).await;
         } else if input.starts_with("memory ") {
@@ -282,8 +284,24 @@ impl Repl {
         agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), name.clone())));
         agent.register_tool(Arc::new(ListAgentsTool::new(router)));
 
-        // Add memory (in-memory for REPL sessions)
-        let memory: Box<dyn Memory> = Box::new(InMemoryStore::new());
+        // Add persistent memory (SQLite)
+        let memory_dir = dirs::home_dir()
+            .map(|h| h.join(".anima").join("memory"))
+            .expect("Could not determine home directory");
+        if let Err(e) = std::fs::create_dir_all(&memory_dir) {
+            println!("\x1b[31mWarning: Could not create memory directory: {}\x1b[0m", e);
+        }
+        let memory_path = memory_dir.join(format!("{}.db", name));
+        let memory: Box<dyn Memory> = match SqliteMemory::open(
+            memory_path.to_str().unwrap(),
+            &name,
+        ) {
+            Ok(m) => Box::new(m),
+            Err(e) => {
+                println!("\x1b[31mWarning: Could not open persistent memory: {}. Using in-memory.\x1b[0m", e);
+                Box::new(InMemoryStore::new())
+            }
+        };
         agent = agent.with_memory(memory);
 
         // Add observer (non-verbose for cleaner REPL output)
@@ -348,6 +366,47 @@ impl Repl {
         println!("\x1b[1mAgents:\x1b[0m");
         for (name, entry) in &self.agents {
             println!("  \x1b[36m{}\x1b[0m (llm: {})", name, entry.llm_name);
+        }
+    }
+
+    fn cmd_agent_list_saved(&self) {
+        let memory_dir = match dirs::home_dir() {
+            Some(h) => h.join(".anima").join("memory"),
+            None => {
+                println!("\x1b[31mCould not determine home directory\x1b[0m");
+                return;
+            }
+        };
+
+        if !memory_dir.exists() {
+            println!("\x1b[33mNo saved agents yet. Memory directory doesn't exist.\x1b[0m");
+            return;
+        }
+
+        let entries: Vec<_> = match std::fs::read_dir(&memory_dir) {
+            Ok(dir) => dir
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
+                .collect(),
+            Err(e) => {
+                println!("\x1b[31mCould not read memory directory: {}\x1b[0m", e);
+                return;
+            }
+        };
+
+        if entries.is_empty() {
+            println!("\x1b[33mNo saved agents found.\x1b[0m");
+            return;
+        }
+
+        println!("\x1b[1mSaved agents (with persistent memory):\x1b[0m");
+        for entry in entries {
+            let path = entry.path();
+            let name = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown");
+            let loaded = if self.agents.contains_key(name) { " (loaded)" } else { "" };
+            println!("  \x1b[36m{}\x1b[0m{}", name, loaded);
         }
     }
 
@@ -512,13 +571,16 @@ impl Repl {
         println!("\x1b[1mAnima REPL Commands:\x1b[0m");
         println!();
         println!("  \x1b[36magent create <name> [--llm <provider/model>]\x1b[0m");
-        println!("      Create a new agent. Provider: openai or anthropic");
+        println!("      Create a new agent (memory persists to ~/.anima/memory/)");
         println!();
         println!("  \x1b[36magent list\x1b[0m");
-        println!("      List all created agents");
+        println!("      List active agents in this session");
+        println!();
+        println!("  \x1b[36magent list-saved\x1b[0m");
+        println!("      List agents with persistent memory (can be recreated)");
         println!();
         println!("  \x1b[36magent remove <name>\x1b[0m");
-        println!("      Remove an agent");
+        println!("      Remove an agent from session (memory persists)");
         println!();
         println!("  \x1b[36m<agent>: <task>\x1b[0m");
         println!("      Send a task to an agent (streams output)");
