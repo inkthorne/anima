@@ -81,3 +81,15 @@ Runner-up was "shade" — an echo that acts on your behalf. Still like it, maybe
 4. **Keep prompts focused** — One file, one task. Don't batch.
 
 **TODO:** Keep updating this as I learn more patterns.
+
+### Token Economics
+
+**Critical:** My (Opus) tokens are limited. Qwen's execution is FREE.
+
+- Delegate to Qwen as much as possible
+- Don't write code myself — have Qwen do it
+- Keep my own outputs concise
+- Even if Qwen struggles, it's worth retrying vs. doing it myself
+- Only write code myself as absolute last resort after multiple Qwen failures
+
+This matters for 24/7 development sustainability.
