@@ -115,10 +115,20 @@ impl Highlighter for ReplHelper {}
 impl Validator for ReplHelper {}
 impl Helper for ReplHelper {}
 
+/// Agent persona configuration
+#[derive(Debug, Clone, Default)]
+struct AgentPersona {
+    /// System prompt that defines the agent's personality
+    system_prompt: Option<String>,
+    /// Initial memories to preload
+    initial_memories: Vec<(String, String)>,
+}
+
 /// Agent entry stored in the REPL
 struct ReplAgent {
     agent: Arc<Mutex<Agent>>,
     llm_name: String,
+    persona: AgentPersona,
 }
 
 pub struct Repl {
@@ -240,10 +250,10 @@ impl Repl {
     }
 
     async fn cmd_agent_create(&mut self, args: &str) {
-        // Parse: <name> [--llm <provider/model>]
+        // Parse: <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]
         let parts: Vec<&str> = args.split_whitespace().collect();
         if parts.is_empty() {
-            println!("\x1b[31mUsage: agent create <name> [--llm <provider/model>]\x1b[0m");
+            println!("\x1b[31mUsage: agent create <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]\x1b[0m");
             return;
         }
 
@@ -255,14 +265,54 @@ impl Repl {
             return;
         }
 
-        // Parse --llm flag
-        let llm_spec = if parts.len() >= 3 && parts[1] == "--llm" {
-            Some(parts[2].to_string())
-        } else {
-            self.default_llm.clone()
-        };
+        // Parse flags
+        let mut llm_spec: Option<String> = None;
+        let mut persona_file: Option<String> = None;
+        let mut system_prompt: Option<String> = None;
+        
+        let mut i = 1;
+        while i < parts.len() {
+            match parts[i] {
+                "--llm" if i + 1 < parts.len() => {
+                    llm_spec = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                "--persona" if i + 1 < parts.len() => {
+                    persona_file = Some(parts[i + 1].to_string());
+                    i += 2;
+                }
+                "--system" if i + 1 < parts.len() => {
+                    // Collect remaining args as system prompt
+                    system_prompt = Some(parts[i + 1..].join(" "));
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
+        
+        // Use default LLM if not specified
+        let llm_spec = llm_spec.or_else(|| self.default_llm.clone());
 
         let llm_name = llm_spec.clone().unwrap_or_else(|| "none".to_string());
+
+        // Build persona
+        let mut persona = AgentPersona::default();
+        
+        // Load from file if specified
+        if let Some(ref file) = persona_file {
+            match self.load_persona_file(file) {
+                Ok(p) => persona = p,
+                Err(e) => {
+                    println!("\x1b[31mFailed to load persona file: {}\x1b[0m", e);
+                    return;
+                }
+            }
+        }
+        
+        // Override with --system if provided
+        if let Some(prompt) = system_prompt {
+            persona.system_prompt = Some(prompt);
+        }
 
         // Create the LLM client if specified
         let llm: Option<Arc<dyn LLM>> = if let Some(spec) = &llm_spec {
@@ -325,9 +375,11 @@ impl Repl {
         self.agents.insert(name.clone(), ReplAgent {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
+            persona: persona.clone(),
         });
 
-        println!("\x1b[32m✓ Created agent '{}' (llm: {})\x1b[0m", name, llm_name);
+        let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
+        println!("\x1b[32m✓ Created agent '{}' (llm: {}{})\x1b[0m", name, llm_name, persona_info);
     }
 
     fn create_llm_from_spec(&self, spec: &str) -> Result<Arc<dyn LLM>, Box<dyn Error>> {
@@ -364,6 +416,51 @@ impl Repl {
             }
             _ => Err(format!("Unknown provider: {} (use 'openai', 'anthropic', or 'ollama')", provider).into()),
         }
+    }
+
+    fn load_persona_file(&self, path: &str) -> Result<AgentPersona, Box<dyn Error>> {
+        let content = std::fs::read_to_string(path)?;
+        
+        // Simple TOML-like parsing for persona files
+        // Format:
+        // system_prompt = """
+        // Your prompt here
+        // """
+        // memory.key = value
+        
+        let mut persona = AgentPersona::default();
+        let mut in_system_prompt = false;
+        let mut system_prompt_lines: Vec<String> = Vec::new();
+        
+        for line in content.lines() {
+            let trimmed = line.trim();
+            
+            if trimmed.starts_with("system_prompt") && trimmed.contains("\"\"\"") {
+                in_system_prompt = true;
+                continue;
+            }
+            
+            if in_system_prompt {
+                if trimmed == "\"\"\"" {
+                    in_system_prompt = false;
+                    persona.system_prompt = Some(system_prompt_lines.join("\n"));
+                } else {
+                    system_prompt_lines.push(line.to_string());
+                }
+                continue;
+            }
+            
+            // Parse memory.key = value
+            if trimmed.starts_with("memory.") {
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let key = trimmed[7..eq_pos].trim().to_string();
+                    let value = trimmed[eq_pos + 1..].trim().trim_matches('"').to_string();
+                    persona.initial_memories.push((key, value));
+                }
+            }
+        }
+        
+        Ok(persona)
     }
 
     fn cmd_agent_list(&self) {
@@ -454,6 +551,7 @@ impl Repl {
 
         let options = ThinkOptions {
             stream: true,
+            system_prompt: entry.persona.system_prompt.clone(),
             ..Default::default()
         };
 
@@ -677,8 +775,10 @@ impl Repl {
     fn cmd_help(&self) {
         println!("\x1b[1mAnima REPL Commands:\x1b[0m");
         println!();
-        println!("  \x1b[36magent create <name> [--llm <provider/model>]\x1b[0m");
-        println!("      Create a new agent (memory persists to ~/.anima/memory/)");
+        println!("  \x1b[36magent create <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]\x1b[0m");
+        println!("      Create a new agent with optional personality configuration");
+        println!("      --persona: load system prompt from file");
+        println!("      --system: inline system prompt (rest of line)");
         println!();
         println!("  \x1b[36magent list\x1b[0m");
         println!("      List active agents in this session");
