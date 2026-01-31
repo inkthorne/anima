@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod agent_dir;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod llm;
 pub mod memory;
@@ -10,6 +11,7 @@ pub mod observe;
 pub mod repl;
 pub mod retry;
 pub mod runtime;
+pub mod socket_api;
 pub mod supervision;
 pub mod tool;
 pub mod tools;

@@ -31,6 +31,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures-util",
+ "libc",
  "rand",
  "regex",
  "reqwest",

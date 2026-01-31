@@ -1,0 +1,240 @@
+//! Unix socket API for daemon communication.
+//!
+//! This module provides a simple JSON protocol over Unix sockets for
+//! communicating with running agent daemons.
+
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+/// Request types for the socket API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// Send a message to the agent and get a response.
+    Message {
+        content: String,
+    },
+    /// Get the current status of the daemon.
+    Status,
+    /// Request a graceful shutdown.
+    Shutdown,
+}
+
+/// Response types for the socket API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    /// Response to a message request.
+    Message {
+        content: String,
+    },
+    /// Response to a status request.
+    Status {
+        running: bool,
+        history_len: usize,
+    },
+    /// Generic OK response.
+    Ok,
+    /// Error response.
+    Error {
+        message: String,
+    },
+}
+
+/// Socket API handler for reading and writing protocol messages.
+pub struct SocketApi {
+    reader: BufReader<tokio::io::ReadHalf<UnixStream>>,
+    writer: tokio::io::WriteHalf<UnixStream>,
+}
+
+impl SocketApi {
+    /// Create a new SocketApi from a UnixStream.
+    pub fn new(stream: UnixStream) -> Self {
+        let (reader, writer) = tokio::io::split(stream);
+        Self {
+            reader: BufReader::new(reader),
+            writer,
+        }
+    }
+
+    /// Read a request from the socket.
+    /// Returns None if the connection is closed.
+    pub async fn read_request(&mut self) -> Result<Option<Request>, SocketApiError> {
+        let mut line = String::new();
+        let bytes_read = self.reader.read_line(&mut line).await
+            .map_err(SocketApiError::Io)?;
+
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        let request: Request = serde_json::from_str(line.trim())
+            .map_err(SocketApiError::Json)?;
+
+        Ok(Some(request))
+    }
+
+    /// Write a response to the socket.
+    pub async fn write_response(&mut self, response: &Response) -> Result<(), SocketApiError> {
+        let json = serde_json::to_string(response)
+            .map_err(SocketApiError::Json)?;
+
+        self.writer.write_all(json.as_bytes()).await
+            .map_err(SocketApiError::Io)?;
+        self.writer.write_all(b"\n").await
+            .map_err(SocketApiError::Io)?;
+        self.writer.flush().await
+            .map_err(SocketApiError::Io)?;
+
+        Ok(())
+    }
+}
+
+/// Errors that can occur in the socket API.
+#[derive(Debug)]
+pub enum SocketApiError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for SocketApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocketApiError::Io(e) => write!(f, "IO error: {}", e),
+            SocketApiError::Json(e) => write!(f, "JSON error: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for SocketApiError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SocketApiError::Io(e) => Some(e),
+            SocketApiError::Json(e) => Some(e),
+        }
+    }
+}
+
+// Make SocketApiError Send + Sync for use with tokio
+unsafe impl Send for SocketApiError {}
+unsafe impl Sync for SocketApiError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_message_serialization() {
+        let request = Request::Message {
+            content: "Hello, agent!".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"message\""));
+        assert!(json.contains("\"content\":\"Hello, agent!\""));
+
+        // Deserialize back
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::Message { content } => assert_eq!(content, "Hello, agent!"),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_status_serialization() {
+        let request = Request::Status;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"status"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Status));
+    }
+
+    #[test]
+    fn test_request_shutdown_serialization() {
+        let request = Request::Shutdown;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"shutdown"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Shutdown));
+    }
+
+    #[test]
+    fn test_response_message_serialization() {
+        let response = Response::Message {
+            content: "Hello back!".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"message\""));
+        assert!(json.contains("\"content\":\"Hello back!\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Message { content } => assert_eq!(content, "Hello back!"),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_status_serialization() {
+        let response = Response::Status {
+            running: true,
+            history_len: 5,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"status\""));
+        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"history_len\":5"));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Status { running, history_len } => {
+                assert!(running);
+                assert_eq!(history_len, 5);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_ok_serialization() {
+        let response = Response::Ok;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"type":"ok"}"#);
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Ok));
+    }
+
+    #[test]
+    fn test_response_error_serialization() {
+        let response = Response::Error {
+            message: "Something went wrong".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"error\""));
+        assert!(json.contains("\"message\":\"Something went wrong\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Error { message } => assert_eq!(message, "Something went wrong"),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_socket_api_error_display() {
+        let io_error = SocketApiError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "file not found",
+        ));
+        assert!(io_error.to_string().contains("IO error"));
+
+        let json_error = SocketApiError::Json(
+            serde_json::from_str::<Request>("invalid json").unwrap_err()
+        );
+        assert!(json_error.to_string().contains("JSON error"));
+    }
+}

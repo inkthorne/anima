@@ -25,6 +25,9 @@ enum Commands {
     Run {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
+        /// Run as a daemon (headless, no REPL)
+        #[arg(long)]
+        daemon: bool,
     },
     /// Scaffold a new agent directory
     Create {
@@ -59,10 +62,17 @@ async fn main() {
     let command = cli.command.unwrap_or(Commands::Repl);
 
     match command {
-        Commands::Run { agent } => {
-            if let Err(e) = run_agent_dir(&agent).await {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Commands::Run { agent, daemon } => {
+            if daemon {
+                if let Err(e) = anima::daemon::run_daemon(&agent).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                if let Err(e) = run_agent_dir(&agent).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
         }
         Commands::Create { name, path } => {
