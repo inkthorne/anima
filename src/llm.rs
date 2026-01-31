@@ -803,7 +803,8 @@ impl LLM for OllamaClient {
 
         let mut request_body = serde_json::json!({
             "model": self.model,
-            "messages": formatted_messages
+            "messages": formatted_messages,
+            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"]
         });
 
         if let Some(tool_list) = tools {
@@ -911,7 +912,8 @@ impl LLM for OllamaClient {
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": formatted_messages,
-            "stream": true
+            "stream": true,
+            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"]
         });
 
         if let Some(tool_list) = tools {
