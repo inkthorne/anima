@@ -1,0 +1,16 @@
+[agent]
+name = "demo"
+persona_file = "persona.md"
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4"
+# api_key = "${ANTHROPIC_API_KEY}"  # uncomment and set
+
+[memory]
+path = "memory.db"
+
+[timer]
+enabled = true
+interval = "5m"
+message = "Periodic check-in"
