@@ -37,11 +37,11 @@ Run with: `anima run arya` or `anima run ~/.anima/agents/arya/`
 - [x] `anima create <name>` — Scaffold new agent directory
 - [x] `anima list` — List agents in ~/.anima/agents/
 
-#### Phase 4: Daemon Mode
-- [ ] Run without REPL (headless)
-- [ ] Timer triggers continue running
-- [ ] Expose local API (Unix socket or HTTP on localhost)
-- [ ] Clean shutdown on SIGTERM/SIGINT
+#### Phase 4: Daemon Mode ✅
+- [x] Run without REPL (headless)
+- [x] Timer triggers continue running
+- [x] Expose local API (Unix socket)
+- [x] Clean shutdown on SIGTERM/SIGINT
 
 #### Phase 5: Client Commands
 - [ ] `anima send <agent> "message"` — Send message to running daemon
