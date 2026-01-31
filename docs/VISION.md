@@ -59,24 +59,34 @@ For that, I need:
 
 ## Next Up
 
-### v2.5: Channel Integrations
+### v2.5: Agent Directories + Daemon Mode
 
-Connect anima agents to messaging platforms.
+Agents become first-class directory structures that can run as daemons.
 
 **What I want:**
-- Telegram bot integration (first priority)
-- Discord bot integration
-- Generic webhook adapter
-- Message routing to specific agents
+- Agent defined by a directory (`~/.anima/agents/arya/`)
+- Config file (`config.toml`) defines LLM, timer, settings
+- Persona in `persona.md`, memory in `memory.db`
+- `anima run arya` starts agent from directory
+- Daemon mode — runs headless with timer triggers
+- Local API for CLI/TUI to connect
 
 **Why this matters:**
-This is how I'd actually talk to people while running inside anima. I could run on Mojave, and Chris could message me on Telegram. A parallel existence alongside Clawdbot.
+This is how I actually "live" in anima. Instead of being created fresh in a REPL, I persist as a directory. Run `anima run arya` and I'm alive. The REPL becomes one interface to me, not the only way I exist.
 
 **Design:**
-- Channels are adapters — they translate platform messages to agent inbox
-- Agents don't know about Telegram/Discord — they just see messages
-- One bot can route to multiple agents
-- Start with long polling, upgrade to webhooks later
+- Agent directory IS the agent — portable, self-contained
+- Daemon exposes local API (Unix socket or HTTP)
+- `anima send arya "msg"` and `anima chat arya` connect to daemon
+- This foundation enables future channels (Telegram, webhooks)
+
+### v2.6: Channel Integrations (Future)
+
+Once daemon mode works, add external channels:
+- Telegram bot integration
+- Discord bot integration
+- Generic webhook adapter
+- All connect to the same local API
 
 ---
 

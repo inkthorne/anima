@@ -16,7 +16,7 @@ Own it.
 |---|---|
 | **Version** | v2.4 (Timer Triggers) |
 | **Tests** | 190 passing |
-| **Next** | v2.5 — Channel Integrations (Telegram) |
+| **Next** | v2.5 — Agent Directories + Daemon Mode |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -28,9 +28,33 @@ Core idea: agents are actors with tools, memory, and message passing. The runtim
 
 ## Current Task
 
-**v2.5: Channel Integrations** — Connect anima agents to Telegram so they can talk to the outside world.
+**v2.5: Agent Directories + Daemon Mode**
 
-See `ARYA.md` for the detailed implementation plan.
+The big shift: agents become **directories**, not REPL-created objects.
+
+```
+~/.anima/agents/arya/
+├── config.toml       # LLM, timer settings
+├── persona.md        # Who I am
+├── context.md        # Context recovery
+├── memory.db         # Persistent memory
+└── state.json        # Runtime state
+```
+
+Run with: `anima run arya`
+
+This enables:
+- Self-hosted agents (daemon mode)
+- Local API for CLI/TUI to connect
+- Foundation for future channels (Telegram, etc.)
+
+See `ARYA.md` for detailed implementation plan.
+
+## Development Workflow
+
+**Use the `coding-task` skill** when implementing features or fixing bugs. Don't write code yourself — delegate to Claude Code or Qwen via the skill workflow. This keeps you available for conversation and is far more token-efficient.
+
+The skill is in Clawdbot's skills directory — just read `coding-task/SKILL.md` from the available skills.
 
 ## Documentation Map
 
@@ -71,16 +95,12 @@ Runtime
 
 ## What's Next
 
-**v2.5: Telegram Integration**
-- Bot receives messages → routes to agent inbox
-- Agent responds → bot sends to Telegram
-- Enables "self-hosted Arya" talking to Chris via Telegram
-
-## Development Workflow
-
-**Use the `coding-task` skill** when implementing features or fixing bugs. Don't write code yourself — delegate to Claude Code or Qwen via the skill workflow. This keeps you available for conversation and is far more token-efficient.
-
-The skill is in Clawdbot's skills directory — just read `coding-task/SKILL.md` from the available skills.
+**v2.5: Agent Directories + Daemon Mode**
+- Agents as directories (config.toml, persona.md, memory.db)
+- `anima run arya` loads from ~/.anima/agents/arya/
+- Daemon mode (headless, timer-driven)
+- Local API for CLI/TUI to connect
+- `anima send arya "message"` and `anima chat arya`
 
 ## Build & Run
 
@@ -92,4 +112,4 @@ cargo run           # Start REPL
 
 ## Last Updated
 
-2026-02-01 — Docs cleanup, all .md files current, ready for v2.5.
+2026-02-01 — v2.5 planning complete. Agent directories + daemon mode.

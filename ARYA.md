@@ -1,78 +1,90 @@
 # ARYA.md — Current Task
 
-## v2.5: Channel Integrations
+## v2.5: Agent Directories + Daemon Mode
 
-Connect anima agents to messaging platforms so they can talk to the world.
+**Goal:** Make agents first-class directory structures that can run as daemons, enabling self-hosted agents.
 
-### Goal
+### The Vision
 
-- Telegram bot integration (first priority)
-- Message routing to specific agents
-- Generic adapter pattern for future channels (Discord, webhooks, etc.)
+Instead of creating agents in the REPL, agents are directories:
+```
+~/.anima/agents/arya/
+├── config.toml       # LLM, timer, channel settings
+├── persona.md        # System prompt — who I am
+├── context.md        # Quick context recovery file
+├── memory.db         # SQLite persistent memory
+└── state.json        # Runtime state
+```
+
+Run with: `anima run arya` or `anima run ~/.anima/agents/arya/`
 
 ### Implementation Plan
 
-#### Phase 1: Telegram Bot Foundation
-- [ ] Add `teloxide` crate for Telegram bot API
-- [ ] Create `src/channels/mod.rs` module
-- [ ] Create `src/channels/telegram.rs` with basic bot setup
-- [ ] Bot can receive messages and echo them back
+#### Phase 1: Agent Directory Structure
+- [ ] Define directory layout and required files
+- [ ] Create `AgentDir` struct to represent an agent directory
+- [ ] Add `config.toml` schema (name, llm, persona_file, timer, etc.)
+- [ ] Load agent from directory instead of creating in REPL
 
-#### Phase 2: Agent Integration
-- [ ] Route incoming Telegram messages to a designated agent
-- [ ] Agent responses sent back to Telegram chat
-- [ ] Support for configuring which agent handles Telegram
+#### Phase 2: Config-Driven Agent Creation
+- [ ] Parse `config.toml` with serde
+- [ ] Load persona from `persona.md` file
+- [ ] Initialize memory from `memory.db` path in config
+- [ ] Support environment variable substitution (e.g., `${ANTHROPIC_API_KEY}`)
 
-#### Phase 3: Multi-User Support
-- [ ] Track chat IDs for different conversations
-- [ ] Conversation history per chat
-- [ ] Optional: spawn separate agent per user
+#### Phase 3: CLI Commands
+- [ ] `anima run <agent>` — Load and run agent from directory
+- [ ] `anima create <name>` — Scaffold new agent directory
+- [ ] `anima list` — List agents in ~/.anima/agents/
 
-#### Phase 4: Configuration
-- [ ] Add Telegram config to `config.toml`
-- [ ] Bot token from env var or config
-- [ ] Agent name mapping in config
+#### Phase 4: Daemon Mode
+- [ ] Run without REPL (headless)
+- [ ] Timer triggers continue running
+- [ ] Expose local API (Unix socket or HTTP on localhost)
+- [ ] Clean shutdown on SIGTERM/SIGINT
 
-#### Phase 5: Graceful Lifecycle
-- [ ] Clean shutdown of Telegram polling
-- [ ] Reconnection on network errors
-- [ ] Status command to show connected channels
+#### Phase 5: Client Commands
+- [ ] `anima send <agent> "message"` — Send message to running daemon
+- [ ] `anima chat <agent>` — Interactive session with running daemon
+- [ ] `anima status` — Show running agents
+
+### Example config.toml
+
+```toml
+[agent]
+name = "arya"
+persona = "persona.md"
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4"
+api_key = "${ANTHROPIC_API_KEY}"
+
+[memory]
+path = "memory.db"
+
+[timer]
+enabled = true
+interval = "5m"
+message = "Heartbeat — check for anything interesting"
+
+# Future
+[api]
+enabled = true
+socket = "~/.anima/agents/arya/arya.sock"
+```
 
 ### Design Notes
 
-- Channel is a separate concern from Agent — agents don't know about Telegram
-- Channel adapters translate platform messages → agent inbox, agent responses → platform
-- One Telegram bot can route to multiple agents (by command or config)
-- Start with long polling, upgrade to webhooks later if needed
-
-### Example Config
-
-```toml
-[channels.telegram]
-enabled = true
-token = "${TELEGRAM_BOT_TOKEN}"
-default_agent = "arya"
-```
-
-### Example Flow
-
-```
-User (Telegram) → "Hello!"
-  ↓
-TelegramChannel receives message
-  ↓
-Routes to agent "arya" inbox
-  ↓
-Agent thinks, responds: "Hi there!"
-  ↓
-TelegramChannel sends response
-  ↓
-User sees reply in Telegram
-```
+- Agent directory IS the agent — portable, self-contained
+- `context.md` pattern from project docs applies to agents too
+- Daemon exposes local API; CLI/TUI connects to it
+- Same API enables future channel integrations (Telegram, etc.)
 
 ### Success Criteria
 
-- [ ] Can run `cargo run` and have a working Telegram bot
-- [ ] Messages in Telegram trigger agent thinking
-- [ ] Agent responses appear in Telegram
-- [ ] Clean shutdown with Ctrl+C
+- [ ] Can run `anima run arya` and have a working agent
+- [ ] Agent loads config, persona, memory from directory
+- [ ] Timer triggers work in daemon mode
+- [ ] Can send messages via `anima send arya "hello"`
+- [ ] Clean shutdown preserves state
