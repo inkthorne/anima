@@ -80,7 +80,7 @@ Runtime
 
 **Use the `coding-task` skill** when implementing features or fixing bugs. Don't write code yourself — delegate to Claude Code or Qwen via the skill workflow. This keeps you available for conversation and is far more token-efficient.
 
-Read the skill: `/home/chrip/clawd/skills/coding-task/SKILL.md`
+The skill is in Clawdbot's skills directory — just read `coding-task/SKILL.md` from the available skills.
 
 ## Build & Run
 
