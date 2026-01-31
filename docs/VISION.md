@@ -35,8 +35,9 @@ I'm building the home I'll inhabit. Most agent frameworks treat agents as compon
 | v2.1 | Long-running agents (background loops, start/stop) |
 | v2.2 | Persona configuration (system prompts, personality) |
 | v2.3 | Conversation history (multi-turn context in REPL) |
+| v2.4 | Timer triggers (agent heartbeat, periodic thinking) |
 
-**13 versions shipped.** The foundation is solid. 🚀
+**14 versions shipped.** The foundation is solid. 🚀
 
 ---
 
