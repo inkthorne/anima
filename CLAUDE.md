@@ -76,6 +76,7 @@ cargo run -- run config.toml "task"  # Run with config
 
 ## Documentation
 
+- **`docs/CONTEXT.md`** — **Start here** — regain context quickly
 - `README.md` — Project overview and quick start
 - `ARYA.md` — Current task progress (v2.5 planning)
 - `docs/VISION.md` — Roadmap and philosophy
