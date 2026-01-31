@@ -1,6 +1,26 @@
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
 use serde::Deserialize;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum AgentDirError {
+    #[error("Config file not found: {0}")]
+    ConfigNotFound(PathBuf),
+    #[error("Failed to parse config: {0}")]
+    ParseError(#[from] toml::de::Error),
+    #[error("Environment variable not set: {0}")]
+    EnvVarNotSet(String),
+    #[error("Failed to read file: {0}")]
+    IoError(#[from] std::io::Error),
+    #[error("Unsupported LLM provider: {0}")]
+    UnsupportedProvider(String),
+    #[error("LLM error: {0}")]
+    LlmError(String),
+    #[error("Memory error: {0}")]
+    MemoryError(String),
+}
 
 #[derive(Debug, Deserialize)]
 pub struct LlmSection {
@@ -42,12 +62,75 @@ pub struct AgentDir {
 }
 
 impl AgentDir {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Load an agent directory from the given path.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, AgentDirError> {
         let path = path.as_ref().to_path_buf();
         let config_path = path.join("config.toml");
+        
+        if !config_path.exists() {
+            return Err(AgentDirError::ConfigNotFound(config_path));
+        }
+        
         let content = std::fs::read_to_string(&config_path)?;
         let config: AgentDirConfig = toml::from_str(&content)?;
         Ok(Self { path, config })
+    }
+
+    /// Expand ${VAR} patterns in a string with environment variable values.
+    /// Returns an error if any referenced variable is not set.
+    pub fn expand_env_vars(s: &str) -> Result<String, AgentDirError> {
+        let re = Regex::new(r"\$\{([^}]+)\}").unwrap();
+        let mut result = s.to_string();
+        
+        for cap in re.captures_iter(s) {
+            let var_name = &cap[1];
+            let value = std::env::var(var_name)
+                .map_err(|_| AgentDirError::EnvVarNotSet(var_name.to_string()))?;
+            result = result.replace(&cap[0], &value);
+        }
+        
+        Ok(result)
+    }
+
+    /// Load persona content from the configured persona file.
+    /// Returns Ok(None) if no persona file is configured.
+    pub fn load_persona(&self) -> Result<Option<String>, AgentDirError> {
+        match &self.config.agent.persona_file {
+            Some(persona_path) => {
+                let full_path = self.path.join(persona_path);
+                let content = std::fs::read_to_string(&full_path)?;
+                Ok(Some(content))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get the absolute path for the memory database.
+    /// Returns None if no memory section is configured.
+    pub fn memory_path(&self) -> Option<PathBuf> {
+        self.config.memory.as_ref().map(|m| self.path.join(&m.path))
+    }
+
+    /// Get the API key, expanding environment variables if needed.
+    /// Falls back to provider-specific env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY).
+    pub fn api_key(&self) -> Result<Option<String>, AgentDirError> {
+        match &self.config.llm.api_key {
+            Some(key) => {
+                // Expand env vars in the key (e.g., "${ANTHROPIC_API_KEY}")
+                let expanded = Self::expand_env_vars(key)?;
+                Ok(Some(expanded))
+            }
+            None => {
+                // Fallback to provider-specific env var
+                let env_var = match self.config.llm.provider.as_str() {
+                    "openai" => "OPENAI_API_KEY",
+                    "anthropic" => "ANTHROPIC_API_KEY",
+                    "ollama" => return Ok(None), // Ollama doesn't need an API key
+                    _ => return Ok(None),
+                };
+                Ok(std::env::var(env_var).ok())
+            }
+        }
     }
 }
 
@@ -98,5 +181,156 @@ message = "heartbeat"
         assert!(timer.enabled);
         assert_eq!(timer.interval, "5m");
         assert_eq!(timer.message, Some("heartbeat".to_string()));
+    }
+
+    #[test]
+    fn test_config_not_found() {
+        let dir = tempdir().unwrap();
+        let result = AgentDir::load(dir.path());
+        assert!(matches!(result, Err(AgentDirError::ConfigNotFound(_))));
+    }
+
+    #[test]
+    fn test_expand_env_vars() {
+        unsafe { std::env::set_var("TEST_ANIMA_VAR", "hello") };
+        let result = AgentDir::expand_env_vars("prefix_${TEST_ANIMA_VAR}_suffix").unwrap();
+        assert_eq!(result, "prefix_hello_suffix");
+        unsafe { std::env::remove_var("TEST_ANIMA_VAR") };
+    }
+
+    #[test]
+    fn test_expand_env_vars_missing() {
+        let result = AgentDir::expand_env_vars("${DEFINITELY_NOT_SET_12345}");
+        assert!(matches!(result, Err(AgentDirError::EnvVarNotSet(_))));
+    }
+
+    #[test]
+    fn test_expand_env_vars_multiple() {
+        unsafe {
+            std::env::set_var("TEST_A", "aaa");
+            std::env::set_var("TEST_B", "bbb");
+        }
+        let result = AgentDir::expand_env_vars("${TEST_A}/${TEST_B}").unwrap();
+        assert_eq!(result, "aaa/bbb");
+        unsafe {
+            std::env::remove_var("TEST_A");
+            std::env::remove_var("TEST_B");
+        }
+    }
+
+    #[test]
+    fn test_load_persona() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+persona_file = "persona.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        fs::write(dir.path().join("persona.md"), "I am a helpful assistant.").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let persona = agent_dir.load_persona().unwrap();
+        assert_eq!(persona, Some("I am a helpful assistant.".to_string()));
+    }
+
+    #[test]
+    fn test_load_persona_none() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let persona = agent_dir.load_persona().unwrap();
+        assert_eq!(persona, None);
+    }
+
+    #[test]
+    fn test_memory_path() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+
+[memory]
+path = "data/memory.db"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let mem_path = agent_dir.memory_path().unwrap();
+        assert_eq!(mem_path, dir.path().join("data/memory.db"));
+    }
+
+    #[test]
+    fn test_memory_path_none() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        assert!(agent_dir.memory_path().is_none());
+    }
+
+    #[test]
+    fn test_api_key_literal() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-literal-key"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let key = agent_dir.api_key().unwrap();
+        assert_eq!(key, Some("sk-literal-key".to_string()));
+    }
+
+    #[test]
+    fn test_api_key_env_expansion() {
+        let dir = tempdir().unwrap();
+        unsafe { std::env::set_var("TEST_API_KEY", "sk-from-env") };
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "${TEST_API_KEY}"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let key = agent_dir.api_key().unwrap();
+        assert_eq!(key, Some("sk-from-env".to_string()));
+        unsafe { std::env::remove_var("TEST_API_KEY") };
     }
 }
