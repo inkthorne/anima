@@ -3,6 +3,7 @@ use std::error::Error;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -18,6 +19,32 @@ use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::agent::{Agent, ThinkOptions};
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
+
+/// Parse a duration string like "30s", "5m", "1h" into a Duration.
+/// Returns None if the format is invalid.
+fn parse_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    // Find where the numeric part ends
+    let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if num_end == 0 {
+        return None;
+    }
+
+    let num: u64 = s[..num_end].parse().ok()?;
+    let unit = &s[num_end..];
+
+    match unit {
+        "s" | "sec" | "secs" | "second" | "seconds" => Some(Duration::from_secs(num)),
+        "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::from_secs(num * 60)),
+        "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::from_secs(num * 3600)),
+        "" => Some(Duration::from_secs(num)), // Default to seconds if no unit
+        _ => None,
+    }
+}
 
 const BANNER: &str = r#"
     _          _
@@ -133,12 +160,27 @@ struct ReplAgent {
     history: Vec<ChatMessage>,
 }
 
+/// Timer configuration for running agents
+#[derive(Debug, Clone)]
+struct TimerConfig {
+    /// How often the timer fires
+    interval: Duration,
+    /// Message to think with when timer fires
+    message: String,
+}
+
+/// Info about a running agent
+struct RunningAgentInfo {
+    abort_handle: tokio::task::AbortHandle,
+    timer: Option<TimerConfig>,
+}
+
 pub struct Repl {
     runtime: Runtime,
     agents: HashMap<String, ReplAgent>,
     default_llm: Option<String>,
     history_file: Option<PathBuf>,
-    running_agents: HashMap<String, tokio::task::AbortHandle>,
+    running_agents: HashMap<String, RunningAgentInfo>,
 }
 
 impl Repl {
@@ -712,8 +754,41 @@ impl Repl {
         }
     }
 
-    async fn cmd_agent_start(&mut self, name: &str) {
-        let name = name.trim().to_string();
+    async fn cmd_agent_start(&mut self, args: &str) {
+        // Parse: <name> [--every <duration>] [--on-timer <message>]
+        let parts: Vec<&str> = args.split_whitespace().collect();
+        if parts.is_empty() {
+            println!("\x1b[31mUsage: agent start <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
+            return;
+        }
+
+        let name = parts[0].trim().to_string();
+
+        // Parse flags
+        let mut timer_interval: Option<Duration> = None;
+        let mut timer_message: Option<String> = None;
+
+        let mut i = 1;
+        while i < parts.len() {
+            match parts[i] {
+                "--every" if i + 1 < parts.len() => {
+                    match parse_duration(parts[i + 1]) {
+                        Some(d) => timer_interval = Some(d),
+                        None => {
+                            println!("\x1b[31mInvalid duration '{}'. Use format like 30s, 5m, 1h\x1b[0m", parts[i + 1]);
+                            return;
+                        }
+                    }
+                    i += 2;
+                }
+                "--on-timer" if i + 1 < parts.len() => {
+                    // Collect remaining args as timer message
+                    timer_message = Some(parts[i + 1..].join(" "));
+                    break;
+                }
+                _ => i += 1,
+            }
+        }
 
         // Check if agent exists
         let entry = match self.agents.get(&name) {
@@ -740,48 +815,104 @@ impl Repl {
         let agent = entry.agent.clone();
         let agent_name = name.clone();
 
-        // Spawn a background task that loops: sleep, drain inbox, think if messages
+        // Build timer config if interval was specified
+        let timer_config = timer_interval.map(|interval| TimerConfig {
+            interval,
+            message: timer_message.clone().unwrap_or_else(|| "Timer trigger".to_string()),
+        });
+
+        // Clone timer config for the spawned task
+        let task_timer = timer_config.clone();
+
+        // Spawn a background task that loops: check inbox, optionally fire timer
         let handle = tokio::spawn(async move {
+            // Set up timer interval if configured
+            let mut timer = task_timer.as_ref().map(|t| tokio::time::interval(t.interval));
+
+            // Skip the first immediate tick if we have a timer
+            if let Some(ref mut t) = timer {
+                t.tick().await;
+            }
+
             loop {
-                // Sleep for 1 second
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                // Lock the agent and check for messages
-                let mut agent_guard = agent.lock().await;
-
-                // Check if there are pending messages by trying to receive one
-                if let Some(msg) = agent_guard.receive_message().await {
-                    println!("\n\x1b[33m[{}]\x1b[0m received message from \x1b[36m{}\x1b[0m: {}",
-                             agent_name, msg.from, msg.content);
-
-                    // Process the message by thinking about it
-                    let task = format!("You received a message from {}: {}", msg.from, msg.content);
-                    match agent_guard.think(&task).await {
-                        Ok(response) => {
-                            println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                // Use select! to handle both timer and inbox checking
+                tokio::select! {
+                    // Timer branch (only if timer is configured)
+                    _ = async {
+                        if let Some(ref mut t) = timer {
+                            t.tick().await
+                        } else {
+                            // If no timer, never resolve this branch
+                            std::future::pending::<tokio::time::Instant>().await
                         }
-                        Err(e) => {
-                            println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
+                    } => {
+                        // Timer fired
+                        if let Some(ref tc) = task_timer {
+                            let mut agent_guard = agent.lock().await;
+                            println!("\n\x1b[35m[{}]\x1b[0m timer fired, thinking...", agent_name);
+                            match agent_guard.think(&tc.message).await {
+                                Ok(response) => {
+                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                                }
+                                Err(e) => {
+                                    println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
+                                }
+                            }
+                            print!("\x1b[36manima>\x1b[0m ");
+                            let _ = io::stdout().flush();
                         }
                     }
-                    print!("\x1b[36manima>\x1b[0m ");
-                    let _ = io::stdout().flush();
+
+                    // Inbox check branch (always runs on a 1-second interval)
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        // Lock the agent and check for messages
+                        let mut agent_guard = agent.lock().await;
+
+                        // Check if there are pending messages by trying to receive one
+                        if let Some(msg) = agent_guard.receive_message().await {
+                            println!("\n\x1b[33m[{}]\x1b[0m received message from \x1b[36m{}\x1b[0m: {}",
+                                     agent_name, msg.from, msg.content);
+
+                            // Process the message by thinking about it
+                            let task = format!("You received a message from {}: {}", msg.from, msg.content);
+                            match agent_guard.think(&task).await {
+                                Ok(response) => {
+                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                                }
+                                Err(e) => {
+                                    println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
+                                }
+                            }
+                            print!("\x1b[36manima>\x1b[0m ");
+                            let _ = io::stdout().flush();
+                        }
+                    }
                 }
             }
         });
 
-        // Store the abort handle
-        self.running_agents.insert(name.clone(), handle.abort_handle());
-        println!("\x1b[32m✓ Started agent '{}' (running in background)\x1b[0m", name);
+        // Store the abort handle and timer config
+        self.running_agents.insert(name.clone(), RunningAgentInfo {
+            abort_handle: handle.abort_handle(),
+            timer: timer_config.clone(),
+        });
+
+        // Build status message
+        let timer_info = if let Some(tc) = timer_config {
+            format!(" with timer every {:?}", tc.interval)
+        } else {
+            String::new()
+        };
+        println!("\x1b[32m✓ Started agent '{}' (running in background{})\x1b[0m", name, timer_info);
     }
 
     fn cmd_agent_stop(&mut self, name: &str) {
         let name = name.trim();
 
-        // Get and remove the abort handle
+        // Get and remove the running agent info
         match self.running_agents.remove(name) {
-            Some(handle) => {
-                handle.abort();
+            Some(info) => {
+                info.abort_handle.abort();
                 println!("\x1b[32m✓ Stopped agent '{}'\x1b[0m", name);
             }
             None => {
@@ -798,12 +929,17 @@ impl Repl {
 
         println!("\x1b[1mAgent Status:\x1b[0m");
         for (name, entry) in &self.agents {
-            let status = if self.running_agents.contains_key(name) {
-                "\x1b[32m(running)\x1b[0m"
+            let (status, timer_info) = if let Some(info) = self.running_agents.get(name) {
+                let timer_str = if let Some(ref tc) = info.timer {
+                    format!(" [timer: every {:?}, msg: \"{}\"]", tc.interval, tc.message)
+                } else {
+                    String::new()
+                };
+                (format!("\x1b[32m(running)\x1b[0m{}", timer_str), String::new())
             } else {
-                "\x1b[33m(stopped)\x1b[0m"
+                ("\x1b[33m(stopped)\x1b[0m".to_string(), String::new())
             };
-            println!("  \x1b[36m{}\x1b[0m {} (llm: {})", name, status, entry.llm_name);
+            println!("  \x1b[36m{}\x1b[0m {} (llm: {}){}", name, status, entry.llm_name, timer_info);
         }
     }
 
@@ -845,8 +981,10 @@ impl Repl {
         println!("  \x1b[36magent remove <name>\x1b[0m");
         println!("      Remove an agent from session (memory persists)");
         println!();
-        println!("  \x1b[36magent start <name>\x1b[0m");
+        println!("  \x1b[36magent start <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
         println!("      Start an agent in background loop (processes inbox automatically)");
+        println!("      --every: timer interval (e.g., 30s, 5m, 1h) for periodic wake-ups");
+        println!("      --on-timer: message to think with when timer fires (default: 'Timer trigger')");
         println!();
         println!("  \x1b[36magent stop <name>\x1b[0m");
         println!("      Stop a running background agent");
@@ -966,5 +1104,44 @@ mod tests {
         let mut repl = Repl::new();
         // Stopping a non-existent agent should not panic
         repl.cmd_agent_stop("nonexistent");
+    }
+
+    #[test]
+    fn test_parse_duration_seconds() {
+        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_duration("1sec"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_duration("5secs"), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn test_parse_duration_minutes() {
+        assert_eq!(parse_duration("5m"), Some(Duration::from_secs(300)));
+        assert_eq!(parse_duration("1min"), Some(Duration::from_secs(60)));
+        assert_eq!(parse_duration("2mins"), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_duration("2hr"), Some(Duration::from_secs(7200)));
+        assert_eq!(parse_duration("3hrs"), Some(Duration::from_secs(10800)));
+    }
+
+    #[test]
+    fn test_parse_duration_no_unit() {
+        // Defaults to seconds
+        assert_eq!(parse_duration("60"), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert_eq!(parse_duration(""), None);
+        assert_eq!(parse_duration("abc"), None);
+        assert_eq!(parse_duration("5x"), None);
+    }
+
+    #[test]
+    fn test_parse_duration_whitespace() {
+        assert_eq!(parse_duration("  30s  "), Some(Duration::from_secs(30)));
     }
 }
