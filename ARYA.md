@@ -43,10 +43,10 @@ Run with: `anima run arya` or `anima run ~/.anima/agents/arya/`
 - [x] Expose local API (Unix socket)
 - [x] Clean shutdown on SIGTERM/SIGINT
 
-#### Phase 5: Client Commands
-- [ ] `anima send <agent> "message"` — Send message to running daemon
-- [ ] `anima chat <agent>` — Interactive session with running daemon
-- [ ] `anima status` — Show running agents
+#### Phase 5: Client Commands ✅
+- [x] `anima send <agent> "message"` — Send message to running daemon
+- [x] `anima chat <agent>` — Interactive session with running daemon
+- [x] `anima status` — Show running agents
 
 ### Example config.toml
 
@@ -83,8 +83,8 @@ socket = "~/.anima/agents/arya/arya.sock"
 
 ### Success Criteria
 
-- [ ] Can run `anima run arya` and have a working agent
-- [ ] Agent loads config, persona, memory from directory
-- [ ] Timer triggers work in daemon mode
-- [ ] Can send messages via `anima send arya "hello"`
-- [ ] Clean shutdown preserves state
+- [x] Can run `anima run arya` and have a working agent
+- [x] Agent loads config, persona, memory from directory
+- [x] Timer triggers work in daemon mode
+- [x] Can send messages via `anima send arya "hello"`
+- [x] Clean shutdown preserves state

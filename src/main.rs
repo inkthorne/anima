@@ -4,13 +4,16 @@ use anima::{
 };
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
+use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
 use anima::repl::Repl;
+use anima::socket_api::{SocketApi, Request, Response};
 use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::io::{self, Write};
+use tokio::net::UnixStream;
 
 #[derive(Parser)]
 #[command(name = "anima", about = "The animating spirit - AI agent runtime")]
@@ -54,6 +57,20 @@ enum Commands {
     },
     /// Interactive REPL for exploring anima (default if no command given)
     Repl,
+    /// Send a message to a running agent daemon
+    Send {
+        /// Agent name (from ~/.anima/agents/)
+        agent: String,
+        /// Message to send
+        message: String,
+    },
+    /// Start an interactive chat session with a running agent daemon
+    Chat {
+        /// Agent name (from ~/.anima/agents/)
+        agent: String,
+    },
+    /// Show status of all agents (running/stopped)
+    Status,
 }
 
 #[tokio::main]
@@ -97,6 +114,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Send { agent, message } => {
+            if let Err(e) = send_message(&agent, &message).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Chat { agent } => {
+            if let Err(e) = chat_with_agent(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Status => {
+            show_status();
+        }
     }
 }
 
@@ -116,6 +148,176 @@ fn resolve_agent_path(agent: &str) -> PathBuf {
         PathBuf::from(agent)
     } else {
         agents_dir().join(agent)
+    }
+}
+
+/// Resolve the socket path for an agent.
+fn resolve_agent_socket(agent: &str) -> PathBuf {
+    resolve_agent_path(agent).join("agent.sock")
+}
+
+/// Connect to a running agent daemon and return a SocketApi.
+async fn connect_to_agent(agent: &str) -> Result<SocketApi, Box<dyn std::error::Error>> {
+    let socket_path = resolve_agent_socket(agent);
+
+    if !socket_path.exists() {
+        return Err(format!(
+            "Agent '{}' is not running (socket not found: {})",
+            agent,
+            socket_path.display()
+        ).into());
+    }
+
+    let stream = UnixStream::connect(&socket_path).await
+        .map_err(|e| format!("Failed to connect to agent '{}': {}", agent, e))?;
+
+    Ok(SocketApi::new(stream))
+}
+
+/// Send a single message to a running agent daemon.
+async fn send_message(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    // Send the message
+    api.write_request(&Request::Message {
+        content: message.to_string(),
+    }).await.map_err(|e| format!("Failed to send message: {}", e))?;
+
+    // Read the response
+    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+        Some(Response::Message { content }) => {
+            println!("{}", content);
+        }
+        Some(Response::Error { message }) => {
+            eprintln!("Error from agent: {}", message);
+            std::process::exit(1);
+        }
+        Some(other) => {
+            eprintln!("Unexpected response: {:?}", other);
+            std::process::exit(1);
+        }
+        None => {
+            eprintln!("Connection closed unexpectedly");
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Start an interactive chat session with a running agent daemon.
+async fn chat_with_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent);
+    println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
+
+    // Use rustyline for interactive input
+    let mut rl = rustyline::DefaultEditor::new()?;
+
+    loop {
+        match rl.readline(&format!("\x1b[36m{}>\x1b[0m ", agent)) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Add to history
+                let _ = rl.add_history_entry(line);
+
+                // Send the message
+                if let Err(e) = api.write_request(&Request::Message {
+                    content: line.to_string(),
+                }).await {
+                    eprintln!("\x1b[31mFailed to send message: {}\x1b[0m", e);
+                    break;
+                }
+
+                // Read the response
+                match api.read_response().await {
+                    Ok(Some(Response::Message { content })) => {
+                        println!("\n{}\n", content);
+                    }
+                    Ok(Some(Response::Error { message })) => {
+                        eprintln!("\x1b[31mError: {}\x1b[0m\n", message);
+                    }
+                    Ok(Some(other)) => {
+                        eprintln!("\x1b[31mUnexpected response: {:?}\x1b[0m\n", other);
+                    }
+                    Ok(None) => {
+                        println!("\n\x1b[33mConnection closed by agent.\x1b[0m");
+                        break;
+                    }
+                    Err(e) => {
+                        eprintln!("\x1b[31mFailed to read response: {}\x1b[0m", e);
+                        break;
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("\n\x1b[33mInterrupted. Goodbye!\x1b[0m");
+                break;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("\n\x1b[33mGoodbye!\x1b[0m");
+                break;
+            }
+            Err(e) => {
+                eprintln!("\x1b[31mInput error: {}\x1b[0m", e);
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Show status of all agents (running/stopped).
+fn show_status() {
+    let agents_path = agents_dir();
+
+    if !agents_path.exists() {
+        println!("\x1b[33mNo agents directory found at {}\x1b[0m", agents_path.display());
+        println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
+        return;
+    }
+
+    let entries: Vec<_> = match std::fs::read_dir(&agents_path) {
+        Ok(dir) => dir
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter(|e| e.path().join("config.toml").exists())
+            .collect(),
+        Err(e) => {
+            eprintln!("\x1b[31mCould not read agents directory: {}\x1b[0m", e);
+            return;
+        }
+    };
+
+    if entries.is_empty() {
+        println!("\x1b[33mNo agents found in {}\x1b[0m", agents_path.display());
+        println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
+        return;
+    }
+
+    // Print header
+    println!("\x1b[1m{:<20} {:<10} {:<10}\x1b[0m", "AGENT", "STATUS", "PID");
+    println!("{}", "-".repeat(42));
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let agent_path = entry.path();
+        let pid_path = agent_path.join("daemon.pid");
+
+        let (status, pid) = if PidFile::is_running(&pid_path) {
+            let pid = PidFile::read(&pid_path).unwrap_or(0);
+            ("\x1b[32mrunning\x1b[0m", pid.to_string())
+        } else {
+            ("\x1b[90mstopped\x1b[0m", "-".to_string())
+        };
+
+        println!("{:<20} {:<19} {:<10}", name, status, pid);
     }
 }
 
@@ -503,5 +705,93 @@ mod tests {
         let result = create_agent("existing-agent", Some(agent_path));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn test_resolve_agent_socket() {
+        let socket_path = resolve_agent_socket("myagent");
+        assert!(socket_path.ends_with(".anima/agents/myagent/agent.sock"));
+    }
+
+    #[test]
+    fn test_resolve_agent_socket_with_path() {
+        let socket_path = resolve_agent_socket("/custom/path/myagent");
+        assert_eq!(socket_path, PathBuf::from("/custom/path/myagent/agent.sock"));
+    }
+
+    #[test]
+    fn test_status_with_running_agent() {
+        // Create a temp agent directory with a PID file for current process
+        let dir = tempdir().unwrap();
+        let agent_path = dir.path().join("test-agent");
+        std::fs::create_dir_all(&agent_path).unwrap();
+
+        // Write a minimal config.toml
+        let config_content = r#"
+[agent]
+name = "test-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-test"
+"#;
+        std::fs::write(agent_path.join("config.toml"), config_content).unwrap();
+
+        // Write a PID file with current process ID (so is_running returns true)
+        let pid = std::process::id();
+        std::fs::write(agent_path.join("daemon.pid"), pid.to_string()).unwrap();
+
+        // Verify PidFile::is_running works
+        assert!(PidFile::is_running(agent_path.join("daemon.pid")));
+    }
+
+    #[test]
+    fn test_status_with_stopped_agent() {
+        // Create a temp agent directory without a PID file
+        let dir = tempdir().unwrap();
+        let agent_path = dir.path().join("stopped-agent");
+        std::fs::create_dir_all(&agent_path).unwrap();
+
+        // Write a minimal config.toml
+        let config_content = r#"
+[agent]
+name = "stopped-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-test"
+"#;
+        std::fs::write(agent_path.join("config.toml"), config_content).unwrap();
+
+        // No PID file means agent is stopped
+        assert!(!PidFile::is_running(agent_path.join("daemon.pid")));
+    }
+
+    #[test]
+    fn test_status_with_stale_pid_file() {
+        // Create a temp agent directory with a PID file for a non-existent process
+        let dir = tempdir().unwrap();
+        let agent_path = dir.path().join("stale-agent");
+        std::fs::create_dir_all(&agent_path).unwrap();
+
+        // Write a minimal config.toml
+        let config_content = r#"
+[agent]
+name = "stale-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-test"
+"#;
+        std::fs::write(agent_path.join("config.toml"), config_content).unwrap();
+
+        // Write a PID file with a very high PID that likely doesn't exist
+        std::fs::write(agent_path.join("daemon.pid"), "999999999").unwrap();
+
+        // Should return false for non-existent process
+        assert!(!PidFile::is_running(agent_path.join("daemon.pid")));
     }
 }

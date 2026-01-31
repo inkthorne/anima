@@ -89,6 +89,38 @@ impl SocketApi {
 
         Ok(())
     }
+
+    /// Write a request to the socket (client-side).
+    pub async fn write_request(&mut self, request: &Request) -> Result<(), SocketApiError> {
+        let json = serde_json::to_string(request)
+            .map_err(SocketApiError::Json)?;
+
+        self.writer.write_all(json.as_bytes()).await
+            .map_err(SocketApiError::Io)?;
+        self.writer.write_all(b"\n").await
+            .map_err(SocketApiError::Io)?;
+        self.writer.flush().await
+            .map_err(SocketApiError::Io)?;
+
+        Ok(())
+    }
+
+    /// Read a response from the socket (client-side).
+    /// Returns None if the connection is closed.
+    pub async fn read_response(&mut self) -> Result<Option<Response>, SocketApiError> {
+        let mut line = String::new();
+        let bytes_read = self.reader.read_line(&mut line).await
+            .map_err(SocketApiError::Io)?;
+
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        let response: Response = serde_json::from_str(line.trim())
+            .map_err(SocketApiError::Json)?;
+
+        Ok(Some(response))
+    }
 }
 
 /// Errors that can occur in the socket API.

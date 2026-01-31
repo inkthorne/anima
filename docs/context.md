@@ -14,10 +14,10 @@ Own it.
 
 | | |
 |---|---|
-| **Version** | v2.5 in progress |
-| **Tests** | 207 passing |
-| **Done** | Phase 1 (AgentDir struct), Phase 2 (config utilities), Phase 3 (CLI commands) |
-| **Next** | Phase 4 — Daemon Mode |
+| **Version** | v2.5 complete |
+| **Tests** | 234 passing |
+| **Done** | All phases: AgentDir, config utilities, CLI commands, daemon mode, client commands |
+| **Next** | v2.6 — Channel Integrations (Telegram) |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -113,4 +113,4 @@ cargo run           # Start REPL
 
 ## Last Updated
 
-2026-01-31 — v2.5 Phase 1-3 complete. Next: Phase 4 Daemon Mode.
+2026-01-31 — v2.5 complete! All phases done: AgentDir, config utilities, CLI commands, daemon mode, and client commands.
