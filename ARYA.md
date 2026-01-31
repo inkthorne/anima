@@ -32,10 +32,10 @@ Run with: `anima run arya` or `anima run ~/.anima/agents/arya/`
 - [x] Initialize memory from `memory.db` path in config
 - [x] Support environment variable substitution (e.g., `${ANTHROPIC_API_KEY}`)
 
-#### Phase 3: CLI Commands
-- [ ] `anima run <agent>` — Load and run agent from directory
-- [ ] `anima create <name>` — Scaffold new agent directory
-- [ ] `anima list` — List agents in ~/.anima/agents/
+#### Phase 3: CLI Commands ✅
+- [x] `anima run <agent>` — Load and run agent from directory
+- [x] `anima create <name>` — Scaffold new agent directory
+- [x] `anima list` — List agents in ~/.anima/agents/
 
 #### Phase 4: Daemon Mode
 - [ ] Run without REPL (headless)

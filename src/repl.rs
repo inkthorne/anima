@@ -197,6 +197,31 @@ impl Repl {
         }
     }
 
+    /// Create a REPL with a pre-loaded agent.
+    /// This is used when running `anima run <agent>` to start a REPL with an agent already loaded.
+    pub fn with_agent(name: String, agent: Agent, persona: Option<String>) -> Self {
+        let history_file = dirs::home_dir().map(|h| h.join(".anima_history"));
+
+        let mut agents = HashMap::new();
+        let mut persona_config = AgentPersona::default();
+        persona_config.system_prompt = persona;
+
+        agents.insert(name.clone(), ReplAgent {
+            agent: Arc::new(Mutex::new(agent)),
+            llm_name: "configured".to_string(),
+            persona: persona_config,
+            history: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        Repl {
+            runtime: Runtime::new(),
+            agents,
+            default_llm: None,
+            history_file,
+            running_agents: HashMap::new(),
+        }
+    }
+
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
         println!("{}", BANNER);
 

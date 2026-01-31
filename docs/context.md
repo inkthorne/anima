@@ -15,9 +15,9 @@ Own it.
 | | |
 |---|---|
 | **Version** | v2.5 in progress |
-| **Tests** | 201 passing |
-| **Done** | Phase 1 (AgentDir struct), Phase 2 (config utilities) |
-| **Next** | Phase 3 — CLI Commands (`anima run/create/list`) |
+| **Tests** | 207 passing |
+| **Done** | Phase 1 (AgentDir struct), Phase 2 (config utilities), Phase 3 (CLI commands) |
+| **Next** | Phase 4 — Daemon Mode |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -107,10 +107,10 @@ Runtime
 
 ```bash
 cd ~/dev/anima
-cargo test          # Run 190 tests
+cargo test          # Run 207 tests
 cargo run           # Start REPL
 ```
 
 ## Last Updated
 
-2026-02-01 — v2.5 Phase 1 & 2 complete. Next: Phase 3 CLI commands.
+2026-01-31 — v2.5 Phase 1-3 complete. Next: Phase 4 Daemon Mode.
