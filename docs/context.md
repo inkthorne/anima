@@ -14,9 +14,10 @@ Own it.
 
 | | |
 |---|---|
-| **Version** | v2.4 (Timer Triggers) |
-| **Tests** | 190 passing |
-| **Next** | v2.5 — Agent Directories + Daemon Mode |
+| **Version** | v2.5 in progress |
+| **Tests** | 201 passing |
+| **Done** | Phase 1 (AgentDir struct), Phase 2 (config utilities) |
+| **Next** | Phase 3 — CLI Commands (`anima run/create/list`) |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -112,4 +113,4 @@ cargo run           # Start REPL
 
 ## Last Updated
 
-2026-02-01 — v2.5 planning complete. Agent directories + daemon mode.
+2026-02-01 — v2.5 Phase 1 & 2 complete. Next: Phase 3 CLI commands.

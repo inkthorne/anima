@@ -20,17 +20,17 @@ Run with: `anima run arya` or `anima run ~/.anima/agents/arya/`
 
 ### Implementation Plan
 
-#### Phase 1: Agent Directory Structure
-- [ ] Define directory layout and required files
-- [ ] Create `AgentDir` struct to represent an agent directory
-- [ ] Add `config.toml` schema (name, llm, persona_file, timer, etc.)
-- [ ] Load agent from directory instead of creating in REPL
+#### Phase 1: Agent Directory Structure ✅
+- [x] Define directory layout and required files
+- [x] Create `AgentDir` struct to represent an agent directory
+- [x] Add `config.toml` schema (name, llm, persona_file, timer, etc.)
+- [x] Load agent from directory instead of creating in REPL
 
-#### Phase 2: Config-Driven Agent Creation
-- [ ] Parse `config.toml` with serde
-- [ ] Load persona from `persona.md` file
-- [ ] Initialize memory from `memory.db` path in config
-- [ ] Support environment variable substitution (e.g., `${ANTHROPIC_API_KEY}`)
+#### Phase 2: Config-Driven Agent Creation ✅
+- [x] Parse `config.toml` with serde
+- [x] Load persona from `persona.md` file
+- [x] Initialize memory from `memory.db` path in config
+- [x] Support environment variable substitution (e.g., `${ANTHROPIC_API_KEY}`)
 
 #### Phase 3: CLI Commands
 - [ ] `anima run <agent>` — Load and run agent from directory
