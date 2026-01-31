@@ -1,56 +1,83 @@
-# Anima - Claude Code Instructions
+# Anima — Claude Code Instructions
 
-## Project Overview
+## Overview
 
-Anima is a lightweight Rust runtime for AI agents. This is Arya's project — she's the lead architect.
+Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-## Structure
+**Current version:** v2.4 (Timer Triggers)  
+**Tests:** 190 passing  
+**Next milestone:** v2.5 (Channel Integrations — Telegram)
+
+## Project Structure
 
 ```
 src/
-├── lib.rs          # Module exports
-├── error.rs        # ToolError enum
-├── tool.rs         # Tool trait
-├── agent.rs        # Agent struct with tool registry
-├── runtime.rs      # Runtime manages agents
-├── main.rs         # Demo binary
+├── lib.rs              # Module exports
+├── main.rs             # REPL entry point
+├── error.rs            # Error types
+├── tool.rs             # Tool trait
+├── agent.rs            # Agent struct, inbox, conversation history
+├── runtime.rs          # Runtime manages agents, message routing
+├── config.rs           # AgentConfig, persona, timer settings
+├── repl/
+│   ├── mod.rs          # REPL main loop
+│   └── commands.rs     # Command handlers
+├── llm/
+│   ├── mod.rs          # LLM provider trait
+│   ├── openai.rs       # OpenAI client
+│   ├── anthropic.rs    # Anthropic client
+│   └── ollama.rs       # Ollama client
+├── memory/
+│   ├── mod.rs          # Memory trait
+│   ├── in_memory.rs    # In-memory store
+│   └── sqlite.rs       # SQLite persistent store
 └── tools/
     ├── mod.rs
-    ├── echo.rs     # EchoTool
-    └── add.rs      # AddTool
+    ├── file.rs         # File read/write
+    ├── http.rs         # HTTP requests
+    └── shell.rs        # Shell execution
 ```
 
-## Current State
+## Key Concepts
 
-v1.0 — Complete Runtime:
-- Tool trait, Agent, Runtime, example tools
-- Async execution (Tokio), message passing
-- Memory system with InMemoryStore + SqliteMemory
-- LLM integration (OpenAI-compatible, Anthropic)
-- Multi-turn agentic loop
-- Agent supervision (parent/child)
-- Concurrent child execution
-- **NEW: SQLite-backed persistent memory** — agents survive restarts
+- **Agent**: Actor with tools, memory, LLM, inbox, persona, conversation history
+- **Runtime**: Manages agents, routes messages between them
+- **Tool**: Capability an agent can use (file, HTTP, shell, etc.)
+- **Memory**: Persistent storage (SQLite) for agent state
+- **REPL**: Interactive shell for creating/managing agents
 
 ## Build Commands
 
 ```bash
-cargo check    # Type check
-cargo build    # Build
-cargo run      # Run demo
-cargo test     # Run tests (none yet)
+cargo check           # Type check
+cargo build           # Build
+cargo run             # Run REPL
+cargo test            # Run tests (190 tests)
+cargo run -- run config.toml "task"  # Run with config
 ```
+
+## Current Features (v2.4)
+
+- Interactive REPL with history, tab completion
+- Long-running agents (background loops)
+- Agent-to-agent messaging
+- Persona configuration (system prompts)
+- Conversation history (multi-turn context)
+- Timer triggers (periodic agent heartbeat)
+- Persistent SQLite memory
+- Multiple LLM providers (OpenAI, Anthropic, Ollama)
 
 ## Design Principles
 
-1. Tools are first-class citizens
-2. Agents are isolated actors
-3. Memory provides continuity
-4. Runtime should be boring (reliable)
+1. **Agents are actors** — isolated, communicate via messages
+2. **Tools are first-class** — inspectable, composable, mockable
+3. **Memory is identity** — persistence across sessions
+4. **Runtime is boring** — reliable, predictable infrastructure
 
 ## Documentation
 
-- `README.md` — Project overview
-- `docs/DESIGN.md` — Architecture and roadmap
-- `docs/NOTES.md` — Arya's thinking and learnings
-- `ARYA.md` — Current task progress
+- `README.md` — Project overview and quick start
+- `ARYA.md` — Current task progress (v2.5 planning)
+- `docs/VISION.md` — Roadmap and philosophy
+- `docs/DESIGN.md` — Architecture deep-dive
+- `docs/NOTES.md` — Arya's learnings and ideas

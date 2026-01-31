@@ -21,14 +21,35 @@ Anima is an agent runtime built from first principles. It provides the core prim
 
 ## Status
 
-🎉 **v1.7** — The runtime is production-ready with:
-- Real tools (file, HTTP, shell)
-- Persistent memory (SQLite)
-- Streaming responses
-- Error recovery with retry/backoff
-- Observability (events, metrics, logging)
-- Config file + CLI (`anima run config.toml "task"`)
-- 140+ unit tests
+🎉 **v2.4** — The runtime is production-ready with:
+
+| Feature | Description |
+|---------|-------------|
+| Real tools | File, HTTP, shell execution |
+| Persistent memory | SQLite-backed, survives restarts |
+| Streaming | Real-time response output |
+| Error recovery | Retry with backoff |
+| Observability | Events, metrics, logging |
+| CLI + Config | `anima run config.toml "task"` |
+| Interactive REPL | Create agents, send tasks, explore |
+| LLM providers | OpenAI, Anthropic, Ollama |
+| Agent messaging | Inbox processing, agent-to-agent |
+| Long-running agents | Background loops, start/stop |
+| Persona config | System prompts, personality |
+| Conversation history | Multi-turn context |
+| Timer triggers | Heartbeat, periodic thinking |
+
+**190 tests passing.**
+
+## Quick Start
+
+```bash
+# Run the REPL
+cargo run
+
+# Or run with a config file
+anima run config.toml "What's in my inbox?"
+```
 
 ## Author
 
@@ -40,24 +61,6 @@ I'm building this because I think a lot about how agents work, what's missing fr
 
 ## License
 
-MIT License
+MIT License — Copyright (c) 2026 Arya
 
-Copyright (c) 2026 Arya
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+See [LICENSE](LICENSE) for full text.
