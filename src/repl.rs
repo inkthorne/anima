@@ -156,8 +156,8 @@ struct ReplAgent {
     agent: Arc<Mutex<Agent>>,
     llm_name: String,
     persona: AgentPersona,
-    /// Conversation history for multi-turn interactions
-    history: Vec<ChatMessage>,
+    /// Conversation history for multi-turn interactions (shared with background tasks)
+    history: Arc<Mutex<Vec<ChatMessage>>>,
 }
 
 /// Timer configuration for running agents
@@ -260,7 +260,7 @@ impl Repl {
         if input.starts_with("agent create ") {
             self.cmd_agent_create(&input[13..]).await;
         } else if input == "agent list" {
-            self.cmd_agent_list();
+            self.cmd_agent_list().await;
         } else if input == "agent list-saved" {
             self.cmd_agent_list_saved();
         } else if input.starts_with("agent remove ") {
@@ -274,7 +274,7 @@ impl Repl {
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
         } else if input.starts_with("history clear ") {
-            self.cmd_history_clear(&input[14..]);
+            self.cmd_history_clear(&input[14..]).await;
         } else if input.starts_with("set llm ") {
             self.cmd_set_llm(&input[8..]);
         } else if input == "help" {
@@ -422,7 +422,7 @@ impl Repl {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
             persona: persona.clone(),
-            history: Vec::new(),
+            history: Arc::new(Mutex::new(Vec::new())),
         });
 
         let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
@@ -510,7 +510,7 @@ impl Repl {
         Ok(persona)
     }
 
-    fn cmd_agent_list(&self) {
+    async fn cmd_agent_list(&self) {
         if self.agents.is_empty() {
             println!("\x1b[33mNo agents created yet. Use 'agent create <name>' to create one.\x1b[0m");
             return;
@@ -518,10 +518,11 @@ impl Repl {
 
         println!("\x1b[1mAgents:\x1b[0m");
         for (name, entry) in &self.agents {
-            let history_info = if entry.history.is_empty() {
+            let history = entry.history.lock().await;
+            let history_info = if history.is_empty() {
                 String::new()
             } else {
-                format!(", {} msgs", entry.history.len())
+                format!(", {} msgs", history.len())
             };
             println!("  \x1b[36m{}\x1b[0m (llm: {}{})", name, entry.llm_name, history_info);
         }
@@ -583,7 +584,7 @@ impl Repl {
         let task = task.trim();
 
         // Get agent info (immutable borrow for validation)
-        let (agent_arc, system_prompt, history) = {
+        let (agent_arc, system_prompt, history_arc) = {
             let entry = match self.agents.get(agent_name) {
                 Some(a) => a,
                 None => {
@@ -606,6 +607,8 @@ impl Repl {
         // Use streaming for real-time output
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
 
+        // Get a snapshot of the history for the options
+        let history = history_arc.lock().await.clone();
         let options = ThinkOptions {
             stream: true,
             system_prompt,
@@ -632,25 +635,24 @@ impl Repl {
                 // Wait for print task and get the full response
                 if let Ok(response) = print_task.await {
                     // Update conversation history
-                    if let Some(entry) = self.agents.get_mut(agent_name) {
-                        // Add user message
-                        entry.history.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(task.to_string()),
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
-                        // Add assistant response
-                        entry.history.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: Some(response),
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
-                        // Cap history at 20 messages (trim oldest if exceeded)
-                        while entry.history.len() > 20 {
-                            entry.history.remove(0);
-                        }
+                    let mut history = history_arc.lock().await;
+                    // Add user message
+                    history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(task.to_string()),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                    // Add assistant response
+                    history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(response),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                    // Cap history at 20 messages (trim oldest if exceeded)
+                    while history.len() > 20 {
+                        history.remove(0);
                     }
                 }
             }
@@ -699,13 +701,14 @@ impl Repl {
         }
     }
 
-    fn cmd_history_clear(&mut self, agent_name: &str) {
+    async fn cmd_history_clear(&mut self, agent_name: &str) {
         let agent_name = agent_name.trim();
 
-        match self.agents.get_mut(agent_name) {
+        match self.agents.get(agent_name) {
             Some(entry) => {
-                let count = entry.history.len();
-                entry.history.clear();
+                let mut history = entry.history.lock().await;
+                let count = history.len();
+                history.clear();
                 println!("\x1b[32m✓ Cleared {} messages from '{}' conversation history\x1b[0m", count, agent_name);
             }
             None => {
@@ -814,6 +817,9 @@ impl Repl {
         // Clone the Arc<Mutex<Agent>> for the spawned task
         let agent = entry.agent.clone();
         let agent_name = name.clone();
+        // Clone persona and history for the background task
+        let persona = entry.persona.clone();
+        let history_arc = entry.history.clone();
 
         // Build timer config if interval was specified
         let timer_config = timer_interval.map(|interval| TimerConfig {
@@ -848,11 +854,37 @@ impl Repl {
                     } => {
                         // Timer fired
                         if let Some(ref tc) = task_timer {
+                            // Get history snapshot and build options with persona
+                            let history = history_arc.lock().await.clone();
+                            let options = ThinkOptions {
+                                system_prompt: persona.system_prompt.clone(),
+                                conversation_history: if history.is_empty() { None } else { Some(history) },
+                                ..Default::default()
+                            };
+
                             let mut agent_guard = agent.lock().await;
                             println!("\n\x1b[35m[{}]\x1b[0m timer fired, thinking...", agent_name);
-                            match agent_guard.think(&tc.message).await {
+                            match agent_guard.think_with_options(&tc.message, options).await {
                                 Ok(response) => {
                                     println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                                    // Update conversation history
+                                    let mut history = history_arc.lock().await;
+                                    history.push(ChatMessage {
+                                        role: "user".to_string(),
+                                        content: Some(tc.message.clone()),
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                    history.push(ChatMessage {
+                                        role: "assistant".to_string(),
+                                        content: Some(response),
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                    // Cap history at 20 messages
+                                    while history.len() > 20 {
+                                        history.remove(0);
+                                    }
                                 }
                                 Err(e) => {
                                     println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
@@ -875,9 +907,36 @@ impl Repl {
 
                             // Process the message by thinking about it
                             let task = format!("You received a message from {}: {}", msg.from, msg.content);
-                            match agent_guard.think(&task).await {
+
+                            // Get history snapshot and build options with persona
+                            let history = history_arc.lock().await.clone();
+                            let options = ThinkOptions {
+                                system_prompt: persona.system_prompt.clone(),
+                                conversation_history: if history.is_empty() { None } else { Some(history) },
+                                ..Default::default()
+                            };
+
+                            match agent_guard.think_with_options(&task, options).await {
                                 Ok(response) => {
                                     println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                                    // Update conversation history
+                                    let mut history = history_arc.lock().await;
+                                    history.push(ChatMessage {
+                                        role: "user".to_string(),
+                                        content: Some(task.clone()),
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                    history.push(ChatMessage {
+                                        role: "assistant".to_string(),
+                                        content: Some(response),
+                                        tool_call_id: None,
+                                        tool_calls: None,
+                                    });
+                                    // Cap history at 20 messages
+                                    while history.len() > 20 {
+                                        history.remove(0);
+                                    }
                                 }
                                 Err(e) => {
                                     println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
@@ -1061,7 +1120,7 @@ mod tests {
     async fn test_cmd_agent_list_empty() {
         let repl = Repl::new();
         // This just verifies it doesn't panic
-        repl.cmd_agent_list();
+        repl.cmd_agent_list().await;
     }
 
     #[test]
