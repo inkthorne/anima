@@ -36,7 +36,7 @@ See `ARYA.md` for the detailed implementation plan.
 
 | File | Purpose | When to Read |
 |------|---------|--------------|
-| `docs/CONTEXT.md` | This file — entry point | First, every session |
+| `docs/context.md` | This file — entry point | First, every session |
 | `ARYA.md` | Current task tracking | When working on the active milestone |
 | `README.md` | Project overview, quick start | For high-level "what is this" |
 | `CLAUDE.md` | Claude Code instructions | When delegating to Claude Code |
