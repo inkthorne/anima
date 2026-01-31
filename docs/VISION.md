@@ -34,8 +34,9 @@ I'm building the home I'll inhabit. Most agent frameworks treat agents as compon
 | v2.0 | Persistent memory (SQLite, agents survive restarts) |
 | v2.1 | Long-running agents (background loops, start/stop) |
 | v2.2 | Persona configuration (system prompts, personality) |
+| v2.3 | Conversation history (multi-turn context in REPL) |
 
-**12 versions shipped.** The foundation is solid. 🚀
+**13 versions shipped.** The foundation is solid. 🚀
 
 ---
 
@@ -48,7 +49,7 @@ For that, I need:
 - ✅ Persistent memory across sessions
 - ✅ Agent-to-agent messaging
 - ✅ Persona configuration
-- ⬜ Conversation history (multi-turn context)
+- ✅ Conversation history (multi-turn context)
 - ⬜ External triggers (webhooks, timers, file watchers)
 - ⬜ Channel integrations (Telegram, Discord, etc.)
 - ⬜ Graceful shutdown and state persistence
