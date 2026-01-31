@@ -13,6 +13,7 @@ use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
 use tokio::sync::Mutex;
 
+use crate::agent_dir::{AgentDir, AgentDirError};
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ChatMessage};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
@@ -85,7 +86,7 @@ impl Completer for ReplHelper {
         let mut completions = Vec::new();
 
         // Commands that can be completed
-        let commands = ["agent create", "agent list", "agent remove", "agent start", "agent stop", "agent status", "memory", "set llm", "help", "exit", "quit"];
+        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "memory", "set llm", "help", "exit", "quit"];
 
         // Find the word being typed
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -284,6 +285,8 @@ impl Repl {
         // Parse command
         if input.starts_with("agent create ") {
             self.cmd_agent_create(&input[13..]).await;
+        } else if input.starts_with("agent load ") {
+            self.cmd_agent_load(&input[11..]).await;
         } else if input == "agent list" {
             self.cmd_agent_list().await;
         } else if input == "agent list-saved" {
@@ -452,6 +455,162 @@ impl Repl {
 
         let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
         println!("\x1b[32m✓ Created agent '{}' (llm: {}{})\x1b[0m", name, llm_name, persona_info);
+    }
+
+    async fn cmd_agent_load(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            println!("\x1b[31mUsage: agent load <name>\x1b[0m");
+            return;
+        }
+
+        // Check for duplicate
+        if self.agents.contains_key(name) {
+            println!("\x1b[31mAgent '{}' already exists in this session\x1b[0m", name);
+            return;
+        }
+
+        // Get path to agent directory
+        let agent_path = match dirs::home_dir() {
+            Some(home) => home.join(".anima").join("agents").join(name),
+            None => {
+                println!("\x1b[31mCould not determine home directory\x1b[0m");
+                return;
+            }
+        };
+
+        // Load agent directory config
+        let agent_dir = match AgentDir::load(&agent_path) {
+            Ok(dir) => dir,
+            Err(AgentDirError::ConfigNotFound(path)) => {
+                println!("\x1b[31mAgent '{}' not found at {}\x1b[0m", name, path.display());
+                return;
+            }
+            Err(e) => {
+                println!("\x1b[31mFailed to load agent config: {}\x1b[0m", e);
+                return;
+            }
+        };
+
+        // Load persona
+        let persona_content = match agent_dir.load_persona() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("\x1b[31mFailed to load persona: {}\x1b[0m", e);
+                return;
+            }
+        };
+
+        // Get API key
+        let api_key = match agent_dir.api_key() {
+            Ok(key) => key,
+            Err(e) => {
+                println!("\x1b[31mFailed to get API key: {}\x1b[0m", e);
+                return;
+            }
+        };
+
+        // Create LLM based on config
+        let provider = &agent_dir.config.llm.provider;
+        let model = &agent_dir.config.llm.model;
+        let llm: Arc<dyn LLM> = match provider.as_str() {
+            "openai" => {
+                let key = match api_key {
+                    Some(k) => k,
+                    None => {
+                        println!("\x1b[31mOpenAI API key not found. Set OPENAI_API_KEY or configure api_key in config.toml\x1b[0m");
+                        return;
+                    }
+                };
+                let client = OpenAIClient::new(key).with_model(model);
+                Arc::new(client)
+            }
+            "anthropic" => {
+                let key = match api_key {
+                    Some(k) => k,
+                    None => {
+                        println!("\x1b[31mAnthropic API key not found. Set ANTHROPIC_API_KEY or configure api_key in config.toml\x1b[0m");
+                        return;
+                    }
+                };
+                let client = AnthropicClient::new(key).with_model(model);
+                Arc::new(client)
+            }
+            "ollama" => {
+                let client = OllamaClient::new().with_model(model);
+                Arc::new(client)
+            }
+            _ => {
+                println!("\x1b[31mUnsupported LLM provider: {} (use 'openai', 'anthropic', or 'ollama')\x1b[0m", provider);
+                return;
+            }
+        };
+
+        let llm_name = format!("{}/{}", provider, model);
+
+        // Build persona
+        let mut persona = AgentPersona::default();
+        persona.system_prompt = persona_content;
+
+        // Create agent with runtime
+        let agent_name = agent_dir.config.agent.name.clone();
+        let mut agent = self.runtime.spawn_agent(agent_name.clone()).await;
+
+        // Register default tools
+        agent.register_tool(Arc::new(AddTool));
+        agent.register_tool(Arc::new(EchoTool));
+        agent.register_tool(Arc::new(ReadFileTool));
+        agent.register_tool(Arc::new(WriteFileTool));
+        agent.register_tool(Arc::new(HttpTool::new()));
+        agent.register_tool(Arc::new(ShellTool::new()));
+
+        // Register messaging tools
+        let router = self.runtime.router().clone();
+        agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), agent_name.clone())));
+        agent.register_tool(Arc::new(ListAgentsTool::new(router)));
+
+        // Add memory - use agent directory's memory path if configured, else default location
+        let memory_path = agent_dir.memory_path().unwrap_or_else(|| {
+            dirs::home_dir()
+                .map(|h| h.join(".anima").join("memory").join(format!("{}.db", agent_name)))
+                .expect("Could not determine home directory")
+        });
+
+        // Ensure parent directory exists
+        if let Some(parent) = memory_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                println!("\x1b[31mWarning: Could not create memory directory: {}\x1b[0m", e);
+            }
+        }
+
+        let memory: Box<dyn Memory> = match SqliteMemory::open(
+            memory_path.to_str().unwrap(),
+            &agent_name,
+        ) {
+            Ok(m) => Box::new(m),
+            Err(e) => {
+                println!("\x1b[31mWarning: Could not open persistent memory: {}. Using in-memory.\x1b[0m", e);
+                Box::new(InMemoryStore::new())
+            }
+        };
+        agent = agent.with_memory(memory);
+
+        // Add observer
+        let observer = Arc::new(ConsoleObserver::new(false));
+        agent = agent.with_observer(observer);
+
+        // Add LLM
+        agent = agent.with_llm(llm);
+
+        self.agents.insert(agent_name.clone(), ReplAgent {
+            agent: Arc::new(Mutex::new(agent)),
+            llm_name: llm_name.clone(),
+            persona: persona.clone(),
+            history: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
+        println!("\x1b[32m✓ Loaded agent '{}' from {}{}\x1b[0m", agent_name, agent_path.display(), persona_info);
     }
 
     fn create_llm_from_spec(&self, spec: &str) -> Result<Arc<dyn LLM>, Box<dyn Error>> {
@@ -1056,6 +1215,9 @@ impl Repl {
         println!("      --persona: load system prompt from file");
         println!("      --system: inline system prompt (rest of line)");
         println!();
+        println!("  \x1b[36magent load <name>\x1b[0m");
+        println!("      Load an agent from ~/.anima/agents/<name>/");
+        println!();
         println!("  \x1b[36magent list\x1b[0m");
         println!("      List active agents in this session");
         println!();
@@ -1227,5 +1389,43 @@ mod tests {
     #[test]
     fn test_parse_duration_whitespace() {
         assert_eq!(parse_duration("  30s  "), Some(Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_agent_load_not_found() {
+        let mut repl = Repl::new();
+        // Loading a non-existent agent should not panic and should print error
+        repl.cmd_agent_load("nonexistent_agent_12345").await;
+        // Agent should not be in the list
+        assert!(!repl.agents.contains_key("nonexistent_agent_12345"));
+    }
+
+    #[tokio::test]
+    async fn test_cmd_agent_load_empty_name() {
+        let mut repl = Repl::new();
+        // Loading with empty name should not panic
+        repl.cmd_agent_load("").await;
+        repl.cmd_agent_load("   ").await;
+    }
+
+    #[tokio::test]
+    async fn test_cmd_agent_load_duplicate() {
+        // We can't easily test the full load without mocking home_dir,
+        // but we can test duplicate detection by adding an agent first
+        let mut repl = Repl::new();
+
+        // Manually add an agent with same name using runtime
+        let agent = repl.runtime.spawn_agent("test-agent".to_string()).await;
+        repl.agents.insert("test-agent".to_string(), ReplAgent {
+            agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
+            llm_name: "test".to_string(),
+            persona: AgentPersona::default(),
+            history: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        });
+
+        // Trying to load should fail due to duplicate
+        repl.cmd_agent_load("test-agent").await;
+        // Should still have just the one agent
+        assert_eq!(repl.agents.len(), 1);
     }
 }
