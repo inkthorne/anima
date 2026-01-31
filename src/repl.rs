@@ -12,7 +12,7 @@ use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
 use tokio::sync::Mutex;
 
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ChatMessage};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
@@ -26,7 +26,7 @@ const BANNER: &str = r#"
  / ___ \| | | | | | | | | | (_| |
 /_/   \_\_| |_|_|_| |_| |_|\__,_|
 
-Interactive REPL v1.9 - Type 'help' for commands
+Interactive REPL v2.3 - Type 'help' for commands
 "#;
 
 /// REPL helper for tab completion
@@ -129,6 +129,8 @@ struct ReplAgent {
     agent: Arc<Mutex<Agent>>,
     llm_name: String,
     persona: AgentPersona,
+    /// Conversation history for multi-turn interactions
+    history: Vec<ChatMessage>,
 }
 
 pub struct Repl {
@@ -229,6 +231,8 @@ impl Repl {
             self.cmd_agent_status();
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
+        } else if input.starts_with("history clear ") {
+            self.cmd_history_clear(&input[14..]);
         } else if input.starts_with("set llm ") {
             self.cmd_set_llm(&input[8..]);
         } else if input == "help" {
@@ -376,6 +380,7 @@ impl Repl {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
             persona: persona.clone(),
+            history: Vec::new(),
         });
 
         let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
@@ -471,7 +476,12 @@ impl Repl {
 
         println!("\x1b[1mAgents:\x1b[0m");
         for (name, entry) in &self.agents {
-            println!("  \x1b[36m{}\x1b[0m (llm: {})", name, entry.llm_name);
+            let history_info = if entry.history.is_empty() {
+                String::new()
+            } else {
+                format!(", {} msgs", entry.history.len())
+            };
+            println!("  \x1b[36m{}\x1b[0m (llm: {}{})", name, entry.llm_name, history_info);
         }
     }
 
@@ -530,19 +540,24 @@ impl Repl {
         let agent_name = agent_name.trim();
         let task = task.trim();
 
-        let entry = match self.agents.get(agent_name) {
-            Some(a) => a,
-            None => {
-                println!("\x1b[31mAgent '{}' not found. Create it with 'agent create {}'\x1b[0m", agent_name, agent_name);
+        // Get agent info (immutable borrow for validation)
+        let (agent_arc, system_prompt, history) = {
+            let entry = match self.agents.get(agent_name) {
+                Some(a) => a,
+                None => {
+                    println!("\x1b[31mAgent '{}' not found. Create it with 'agent create {}'\x1b[0m", agent_name, agent_name);
+                    return;
+                }
+            };
+
+            // Check if agent has an LLM
+            if entry.llm_name == "none" {
+                println!("\x1b[31mAgent '{}' has no LLM configured. Recreate with --llm flag.\x1b[0m", agent_name);
                 return;
             }
-        };
 
-        // Check if agent has an LLM
-        if entry.llm_name == "none" {
-            println!("\x1b[31mAgent '{}' has no LLM configured. Recreate with --llm flag.\x1b[0m", agent_name);
-            return;
-        }
+            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.history.clone())
+        };
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
 
@@ -551,25 +566,51 @@ impl Repl {
 
         let options = ThinkOptions {
             stream: true,
-            system_prompt: entry.persona.system_prompt.clone(),
+            system_prompt,
+            conversation_history: if history.is_empty() { None } else { Some(history) },
             ..Default::default()
         };
 
-        // Spawn task to print tokens
+        // Spawn task to print tokens and collect the response
         let print_task = tokio::spawn(async move {
+            let mut full_response = String::new();
             while let Some(token) = rx.recv().await {
                 print!("{}", token);
                 let _ = io::stdout().flush();
+                full_response.push_str(&token);
             }
             println!(); // Final newline
+            full_response
         });
 
         // Run the thinking
-        let mut agent = entry.agent.lock().await;
+        let mut agent = agent_arc.lock().await;
         match agent.think_streaming_with_options(task, options, tx).await {
             Ok(_) => {
-                // Wait for print task
-                let _ = print_task.await;
+                // Wait for print task and get the full response
+                if let Ok(response) = print_task.await {
+                    // Update conversation history
+                    if let Some(entry) = self.agents.get_mut(agent_name) {
+                        // Add user message
+                        entry.history.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: Some(task.to_string()),
+                            tool_call_id: None,
+                            tool_calls: None,
+                        });
+                        // Add assistant response
+                        entry.history.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: Some(response),
+                            tool_call_id: None,
+                            tool_calls: None,
+                        });
+                        // Cap history at 20 messages (trim oldest if exceeded)
+                        while entry.history.len() > 20 {
+                            entry.history.remove(0);
+                        }
+                    }
+                }
             }
             Err(e) => {
                 println!("\x1b[31mError: {}\x1b[0m", e);
@@ -613,6 +654,21 @@ impl Repl {
 
         if !found_any {
             println!("\x1b[33mNo memories stored yet.\x1b[0m");
+        }
+    }
+
+    fn cmd_history_clear(&mut self, agent_name: &str) {
+        let agent_name = agent_name.trim();
+
+        match self.agents.get_mut(agent_name) {
+            Some(entry) => {
+                let count = entry.history.len();
+                entry.history.clear();
+                println!("\x1b[32m✓ Cleared {} messages from '{}' conversation history\x1b[0m", count, agent_name);
+            }
+            None => {
+                println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
+            }
         }
     }
 
@@ -803,6 +859,9 @@ impl Repl {
         println!();
         println!("  \x1b[36mmemory <agent>\x1b[0m");
         println!("      Show an agent's memory");
+        println!();
+        println!("  \x1b[36mhistory clear <agent>\x1b[0m");
+        println!("      Clear an agent's conversation history");
         println!();
         println!("  \x1b[36m<agent>: ask <other> \"<question>\"\x1b[0m");
         println!("      Send a message from one agent to another");

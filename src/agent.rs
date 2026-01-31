@@ -30,6 +30,8 @@ pub struct ThinkOptions {
     pub stream: bool,
     /// Optional retry policy for LLM calls (default: RetryPolicy::default())
     pub retry_policy: Option<RetryPolicy>,
+    /// Optional conversation history to inject before the user task
+    pub conversation_history: Option<Vec<ChatMessage>>,
 }
 
 impl Default for ThinkOptions {
@@ -41,6 +43,7 @@ impl Default for ThinkOptions {
             auto_memory: None,
             stream: false,
             retry_policy: Some(RetryPolicy::default()),
+            conversation_history: None,
         }
     }
 }
@@ -485,6 +488,11 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
+        // Inject conversation history if present
+        if let Some(history) = &options.conversation_history {
+            messages.extend(history.clone());
+        }
+
         // User task
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -682,6 +690,11 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
+        // Inject conversation history if present
+        if let Some(history) = &options.conversation_history {
+            messages.extend(history.clone());
+        }
+
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
@@ -848,6 +861,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 auto_memory: options.auto_memory.clone(),
                 stream: false, // Reflection doesn't use streaming
                 retry_policy: options.retry_policy.clone(),
+                conversation_history: options.conversation_history.clone(),
             };
             
             current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
@@ -1271,6 +1285,7 @@ mod tests {
             auto_memory: Some(AutoMemoryConfig::default()),
             stream: false,
             retry_policy: None,
+            conversation_history: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);

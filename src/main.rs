@@ -141,6 +141,7 @@ async fn run_agent(config_path: &str, task: &str, stream: bool, verbose_cli: boo
         reflection,
         stream,
         retry_policy: Some(config.retry.to_policy()),
+        conversation_history: None,
     };
 
     // 6. Run agent with streaming or non-streaming based on flag
