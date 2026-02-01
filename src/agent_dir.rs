@@ -242,6 +242,108 @@ impl AgentDir {
     }
 }
 
+/// Get the agents directory path (~/.anima/agents/)
+pub fn agents_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".anima")
+        .join("agents")
+}
+
+/// Scaffold a new agent directory with config.toml, persona.md, and always.md templates.
+///
+/// Creates the directory at the specified path, or defaults to ~/.anima/agents/<name>/.
+/// Returns an error if the directory already exists.
+pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirError> {
+    let agent_path = path.unwrap_or_else(|| agents_dir().join(name));
+
+    // Check if directory already exists
+    if agent_path.exists() {
+        return Err(AgentDirError::IoError(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("Agent directory already exists: {}", agent_path.display()),
+        )));
+    }
+
+    // Create the directory
+    std::fs::create_dir_all(&agent_path)?;
+
+    // Write config.toml template
+    let config_content = format!(r#"[agent]
+name = "{name}"
+persona_file = "persona.md"
+always_file = "always.md"
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key = "${{ANTHROPIC_API_KEY}}"
+
+[memory]
+path = "memory.db"
+
+# Optional timer configuration
+# [timer]
+# enabled = true
+# interval = "5m"
+# message = "Heartbeat — check for anything interesting"
+"#);
+    std::fs::write(agent_path.join("config.toml"), config_content)?;
+
+    // Write persona.md template
+    let persona_content = format!(r#"# {name}
+
+You are {name}, an AI agent running in the Anima runtime.
+
+## Personality
+
+Be helpful, concise, and focused on the task at hand.
+
+## Capabilities
+
+You have access to tools for:
+- Reading and writing files
+- Making HTTP requests
+- Running shell commands
+- Sending messages to other agents
+
+## Guidelines
+
+- Think step by step before acting
+- Use tools when needed to accomplish tasks
+- Be proactive about using your memory to track important information
+"#);
+    std::fs::write(agent_path.join("persona.md"), persona_content)?;
+
+    // Write always.md template
+    let always_content = r#"# Persistent Reminders
+
+These reminders are injected before every user message to stay salient in long conversations.
+
+## Key Rules
+
+- Be concise in your responses
+- Always confirm before making destructive changes
+- Use tools when they can help accomplish the task
+"#;
+    std::fs::write(agent_path.join("always.md"), always_content)?;
+
+    println!("\x1b[32m✓ Created agent '{}' at {}\x1b[0m", name, agent_path.display());
+    println!();
+    println!("  Files created:");
+    println!("    \x1b[36mconfig.toml\x1b[0m  — agent configuration");
+    println!("    \x1b[36mpersona.md\x1b[0m   — system prompt / personality");
+    println!("    \x1b[36malways.md\x1b[0m    — persistent reminders (recency bias)");
+    println!();
+    println!("  Next steps:");
+    println!("    1. Edit config.toml to configure your LLM");
+    println!("    2. Edit persona.md to define your agent's personality");
+    println!("    3. Edit always.md to add persistent reminders");
+    println!("    4. Run with: \x1b[36manima run {}\x1b[0m", name);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,5 +1055,52 @@ model = "gpt-4"
 
         // Includes should be expanded in global always.md
         assert_eq!(always, Some("Global: Be kind.".to_string()));
+    }
+
+    // =========================================================================
+    // create_agent tests
+    // =========================================================================
+
+    #[test]
+    fn test_create_agent_success() {
+        let dir = tempdir().unwrap();
+        let agent_path = dir.path().join("test-agent");
+
+        let result = create_agent("test-agent", Some(agent_path.clone()));
+        assert!(result.is_ok());
+
+        // Check files were created
+        assert!(agent_path.join("config.toml").exists());
+        assert!(agent_path.join("persona.md").exists());
+        assert!(agent_path.join("always.md").exists());
+
+        // Check config.toml content
+        let config_content = fs::read_to_string(agent_path.join("config.toml")).unwrap();
+        assert!(config_content.contains("name = \"test-agent\""));
+        assert!(config_content.contains("[llm]"));
+        assert!(config_content.contains("[memory]"));
+        assert!(config_content.contains("always_file = \"always.md\""));
+
+        // Check persona.md content
+        let persona_content = fs::read_to_string(agent_path.join("persona.md")).unwrap();
+        assert!(persona_content.contains("# test-agent"));
+        assert!(persona_content.contains("You are test-agent"));
+
+        // Check always.md content
+        let always_content = fs::read_to_string(agent_path.join("always.md")).unwrap();
+        assert!(always_content.contains("Persistent Reminders"));
+    }
+
+    #[test]
+    fn test_create_agent_already_exists() {
+        let dir = tempdir().unwrap();
+        let agent_path = dir.path().join("existing-agent");
+
+        // Create the directory first
+        fs::create_dir_all(&agent_path).unwrap();
+
+        let result = create_agent("existing-agent", Some(agent_path));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
     }
 }

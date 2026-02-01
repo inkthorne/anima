@@ -81,7 +81,7 @@ impl Completer for ReplHelper {
         if line.starts_with('/') {
             let cmd_partial = &line[1..pos]; // Skip the leading /
             let slash_commands = [
-                "/load", "/start", "/stop", "/status", "/list", "/clear",
+                "/start", "/load", "/stop", "/create", "/status", "/list", "/clear",
                 "/help", "/quit", "/exit"
             ];
 
@@ -362,6 +362,9 @@ impl Repl {
             } else {
                 println!("\x1b[31mUsage: /clear <name>\x1b[0m");
             }
+        } else if input == "create" || input.starts_with("create ") {
+            let name = if input == "create" { "" } else { &input[7..] };
+            self.cmd_create(name);
         } else if input == "help" {
             self.cmd_help();
         } else if input == "quit" || input == "exit" {
@@ -403,7 +406,7 @@ impl Repl {
             if self.connections.len() == 1 {
                 self.connections.keys().cloned().collect()
             } else if self.connections.is_empty() {
-                println!("\x1b[31mNo agents connected. Use /load <name> to connect to an agent.\x1b[0m");
+                println!("\x1b[31mNo agents connected. Use /start <name> to connect to an agent.\x1b[0m");
                 return;
             } else {
                 println!("\x1b[31mMultiple agents connected. Use @name to specify recipient.\x1b[0m");
@@ -645,7 +648,7 @@ impl Repl {
         let running = discovery::discover_running_agents();
 
         if self.connections.is_empty() && running.is_empty() {
-            println!("\x1b[33mNo agents connected or running. Use /load <name> to connect.\x1b[0m");
+            println!("\x1b[33mNo agents connected or running. Use /start <name> to connect.\x1b[0m");
             return;
         }
 
@@ -734,14 +737,33 @@ impl Repl {
         }
     }
 
+    /// Create a new agent directory.
+    fn cmd_create(&self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            println!("\x1b[31mUsage: /create <name>\x1b[0m");
+            return;
+        }
+
+        match crate::agent_dir::create_agent(name, None) {
+            Ok(()) => {}
+            Err(e) => {
+                println!("\x1b[31mFailed to create agent: {}\x1b[0m", e);
+            }
+        }
+    }
+
     fn cmd_help(&self) {
         println!("\x1b[1mAnima REPL (Daemon Mode) - Slash Commands:\x1b[0m");
         println!();
-        println!("  \x1b[36m/load <name>\x1b[0m");
+        println!("  \x1b[36m/start <name>\x1b[0m");
         println!("      Start daemon (if needed) and connect to agent");
         println!();
-        println!("  \x1b[36m/start <name>\x1b[0m");
-        println!("      Alias for /load");
+        println!("  \x1b[36m/load <name>\x1b[0m");
+        println!("      Alias for /start");
+        println!();
+        println!("  \x1b[36m/create <name>\x1b[0m");
+        println!("      Create a new agent directory in ~/.anima/agents/");
         println!();
         println!("  \x1b[36m/stop <name>\x1b[0m");
         println!("      Stop an agent daemon");
