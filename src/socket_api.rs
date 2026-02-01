@@ -19,6 +19,8 @@ pub enum Request {
     Status,
     /// Request a graceful shutdown.
     Shutdown,
+    /// Clear the agent's conversation history.
+    Clear,
 }
 
 /// Response types for the socket API.
@@ -191,6 +193,16 @@ mod tests {
 
         let parsed: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Request::Shutdown));
+    }
+
+    #[test]
+    fn test_request_clear_serialization() {
+        let request = Request::Clear;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"clear"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Clear));
     }
 
     #[test]

@@ -500,6 +500,13 @@ async fn handle_connection(
                 shutdown.notify_waiters();
                 Response::Ok
             }
+
+            Request::Clear => {
+                println!("[socket] Clearing conversation history");
+                let mut hist = history.lock().await;
+                hist.clear();
+                Response::Ok
+            }
         };
 
         if let Err(e) = api.write_response(&response).await {
