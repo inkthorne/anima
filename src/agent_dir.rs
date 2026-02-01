@@ -32,6 +32,9 @@ pub struct LlmSection {
     pub provider: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// Enable thinking mode for Ollama models (default: None = false)
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]

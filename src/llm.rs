@@ -739,12 +739,31 @@ impl LLM for AnthropicClient {
     }
 }
 
+/// Parse thinking prefix from message content.
+/// Returns (thinking_override, stripped_content):
+/// - "/think ..." → (Some(true), "...")
+/// - "/no_think ..." → (Some(false), "...")
+/// - "..." → (None, "...")
+/// Case-insensitive, trims whitespace after prefix.
+fn parse_thinking_prefix(content: &str) -> (Option<bool>, &str) {
+    let content_lower = content.to_lowercase();
+    if content_lower.starts_with("/think ") {
+        (Some(true), content[7..].trim_start())
+    } else if content_lower.starts_with("/no_think ") {
+        (Some(false), content[10..].trim_start())
+    } else {
+        (None, content)
+    }
+}
+
 /// Ollama client using OpenAI-compatible API.
 /// Configure with OLLAMA_HOST env var (defaults to http://localhost:11434)
 pub struct OllamaClient {
     client: Client,
     base_url: String,
     model: String,
+    /// Enable thinking mode (Ollama "think" parameter)
+    thinking: Option<bool>,
 }
 
 impl OllamaClient {
@@ -755,6 +774,7 @@ impl OllamaClient {
             client: Client::new(),
             base_url,
             model: "llama3".to_string(),
+            thinking: None,
         }
     }
 
@@ -765,6 +785,11 @@ impl OllamaClient {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    pub fn with_thinking(mut self, thinking: Option<bool>) -> Self {
+        self.thinking = thinking;
         self
     }
 }
@@ -788,13 +813,37 @@ impl LLM for OllamaClient {
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        // Find thinking override from the last user message
+        let mut thinking_override: Option<bool> = None;
+        let mut stripped_user_content: Option<String> = None;
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+
+        if let Some(idx) = last_user_idx {
+            if let Some(ref content) = messages[idx].content {
+                let (prefix_override, stripped) = parse_thinking_prefix(content);
+                if prefix_override.is_some() {
+                    thinking_override = prefix_override;
+                    stripped_user_content = Some(stripped.to_string());
+                }
+            }
+        }
+
+        // Determine final thinking value: prefix > config > false
+        let thinking = thinking_override.or(self.thinking).unwrap_or(false);
+
         // Transform messages for API compatibility
         let mut formatted_messages = Vec::new();
-        for message in messages {
-            let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls {
+        for (i, message) in messages.iter().enumerate() {
+            let mut formatted_message = serde_json::to_value(message).unwrap();
+            // Use stripped content for the last user message if we have it
+            if Some(i) == last_user_idx {
+                if let Some(ref stripped) = stripped_user_content {
+                    formatted_message["content"] = serde_json::Value::String(stripped.clone());
+                }
+            }
+            if let Some(ref tool_calls) = message.tool_calls {
                 if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    let formatted_tool_calls = format_tool_calls_for_api(tool_calls);
                     formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
                 }
             }
@@ -804,7 +853,8 @@ impl LLM for OllamaClient {
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": formatted_messages,
-            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"]
+            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"],
+            "think": thinking
         });
 
         if let Some(tool_list) = tools {
@@ -896,13 +946,37 @@ impl LLM for OllamaClient {
 
         let url = format!("{}/v1/chat/completions", self.base_url);
 
+        // Find thinking override from the last user message
+        let mut thinking_override: Option<bool> = None;
+        let mut stripped_user_content: Option<String> = None;
+        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+
+        if let Some(idx) = last_user_idx {
+            if let Some(ref content) = messages[idx].content {
+                let (prefix_override, stripped) = parse_thinking_prefix(content);
+                if prefix_override.is_some() {
+                    thinking_override = prefix_override;
+                    stripped_user_content = Some(stripped.to_string());
+                }
+            }
+        }
+
+        // Determine final thinking value: prefix > config > false
+        let thinking = thinking_override.or(self.thinking).unwrap_or(false);
+
         // Transform messages for API compatibility
         let mut formatted_messages = Vec::new();
-        for message in messages {
-            let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls {
+        for (i, message) in messages.iter().enumerate() {
+            let mut formatted_message = serde_json::to_value(message).unwrap();
+            // Use stripped content for the last user message if we have it
+            if Some(i) == last_user_idx {
+                if let Some(ref stripped) = stripped_user_content {
+                    formatted_message["content"] = serde_json::Value::String(stripped.clone());
+                }
+            }
+            if let Some(ref tool_calls) = message.tool_calls {
                 if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                    let formatted_tool_calls = format_tool_calls_for_api(tool_calls);
                     formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
                 }
             }
@@ -913,7 +987,8 @@ impl LLM for OllamaClient {
             "model": self.model,
             "messages": formatted_messages,
             "stream": true,
-            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"]
+            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"],
+            "think": thinking
         });
 
         if let Some(tool_list) = tools {
@@ -1080,9 +1155,59 @@ mod tests {
         let client = AnthropicClient::new("test-key")
             .with_model("claude-opus-4-20250514")
             .with_base_url("https://custom.api.com");
-        
+
         assert_eq!(client.model, "claude-opus-4-20250514");
         assert_eq!(client.base_url, "https://custom.api.com");
         assert_eq!(client.api_key, "test-key");
+    }
+
+    #[test]
+    fn test_parse_thinking_prefix_think() {
+        let (override_val, stripped) = parse_thinking_prefix("/think Hello world");
+        assert_eq!(override_val, Some(true));
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_thinking_prefix_no_think() {
+        let (override_val, stripped) = parse_thinking_prefix("/no_think Hello world");
+        assert_eq!(override_val, Some(false));
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_thinking_prefix_none() {
+        let (override_val, stripped) = parse_thinking_prefix("Hello world");
+        assert_eq!(override_val, None);
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_thinking_prefix_case_insensitive() {
+        let (override_val, stripped) = parse_thinking_prefix("/THINK Hello world");
+        assert_eq!(override_val, Some(true));
+        assert_eq!(stripped, "Hello world");
+
+        let (override_val, stripped) = parse_thinking_prefix("/No_Think Hello world");
+        assert_eq!(override_val, Some(false));
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_parse_thinking_prefix_whitespace() {
+        // Extra whitespace after prefix should be trimmed
+        let (override_val, stripped) = parse_thinking_prefix("/think    Hello world");
+        assert_eq!(override_val, Some(true));
+        assert_eq!(stripped, "Hello world");
+    }
+
+    #[test]
+    fn test_ollama_client_with_thinking() {
+        let client = OllamaClient::new()
+            .with_model("qwen3")
+            .with_thinking(Some(true));
+
+        assert_eq!(client.model, "qwen3");
+        assert_eq!(client.thinking, Some(true));
     }
 }

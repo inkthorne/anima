@@ -56,6 +56,9 @@ pub struct LlmSection {
     pub provider: String,  // "openai" or "anthropic"
     pub model: String,
     pub base_url: Option<String>,
+    /// Enable thinking mode for Ollama models (default: None = false)
+    #[serde(default)]
+    pub thinking: Option<bool>,
     // API key from env: OPENAI_API_KEY or ANTHROPIC_API_KEY
 }
 

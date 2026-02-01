@@ -371,7 +371,11 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
             Arc::new(AnthropicClient::new(key).with_model(&agent_dir.config.llm.model))
         }
         "ollama" => {
-            Arc::new(OllamaClient::new().with_model(&agent_dir.config.llm.model))
+            Arc::new(
+                OllamaClient::new()
+                    .with_model(&agent_dir.config.llm.model)
+                    .with_thinking(agent_dir.config.llm.thinking)
+            )
         }
         other => return Err(format!("Unsupported LLM provider: {}", other).into()),
     };

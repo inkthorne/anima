@@ -539,7 +539,9 @@ impl Repl {
                 Arc::new(client)
             }
             "ollama" => {
-                let client = OllamaClient::new().with_model(model);
+                let client = OllamaClient::new()
+                    .with_model(model)
+                    .with_thinking(agent_dir.config.llm.thinking);
                 Arc::new(client)
             }
             _ => {
