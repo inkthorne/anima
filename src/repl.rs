@@ -1199,7 +1199,7 @@ impl Repl {
                                     debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
                                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
                                     
-                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
+                                    // Don't print response here - it's already shown when recipient receives via send_message
                                     // Update conversation history
                                     let mut history = history_arc.lock().await;
                                     history.push(ChatMessage {
