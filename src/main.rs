@@ -71,6 +71,13 @@ enum Commands {
     },
     /// Show status of all agents (running/stopped)
     Status,
+    /// One-shot query to an agent (no daemon required)
+    Ask {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+        /// Message to send to the agent
+        message: String,
+    },
 }
 
 #[tokio::main]
@@ -128,6 +135,12 @@ async fn main() {
         }
         Commands::Status => {
             show_status();
+        }
+        Commands::Ask { agent, message } => {
+            if let Err(e) = ask_agent(&agent, &message).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -319,6 +332,74 @@ fn show_status() {
 
         println!("{:<20} {:<19} {:<10}", name, status, pid);
     }
+}
+
+/// One-shot query to an agent without daemon.
+/// Loads the agent config, creates LLM, sends message, prints response.
+async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::{ChatMessage, LLM};
+
+    let agent_path = resolve_agent_path(agent);
+
+    // Load the agent directory
+    let agent_dir = AgentDir::load(&agent_path)
+        .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
+
+    // Load persona if configured
+    let persona = agent_dir.load_persona()
+        .map_err(|e| format!("Failed to load persona: {}", e))?;
+
+    // Get API key
+    let api_key = agent_dir.api_key()
+        .map_err(|e| format!("Failed to get API key: {}", e))?;
+
+    // Create LLM from config
+    let llm: Arc<dyn LLM> = match agent_dir.config.llm.provider.as_str() {
+        "openai" => {
+            let key = api_key.ok_or("OpenAI API key not configured")?;
+            Arc::new(OpenAIClient::new(key).with_model(&agent_dir.config.llm.model))
+        }
+        "anthropic" => {
+            let key = api_key.ok_or("Anthropic API key not configured")?;
+            Arc::new(AnthropicClient::new(key).with_model(&agent_dir.config.llm.model))
+        }
+        "ollama" => {
+            Arc::new(OllamaClient::new().with_model(&agent_dir.config.llm.model))
+        }
+        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
+    };
+
+    // Build messages
+    let mut messages = Vec::new();
+
+    // Add system prompt from persona if available
+    if let Some(persona_content) = persona {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(persona_content),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+    }
+
+    // Add user message
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: Some(message.to_string()),
+        tool_call_id: None,
+        tool_calls: None,
+    });
+
+    // Call LLM directly (no tools for simple ask)
+    let response = llm.chat_complete(messages, None).await
+        .map_err(|e| format!("LLM error: {}", e))?;
+
+    // Print the response
+    if let Some(content) = response.content {
+        println!("{}", content);
+    }
+
+    Ok(())
 }
 
 /// Run an agent from a directory and start an interactive REPL
