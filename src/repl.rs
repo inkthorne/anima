@@ -503,7 +503,7 @@ impl Repl {
                             .cloned()
                             .collect();
                         for other in others {
-                            let forwarded_message = format!("[{}] {}", agent_name, stripped);
+                            let forwarded_message = format!("{}: {}", agent_name, stripped);
                             debug::log(&format!("FORWARD (@all): {} -> {} (from {})", other, forwarded_message, agent_name));
                             Box::pin(self.send_message_to_daemon_inner(&other, &forwarded_message, depth + 1)).await;
                         }
@@ -527,7 +527,7 @@ impl Repl {
                     }
 
                     // Forward message with sender context
-                    let forwarded_message = format!("[{}] {}", agent_name, stripped);
+                    let forwarded_message = format!("{}: {}", agent_name, stripped);
                     debug::log(&format!("FORWARD: {} -> {} (from {})", mention, forwarded_message, agent_name));
 
                     Box::pin(self.send_message_to_daemon_inner(&mention, &forwarded_message, depth + 1)).await;
