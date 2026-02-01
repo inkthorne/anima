@@ -426,10 +426,25 @@ impl Repl {
         }
     }
 
-    /// Send a conversation message to a daemon and display the response
-    async fn send_message_to_daemon(&self, agent_name: &str, message: &str) {
+    /// Send a conversation message to a daemon and display the response.
+    async fn send_message_to_daemon(&mut self, agent_name: &str, message: &str) {
+        self.send_message_to_daemon_inner(agent_name, message, 0).await;
+    }
+
+    /// Inner implementation that uses depth limit to prevent runaway loops.
+    async fn send_message_to_daemon_inner(
+        &mut self,
+        agent_name: &str,
+        message: &str,
+        depth: u32,
+    ) {
+        // Safety limit: stop after 15 hops to prevent runaway loops
+        if depth > 15 {
+            debug::log(&format!("DEPTH LIMIT: stopping at depth {} for {}", depth, agent_name));
+            return;
+        }
         let connection = match self.connections.get(agent_name) {
-            Some(c) => c,
+            Some(c) => c.clone(),
             None => {
                 println!("\x1b[31mAgent '{}' not connected\x1b[0m", agent_name);
                 return;
@@ -468,6 +483,51 @@ impl Repl {
                     if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
 
                 println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
+
+                // Check for @mentions in response and forward to mentioned agents
+                let mentions = parse_mentions(&stripped);
+                for mention in mentions {
+                    // Never send back to sender (the only real rule)
+                    if mention == agent_name {
+                        continue;
+                    }
+
+                    // Handle @all: expand to all connected agents except sender
+                    if mention == "all" {
+                        let others: Vec<String> = self.connections.keys()
+                            .filter(|&name| name != agent_name)
+                            .cloned()
+                            .collect();
+                        for other in others {
+                            let forwarded_message = format!("[{}] {}", agent_name, stripped);
+                            debug::log(&format!("FORWARD (@all): {} -> {} (from {})", other, forwarded_message, agent_name));
+                            Box::pin(self.send_message_to_daemon_inner(&other, &forwarded_message, depth + 1)).await;
+                        }
+                        continue;
+                    }
+
+                    // Check if mentioned agent is connected or running
+                    if !self.connections.contains_key(&mention) {
+                        if discovery::is_agent_running(&mention) {
+                            // Auto-connect to running agent
+                            if let Some(agent) = discovery::get_running_agent(&mention) {
+                                self.connections.insert(mention.clone(), AgentConnection::from_running(&agent));
+                                println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            // Agent not running, skip
+                            continue;
+                        }
+                    }
+
+                    // Forward message with sender context
+                    let forwarded_message = format!("[{}] {}", agent_name, stripped);
+                    debug::log(&format!("FORWARD: {} -> {} (from {})", mention, forwarded_message, agent_name));
+
+                    Box::pin(self.send_message_to_daemon_inner(&mention, &forwarded_message, depth + 1)).await;
+                }
             }
             Ok(Some(Response::Error { message })) => {
                 println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, message);
