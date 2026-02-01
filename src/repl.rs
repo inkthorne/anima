@@ -223,11 +223,20 @@ impl Repl {
     /// Get unseen conversation context for an agent and update their cursor.
     /// Returns formatted context string (each line is "sender: content").
     fn get_context_for_agent(&mut self, agent_name: &str) -> String {
-        let cursor = self.agent_cursors.get(agent_name).copied().unwrap_or(0);
-        let unseen = &self.conversation_log[cursor..];
+        self.get_context_for_agent_up_to(agent_name, self.conversation_log.len(), true)
+    }
 
-        // Update cursor to current log length
-        self.agent_cursors.insert(agent_name.to_string(), self.conversation_log.len());
+    /// Get conversation context for an agent up to a specific log index.
+    /// If update_cursor is true, updates the agent's cursor to the snapshot point.
+    fn get_context_for_agent_up_to(&mut self, agent_name: &str, snapshot: usize, update_cursor: bool) -> String {
+        let cursor = self.agent_cursors.get(agent_name).copied().unwrap_or(0);
+        let end = snapshot.min(self.conversation_log.len());
+        let unseen = &self.conversation_log[cursor..end];
+
+        // Update cursor to snapshot point if requested
+        if update_cursor {
+            self.agent_cursors.insert(agent_name.to_string(), end);
+        }
 
         // Format as multiline string
         unseen
@@ -432,8 +441,11 @@ impl Repl {
     async fn handle_conversation(&mut self, input: &str) {
         let mentions = parse_mentions(input);
 
+        // Check if this is an @all broadcast
+        let is_broadcast = mentions.iter().any(|m| m == "all");
+
         // Determine which agents to send to
-        let target_agents: Vec<String> = if mentions.iter().any(|m| m == "all") {
+        let target_agents: Vec<String> = if is_broadcast {
             // @all means all connected agents
             self.connections.keys().cloned().collect()
         } else if !mentions.is_empty() {
@@ -476,9 +488,156 @@ impl Repl {
         // Log the user message to the conversation log
         self.log_message("user", input);
 
-        // Send the message to each target agent
-        for agent_name in target_agents {
-            self.send_message_to_daemon(&agent_name).await;
+        // For @all broadcasts, use snapshot-based sending to ensure all agents
+        // see the same context (no agent sees another's response from the same broadcast)
+        if is_broadcast && target_agents.len() > 1 {
+            self.send_broadcast_to_daemons(&target_agents).await;
+        } else {
+            // Send the message to each target agent normally
+            for agent_name in target_agents {
+                self.send_message_to_daemon(&agent_name).await;
+            }
+        }
+    }
+
+    /// Send a broadcast message to multiple daemons with snapshot isolation.
+    /// All agents receive the same context snapshot - no agent sees another's
+    /// response from the same broadcast.
+    async fn send_broadcast_to_daemons(&mut self, agents: &[String]) {
+        // Snapshot the current log position BEFORE sending to anyone
+        let snapshot = self.conversation_log.len();
+        debug::log(&format!("BROADCAST: snapshot at {} for {} agents", snapshot, agents.len()));
+
+        // Collect contexts for all agents using the snapshot (don't update cursors yet)
+        let mut contexts: HashMap<String, String> = HashMap::new();
+        for agent_name in agents {
+            let context = self.get_context_for_agent_up_to(agent_name, snapshot, false);
+            if !context.is_empty() {
+                contexts.insert(agent_name.clone(), context);
+            }
+        }
+
+        // Send to all agents and collect responses (without logging yet)
+        let mut responses: Vec<(String, String)> = Vec::new();
+        for agent_name in agents {
+            if let Some(context) = contexts.get(agent_name) {
+                if let Some(response) = self.send_message_to_daemon_no_log(agent_name, context).await {
+                    responses.push((agent_name.clone(), response));
+                }
+            }
+        }
+
+        // Now log all responses and update cursors
+        for (agent_name, response) in &responses {
+            self.log_message(agent_name, response);
+        }
+
+        // Update cursors to current log position (after all responses logged)
+        let final_pos = self.conversation_log.len();
+        for agent_name in agents {
+            self.agent_cursors.insert(agent_name.clone(), final_pos);
+        }
+
+        // Handle @mention forwarding from responses
+        for (agent_name, response) in responses {
+            let mentions = parse_mentions(&response);
+            for mention in mentions {
+                // Never send back to sender
+                if mention == agent_name {
+                    continue;
+                }
+
+                // Handle @all in response
+                if mention == "all" {
+                    let others: Vec<String> = self.connections.keys()
+                        .filter(|&name| name != &agent_name)
+                        .cloned()
+                        .collect();
+                    for other in others {
+                        debug::log(&format!("FORWARD (@all): {} (from {})", other, agent_name));
+                        Box::pin(self.send_message_to_daemon_inner(&other, 1)).await;
+                    }
+                    continue;
+                }
+
+                // Auto-connect if needed
+                if !self.connections.contains_key(&mention) {
+                    if discovery::is_agent_running(&mention) {
+                        if let Some(agent) = discovery::get_running_agent(&mention) {
+                            self.connections.insert(mention.clone(), AgentConnection::from_running(&agent));
+                            println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+
+                debug::log(&format!("FORWARD: {} (from {})", mention, agent_name));
+                Box::pin(self.send_message_to_daemon_inner(&mention, 1)).await;
+            }
+        }
+    }
+
+    /// Send a message to a daemon and return the response without logging it.
+    /// Used for broadcast sends where we need to collect all responses before logging.
+    async fn send_message_to_daemon_no_log(&self, agent_name: &str, context: &str) -> Option<String> {
+        let connection = match self.connections.get(agent_name) {
+            Some(c) => c.clone(),
+            None => {
+                println!("\x1b[31mAgent '{}' not connected\x1b[0m", agent_name);
+                return None;
+            }
+        };
+
+        println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+        debug::log(&format!("BROADCAST CONV: {} <- context ({} chars)", agent_name, context.len()));
+
+        // Connect to daemon
+        let mut api = match connection.connect().await {
+            Ok(api) => api,
+            Err(e) => {
+                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
+                return None;
+            }
+        };
+
+        // Send message request with conversation context
+        let request = Request::Message { content: context.to_string() };
+        if let Err(e) = api.write_request(&request).await {
+            println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
+            return None;
+        }
+
+        // Read response
+        match api.read_response().await {
+            Ok(Some(Response::Message { content })) => {
+                let stripped = strip_thinking(&content);
+                debug::log(&format!("BROADCAST RESPONSE (raw, {} chars): {}", content.len(),
+                    if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));
+                debug::log(&format!("BROADCAST RESPONSE (stripped, {} chars): {}", stripped.len(),
+                    if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+
+                println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
+                Some(stripped)
+            }
+            Ok(Some(Response::Error { message })) => {
+                println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, message);
+                None
+            }
+            Ok(Some(_)) => {
+                println!("\x1b[31mUnexpected response from '{}'\x1b[0m", agent_name);
+                None
+            }
+            Ok(None) => {
+                println!("\x1b[31mConnection closed by '{}'\x1b[0m", agent_name);
+                None
+            }
+            Err(e) => {
+                println!("\x1b[31mFailed to read response from '{}': {}\x1b[0m", agent_name, e);
+                None
+            }
         }
     }
 
@@ -1247,5 +1406,72 @@ mod tests {
             context,
             "{\"from\": \"user\", \"text\": \"@arya hello\"}\n{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}\n{\"from\": \"arya\", \"text\": \"@gendry what do you think?\"}"
         );
+    }
+
+    #[test]
+    fn test_get_context_for_agent_up_to_snapshot() {
+        let mut repl = Repl::new();
+
+        // Build up conversation
+        repl.log_message("user", "@all hello everyone");
+        let snapshot = repl.conversation_log.len(); // snapshot at 1
+
+        // Get context for arya with snapshot, don't update cursor
+        let arya_context = repl.get_context_for_agent_up_to("arya", snapshot, false);
+        assert_eq!(arya_context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        // Cursor should NOT be updated
+        assert_eq!(repl.agent_cursors.get("arya"), None);
+
+        // Get context for gendry with snapshot, don't update cursor
+        let gendry_context = repl.get_context_for_agent_up_to("gendry", snapshot, false);
+        assert_eq!(gendry_context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        // Cursor should NOT be updated
+        assert_eq!(repl.agent_cursors.get("gendry"), None);
+
+        // Both agents should see exactly the same context
+        assert_eq!(arya_context, gendry_context);
+    }
+
+    #[test]
+    fn test_get_context_for_agent_up_to_with_cursor_update() {
+        let mut repl = Repl::new();
+
+        repl.log_message("user", "@all hello everyone");
+        let snapshot = repl.conversation_log.len();
+
+        // Get context with cursor update
+        let context = repl.get_context_for_agent_up_to("arya", snapshot, true);
+        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        // Cursor SHOULD be updated
+        assert_eq!(repl.agent_cursors.get("arya"), Some(&1));
+    }
+
+    #[test]
+    fn test_broadcast_snapshot_isolation() {
+        // Simulates @all broadcast behavior: all agents should see same context
+        let mut repl = Repl::new();
+
+        // User sends @all message
+        repl.log_message("user", "@all what do you think?");
+        let snapshot = repl.conversation_log.len();
+
+        // Snapshot contexts for all agents BEFORE any responses
+        let arya_context = repl.get_context_for_agent_up_to("arya", snapshot, false);
+        let gendry_context = repl.get_context_for_agent_up_to("gendry", snapshot, false);
+
+        // Simulate arya responding (this would normally happen via daemon)
+        repl.log_message("arya", "I think it's great!");
+
+        // Even after arya's response is logged, gendry's snapshot context
+        // should NOT include arya's response
+        assert_eq!(arya_context, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}");
+        assert_eq!(gendry_context, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}");
+
+        // Both got exactly the same context
+        assert_eq!(arya_context, gendry_context);
+
+        // Now if we get fresh context for gendry (without snapshot), it would include arya's response
+        let gendry_fresh = repl.get_context_for_agent("gendry");
+        assert_eq!(gendry_fresh, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}\n{\"from\": \"arya\", \"text\": \"I think it's great!\"}");
     }
 }
