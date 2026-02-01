@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use dirs;
 use regex::Regex;
 use serde::Deserialize;
 use thiserror::Error;
@@ -53,6 +54,7 @@ pub struct TimerSection {
 pub struct AgentSection {
     pub name: String,
     pub persona_file: Option<PathBuf>,
+    pub always_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,12 +119,65 @@ impl AgentDir {
         }
     }
 
+    /// Load always content from the configured always file.
+    /// Returns Ok(None) if no always file exists.
+    /// Expands {{include:filename}} directives recursively.
+    ///
+    /// Resolution order:
+    /// 1. Agent-specific: `<agent_dir>/always.md` (or configured always_file)
+    /// 2. Global fallback: `~/.anima/agents/always.md`
+    ///
+    /// Agent-specific always.md completely overrides global (no merge).
+    pub fn load_always(&self) -> Result<Option<String>, AgentDirError> {
+        // Try agent-specific always file first
+        let agent_always_path = match &self.config.agent.always_file {
+            Some(always_path) => self.path.join(always_path),
+            None => self.path.join("always.md"),
+        };
+
+        if agent_always_path.exists() {
+            let content = std::fs::read_to_string(&agent_always_path)?;
+            let mut seen = HashSet::new();
+            seen.insert(agent_always_path.canonicalize().unwrap_or(agent_always_path));
+            let expanded = self.expand_includes(&content, &mut seen)?;
+            return Ok(Some(expanded));
+        }
+
+        // Fall back to global always.md at ~/.anima/agents/always.md
+        if let Some(global_agents_dir) = dirs::home_dir()
+            .map(|h| h.join(".anima").join("agents"))
+        {
+            let global_always_path = global_agents_dir.join("always.md");
+            if global_always_path.exists() {
+                let content = std::fs::read_to_string(&global_always_path)?;
+                let mut seen = HashSet::new();
+                seen.insert(global_always_path.canonicalize().unwrap_or(global_always_path));
+                // Use global agents directory as base path for includes
+                let expanded = Self::expand_includes_with_base(&content, &global_agents_dir, &mut seen)?;
+                return Ok(Some(expanded));
+            }
+        }
+
+        Ok(None)
+    }
+
     /// Expand {{include:filename}} patterns in content.
     /// Paths are relative to the agent directory.
     /// Detects cycles by tracking seen files.
     fn expand_includes(
         &self,
         content: &str,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Result<String, AgentDirError> {
+        Self::expand_includes_with_base(content, &self.path, seen)
+    }
+
+    /// Expand {{include:filename}} patterns in content with a custom base path.
+    /// Paths are relative to the given base_path.
+    /// Detects cycles by tracking seen files.
+    fn expand_includes_with_base(
+        content: &str,
+        base_path: &Path,
         seen: &mut HashSet<PathBuf>,
     ) -> Result<String, AgentDirError> {
         let re = Regex::new(r"\{\{include:([^}]+)\}\}").unwrap();
@@ -135,7 +190,7 @@ impl AgentDir {
             .collect();
 
         for (full_match, filename) in matches {
-            let include_path = self.path.join(filename.trim());
+            let include_path = base_path.join(filename.trim());
             let canonical = include_path
                 .canonicalize()
                 .map_err(|_| AgentDirError::IncludeNotFound(include_path.clone()))?;
@@ -150,7 +205,7 @@ impl AgentDir {
                 .map_err(|_| AgentDirError::IncludeNotFound(include_path))?;
 
             // Recursively expand includes in the included content
-            let expanded_include = self.expand_includes(&include_content, seen)?;
+            let expanded_include = Self::expand_includes_with_base(&include_content, base_path, seen)?;
 
             result = result.replace(&full_match, &expanded_include);
         }
@@ -569,5 +624,300 @@ model = "gpt-4"
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let persona = agent_dir.load_persona().unwrap().unwrap();
         assert_eq!(persona, "Soul content");
+    }
+
+    #[test]
+    fn test_load_always() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+persona_file = "persona.md"
+always_file = "always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        fs::write(dir.path().join("persona.md"), "I am a helpful assistant.").unwrap();
+        fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+        assert_eq!(always, Some("Always be concise.".to_string()));
+    }
+
+    #[test]
+    fn test_load_always_none() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+        assert_eq!(always, None);
+    }
+
+    #[test]
+    fn test_load_always_file_missing() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+always_file = "always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        // Note: always.md file is NOT created
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        // Should return None when file is missing (backward compatible)
+        let always = agent_dir.load_always().unwrap();
+        assert_eq!(always, None);
+    }
+
+    #[test]
+    fn test_load_always_with_include() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+always_file = "always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        fs::write(
+            dir.path().join("always.md"),
+            "Header\n{{include:RULES.md}}\nFooter",
+        )
+        .unwrap();
+        fs::write(dir.path().join("RULES.md"), "Be helpful.").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let always = agent_dir.load_always().unwrap().unwrap();
+        assert_eq!(always, "Header\nBe helpful.\nFooter");
+    }
+
+    // =========================================================================
+    // Global fallback tests for always.md
+    // =========================================================================
+
+    /// Test: Agent-specific always.md is used when present (explicit config)
+    #[test]
+    fn test_load_always_agent_specific_explicit() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+always_file = "my_always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        fs::write(dir.path().join("my_always.md"), "Agent-specific always content").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+        assert_eq!(always, Some("Agent-specific always content".to_string()));
+    }
+
+    /// Test: Default always.md in agent directory is used when no always_file configured
+    #[test]
+    fn test_load_always_agent_specific_default() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        // Create always.md in agent directory (not configured explicitly)
+        fs::write(dir.path().join("always.md"), "Default agent always content").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+        assert_eq!(always, Some("Default agent always content".to_string()));
+    }
+
+    /// Test: Agent-specific always.md overrides global (no merge)
+    /// Note: This test creates a mock global always.md in a temp dir and temporarily
+    /// overrides HOME. Since dirs::home_dir() uses the HOME env var on Unix, we can test this.
+    #[test]
+    fn test_load_always_agent_overrides_global() {
+        // Create fake home directory
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        fs::write(global_always_dir.join("always.md"), "Global always content").unwrap();
+
+        // Create agent directory
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        // Agent-specific always.md
+        fs::write(agent_dir_path.path().join("always.md"), "Agent-specific always").unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Agent-specific should be used, NOT global
+        assert_eq!(always, Some("Agent-specific always".to_string()));
+    }
+
+    /// Test: Falls back to global when agent-specific doesn't exist
+    #[test]
+    fn test_load_always_global_fallback() {
+        // Create fake home directory with global always.md
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        fs::write(global_always_dir.join("always.md"), "Global always content").unwrap();
+
+        // Create agent directory WITHOUT always.md
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        // NO always.md in agent directory
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Global should be used as fallback
+        assert_eq!(always, Some("Global always content".to_string()));
+    }
+
+    /// Test: Returns None when neither agent-specific nor global exists
+    #[test]
+    fn test_load_always_neither_exists() {
+        // Create fake home directory WITHOUT global always.md
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        // NO always.md in global directory
+
+        // Create agent directory WITHOUT always.md
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        // NO always.md in agent directory
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Should return None when neither exists
+        assert_eq!(always, None);
+    }
+
+    /// Test: Global always.md supports include directives
+    #[test]
+    fn test_load_always_global_with_include() {
+        // Create fake home directory with global always.md that uses includes
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        fs::write(
+            global_always_dir.join("always.md"),
+            "Global: {{include:rules.md}}",
+        )
+        .unwrap();
+        fs::write(global_always_dir.join("rules.md"), "Be kind.").unwrap();
+
+        // Create agent directory WITHOUT always.md
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Includes should be expanded in global always.md
+        assert_eq!(always, Some("Global: Be kind.".to_string()));
     }
 }

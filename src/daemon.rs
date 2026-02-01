@@ -34,6 +34,8 @@ pub struct DaemonConfig {
     pub timer: Option<TimerConfig>,
     /// Persona (system prompt)
     pub persona: Option<String>,
+    /// Always content (injected before user messages for recency bias)
+    pub always: Option<String>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -70,6 +72,9 @@ impl DaemonConfig {
         // Load persona
         let persona = agent_dir.load_persona()?;
 
+        // Load always content
+        let always = agent_dir.load_always()?;
+
         Ok(Self {
             name,
             agent_dir: dir_path,
@@ -77,6 +82,7 @@ impl DaemonConfig {
             pid_path,
             timer,
             persona,
+            always,
         })
     }
 }
@@ -240,6 +246,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let agent_clone = agent.clone();
         let history_clone = history.clone();
         let persona = config.persona.clone();
+        let always = config.always.clone();
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
 
@@ -256,6 +263,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let history_snapshot = history_clone.lock().await.clone();
                         let options = ThinkOptions {
                             system_prompt: persona.clone(),
+                            always_prompt: always.clone(),
                             conversation_history: if history_snapshot.is_empty() {
                                 None
                             } else {
@@ -312,6 +320,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let agent_clone = agent.clone();
                         let history_clone = history.clone();
                         let persona = config.persona.clone();
+                        let always = config.always.clone();
                         let shutdown_clone = shutdown.clone();
 
                         tokio::spawn(async move {
@@ -321,6 +330,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 agent_clone,
                                 history_clone,
                                 persona,
+                                always,
                                 shutdown_clone,
                             ).await {
                                 eprintln!("Connection error: {}", e);
@@ -427,6 +437,7 @@ async fn handle_connection(
     agent: Arc<Mutex<Agent>>,
     history: Arc<Mutex<Vec<ChatMessage>>>,
     persona: Option<String>,
+    always: Option<String>,
     shutdown: Arc<tokio::sync::Notify>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -454,6 +465,7 @@ async fn handle_connection(
                 let history_snapshot = history.lock().await.clone();
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
+                    always_prompt: always.clone(),
                     conversation_history: if history_snapshot.is_empty() {
                         None
                     } else {
@@ -692,6 +704,54 @@ interval = "5m"
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
 
         assert!(daemon_config.timer.is_none());
+    }
+
+    #[test]
+    fn test_daemon_config_with_always() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test-agent"
+persona_file = "persona.md"
+always_file = "always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-test"
+"#;
+        std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        std::fs::write(dir.path().join("persona.md"), "Test persona").unwrap();
+        std::fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
+
+        assert_eq!(daemon_config.persona, Some("Test persona".to_string()));
+        assert_eq!(daemon_config.always, Some("Always be concise.".to_string()));
+    }
+
+    #[test]
+    fn test_daemon_config_always_file_missing() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test-agent"
+always_file = "always.md"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+api_key = "sk-test"
+"#;
+        std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        // Note: always.md file is NOT created
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
+
+        // Should be None when file is missing (backward compatible)
+        assert!(daemon_config.always.is_none());
     }
 
     #[test]

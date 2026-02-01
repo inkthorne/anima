@@ -1,6 +1,7 @@
 [agent]
 name = "demo"
 persona_file = "persona.md"
+# always_file = "always.md"  # optional: persistent reminders injected before every user message
 
 [llm]
 provider = "anthropic"

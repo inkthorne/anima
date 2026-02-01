@@ -171,6 +171,8 @@ impl Helper for ReplHelper {}
 struct AgentPersona {
     /// System prompt that defines the agent's personality
     system_prompt: Option<String>,
+    /// Always prompt injected as system message just before user message (recency bias)
+    always_prompt: Option<String>,
     /// Initial memories to preload
     initial_memories: Vec<(String, String)>,
 }
@@ -232,12 +234,13 @@ impl Repl {
 
     /// Create a REPL with a pre-loaded agent.
     /// This is used when running `anima run <agent>` to start a REPL with an agent already loaded.
-    pub fn with_agent(name: String, agent: Agent, persona: Option<String>) -> Self {
+    pub fn with_agent(name: String, agent: Agent, persona: Option<String>, always: Option<String>) -> Self {
         let history_file = dirs::home_dir().map(|h| h.join(".anima_history"));
 
         let mut agents = HashMap::new();
         let mut persona_config = AgentPersona::default();
         persona_config.system_prompt = persona;
+        persona_config.always_prompt = always;
 
         agents.insert(name.clone(), ReplAgent {
             agent: Arc::new(Mutex::new(agent)),
@@ -563,6 +566,15 @@ impl Repl {
             }
         };
 
+        // Load always content
+        let always_content = match agent_dir.load_always() {
+            Ok(content) => content,
+            Err(e) => {
+                println!("\x1b[31mFailed to load always: {}\x1b[0m", e);
+                return;
+            }
+        };
+
         // Get API key
         let api_key = match agent_dir.api_key() {
             Ok(key) => key,
@@ -615,6 +627,7 @@ impl Repl {
         // Build persona
         let mut persona = AgentPersona::default();
         persona.system_prompt = persona_content;
+        persona.always_prompt = always_content;
 
         // Create agent with runtime
         let agent_name = agent_dir.config.agent.name.clone();
@@ -832,7 +845,7 @@ impl Repl {
         let task = task.trim();
 
         // Get agent info (immutable borrow for validation)
-        let (agent_arc, system_prompt, history_arc) = {
+        let (agent_arc, system_prompt, always_prompt, history_arc) = {
             let entry = match self.agents.get(agent_name) {
                 Some(a) => a,
                 None => {
@@ -847,7 +860,7 @@ impl Repl {
                 return;
             }
 
-            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.history.clone())
+            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone(), entry.history.clone())
         };
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
@@ -857,13 +870,14 @@ impl Repl {
 
         // Get a snapshot of the history for the options
         let history = history_arc.lock().await.clone();
-        
+
         debug::log(&format!("TASK: {} -> {}", agent_name, task));
         debug_log_history(agent_name, &history);
-        
+
         let options = ThinkOptions {
             stream: true,
             system_prompt,
+            always_prompt,
             conversation_history: if history.is_empty() { None } else { Some(history) },
             ..Default::default()
         };
@@ -1122,6 +1136,7 @@ impl Repl {
                             
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
+                                always_prompt: persona.always_prompt.clone(),
                                 conversation_history: if history.is_empty() { None } else { Some(history) },
                                 ..Default::default()
                             };
@@ -1187,6 +1202,7 @@ impl Repl {
                             
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
+                                always_prompt: persona.always_prompt.clone(),
                                 conversation_history: if history.is_empty() { None } else { Some(history) },
                                 ..Default::default()
                             };
@@ -1198,7 +1214,7 @@ impl Repl {
                                         if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
                                     debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
                                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-                                    
+
                                     // Don't print response here - it's already shown when recipient receives via send_message
                                     // Update conversation history
                                     let mut history = history_arc.lock().await;

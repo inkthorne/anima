@@ -387,6 +387,10 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
     let persona = agent_dir.load_persona()
         .map_err(|e| format!("Failed to load persona: {}", e))?;
 
+    // Load always content if configured
+    let always = agent_dir.load_always()
+        .map_err(|e| format!("Failed to load always: {}", e))?;
+
     // Get API key
     let api_key = agent_dir.api_key()
         .map_err(|e| format!("Failed to get API key: {}", e))?;
@@ -419,6 +423,16 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
         messages.push(ChatMessage {
             role: "system".to_string(),
             content: Some(persona_content),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+    }
+
+    // Inject always content as system message just before user message (recency bias)
+    if let Some(always_content) = always {
+        messages.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(always_content),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -576,6 +590,9 @@ async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Load persona if configured
     let persona = agent_dir.load_persona()?;
 
+    // Load always content if configured
+    let always = agent_dir.load_always()?;
+
     // Get API key
     let api_key = agent_dir.api_key()?;
 
@@ -639,7 +656,7 @@ async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     agent = agent.with_observer(observer);
 
     // Start interactive REPL with the loaded agent
-    let mut repl = Repl::with_agent(agent_name.clone(), agent, persona);
+    let mut repl = Repl::with_agent(agent_name.clone(), agent, persona, always);
     println!("\x1b[32m✓ Loaded agent '{}' from {}\x1b[0m", agent_name, agent_path.display());
 
     repl.run().await?;
@@ -662,6 +679,7 @@ fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), Box<dyn std::er
     let config_content = format!(r#"[agent]
 name = "{name}"
 persona_file = "persona.md"
+always_file = "always.md"
 
 [llm]
 provider = "anthropic"
@@ -704,16 +722,31 @@ You have access to tools for:
 "#);
     std::fs::write(agent_path.join("persona.md"), persona_content)?;
 
+    // Write always.md template
+    let always_content = r#"# Persistent Reminders
+
+These reminders are injected before every user message to stay salient in long conversations.
+
+## Key Rules
+
+- Be concise in your responses
+- Always confirm before making destructive changes
+- Use tools when they can help accomplish the task
+"#;
+    std::fs::write(agent_path.join("always.md"), always_content)?;
+
     println!("\x1b[32m✓ Created agent '{}' at {}\x1b[0m", name, agent_path.display());
     println!();
     println!("  Files created:");
     println!("    \x1b[36mconfig.toml\x1b[0m  — agent configuration");
     println!("    \x1b[36mpersona.md\x1b[0m   — system prompt / personality");
+    println!("    \x1b[36malways.md\x1b[0m    — persistent reminders (recency bias)");
     println!();
     println!("  Next steps:");
     println!("    1. Edit config.toml to configure your LLM");
     println!("    2. Edit persona.md to define your agent's personality");
-    println!("    3. Run with: \x1b[36manima run {}\x1b[0m", name);
+    println!("    3. Edit always.md to add persistent reminders");
+    println!("    4. Run with: \x1b[36manima run {}\x1b[0m", name);
 
     Ok(())
 }
@@ -846,6 +879,7 @@ async fn run_agent_task(config_path: &str, task: &str, stream: bool, verbose_cli
     let options = ThinkOptions {
         max_iterations: config.think.max_iterations,
         system_prompt: config.agent.system_prompt,
+        always_prompt: None, // Not supported in task mode yet
         auto_memory,
         reflection,
         stream,
@@ -929,17 +963,23 @@ mod tests {
         // Check files were created
         assert!(agent_path.join("config.toml").exists());
         assert!(agent_path.join("persona.md").exists());
+        assert!(agent_path.join("always.md").exists());
 
         // Check config.toml content
         let config_content = std::fs::read_to_string(agent_path.join("config.toml")).unwrap();
         assert!(config_content.contains("name = \"test-agent\""));
         assert!(config_content.contains("[llm]"));
         assert!(config_content.contains("[memory]"));
+        assert!(config_content.contains("always_file = \"always.md\""));
 
         // Check persona.md content
         let persona_content = std::fs::read_to_string(agent_path.join("persona.md")).unwrap();
         assert!(persona_content.contains("# test-agent"));
         assert!(persona_content.contains("You are test-agent"));
+
+        // Check always.md content
+        let always_content = std::fs::read_to_string(agent_path.join("always.md")).unwrap();
+        assert!(always_content.contains("Persistent Reminders"));
     }
 
     #[test]

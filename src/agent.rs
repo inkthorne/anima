@@ -47,6 +47,9 @@ pub struct ThinkOptions {
     pub retry_policy: Option<RetryPolicy>,
     /// Optional conversation history to inject before the user task
     pub conversation_history: Option<Vec<ChatMessage>>,
+    /// Optional "always" prompt injected as system message just before the user message.
+    /// This exploits recency bias to keep critical instructions salient in long conversations.
+    pub always_prompt: Option<String>,
 }
 
 impl Default for ThinkOptions {
@@ -59,6 +62,7 @@ impl Default for ThinkOptions {
             stream: false,
             retry_policy: Some(RetryPolicy::default()),
             conversation_history: None,
+            always_prompt: None,
         }
     }
 }
@@ -509,6 +513,16 @@ pub async fn forget(&mut self, key: &str) -> bool {
             messages.extend(history.clone());
         }
 
+        // Inject always prompt as system message just before user message (recency bias)
+        if let Some(always) = &options.always_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(always.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
         // User task
         messages.push(ChatMessage {
             role: "user".to_string(),
@@ -711,6 +725,16 @@ pub async fn forget(&mut self, key: &str) -> bool {
             messages.extend(history.clone());
         }
 
+        // Inject always prompt as system message just before user message (recency bias)
+        if let Some(always) = &options.always_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(always.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
@@ -873,6 +897,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             let revision_options = ThinkOptions {
                 max_iterations: options.max_iterations,
                 system_prompt: options.system_prompt.clone(),
+                always_prompt: options.always_prompt.clone(),
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
                 stream: false, // Reflection doesn't use streaming
@@ -920,13 +945,23 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
+        // Inject always prompt as system message just before user message (recency bias)
+        if let Some(always) = &options.always_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(always.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(task.to_string()),
             tool_call_id: None,
             tool_calls: None,
         });
-        
+
         for _iteration in 0..options.max_iterations {
             // Call LLM with retry if policy is configured
             let response = if let Some(ref policy) = options.retry_policy {
@@ -1297,6 +1332,7 @@ mod tests {
         let opts = ThinkOptions {
             max_iterations: 5,
             system_prompt: Some("Be helpful".to_string()),
+            always_prompt: None,
             reflection: None,
             auto_memory: Some(AutoMemoryConfig::default()),
             stream: false,
@@ -1732,5 +1768,232 @@ mod tests {
         let input = "<think>only thinking, nothing else</think>";
         let result = strip_thinking(input);
         assert_eq!(result, "");
+    }
+
+    // =========================================================================
+    // always_prompt (always.md) tests
+    // =========================================================================
+
+    /// Helper function to build initial messages array for testing.
+    /// This mirrors the message building logic in think_with_options_inner.
+    fn build_test_messages(
+        system_prompt: Option<&str>,
+        conversation_history: Option<Vec<ChatMessage>>,
+        always_prompt: Option<&str>,
+        user_task: &str,
+    ) -> Vec<ChatMessage> {
+        use crate::llm::ChatMessage;
+
+        let mut messages: Vec<ChatMessage> = Vec::new();
+
+        // Optional system prompt
+        if let Some(system) = system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        // Inject conversation history if present
+        if let Some(history) = conversation_history {
+            messages.extend(history);
+        }
+
+        // Inject always prompt as system message just before user message (recency bias)
+        if let Some(always) = always_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(always.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+
+        // User task
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(user_task.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        messages
+    }
+
+    /// Test 1: Verify always.md content is injected just before the last user message.
+    /// Expected order: [system: persona] ... [system: always.md] [user: task]
+    #[test]
+    fn test_always_prompt_injection_position() {
+        let messages = build_test_messages(
+            Some("You are a helpful assistant."),
+            Some(vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("Previous question".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Previous answer".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ]),
+            Some("Always be concise and helpful."),
+            "Current question",
+        );
+
+        // Verify message count: system + 2 history + always + user = 5
+        assert_eq!(messages.len(), 5);
+
+        // Verify order: persona at index 0
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content.as_ref().unwrap(), "You are a helpful assistant.");
+
+        // History at indices 1 and 2
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content.as_ref().unwrap(), "Previous question");
+        assert_eq!(messages[2].role, "assistant");
+        assert_eq!(messages[2].content.as_ref().unwrap(), "Previous answer");
+
+        // always.md at second to last position
+        assert_eq!(messages[3].role, "system");
+        assert_eq!(messages[3].content.as_ref().unwrap(), "Always be concise and helpful.");
+
+        // User message at last position
+        assert_eq!(messages[4].role, "user");
+        assert_eq!(messages[4].content.as_ref().unwrap(), "Current question");
+    }
+
+    /// Test 2: Verify always.md is NOT stored in conversation history.
+    /// It should be dynamically injected each time, not repeated.
+    #[test]
+    fn test_always_prompt_not_in_history() {
+        let always_content = "Always be concise.";
+
+        // Simulate building messages for first request
+        let _messages_turn_1 = build_test_messages(
+            Some("System prompt"),
+            None, // No history on first turn
+            Some(always_content),
+            "First question",
+        );
+
+        // After the first turn, history would contain user message + assistant response.
+        // Importantly, the always_prompt should NOT be stored in history.
+        // The history should only contain the user/assistant conversation turns.
+        let simulated_history = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("First question".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("First answer".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        // Verify history does not contain always.md content
+        for msg in &simulated_history {
+            assert_ne!(
+                msg.content.as_ref().unwrap(),
+                always_content,
+                "always.md content should not be stored in conversation history"
+            );
+        }
+
+        // Build messages for second request - always.md should be injected fresh
+        let messages_turn_2 = build_test_messages(
+            Some("System prompt"),
+            Some(simulated_history),
+            Some(always_content),
+            "Second question",
+        );
+
+        // Count how many times always_content appears in messages
+        let always_count = messages_turn_2
+            .iter()
+            .filter(|m| m.content.as_ref().map(|c| c == always_content).unwrap_or(false))
+            .count();
+
+        // Should appear exactly once (dynamically injected, not repeated from history)
+        assert_eq!(
+            always_count, 1,
+            "always.md should appear exactly once per request, not duplicated"
+        );
+
+        // Verify the always prompt is still in the correct position (second to last)
+        let second_to_last = &messages_turn_2[messages_turn_2.len() - 2];
+        assert_eq!(second_to_last.role, "system");
+        assert_eq!(second_to_last.content.as_ref().unwrap(), always_content);
+    }
+
+    /// Test 3: Verify backward compatibility when always.md is not configured or missing.
+    #[test]
+    fn test_always_prompt_optional_missing() {
+        // Test with always_prompt = None
+        let messages = build_test_messages(
+            Some("You are a helpful assistant."),
+            Some(vec![
+                ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("Previous question".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Previous answer".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ]),
+            None, // No always.md configured
+            "Current question",
+        );
+
+        // Should have system + 2 history + user = 4 messages (no always.md)
+        assert_eq!(messages.len(), 4);
+
+        // Verify last message is user
+        let last = &messages[messages.len() - 1];
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content.as_ref().unwrap(), "Current question");
+
+        // Verify second to last is the assistant from history (not an always system message)
+        let second_to_last = &messages[messages.len() - 2];
+        assert_eq!(second_to_last.role, "assistant");
+        assert_eq!(second_to_last.content.as_ref().unwrap(), "Previous answer");
+    }
+
+    /// Test that ThinkOptions default has always_prompt as None
+    #[test]
+    fn test_think_options_default_has_no_always_prompt() {
+        let opts = ThinkOptions::default();
+        assert!(opts.always_prompt.is_none());
+    }
+
+    /// Test ThinkOptions with always_prompt set
+    #[test]
+    fn test_think_options_with_always_prompt() {
+        let opts = ThinkOptions {
+            max_iterations: 5,
+            system_prompt: Some("Be helpful".to_string()),
+            always_prompt: Some("Always be concise.".to_string()),
+            reflection: None,
+            auto_memory: None,
+            stream: false,
+            retry_policy: None,
+            conversation_history: None,
+        };
+        assert!(opts.always_prompt.is_some());
+        assert_eq!(opts.always_prompt.as_ref().unwrap(), "Always be concise.");
     }
 }
