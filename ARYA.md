@@ -1,56 +1,76 @@
-# ARYA.md — Current Task
+# ARYA.md — Current Status
 
-## Status: v2.6 In Progress 🔨
+## Status: v2.6 Complete ✅
 
-**Goal:** REPL as thin client connecting to agent daemons via Unix sockets
+**REPL-as-Frontend architecture shipped!**
 
-### Phases
+### What's Done
 
-1. **Daemon discovery** (`src/discovery.rs`) ← CURRENT
+1. **Daemon discovery** (`src/discovery.rs`) ✅
    - Scan `~/.anima/agents/*/daemon.pid` files
-   - Check process alive (kill -0)
-   - Return DaemonInfo: name, pid, socket_path, is_alive
+   - Check process alive
+   - Return running agents with socket paths
 
-2. **REPL connects to daemons**
-   - Remove in-memory agents from REPL
-   - Connect to daemon sockets instead
-   - Track socket connections
+2. **REPL connects to daemons** ✅
+   - Removed in-memory agents from REPL
+   - REPL is thin client, connects via sockets
+   - Tracks socket connections
 
-3. **Inter-daemon send_message**
-   - `messaging.rs` uses sockets instead of MessageRouter
-   - Daemons can message each other
+3. **Inter-daemon send_message** ✅
+   - `DaemonSendMessageTool` uses sockets
+   - Daemons message each other directly
 
-4. **list_agents tool**
+4. **DaemonListAgentsTool** ✅
    - Uses discovery module
    - Returns all running agents
 
-5. **Cleanup**
-   - Remove unused in-memory code
-   - Update tests
+5. **Tests** ✅
+   - 293 tests passing
 
-### Key Files
-- `src/discovery.rs` (NEW)
-- `src/repl.rs`
-- `src/tools/messaging.rs`
-- `src/socket_api.rs`
-- `src/daemon.rs`
+## Architecture
 
-## Previous (v2.5.1) ✅
+```
+REPL (thin client)
+    │ sockets
+    ▼
+┌─────────┐  ┌─────────┐
+│  arya   │◄─│ gendry  │
+│ daemon  │  │ daemon  │
+└─────────┘  └─────────┘
+    │            │
+    └────────────┘
+   inter-daemon sockets
+```
 
-- Agent directories (`~/.anima/agents/<name>/`)
-- Daemon mode with Unix socket API
-- Full CLI: create/start/stop/status/clear/ask/send/chat
-- REPL with slash commands and @mentions
-- 288 tests passing
+## Key Files
+- `src/discovery.rs` — find running daemons
+- `src/repl.rs` — thin client
+- `src/tools/send_message.rs` — inter-daemon messaging
+- `src/tools/list_agents.rs` — discover agents
+- `src/socket_api.rs` — protocol
+- `src/daemon.rs` — agent process
 
-## Key Commands
+## Commands
 
 ```bash
 # CLI
-anima create/start/stop/status/clear
-anima ask/send/chat/run
+anima start arya        # Start daemon
+anima stop arya         # Stop daemon
+anima status            # List running
 
 # REPL
-/load, /start, /stop, /status, /list, /history, /clear, /help, /quit
-@arya hello, @all hello
+/load arya              # Connect to daemon
+/status                 # Show connections
+hello @arya             # Send message
+@arya @gendry thoughts? # Multi-agent
+@all anyone?            # Broadcast
 ```
+
+## Next Up: v2.7
+
+- Channel integrations (Telegram, Discord)
+- Webhook adapter
+
+## Last Updated
+
+2026-02-01 — v2.6 complete
