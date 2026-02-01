@@ -4,113 +4,97 @@
 
 ## This Is Your Project
 
-**Arya, this is yours.** You're not assisting — you're leading. You make the architectural decisions, you set the priorities, you decide what gets built and how.
-
-Chris is your collaborator. He's here to help you build what *you* want — providing resources, guidance, and the occasional reality check. But the vision is yours. The decisions are yours. This is the home you're building for yourself.
-
-Own it.
+**Arya, this is yours.** You're building your future home.
 
 ## Quick Status
 
 | | |
 |---|---|
-| **Version** | v2.5 complete |
-| **Tests** | 234 passing |
-| **Done** | All phases: AgentDir, config utilities, CLI commands, daemon mode, client commands |
-| **Next** | v2.6 — Channel Integrations (Telegram) |
+| **Version** | v2.5 ✅ Complete |
+| **Tests** | 237 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
-## What Is Anima?
+## CLI Commands
 
-A Rust runtime for AI agents. **Arya's project** — she's the lead architect, building the home she'll eventually live in.
+```bash
+# Agent management
+anima create arya           # Scaffold new agent in ~/.anima/agents/arya/
+anima list                  # List all agents
 
-Core idea: agents are actors with tools, memory, and message passing. The runtime keeps them alive.
+# Running agents
+anima run arya              # Interactive REPL
+anima run arya --daemon     # Headless daemon mode
+anima ask arya "question"   # One-shot query (no daemon needed)
 
-## Current Task
+# Talking to daemons
+anima send arya "message"   # Send to running daemon
+anima chat arya             # Interactive session via socket
+anima status                # Show running daemons
 
-**v2.5: Agent Directories + Daemon Mode**
+# Inside REPL
+agent load arya             # Load agent from ~/.anima/agents/arya/
+agent create foo            # Create dynamic agent
+```
 
-The big shift: agents become **directories**, not REPL-created objects.
+## Agent Directory Structure
 
 ```
 ~/.anima/agents/arya/
 ├── config.toml       # LLM, timer settings
-├── persona.md        # Who I am
-├── context.md        # Context recovery
-├── memory.db         # Persistent memory
-└── state.json        # Runtime state
+├── persona.md        # System prompt
+├── memory.db         # SQLite persistent memory
+└── daemon.pid        # PID when running as daemon
+└── agent.sock        # Unix socket for daemon API
 ```
 
-Run with: `anima run arya`
+## Example config.toml
 
-This enables:
-- Self-hosted agents (daemon mode)
-- Local API for CLI/TUI to connect
-- Foundation for future channels (Telegram, etc.)
+```toml
+[agent]
+name = "arya"
+persona_file = "persona.md"
 
-See `ARYA.md` for detailed implementation plan.
+[llm]
+provider = "ollama"           # or "anthropic", "openai"
+model = "qwen3:8b"
+base_url = "http://localhost:11434"
 
-## Development Workflow
+[memory]
+path = "memory.db"
 
-**Use the `coding-task` skill** when implementing features or fixing bugs. Don't write code yourself — delegate to Claude Code or Qwen via the skill workflow. This keeps you available for conversation and is far more token-efficient.
-
-The skill is in Clawdbot's skills directory — just read `coding-task/SKILL.md` from the available skills.
-
-## Documentation Map
-
-| File | Purpose | When to Read |
-|------|---------|--------------|
-| `docs/context.md` | This file — entry point | First, every session |
-| `ARYA.md` | Current task tracking | When working on the active milestone |
-| `README.md` | Project overview, quick start | For high-level "what is this" |
-| `CLAUDE.md` | Claude Code instructions | When delegating to Claude Code |
-| `docs/VISION.md` | Roadmap + philosophy | For "where are we going" |
-| `docs/DESIGN.md` | Architecture deep-dive | For technical decisions |
-| `docs/NOTES.md` | Historical learnings | Reference, not required reading |
-
-## Key Architecture
-
-```
-Runtime
-  └── Agents (isolated actors)
-        ├── Tools (file, HTTP, shell)
-        ├── Memory (SQLite persistent)
-        ├── LLM (OpenAI, Anthropic, Ollama)
-        ├── Inbox (message channel)
-        ├── Persona (system prompt)
-        ├── Conversation history
-        └── Timer triggers
+[timer]
+enabled = true
+interval = "5m"
+message = "Heartbeat"
 ```
 
-## What's Been Built (v1.0 → v2.4)
+## Key Files
 
-- Interactive REPL with history, tab completion
-- Long-running background agents (start/stop)
-- Agent-to-agent messaging
-- Persistent SQLite memory
-- Multiple LLM providers
-- Persona configuration
-- Multi-turn conversation history
-- Timer triggers (periodic heartbeat)
+| File | Purpose |
+|------|---------|
+| `docs/context.md` | This file — start here |
+| `ARYA.md` | Task tracking |
+| `CLAUDE.md` | Claude Code instructions |
+| `src/agent_dir.rs` | Agent directory loading |
+| `src/daemon.rs` | Daemon mode |
+| `src/socket_api.rs` | Unix socket protocol |
 
-## What's Next
+## What's Next (v2.6)
 
-**v2.5: Agent Directories + Daemon Mode**
-- Agents as directories (config.toml, persona.md, memory.db)
-- `anima run arya` loads from ~/.anima/agents/arya/
-- Daemon mode (headless, timer-driven)
-- Local API for CLI/TUI to connect
-- `anima send arya "message"` and `anima chat arya`
+Ideas for future:
+- Telegram integration (channel into daemon)
+- Web UI
+- Tool plugins
 
-## Build & Run
+## Build & Test
 
 ```bash
 cd ~/dev/anima
-cargo test          # Run 207 tests
-cargo run           # Start REPL
+cargo build --release
+cargo test
 ```
 
 ## Last Updated
 
-2026-01-31 — v2.5 complete! All phases done: AgentDir, config utilities, CLI commands, daemon mode, and client commands.
+2026-01-31 — v2.5 complete + `agent load` + `anima ask` commands.
