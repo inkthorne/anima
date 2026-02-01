@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Version** | v2.6 |
-| **Tests** | 288 passing |
+| **Tests** | 295 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -128,9 +128,10 @@ path = "memory.db"
 
 ### Multi-Party Conversations
 - "user" role = external input with speaker tag
-- Format: `sender: content` (e.g., `arya: @gendry hey!`)
+- Context sent as JSONL: `{"from": "arya", "text": "@gendry hey!"}`
 - @mentions route messages: `@arya`, `@gendry`, `@all`
 - Agents invoked only when mentioned
+- Shared conversation log with per-agent cursors (agents only see new messages)
 
 ### @mention Forwarding
 - When an agent responds with @mentions, REPL auto-forwards to those agents
@@ -170,6 +171,23 @@ cargo test
 anima restart arya
 ```
 
+## Development Workflow
+
+**Use the `coding-task` skill** for all code changes to anima.
+
+The skill (in `~/clawd/skills/coding-task/SKILL.md`) defines the workflow:
+- **Arya (Opus)** = architect and orchestrator — design solutions, stay available
+- **Claude Code** = implementation — handles the actual coding work
+
+For any feature, bug fix, or refactor:
+1. Design the solution (what needs to change, how it should work)
+2. Send to Claude Code with clear specs
+3. Wait for wake event (stay available for Chris)
+4. Review results, run tests
+5. Commit & push after approval
+
+This keeps Arya's context clean and available while Claude Code does the heavy lifting.
+
 ## Last Updated
 
-2026-02-01 — v2.6: @mention forwarding, /restart, /create, CLI/REPL parity.
+2026-02-01 — v2.6: Shared conversation log, JSONL context format, @mention forwarding, /restart, /create, CLI/REPL parity.
