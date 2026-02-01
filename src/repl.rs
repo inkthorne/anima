@@ -67,10 +67,17 @@ fn parse_duration(s: &str) -> Option<Duration> {
     }
 }
 
-/// Parse an auto-send pattern from agent response text.
-/// Pattern: `recipient: message content` at the start of response or on its own line.
-/// Agent name must start with a letter, can contain alphanumeric, underscore, hyphen.
-/// Returns (recipient, message) if pattern matches, None otherwise.
+/// Parse @mentions from input text.
+/// Pattern: `@([a-zA-Z][a-zA-Z0-9_-]*)`
+/// Returns a Vec of mentioned agent names (without the @ prefix).
+/// Special case: "@all" is returned as-is.
+fn parse_mentions(input: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"@([a-zA-Z][a-zA-Z0-9_-]*)").unwrap();
+    re.captures_iter(input)
+        .map(|cap| cap[1].to_string())
+        .collect()
+}
+
 const BANNER_ART: &str = r#"
     _          _
    / \   _ __ (_)_ __ ___   __ _
@@ -81,7 +88,7 @@ const BANNER_ART: &str = r#"
 
 fn print_banner() {
     println!("{}", BANNER_ART);
-    println!("Interactive REPL v{} - Type 'help' for commands\n", env!("CARGO_PKG_VERSION"));
+    println!("Interactive REPL v{} - Type '/help' for commands\n", env!("CARGO_PKG_VERSION"));
 }
 
 /// REPL helper for tab completion
@@ -112,44 +119,62 @@ impl Completer for ReplHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let mut completions = Vec::new();
 
-        // Commands that can be completed
-        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "agent clear", "load", "start", "stop", "memory", "set llm", "help", "exit", "quit"];
-
         // Find the word being typed
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
         let partial = &line[word_start..pos];
 
-        // Complete commands
-        for cmd in &commands {
-            if cmd.starts_with(partial) {
-                completions.push(Pair {
-                    display: cmd.to_string(),
-                    replacement: cmd.to_string(),
-                });
-            }
-        }
+        // Slash commands (only complete at start of line or after /)
+        if line.starts_with('/') {
+            let cmd_partial = &line[1..pos]; // Skip the leading /
+            let slash_commands = [
+                "/load", "/start", "/stop", "/status", "/list", "/history", "/clear",
+                "/set llm", "/agent create", "/agent list", "/help", "/quit", "/exit"
+            ];
 
-        // Complete agent names for commands that use them
-        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.starts_with("agent clear ") || line.starts_with("load ") || line.starts_with("start ") || line.starts_with("stop ") || line.contains(": ") {
-            for name in &self.agent_names {
-                if name.starts_with(partial) {
+            for cmd in &slash_commands {
+                let without_slash = &cmd[1..]; // Compare without leading /
+                if without_slash.starts_with(cmd_partial) {
                     completions.push(Pair {
-                        display: name.clone(),
-                        replacement: name.clone(),
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
                     });
                 }
             }
-        }
 
-        // For "<agent>:" syntax
-        if !partial.is_empty() && !partial.contains(':') {
-            for name in &self.agent_names {
-                let with_colon = format!("{}: ", name);
-                if with_colon.starts_with(partial) {
+            // Complete agent names after commands that use them
+            if line.starts_with("/load ") || line.starts_with("/start ") ||
+               line.starts_with("/stop ") || line.starts_with("/clear ") ||
+               line.starts_with("/memory ") {
+                for name in &self.agent_names {
+                    if name.starts_with(partial) {
+                        completions.push(Pair {
+                            display: name.clone(),
+                            replacement: name.clone(),
+                        });
+                    }
+                }
+            }
+        } else {
+            // @mentions for conversation
+            if partial.starts_with('@') {
+                let mention_partial = &partial[1..]; // Skip @
+
+                // Add @all option
+                if "all".starts_with(mention_partial) {
                     completions.push(Pair {
-                        display: with_colon.clone(),
-                        replacement: with_colon,
+                        display: "@all".to_string(),
+                        replacement: "@all".to_string(),
                     });
+                }
+
+                // Complete agent names
+                for name in &self.agent_names {
+                    if name.starts_with(mention_partial) {
+                        completions.push(Pair {
+                            display: format!("@{}", name),
+                            replacement: format!("@{}", name),
+                        });
+                    }
                 }
             }
         }
@@ -287,12 +312,11 @@ impl Repl {
 
                     rl.add_history_entry(line)?;
 
-                    if line == "exit" || line == "quit" {
+                    if self.handle_input(line).await {
+                        // handle_input returns true if we should exit
                         println!("\x1b[33mGoodbye!\x1b[0m");
                         break;
                     }
-
-                    self.handle_command(line).await;
                 }
                 Err(ReadlineError::Interrupted) => {
                     println!("\x1b[33m^C (use 'exit' or 'quit' to leave)\x1b[0m");
@@ -317,34 +341,69 @@ impl Repl {
         Ok(())
     }
 
-    async fn handle_command(&mut self, input: &str) {
-        debug::log(&format!("CMD: {}", input));
-        
+    /// Handle input line. Returns true if we should exit the REPL.
+    async fn handle_input(&mut self, input: &str) -> bool {
+        debug::log(&format!("INPUT: {}", input));
+
+        // Check for slash command prefix first
+        if input.starts_with('/') {
+            return self.handle_command(&input[1..]).await;
+        }
+
+        // Otherwise, treat as conversation with @mentions
+        self.handle_conversation(input).await;
+        false
+    }
+
+    /// Handle a slash command (input without the leading '/')
+    /// Returns true if we should exit the REPL.
+    async fn handle_command(&mut self, input: &str) -> bool {
+        debug::log(&format!("CMD: /{}", input));
+
         // Parse command
         if input.starts_with("agent create ") {
             self.cmd_agent_create(&input[13..]).await;
-        } else if input.starts_with("load ") {
-            self.cmd_agent_load(&input[5..]).await;
+        } else if input == "load" || input.starts_with("load ") {
+            let name = if input == "load" { "" } else { &input[5..] };
+            self.cmd_agent_load(name).await;
         } else if input.starts_with("agent load ") {
             self.cmd_agent_load(&input[11..]).await;
-        } else if input == "agent list" {
+        } else if input == "agent list" || input == "list" {
             self.cmd_agent_list().await;
         } else if input == "agent list-saved" {
             self.cmd_agent_list_saved();
         } else if input.starts_with("agent remove ") {
             self.cmd_agent_remove(&input[13..]).await;
-        } else if input.starts_with("start ") {
-            self.cmd_agent_start(&input[6..]).await;
+        } else if input == "start" || input.starts_with("start ") {
+            let args = if input == "start" { "" } else { &input[6..] };
+            self.cmd_agent_start(args).await;
         } else if input.starts_with("agent start ") {
             self.cmd_agent_start(&input[12..]).await;
-        } else if input.starts_with("stop ") {
-            self.cmd_agent_stop(&input[5..]);
+        } else if input == "stop" || input.starts_with("stop ") {
+            let name = if input == "stop" { "" } else { &input[5..] };
+            if name.is_empty() {
+                println!("\x1b[31mUsage: /stop <name>\x1b[0m");
+            } else {
+                self.cmd_agent_stop(name);
+            }
         } else if input.starts_with("agent stop ") {
             self.cmd_agent_stop(&input[11..]);
-        } else if input == "agent status" {
+        } else if input == "status" || input == "agent status" {
             self.cmd_agent_status();
         } else if input.starts_with("agent clear ") {
             self.cmd_history_clear(&input[12..]).await;
+        } else if input.starts_with("clear ") {
+            self.cmd_history_clear(&input[6..]).await;
+        } else if input == "clear" {
+            // Clear with no args - if single agent, clear it
+            if self.agents.len() == 1 {
+                let name = self.agents.keys().next().unwrap().clone();
+                self.cmd_history_clear(&name).await;
+            } else {
+                println!("\x1b[31mUsage: /clear <name>\x1b[0m");
+            }
+        } else if input == "history" {
+            self.cmd_history().await;
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
         } else if input.starts_with("history clear ") {
@@ -353,19 +412,146 @@ impl Repl {
             self.cmd_set_llm(&input[8..]);
         } else if input == "help" {
             self.cmd_help();
-        } else if let Some(pos) = input.find(": ") {
-            // <agent>: <task> syntax
-            let agent_name = &input[..pos];
-            let task = &input[pos + 2..];
-
-            // Check for "ask" syntax: <agent>: ask <other> "<question>"
-            if task.starts_with("ask ") {
-                self.cmd_ask(agent_name, &task[4..]).await;
-            } else {
-                self.cmd_task(agent_name, task).await;
-            }
+        } else if input == "quit" || input == "exit" {
+            return true;
         } else {
-            println!("\x1b[31mUnknown command. Type 'help' for available commands.\x1b[0m");
+            println!("\x1b[31mUnknown command. Type '/help' for available commands.\x1b[0m");
+        }
+        false
+    }
+
+    /// Handle conversation input (non-command) with @mentions
+    async fn handle_conversation(&mut self, input: &str) {
+        let mentions = parse_mentions(input);
+
+        // Determine which agents to send to
+        let target_agents: Vec<String> = if mentions.iter().any(|m| m == "all") {
+            // @all means all running/started agents
+            if self.running_agents.is_empty() {
+                // Fall back to all loaded agents if none are running
+                self.agents.keys().cloned().collect()
+            } else {
+                self.running_agents.keys().cloned().collect()
+            }
+        } else if !mentions.is_empty() {
+            // Filter to only valid agent names
+            mentions.iter()
+                .filter(|m| self.agents.contains_key(*m))
+                .cloned()
+                .collect()
+        } else {
+            // No mentions - use single agent if exactly one is loaded/running
+            if self.agents.len() == 1 {
+                self.agents.keys().cloned().collect()
+            } else if self.agents.is_empty() {
+                println!("\x1b[31mNo agents loaded. Use /load <name> to load an agent.\x1b[0m");
+                return;
+            } else {
+                println!("\x1b[31mMultiple agents loaded. Use @name to specify recipient.\x1b[0m");
+                println!("\x1b[33mLoaded agents: {}\x1b[0m", self.agents.keys().cloned().collect::<Vec<_>>().join(", "));
+                return;
+            }
+        };
+
+        // Check if any mentioned agents don't exist
+        for mention in &mentions {
+            if mention != "all" && !self.agents.contains_key(mention) {
+                println!("\x1b[31mAgent '{}' not found\x1b[0m", mention);
+            }
+        }
+
+        if target_agents.is_empty() {
+            println!("\x1b[31mNo valid agents to send to\x1b[0m");
+            return;
+        }
+
+        // Send the message to each target agent
+        for agent_name in target_agents {
+            self.send_conversation_message(&agent_name, input).await;
+        }
+    }
+
+    /// Send a conversation message to a single agent and display the response
+    async fn send_conversation_message(&mut self, agent_name: &str, message: &str) {
+        // Get agent info (immutable borrow for validation)
+        let (agent_arc, system_prompt, always_prompt) = {
+            let entry = match self.agents.get(agent_name) {
+                Some(a) => a,
+                None => {
+                    println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
+                    return;
+                }
+            };
+
+            // Check if agent has an LLM
+            if entry.llm_name == "none" {
+                println!("\x1b[31mAgent '{}' has no LLM configured\x1b[0m", agent_name);
+                return;
+            }
+
+            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone())
+        };
+
+        // Format the message with [user] prefix for the agent
+        let formatted_message = format!("[user] {}", message);
+
+        println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+
+        // Use streaming for real-time output
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+
+        debug::log(&format!("CONV: {} -> {}", agent_name, message));
+
+        // Log current history state
+        {
+            let agent = agent_arc.lock().await;
+            debug_log_history(agent_name, agent.history());
+        }
+
+        let options = ThinkOptions {
+            stream: true,
+            system_prompt,
+            always_prompt,
+            ..Default::default()
+        };
+
+        // Spawn task to print tokens and collect the response
+        let agent_name_clone = agent_name.to_string();
+        let print_task = tokio::spawn(async move {
+            let mut full_response = String::new();
+            let mut first_token = true;
+            while let Some(token) = rx.recv().await {
+                if first_token {
+                    // Print agent name prefix before first token
+                    print!("\x1b[33m[{}]\x1b[0m ", agent_name_clone);
+                    first_token = false;
+                }
+                print!("{}", token);
+                let _ = io::stdout().flush();
+                full_response.push_str(&token);
+            }
+            println!(); // Final newline
+            full_response
+        });
+
+        // Run the thinking (agent manages history internally)
+        let mut agent = agent_arc.lock().await;
+        match agent.think_streaming_with_options(&formatted_message, options, tx).await {
+            Ok(_) => {
+                // Wait for print task and get the full response for logging
+                if let Ok(response) = print_task.await {
+                    let stripped = strip_thinking(&response);
+                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(),
+                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                    debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
+                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+
+                    debug::log(&format!("HISTORY updated: {} messages", agent.history_len()));
+                }
+            }
+            Err(e) => {
+                println!("\x1b[31mError: {}\x1b[0m", e);
+            }
         }
     }
 
@@ -840,84 +1026,6 @@ impl Repl {
         }
     }
 
-    async fn cmd_task(&mut self, agent_name: &str, task: &str) {
-        let agent_name = agent_name.trim();
-        let task = task.trim();
-
-        // Get agent info (immutable borrow for validation)
-        let (agent_arc, system_prompt, always_prompt) = {
-            let entry = match self.agents.get(agent_name) {
-                Some(a) => a,
-                None => {
-                    println!("\x1b[31mAgent '{}' not found. Create it with 'agent create {}'\x1b[0m", agent_name, agent_name);
-                    return;
-                }
-            };
-
-            // Check if agent has an LLM
-            if entry.llm_name == "none" {
-                println!("\x1b[31mAgent '{}' has no LLM configured. Recreate with --llm flag.\x1b[0m", agent_name);
-                return;
-            }
-
-            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone())
-        };
-
-        println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
-
-        // Use streaming for real-time output
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-
-        debug::log(&format!("TASK: {} -> {}", agent_name, task));
-
-        // Log current history state (agent manages its own history now)
-        {
-            let agent = agent_arc.lock().await;
-            debug_log_history(agent_name, agent.history());
-        }
-
-        let options = ThinkOptions {
-            stream: true,
-            system_prompt,
-            always_prompt,
-            // conversation_history is now managed internally by the agent
-            ..Default::default()
-        };
-
-        // Spawn task to print tokens and collect the response
-        let print_task = tokio::spawn(async move {
-            let mut full_response = String::new();
-            while let Some(token) = rx.recv().await {
-                print!("{}", token);
-                let _ = io::stdout().flush();
-                full_response.push_str(&token);
-            }
-            println!(); // Final newline
-            full_response
-        });
-
-        // Run the thinking (agent manages history internally)
-        let mut agent = agent_arc.lock().await;
-        match agent.think_streaming_with_options(task, options, tx).await {
-            Ok(_) => {
-                // Wait for print task and get the full response for logging
-                if let Ok(response) = print_task.await {
-                    let stripped = strip_thinking(&response);
-                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(),
-                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
-                    debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
-                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-
-                    // History is now managed internally by the agent
-                    debug::log(&format!("HISTORY updated: {} messages", agent.history_len()));
-                }
-            }
-            Err(e) => {
-                println!("\x1b[31mError: {}\x1b[0m", e);
-            }
-        }
-    }
-
     async fn cmd_memory(&mut self, agent_name: &str) {
         let agent_name = agent_name.trim();
 
@@ -973,43 +1081,32 @@ impl Repl {
         }
     }
 
-    async fn cmd_ask(&mut self, from_agent: &str, args: &str) {
-        let from_agent = from_agent.trim();
-
-        // Parse: <other_agent> "<question>"
-        // Find the target agent and question
-        let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        if parts.len() < 2 {
-            println!("\x1b[31mUsage: <agent>: ask <other_agent> \"<question>\"\x1b[0m");
+    async fn cmd_history(&self) {
+        if self.agents.is_empty() {
+            println!("\x1b[33mNo agents loaded.\x1b[0m");
             return;
         }
 
-        let to_agent = parts[0].trim();
-        let question = parts[1].trim().trim_matches('"');
-
-        // Check both agents exist
-        if !self.agents.contains_key(from_agent) {
-            println!("\x1b[31mAgent '{}' not found\x1b[0m", from_agent);
-            return;
-        }
-        if !self.agents.contains_key(to_agent) {
-            println!("\x1b[31mAgent '{}' not found\x1b[0m", to_agent);
-            return;
-        }
-
-        println!("\x1b[33m[{}]\x1b[0m {}: {}", from_agent, to_agent, question);
-
-        // Send message from one agent to another
-        let from_entry = self.agents.get(from_agent).unwrap();
-        let agent = from_entry.agent.lock().await;
-        match agent.send_message(to_agent, question).await {
-            Ok(_) => {
-                println!("\x1b[32m✓ Message sent to {}\x1b[0m", to_agent);
-                println!("\x1b[33m(Send a task to '{}' and they'll see the message)\x1b[0m", to_agent);
+        for (name, entry) in &self.agents {
+            let agent = entry.agent.lock().await;
+            let history = agent.history();
+            println!("\x1b[1m{}\x1b[0m ({} messages):", name, history.len());
+            for msg in history {
+                let role_color = match msg.role.as_str() {
+                    "user" => "\x1b[36m",      // cyan
+                    "assistant" => "\x1b[33m", // yellow
+                    "system" => "\x1b[35m",    // magenta
+                    _ => "\x1b[0m",
+                };
+                let content = msg.content.as_deref().unwrap_or("<none>");
+                let preview = if content.len() > 100 {
+                    format!("{}...", &content[..100])
+                } else {
+                    content.to_string()
+                };
+                println!("  {}[{}]\x1b[0m {}", role_color, msg.role, preview);
             }
-            Err(e) => {
-                println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
-            }
+            println!();
         }
     }
 
@@ -1158,8 +1255,8 @@ impl Repl {
                             // Display received message: [recipient] from sender: message
                             println!("\n\x1b[33m[{}]\x1b[0m from {}: {}", agent_name, msg.from, msg.content);
 
-                            // Process the message by thinking about it
-                            let task = format!("Message from {}: \"{}\"\n\nRespond to {} using send_message. Your response here should be empty or minimal after sending.", msg.from, msg.content, msg.from);
+                            // Process the message using new [sender] format
+                            let task = format!("[{}] {}", msg.from, msg.content);
 
                             debug::log(&format!("MSG TASK: {} processing message", agent_name));
                             debug_log_history(&agent_name, agent_guard.history());
@@ -1274,58 +1371,49 @@ impl Repl {
     }
 
     fn cmd_help(&self) {
-        println!("\x1b[1mAnima REPL Commands:\x1b[0m");
+        println!("\x1b[1mAnima REPL - Slash Commands:\x1b[0m");
         println!();
-        println!("  \x1b[36magent create <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]\x1b[0m");
-        println!("      Create a new agent with optional personality configuration");
-        println!("      --persona: load system prompt from file");
-        println!("      --system: inline system prompt (rest of line)");
-        println!();
-        println!("  \x1b[36mload <name>\x1b[0m / \x1b[36magent load <name>\x1b[0m");
+        println!("  \x1b[36m/load <name>\x1b[0m");
         println!("      Load an agent from ~/.anima/agents/<name>/");
         println!();
-        println!("  \x1b[36magent list\x1b[0m");
-        println!("      List active agents in this session");
+        println!("  \x1b[36m/start <name>\x1b[0m [--every <duration>] [--on-timer <message>]");
+        println!("      Start an agent in background loop (processes inbox)");
+        println!("      --every: timer interval (e.g., 30s, 5m, 1h)");
+        println!("      --on-timer: message when timer fires");
         println!();
-        println!("  \x1b[36magent list-saved\x1b[0m");
-        println!("      List agents with persistent memory (can be recreated)");
-        println!();
-        println!("  \x1b[36magent remove <name>\x1b[0m");
-        println!("      Remove an agent from session (memory persists)");
-        println!();
-        println!("  \x1b[36mstart <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
-        println!("      Start an agent in background loop (processes inbox automatically)");
-        println!("      --every: timer interval (e.g., 30s, 5m, 1h) for periodic wake-ups");
-        println!("      --on-timer: message to think with when timer fires (default: 'Timer trigger')");
-        println!();
-        println!("  \x1b[36mstop <name>\x1b[0m");
+        println!("  \x1b[36m/stop <name>\x1b[0m");
         println!("      Stop a running background agent");
         println!();
-        println!("  \x1b[36magent status\x1b[0m");
-        println!("      Show all agents with running/stopped status");
+        println!("  \x1b[36m/status\x1b[0m");
+        println!("      Show running/stopped status for all agents");
         println!();
-        println!("  \x1b[36m<agent>: <task>\x1b[0m");
-        println!("      Send a task to an agent (streams output)");
+        println!("  \x1b[36m/list\x1b[0m");
+        println!("      List active agents in this session");
         println!();
-        println!("  \x1b[36mmemory <agent>\x1b[0m");
-        println!("      Show an agent's memory");
+        println!("  \x1b[36m/history\x1b[0m");
+        println!("      Show conversation history for all agents");
         println!();
-        println!("  \x1b[36magent clear <name>\x1b[0m / \x1b[36mhistory clear <name>\x1b[0m");
-        println!("      Clear an agent's conversation history");
+        println!("  \x1b[36m/clear [name]\x1b[0m");
+        println!("      Clear conversation history (name optional if single agent)");
         println!();
-        println!("  \x1b[36m<agent>: ask <other> \"<question>\"\x1b[0m");
-        println!("      Send a message from one agent to another");
-        println!();
-        println!("  \x1b[36mset llm <provider/model>\x1b[0m");
+        println!("  \x1b[36m/set llm <provider/model>\x1b[0m");
         println!("      Set default LLM for new agents");
         println!("      Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3");
-        println!("      Ollama: set OLLAMA_HOST env var (default: http://localhost:11434)");
         println!();
-        println!("  \x1b[36mhelp\x1b[0m");
+        println!("  \x1b[36m/agent create <name>\x1b[0m [--llm <provider/model>] [--persona <file>]");
+        println!("      Create a new agent with optional configuration");
+        println!();
+        println!("  \x1b[36m/help\x1b[0m");
         println!("      Show this help message");
         println!();
-        println!("  \x1b[36mexit\x1b[0m / \x1b[36mquit\x1b[0m");
+        println!("  \x1b[36m/quit\x1b[0m, \x1b[36m/exit\x1b[0m");
         println!("      Exit the REPL");
+        println!();
+        println!("\x1b[1mConversation (no slash):\x1b[0m");
+        println!();
+        println!("  \x1b[36m@name message\x1b[0m      Send message to specific agent");
+        println!("  \x1b[36m@all message\x1b[0m       Send to all running agents");
+        println!("  \x1b[36mmessage\x1b[0m            Send to single loaded agent (if only one)");
         println!();
         println!("\x1b[33mNote: Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or OLLAMA_HOST environment variables.\x1b[0m");
     }
@@ -1492,5 +1580,99 @@ mod tests {
         repl.cmd_agent_load("test-agent").await;
         // Should still have just the one agent
         assert_eq!(repl.agents.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_mentions_single() {
+        let mentions = parse_mentions("hello @arya how are you?");
+        assert_eq!(mentions, vec!["arya"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_multiple() {
+        let mentions = parse_mentions("@arya and @gendry let's chat");
+        assert_eq!(mentions, vec!["arya", "gendry"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_all() {
+        let mentions = parse_mentions("@all hello everyone");
+        assert_eq!(mentions, vec!["all"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_none() {
+        let mentions = parse_mentions("hello world");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mentions_with_hyphen_underscore() {
+        let mentions = parse_mentions("@my-agent and @another_agent");
+        assert_eq!(mentions, vec!["my-agent", "another_agent"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_must_start_with_letter() {
+        // @123 should not be matched
+        let mentions = parse_mentions("@123 is not valid");
+        assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_mentions_at_start() {
+        let mentions = parse_mentions("@arya hello");
+        assert_eq!(mentions, vec!["arya"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_at_end() {
+        let mentions = parse_mentions("hello @arya");
+        assert_eq!(mentions, vec!["arya"]);
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_quit() {
+        let mut repl = Repl::new();
+        // /quit should return true (exit)
+        assert!(repl.handle_command("quit").await);
+        assert!(repl.handle_command("exit").await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_help() {
+        let mut repl = Repl::new();
+        // /help should not exit
+        assert!(!repl.handle_command("help").await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_command_status() {
+        let mut repl = Repl::new();
+        // /status should not exit
+        assert!(!repl.handle_command("status").await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_input_slash_command() {
+        let mut repl = Repl::new();
+        // /help is a command, should not exit
+        assert!(!repl.handle_input("/help").await);
+        // /quit should exit
+        assert!(repl.handle_input("/quit").await);
+    }
+
+    #[tokio::test]
+    async fn test_handle_conversation_no_agents() {
+        let mut repl = Repl::new();
+        // No agents loaded, should print error but not panic
+        repl.handle_conversation("hello").await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_conversation_unknown_mention() {
+        let mut repl = Repl::new();
+        // Mention unknown agent, should print error but not panic
+        repl.handle_conversation("@unknown hello").await;
     }
 }

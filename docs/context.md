@@ -4,10 +4,35 @@
 
 | | |
 |---|---|
-| **Version** | v2.5+ |
-| **Tests** | 238+ passing |
+| **Version** | v2.6-dev |
+| **Tests** | 274 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
+
+## Recent Changes (2026-02-01)
+
+### Agent-Internal History
+- Agent now manages its own conversation history internally
+- Proper message structure preserved: user → assistant(tool_calls) → tool → assistant
+- REPL/daemon no longer manage history externally
+- Fixes echo loops in multi-agent conversations
+
+### always.md Feature
+- Persistent reminders injected before each user message (recency bias)
+- Agent-specific: `~/.anima/agents/<name>/always.md`
+- Global fallback: `~/.anima/agents/always.md`
+- Agent-specific overrides global completely
+
+### ThinkResult Struct
+- `think_with_options()` returns `ThinkResult` with:
+  - `response: String` — final text
+  - `tools_used: bool` — whether tools were called
+  - `tool_names: Vec<String>` — which tools
+
+### REPL Changes (in progress)
+- Slash commands: `/load`, `/start`, `/help`, etc.
+- @mentions for conversation: `hello @arya`, `@all thoughts?`
+- Cleaner message format: `[sender] content`
 
 ## CLI Commands
 
@@ -32,17 +57,22 @@ anima run <name>            # REPL with agent loaded
 anima                       # REPL (no agent)
 ```
 
-## REPL Commands
+## REPL Commands (slash-prefix)
 
 ```bash
-agent create <name>         # Create ephemeral in-memory agent
-load <name>                 # Load from ~/.anima/agents/<name>/
-start <name>                # Start background agent
-stop <name>                 # Stop background agent
-agent clear <name>          # Clear conversation history
-agent list                  # List agents in session
-agent status                # Show running status
-<name>: <message>           # Send message to agent
+/load <name>                # Load from ~/.anima/agents/<name>/
+/start <name>               # Start background agent
+/stop <name>                # Stop background agent
+/status                     # Show running status
+/clear [name]               # Clear conversation history
+/help                       # Show commands
+/quit, /exit                # Exit REPL
+
+# Conversation (no slash)
+hello @arya                 # Send to arya
+@gendry what's up?          # Send to gendry
+@arya @gendry thoughts?     # Send to both
+@all anyone?                # Send to all running agents
 ```
 
 ## Agent Directory
@@ -50,10 +80,14 @@ agent status                # Show running status
 ```
 ~/.anima/agents/arya/
 ├── config.toml       # LLM config
-├── persona.md        # System prompt
+├── persona.md        # System prompt (identity)
+├── always.md         # Persistent reminders (recency bias)
 ├── memory.db         # SQLite memory
 ├── daemon.pid        # PID (when running)
 └── agent.sock        # Socket (when running)
+
+~/.anima/agents/
+└── always.md         # Global always.md fallback
 ```
 
 ## Example config.toml
@@ -62,6 +96,7 @@ agent status                # Show running status
 [agent]
 name = "arya"
 persona_file = "persona.md"
+always_file = "always.md"
 
 [llm]
 provider = "ollama"
@@ -80,9 +115,38 @@ path = "memory.db"
 | `src/repl.rs` | Interactive REPL |
 | `src/daemon.rs` | Daemon mode |
 | `src/socket_api.rs` | Unix socket protocol |
-| `src/agent_dir.rs` | Directory loading |
-| `src/agent.rs` | Core agent logic |
+| `src/agent_dir.rs` | Directory loading, always.md |
+| `src/agent.rs` | Core agent logic, internal history |
 | `src/llm.rs` | LLM providers |
+
+## Architecture Notes
+
+### Multi-Party Conversations
+- "user" role = external input (with speaker tag)
+- "assistant" role = this agent's responses
+- Format: `[speaker] content`
+- @mentions route messages: `@arya`, `@all`
+- Agents invoked only when mentioned (efficient)
+
+### Message Flow (Agent-to-Agent)
+```
+[chris] @arya ask gendry about rust
+→ arya invoked, sees [chris] message
+→ arya calls send_message tool
+→ gendry receives, sees [arya] message
+→ gendry responds via send_message
+→ arya sees [gendry] response
+```
+
+### History Structure
+```
+user: "[chris] hello"
+assistant: "" (tool_calls: [send_message])
+tool: {"sent": true}
+assistant: "message sent"
+user: "[gendry] hey there!"
+assistant: "gendry says hi"
+```
 
 ## Build & Test
 
@@ -96,4 +160,4 @@ anima stop arya && anima start arya
 
 ## Last Updated
 
-2026-01-31 — v2.5 complete + start/stop/clear/ask commands.
+2026-02-01 — Agent-internal history, always.md, slash commands, @mentions.
