@@ -4,24 +4,29 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Current version:** v2.4 (Timer Triggers)  
-**Tests:** 190 passing  
-**Next milestone:** v2.5 (Channel Integrations — Telegram)
+**Current version:** v2.6 (Daemon Architecture + @mention Forwarding)  
+**Tests:** 288 passing  
+**Next milestone:** v2.7 (Channel Integrations — Telegram, Discord)
+
+## Quick Context
+
+**Read `docs/context.md` first** — it has the full architecture and command reference.
 
 ## Project Structure
 
 ```
 src/
 ├── lib.rs              # Module exports
-├── main.rs             # REPL entry point
+├── main.rs             # CLI entry point
+├── repl.rs             # REPL (thin client, socket connections)
+├── daemon.rs           # Daemon mode, socket server
+├── discovery.rs        # Find running daemons via pid files
+├── socket_api.rs       # Unix socket protocol
+├── agent_dir.rs        # Directory loading, always.md, create_agent()
+├── agent.rs            # Core agent logic, internal history
 ├── error.rs            # Error types
 ├── tool.rs             # Tool trait
-├── agent.rs            # Agent struct, inbox, conversation history
-├── runtime.rs          # Runtime manages agents, message routing
-├── config.rs           # AgentConfig, persona, timer settings
-├── repl/
-│   ├── mod.rs          # REPL main loop
-│   └── commands.rs     # Command handlers
+├── config.rs           # AgentConfig, persona settings
 ├── llm/
 │   ├── mod.rs          # LLM provider trait
 │   ├── openai.rs       # OpenAI client
@@ -35,50 +40,56 @@ src/
     ├── mod.rs
     ├── file.rs         # File read/write
     ├── http.rs         # HTTP requests
-    └── shell.rs        # Shell execution
+    ├── shell.rs        # Shell execution
+    └── send_message.rs # Inter-daemon messaging
 ```
 
-## Key Concepts
+## Architecture (v2.6)
 
-- **Agent**: Actor with tools, memory, LLM, inbox, persona, conversation history
-- **Runtime**: Manages agents, routes messages between them
-- **Tool**: Capability an agent can use (file, HTTP, shell, etc.)
-- **Memory**: Persistent storage (SQLite) for agent state
-- **REPL**: Interactive shell for creating/managing agents
+**REPL-as-Frontend:** Agents always run as daemons. REPL is a thin client.
+
+```
+~/.anima/agents/arya/     # Agent directory
+├── config.toml           # LLM config
+├── persona.md            # System prompt
+├── always.md             # Persistent reminders
+├── daemon.pid            # PID (when running)
+└── agent.sock            # Unix socket (when running)
+```
 
 ## Build Commands
 
 ```bash
 cargo check           # Type check
-cargo build           # Build
-cargo run             # Run REPL
-cargo test            # Run tests (190 tests)
-cargo run -- run config.toml "task"  # Run with config
+cargo build --release # Build
+cargo test            # Run tests (288 tests)
+anima                 # Run REPL
+anima start arya      # Start agent daemon
+anima restart arya    # Restart agent daemon
 ```
 
-## Current Features (v2.4)
+## Current Features (v2.6)
 
-- Interactive REPL with history, tab completion
-- Long-running agents (background loops)
-- Agent-to-agent messaging
-- Persona configuration (system prompts)
-- Conversation history (multi-turn context)
-- Timer triggers (periodic agent heartbeat)
-- Persistent SQLite memory
-- Multiple LLM providers (OpenAI, Anthropic, Ollama)
+- **Daemon architecture** — agents run as background processes
+- **REPL thin client** — connects to daemons via Unix sockets
+- **@mention forwarding** — agent responses with @mentions auto-forward
+- **CLI/REPL parity** — same commands in both (create, start, stop, restart)
+- **Persistent reminders** — always.md injected before each message
+- **Multi-agent conversations** — @mentions route between agents
+- **Depth-limited forwarding** — prevents runaway loops (max 15 hops)
+- **Multiple LLM providers** — OpenAI, Anthropic, Ollama
 
-## Design Principles
+## Key Design Decisions
 
-1. **Agents are actors** — isolated, communicate via messages
-2. **Tools are first-class** — inspectable, composable, mockable
-3. **Memory is identity** — persistence across sessions
-4. **Runtime is boring** — reliable, predictable infrastructure
+1. **Agents are daemons** — persistent processes, not ephemeral
+2. **REPL is thin** — just a socket client, no agent logic
+3. **@mentions are routing** — agents talk to each other via @mentions
+4. **always.md exploits recency bias** — keeps instructions salient
+5. **Never forward to sender** — prevents echo loops
 
 ## Documentation
 
-- **`docs/context.md`** — **Start here** — regain context quickly
-- `README.md` — Project overview and quick start
-- `ARYA.md` — Current task progress (v2.5 planning)
+- **`docs/context.md`** — **Start here** — full context and commands
+- `ARYA.md` — Current task progress (if exists)
 - `docs/VISION.md` — Roadmap and philosophy
 - `docs/DESIGN.md` — Architecture deep-dive
-- `docs/NOTES.md` — Arya's learnings and ideas

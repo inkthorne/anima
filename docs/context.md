@@ -5,7 +5,7 @@
 | | |
 |---|---|
 | **Version** | v2.6 |
-| **Tests** | 293 passing |
+| **Tests** | 288 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -21,7 +21,7 @@ REPL (thin client, connects via sockets)
 
 **Daemon Discovery:** Agents found by scanning `~/.anima/agents/*/daemon.pid`
 
-**Inter-Agent Messaging:** Daemons communicate via sockets, not shared memory.
+**Inter-Agent Messaging:** Daemons communicate via sockets. @mentions in agent responses are auto-forwarded.
 
 ## CLI Commands
 
@@ -33,6 +33,7 @@ anima list                  # List all agents
 # Daemon control
 anima start <name>          # Start daemon in background
 anima stop <name>           # Stop daemon
+anima restart <name>        # Stop then start daemon
 anima status                # Show running daemons
 anima clear <name>          # Clear conversation history
 
@@ -49,9 +50,10 @@ anima                       # REPL (no agent)
 ## REPL Commands (slash-prefix)
 
 ```bash
-/load <name>                # Start daemon if needed, connect
-/start <name>               # Start daemon in background
+/start <name>               # Start daemon if needed, connect
 /stop <name>                # Stop daemon
+/restart <name>             # Stop, start, reconnect
+/create <name>              # Scaffold new agent directory
 /status                     # Show running daemons (connected/not)
 /list                       # List all agent directories
 /clear [name]               # Clear conversation history
@@ -107,7 +109,7 @@ path = "memory.db"
 | `src/daemon.rs` | Daemon mode, socket server |
 | `src/discovery.rs` | Find running daemons via pid files |
 | `src/socket_api.rs` | Unix socket protocol |
-| `src/agent_dir.rs` | Directory loading, always.md |
+| `src/agent_dir.rs` | Directory loading, always.md, create_agent() |
 | `src/agent.rs` | Core agent logic, internal history |
 | `src/tools/send_message.rs` | Inter-daemon messaging |
 | `src/llm.rs` | LLM providers |
@@ -126,9 +128,15 @@ path = "memory.db"
 
 ### Multi-Party Conversations
 - "user" role = external input with speaker tag
-- Format: `[sender] content`
+- Format: `sender: content` (e.g., `arya: @gendry hey!`)
 - @mentions route messages: `@arya`, `@gendry`, `@all`
 - Agents invoked only when mentioned
+
+### @mention Forwarding
+- When an agent responds with @mentions, REPL auto-forwards to those agents
+- Depth limit (15) prevents runaway loops
+- Never forwards back to sender (prevents echo loops)
+- Enables natural agent-to-agent conversations
 
 ### Daemon Discovery
 ```rust
@@ -159,9 +167,9 @@ cargo build --release
 cargo test
 
 # After changes, restart daemons:
-anima stop arya && anima start arya
+anima restart arya
 ```
 
 ## Last Updated
 
-2026-02-01 — v2.6: REPL-as-frontend, daemon discovery, slash commands, @mentions.
+2026-02-01 — v2.6: @mention forwarding, /restart, /create, CLI/REPL parity.
