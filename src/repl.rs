@@ -376,7 +376,7 @@ impl Repl {
 
         // Build persona
         let mut persona = AgentPersona::default();
-        
+
         // Load from file if specified
         if let Some(ref file) = persona_file {
             match self.load_persona_file(file) {
@@ -386,8 +386,22 @@ impl Repl {
                     return;
                 }
             }
+        } else if system_prompt.is_none() {
+            // No --persona or --system provided, try to load base persona from ~/.anima/agents/persona.md
+            if let Some(base_persona_path) = dirs::home_dir().map(|h| h.join(".anima").join("agents").join("persona.md")) {
+                if base_persona_path.exists() {
+                    match std::fs::read_to_string(&base_persona_path) {
+                        Ok(content) => {
+                            persona.system_prompt = Some(content);
+                        }
+                        Err(e) => {
+                            println!("\x1b[31mWarning: Failed to read base persona file: {}\x1b[0m", e);
+                        }
+                    }
+                }
+            }
         }
-        
+
         // Override with --system if provided
         if let Some(prompt) = system_prompt {
             persona.system_prompt = Some(prompt);
