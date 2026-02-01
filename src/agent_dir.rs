@@ -36,6 +36,13 @@ pub struct LlmSection {
     /// Enable thinking mode for Ollama models (default: None = false)
     #[serde(default)]
     pub thinking: Option<bool>,
+    /// Enable tool support (default: true). Set to false for models that don't support tools.
+    #[serde(default = "default_tools_enabled")]
+    pub tools: bool,
+}
+
+fn default_tools_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize)]

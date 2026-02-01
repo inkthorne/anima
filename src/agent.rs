@@ -523,7 +523,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools = self.list_tools_for_llm();
+        let tools_list = self.list_tools_for_llm();
+        // Send None instead of Some(empty_vec) for models that don't support tools
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -599,7 +601,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         let llm = llm_ref.clone();
                         let m = msgs.clone();
                         let t = tls.clone();
-                        async move { llm.chat_complete(m, Some(t)).await }
+                        async move { llm.chat_complete(m, t).await }
                     },
                     |e: &LLMError| e.is_retryable,
                 ).await;
@@ -620,7 +622,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
                 result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                llm.chat_complete(messages.clone(), tools.clone()).await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
 
@@ -783,7 +785,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools = self.list_tools_for_llm();
+        let tools_list = self.list_tools_for_llm();
+        // Send None instead of Some(empty_vec) for models that don't support tools
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -858,7 +862,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         let m = msgs.clone();
                         let t = tls.clone();
                         let tx_clone = tx.clone();
-                        async move { llm.chat_complete_stream(m, Some(t), tx_clone).await }
+                        async move { llm.chat_complete_stream(m, t, tx_clone).await }
                     },
                     |e: &LLMError| e.is_retryable,
                 ).await;
@@ -881,7 +885,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             } else {
                 llm.chat_complete_stream(
                     messages.clone(),
-                    Some(tools.clone()),
+                    tools.clone(),
                     token_tx.clone(),
                 ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
@@ -1044,7 +1048,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools = self.list_tools_for_llm();
+        let tools_list = self.list_tools_for_llm();
+        // Send None instead of Some(empty_vec) for models that don't support tools
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -1097,13 +1103,13 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         let llm = llm_ref.clone();
                         let m = msgs.clone();
                         let t = tls.clone();
-                        async move { llm.chat_complete(m, Some(t)).await }
+                        async move { llm.chat_complete(m, t).await }
                     },
                     |e: &LLMError| e.is_retryable,
                 ).await;
                 result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete(messages.clone(), Some(tools.clone())).await
+                llm.chat_complete(messages.clone(), tools.clone()).await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
 

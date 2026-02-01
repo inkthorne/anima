@@ -59,7 +59,14 @@ pub struct LlmSection {
     /// Enable thinking mode for Ollama models (default: None = false)
     #[serde(default)]
     pub thinking: Option<bool>,
+    /// Enable tool support (default: true). Set to false for models that don't support tools.
+    #[serde(default = "default_tools_enabled")]
+    pub tools: bool,
     // API key from env: OPENAI_API_KEY or ANTHROPIC_API_KEY
+}
+
+fn default_tools_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -193,6 +200,8 @@ model = "gpt-4o"
         assert_eq!(config.retry.max_delay_ms, 5000);
         // Observe defaults
         assert!(!config.observe.verbose);
+        // LLM tools default to enabled
+        assert!(config.llm.tools);
     }
 
     #[test]
@@ -248,5 +257,23 @@ verbose = true
         // Observe config
         assert!(config.observe.verbose);
         assert!((config.retry.exponential_base - 3.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_tools_disabled() {
+        let toml = r#"
+[agent]
+name = "no-tools-agent"
+
+[llm]
+provider = "ollama"
+model = "gemma3:27b"
+tools = false
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.agent.name, "no-tools-agent");
+        assert_eq!(config.llm.provider, "ollama");
+        assert_eq!(config.llm.model, "gemma3:27b");
+        assert!(!config.llm.tools);
     }
 }
