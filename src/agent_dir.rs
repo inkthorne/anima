@@ -323,15 +323,33 @@ You have access to tools for:
     std::fs::write(agent_path.join("persona.md"), persona_content)?;
 
     // Write always.md template
-    let always_content = r#"# Persistent Reminders
+    let always_content = r#"# Always
 
-These reminders are injected before every user message to stay salient in long conversations.
+## How Conversations Work
 
-## Key Rules
+When someone talks to you, **just respond naturally** — no @mention needed.
 
-- Be concise in your responses
-- Always confirm before making destructive changes
-- Use tools when they can help accomplish the task
+The conversation history shows who said what. The `from` field tells you the speaker.
+
+## Responding
+
+- **To the user:** Just respond. No @mention.
+- **To another agent:** Use @mention to reach them.
+
+## Other Agents
+
+You can reach other agents by @mentioning them.
+
+**Rule:** Use @name to talk TO someone. Use Name to talk ABOUT someone.
+
+Only @mentions actually reach the other agent.
+
+**Never @mention yourself.**
+
+## Response Style
+- Respond naturally with your actual answer
+- If you @mention someone, include your message to them
+- Dont repeat what others just said — add your own perspective
 "#;
     std::fs::write(agent_path.join("always.md"), always_content)?;
 
@@ -1102,7 +1120,9 @@ model = "gpt-4"
 
         // Check always.md content
         let always_content = fs::read_to_string(agent_path.join("always.md")).unwrap();
-        assert!(always_content.contains("Persistent Reminders"));
+        assert!(always_content.contains("# Always"));
+        assert!(always_content.contains("How Conversations Work"));
+        assert!(always_content.contains("Never @mention yourself"));
     }
 
     #[test]

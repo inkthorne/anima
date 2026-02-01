@@ -867,7 +867,9 @@ mod tests {
 
         // Check always.md content
         let always_content = std::fs::read_to_string(agent_path.join("always.md")).unwrap();
-        assert!(always_content.contains("Persistent Reminders"));
+        assert!(always_content.contains("# Always"));
+        assert!(always_content.contains("How Conversations Work"));
+        assert!(always_content.contains("Never @mention yourself"));
     }
 
     #[test]
