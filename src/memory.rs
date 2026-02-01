@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+fn now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
 #[derive(Debug, Clone)]
@@ -30,8 +30,8 @@ impl std::error::Error for MemoryError {}
 #[derive(Debug, Clone)]
 pub struct MemoryEntry {
     pub value: Value,
-    pub created_at: u64,
-    pub updated_at: u64,
+    pub created_at: i64,
+    pub updated_at: i64,
 }
 
 #[async_trait]
@@ -175,7 +175,7 @@ impl SqliteMemory {
                 let value_str: String = row.get(1)?;
                 let created_at: i64 = row.get(2)?;
                 let updated_at: i64 = row.get(3)?;
-                Ok((key, value_str, created_at as u64, updated_at as u64))
+                Ok((key, value_str, created_at, updated_at))
             }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
             
             let mut results = Vec::new();
@@ -200,7 +200,7 @@ impl Memory for SqliteMemory {
         
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let result: Result<(String, u64, u64), _> = conn.query_row(
+            let result: Result<(String, i64, i64), _> = conn.query_row(
                 "SELECT value, created_at, updated_at FROM memories WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id, key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -229,7 +229,7 @@ impl Memory for SqliteMemory {
             let conn = conn.lock().unwrap();
             
             // Check if exists to preserve created_at
-            let existing: Option<u64> = conn.query_row(
+            let existing: Option<i64> = conn.query_row(
                 "SELECT created_at FROM memories WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id, key],
                 |row| row.get(0)
@@ -542,7 +542,7 @@ mod tests {
 
         // Set some values
         mem.set("key1", json!("v1")).await.unwrap();
-        let time_after_first = now();
+        let time_after_first = now() as u64;
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         mem.set("key2", json!("v2")).await.unwrap();
