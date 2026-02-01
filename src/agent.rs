@@ -115,6 +115,21 @@ pub struct ReflectionResult {
     pub feedback: Option<String>,
 }
 
+/// Result from a think operation, including tool usage information.
+#[derive(Debug, Clone)]
+pub struct ThinkResult {
+    /// The final text response from the agent
+    pub response: String,
+    /// Whether any tools were called during this think operation
+    pub tools_used: bool,
+    /// Names of tools that were called (for logging/debugging)
+    pub tool_names: Vec<String>,
+}
+
+/// Maximum number of messages to retain in conversation history.
+/// When exceeded, oldest messages are removed.
+const MAX_HISTORY_LEN: usize = 50;
+
 pub struct Agent {
     pub id: String,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -128,6 +143,8 @@ pub struct Agent {
     message_rx: Option<mpsc::Receiver<AgentMessage>>,
     /// Router for sending messages to other agents
     router: Option<Arc<Mutex<MessageRouter>>>,
+    /// Conversation history for multi-turn interactions
+    history: Vec<ChatMessage>,
 }
 
 impl Agent {
@@ -142,6 +159,7 @@ impl Agent {
             observer: None,
             message_rx: None,
             router: None,
+            history: Vec::new(),
         }
     }
 
@@ -350,6 +368,29 @@ impl Agent {
         Ok(router_guard.list_agents())
     }
 
+    /// Get a reference to the current conversation history
+    pub fn history(&self) -> &[ChatMessage] {
+        &self.history
+    }
+
+    /// Clear conversation history
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+    }
+
+    /// Get the number of messages in history
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Trim history to stay within MAX_HISTORY_LEN.
+    /// Removes oldest messages when limit is exceeded.
+    fn trim_history(&mut self) {
+        while self.history.len() > MAX_HISTORY_LEN {
+            self.history.remove(0);
+        }
+    }
+
     pub async fn remember(&mut self, key: &str, value: serde_json::Value) -> Result<(), MemoryError> {
         match &mut self.memory {
             Some(mem) => mem.set(key, value).await,
@@ -435,7 +476,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
         Some(context)
     }
 
-    pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
+    pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<ThinkResult, crate::error::AgentError> {
         let agent_start = Instant::now();
 
         // Emit agent start event
@@ -465,7 +506,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
     }
 
     /// Inner implementation of think_with_options (without event wrapper).
-    async fn think_with_options_inner(&mut self, task: &str, options: ThinkOptions) -> Result<String, crate::error::AgentError> {
+    async fn think_with_options_inner(&mut self, task: &str, options: ThinkOptions) -> Result<ThinkResult, crate::error::AgentError> {
         // Drain any pending messages from inbox (must happen before borrowing llm)
         let pending_messages = self.drain_inbox();
         let effective_task = if pending_messages.is_empty() {
@@ -495,7 +536,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             (None, None) => None,
         };
 
-        // Build initial messages
+        // Build initial messages for LLM call
         let mut messages: Vec<ChatMessage> = Vec::new();
 
         // Optional system prompt (with memory context prepended)
@@ -508,9 +549,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
-        // Inject conversation history if present
-        if let Some(history) = &options.conversation_history {
-            messages.extend(history.clone());
+        // Inject internal conversation history
+        messages.extend(self.history.clone());
+
+        // Also inject any additional context from options (additive, not replacement)
+        if let Some(extra_history) = &options.conversation_history {
+            messages.extend(extra_history.clone());
         }
 
         // Inject always prompt as system message just before user message (recency bias)
@@ -523,13 +567,22 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
-        // User task
-        messages.push(ChatMessage {
+        // Create user message
+        let user_message = ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
-        });
+        };
+
+        // Add user message to internal history
+        self.history.push(user_message.clone());
+
+        // Add user message to LLM messages
+        messages.push(user_message);
+
+        // Track tool usage across the agentic loop
+        let mut tool_names_used: Vec<String> = Vec::new();
 
         // Agentic loop
         for _iteration in 0..options.max_iterations {
@@ -584,45 +637,80 @@ pub async fn forget(&mut self, key: &str) -> bool {
             if response.tool_calls.is_empty() {
                 let final_response = response.content.unwrap_or_else(|| "No response".to_string());
 
+                // Add final assistant response to internal history (strip thinking tags)
+                let stripped_response = strip_thinking(&final_response);
+                self.history.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(stripped_response),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+
+                // Trim history to stay within limit
+                self.trim_history();
+
                 // Apply reflection if configured
                 if let Some(ref config) = options.reflection {
-                    return self.reflect_and_revise(
+                    let reflected_response = self.reflect_and_revise(
                         task,
                         &final_response,
                         config,
                         &options,
-                    ).await;
+                    ).await?;
+                    return Ok(ThinkResult {
+                        response: reflected_response,
+                        tools_used: !tool_names_used.is_empty(),
+                        tool_names: tool_names_used,
+                    });
                 }
 
-                return Ok(final_response);
+                return Ok(ThinkResult {
+                    response: final_response,
+                    tools_used: !tool_names_used.is_empty(),
+                    tool_names: tool_names_used,
+                });
             }
 
-            // Add assistant message with tool calls (strip thinking tags for storage)
-            messages.push(ChatMessage {
+            // Create assistant message with tool calls (strip thinking tags for storage)
+            let assistant_message = ChatMessage {
                 role: "assistant".to_string(),
                 content: response.content.as_ref().map(|c| strip_thinking(c)),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
-            });
+            };
+
+            // Add to both internal history and LLM messages
+            self.history.push(assistant_message.clone());
+            messages.push(assistant_message);
 
             // Execute each tool and add results
             for tool_call in &response.tool_calls {
+                // Track tool name
+                tool_names_used.push(tool_call.name.clone());
+
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
-                messages.push(ChatMessage {
+                let tool_message = ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
                     tool_call_id: Some(tool_call.id.clone()),
                     tool_calls: None,
-                });
+                };
+
+                // Add to both internal history and LLM messages
+                self.history.push(tool_message.clone());
+                messages.push(tool_message);
             }
         }
+
+        // Trim history even on error path
+        self.trim_history();
 
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
 
-     pub async fn think(&mut self, task: &str) -> Result<String, crate::error::AgentError> {
+    pub async fn think(&mut self, task: &str) -> Result<ThinkResult, crate::error::AgentError> {
         self.think_with_options(task, ThinkOptions::default()).await
     }
 
@@ -708,7 +796,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             (None, None) => None,
         };
 
-        // Build initial messages
+        // Build initial messages for LLM call
         let mut messages: Vec<ChatMessage> = Vec::new();
 
         if let Some(system) = &effective_system_prompt {
@@ -720,9 +808,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
-        // Inject conversation history if present
-        if let Some(history) = &options.conversation_history {
-            messages.extend(history.clone());
+        // Inject internal conversation history
+        messages.extend(self.history.clone());
+
+        // Also inject any additional context from options (additive, not replacement)
+        if let Some(extra_history) = &options.conversation_history {
+            messages.extend(extra_history.clone());
         }
 
         // Inject always prompt as system message just before user message (recency bias)
@@ -735,12 +826,19 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
         }
 
-        messages.push(ChatMessage {
+        // Create user message
+        let user_message = ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
-        });
+        };
+
+        // Add user message to internal history
+        self.history.push(user_message.clone());
+
+        // Add user message to LLM messages
+        messages.push(user_message);
 
         // Agentic loop with streaming
         for _iteration in 0..options.max_iterations {
@@ -799,30 +897,55 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
-                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+                let final_response = response.content.unwrap_or_else(|| "No response".to_string());
+
+                // Add final assistant response to internal history (strip thinking tags)
+                let stripped_response = strip_thinking(&final_response);
+                self.history.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some(stripped_response),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+
+                // Trim history to stay within limit
+                self.trim_history();
+
+                return Ok(final_response);
             }
 
-            // Add assistant message with tool calls (strip thinking tags for storage)
-            messages.push(ChatMessage {
+            // Create assistant message with tool calls (strip thinking tags for storage)
+            let assistant_message = ChatMessage {
                 role: "assistant".to_string(),
                 content: response.content.as_ref().map(|c| strip_thinking(c)),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
-            });
+            };
+
+            // Add to both internal history and LLM messages
+            self.history.push(assistant_message.clone());
+            messages.push(assistant_message);
 
             // Execute each tool and add results
             for tool_call in &response.tool_calls {
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
-                messages.push(ChatMessage {
+                let tool_message = ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
                     tool_call_id: Some(tool_call.id.clone()),
                     tool_calls: None,
-                });
+                };
+
+                // Add to both internal history and LLM messages
+                self.history.push(tool_message.clone());
+                messages.push(tool_message);
             }
         }
+
+        // Trim history even on error path
+        self.trim_history();
 
         Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
     }
@@ -1036,6 +1159,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             observer: parent.observer.clone(),  // Inherit observer
             message_rx,
             router,
+            history: Vec::new(),  // Child starts with fresh history
         }
     }
 
@@ -1043,21 +1167,21 @@ pub async fn forget(&mut self, key: &str) -> bool {
     pub fn spawn_child(&mut self, config: ChildConfig) -> String {
         let child_id = format!("{}-child-{}", self.id, self.children.len());
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        
+
         // Create child agent with inherited tools/LLM
         let mut child = Self::create_child_agent(self, child_id.clone());
         let task = config.task.clone();
-        
+
         // Spawn the child task in background
         tokio::spawn(async move {
             let result = child.think(&task).await;
-            let _ = result_tx.send(result.map_err(|e| e.to_string()));
+            let _ = result_tx.send(result.map(|r| r.response).map_err(|e| e.to_string()));
         });
-        
+
         // Store handle for parent to wait on
         let handle = ChildHandle::new(child_id.clone(), config.task, result_rx);
         self.children.insert(child_id.clone(), handle);
-        
+
         child_id
     }
 

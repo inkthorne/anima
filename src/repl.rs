@@ -186,8 +186,6 @@ struct ReplAgent {
     agent: Arc<Mutex<Agent>>,
     llm_name: String,
     persona: AgentPersona,
-    /// Conversation history for multi-turn interactions (shared with background tasks)
-    history: Arc<Mutex<Vec<ChatMessage>>>,
 }
 
 /// Timer configuration for running agents
@@ -250,7 +248,6 @@ impl Repl {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: "configured".to_string(),
             persona: persona_config,
-            history: Arc::new(Mutex::new(Vec::new())),
         });
 
         Repl {
@@ -513,7 +510,6 @@ impl Repl {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
             persona: persona.clone(),
-            history: Arc::new(Mutex::new(Vec::new())),
         });
 
         let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
@@ -687,7 +683,6 @@ impl Repl {
             agent: Arc::new(Mutex::new(agent)),
             llm_name: llm_name.clone(),
             persona: persona.clone(),
-            history: Arc::new(Mutex::new(Vec::new())),
         });
 
         let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
@@ -783,11 +778,12 @@ impl Repl {
 
         println!("\x1b[1mAgents:\x1b[0m");
         for (name, entry) in &self.agents {
-            let history = entry.history.lock().await;
-            let history_info = if history.is_empty() {
+            let agent = entry.agent.lock().await;
+            let history_len = agent.history_len();
+            let history_info = if history_len == 0 {
                 String::new()
             } else {
-                format!(", {} msgs", history.len())
+                format!(", {} msgs", history_len)
             };
             println!("  \x1b[36m{}\x1b[0m (llm: {}{})", name, entry.llm_name, history_info);
         }
@@ -849,7 +845,7 @@ impl Repl {
         let task = task.trim();
 
         // Get agent info (immutable borrow for validation)
-        let (agent_arc, system_prompt, always_prompt, history_arc) = {
+        let (agent_arc, system_prompt, always_prompt) = {
             let entry = match self.agents.get(agent_name) {
                 Some(a) => a,
                 None => {
@@ -864,7 +860,7 @@ impl Repl {
                 return;
             }
 
-            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone(), entry.history.clone())
+            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone())
         };
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
@@ -872,17 +868,19 @@ impl Repl {
         // Use streaming for real-time output
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
 
-        // Get a snapshot of the history for the options
-        let history = history_arc.lock().await.clone();
-
         debug::log(&format!("TASK: {} -> {}", agent_name, task));
-        debug_log_history(agent_name, &history);
+
+        // Log current history state (agent manages its own history now)
+        {
+            let agent = agent_arc.lock().await;
+            debug_log_history(agent_name, agent.history());
+        }
 
         let options = ThinkOptions {
             stream: true,
             system_prompt,
             always_prompt,
-            conversation_history: if history.is_empty() { None } else { Some(history) },
+            // conversation_history is now managed internally by the agent
             ..Default::default()
         };
 
@@ -898,40 +896,20 @@ impl Repl {
             full_response
         });
 
-        // Run the thinking
+        // Run the thinking (agent manages history internally)
         let mut agent = agent_arc.lock().await;
         match agent.think_streaming_with_options(task, options, tx).await {
             Ok(_) => {
-                // Wait for print task and get the full response
+                // Wait for print task and get the full response for logging
                 if let Ok(response) = print_task.await {
                     let stripped = strip_thinking(&response);
-                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(), 
+                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(),
                         if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
                     debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-                    
-                    // Update conversation history
-                    let mut history = history_arc.lock().await;
-                    // Add user message
-                    history.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: Some(task.to_string()),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
-                    // Add assistant response (strip thinking tags to keep history clean)
-                    history.push(ChatMessage {
-                        role: "assistant".to_string(),
-                        content: Some(stripped),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
-                    // Cap history at 20 messages (trim oldest if exceeded)
-                    while history.len() > 20 {
-                        history.remove(0);
-                    }
-                    
-                    debug::log(&format!("HISTORY updated: {} messages", history.len()));
+
+                    // History is now managed internally by the agent
+                    debug::log(&format!("HISTORY updated: {} messages", agent.history_len()));
                 }
             }
             Err(e) => {
@@ -984,9 +962,9 @@ impl Repl {
 
         match self.agents.get(agent_name) {
             Some(entry) => {
-                let mut history = entry.history.lock().await;
-                let count = history.len();
-                history.clear();
+                let mut agent = entry.agent.lock().await;
+                let count = agent.history_len();
+                agent.clear_history();
                 println!("\x1b[32m✓ Cleared {} messages from '{}' conversation history\x1b[0m", count, agent_name);
             }
             None => {
@@ -1095,9 +1073,8 @@ impl Repl {
         // Clone the Arc<Mutex<Agent>> for the spawned task
         let agent = entry.agent.clone();
         let agent_name = name.clone();
-        // Clone persona and history for the background task
+        // Clone persona for the background task
         let persona = entry.persona.clone();
-        let history_arc = entry.history.clone();
 
         // Build timer config if interval was specified
         let timer_config = timer_interval.map(|interval| TimerConfig {
@@ -1133,48 +1110,32 @@ impl Repl {
                         // Timer fired
                         if let Some(ref tc) = task_timer {
                             debug::log(&format!("TIMER: {} fired with message: {}", agent_name, tc.message));
-                            
-                            // Get history snapshot and build options with persona
-                            let history = history_arc.lock().await.clone();
-                            debug_log_history(&agent_name, &history);
-                            
+
+                            let mut agent_guard = agent.lock().await;
+
+                            // Log current history state (agent manages its own history)
+                            debug_log_history(&agent_name, agent_guard.history());
+
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
                                 always_prompt: persona.always_prompt.clone(),
-                                conversation_history: if history.is_empty() { None } else { Some(history) },
+                                // conversation_history is managed internally by the agent
                                 ..Default::default()
                             };
 
-                            let mut agent_guard = agent.lock().await;
                             println!("\n\x1b[35m[{}]\x1b[0m timer fired, thinking...", agent_name);
                             match agent_guard.think_with_options(&tc.message, options).await {
-                                Ok(response) => {
-                                    let stripped = strip_thinking(&response);
-                                    debug::log(&format!("TIMER RESPONSE (raw, {} chars): {}", response.len(),
-                                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                                Ok(result) => {
+                                    let stripped = strip_thinking(&result.response);
+                                    debug::log(&format!("TIMER RESPONSE (raw, {} chars): {}", result.response.len(),
+                                        if result.response.len() > 300 { format!("{}...", &result.response[..300]) } else { result.response.clone() }));
                                     debug::log(&format!("TIMER RESPONSE (stripped, {} chars): {}", stripped.len(),
                                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-                                    
-                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
-                                    // Update conversation history
-                                    let mut history = history_arc.lock().await;
-                                    history.push(ChatMessage {
-                                        role: "user".to_string(),
-                                        content: Some(tc.message.clone()),
-                                        tool_call_id: None,
-                                        tool_calls: None,
-                                    });
-                                    history.push(ChatMessage {
-                                        role: "assistant".to_string(),
-                                        content: Some(stripped),
-                                        tool_call_id: None,
-                                        tool_calls: None,
-                                    });
-                                    // Cap history at 20 messages
-                                    while history.len() > 20 {
-                                        history.remove(0);
-                                    }
-                                    debug::log(&format!("TIMER HISTORY updated: {} messages", history.len()));
+
+                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, result.response);
+
+                                    // History is now managed internally by the agent
+                                    debug::log(&format!("TIMER HISTORY updated: {} messages", agent_guard.history_len()));
                                 }
                                 Err(e) => {
                                     debug::log(&format!("TIMER ERROR: {} - {}", agent_name, e));
@@ -1200,23 +1161,21 @@ impl Repl {
                             // Process the message by thinking about it
                             let task = format!("Message from {}: \"{}\"\n\nRespond to {} using send_message. Your response here should be empty or minimal after sending.", msg.from, msg.content, msg.from);
 
-                            // Get history snapshot and build options with persona
-                            let history = history_arc.lock().await.clone();
                             debug::log(&format!("MSG TASK: {} processing message", agent_name));
-                            debug_log_history(&agent_name, &history);
-                            
+                            debug_log_history(&agent_name, agent_guard.history());
+
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
                                 always_prompt: persona.always_prompt.clone(),
-                                conversation_history: if history.is_empty() { None } else { Some(history) },
+                                // conversation_history is managed internally by the agent
                                 ..Default::default()
                             };
 
                             match agent_guard.think_with_options(&task, options).await {
-                                Ok(response) => {
-                                    let stripped = strip_thinking(&response);
-                                    debug::log(&format!("MSG RESPONSE (raw, {} chars): {}", response.len(),
-                                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                                Ok(result) => {
+                                    let stripped = strip_thinking(&result.response);
+                                    debug::log(&format!("MSG RESPONSE (raw, {} chars): {}", result.response.len(),
+                                        if result.response.len() > 300 { format!("{}...", &result.response[..300]) } else { result.response.clone() }));
                                     debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
                                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
 
@@ -1224,25 +1183,9 @@ impl Repl {
                                     if !stripped.is_empty() {
                                         println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, stripped);
                                     }
-                                    // Update conversation history
-                                    let mut history = history_arc.lock().await;
-                                    history.push(ChatMessage {
-                                        role: "user".to_string(),
-                                        content: Some(task.clone()),
-                                        tool_call_id: None,
-                                        tool_calls: None,
-                                    });
-                                    history.push(ChatMessage {
-                                        role: "assistant".to_string(),
-                                        content: Some(stripped),
-                                        tool_call_id: None,
-                                        tool_calls: None,
-                                    });
-                                    // Cap history at 20 messages
-                                    while history.len() > 20 {
-                                        history.remove(0);
-                                    }
-                                    debug::log(&format!("MSG HISTORY updated: {} messages", history.len()));
+
+                                    // History is now managed internally by the agent
+                                    debug::log(&format!("MSG HISTORY updated: {} messages", agent_guard.history_len()));
                                 }
                                 Err(e) => {
                                     debug::log(&format!("MSG ERROR: {} - {}", agent_name, e));
@@ -1543,7 +1486,6 @@ mod tests {
             agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
             llm_name: "test".to_string(),
             persona: AgentPersona::default(),
-            history: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
         });
 
         // Trying to load should fail due to duplicate

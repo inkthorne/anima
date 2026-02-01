@@ -650,6 +650,12 @@ model = "gpt-4"
 
     #[test]
     fn test_load_always_none() {
+        // Create fake home directory WITHOUT global always.md
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        // NO always.md in global directory
+
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -661,13 +667,30 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
 
+        // Override HOME temporarily to avoid picking up real global always.md
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
         assert_eq!(always, None);
     }
 
     #[test]
     fn test_load_always_file_missing() {
+        // Create fake home directory WITHOUT global always.md
+        let fake_home = tempdir().unwrap();
+        let global_always_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_always_dir).unwrap();
+        // NO always.md in global directory
+
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -681,9 +704,20 @@ model = "gpt-4"
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         // Note: always.md file is NOT created
 
+        // Override HOME temporarily to avoid picking up real global always.md
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         // Should return None when file is missing (backward compatible)
         let always = agent_dir.load_always().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
         assert_eq!(always, None);
     }
 

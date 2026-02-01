@@ -18,7 +18,7 @@ pub mod tool;
 pub mod tools;
 
 // Re-export main types for convenience
-pub use agent::{Agent, ThinkOptions, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
+pub use agent::{Agent, ThinkOptions, ThinkResult, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
 pub use error::{AgentError, ToolError, ErrorContext};
 pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory};
 pub use message::Message;

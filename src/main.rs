@@ -911,7 +911,7 @@ async fn run_agent_task(config_path: &str, task: &str, stream: bool, verbose_cli
         let _ = result;
     } else {
         let result = agent.think_with_options(task, options).await?;
-        println!("{}", result);
+        println!("{}", result.response);
     }
 
     Ok(())

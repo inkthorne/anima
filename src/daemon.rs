@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError};
-use crate::llm::{LLM, ChatMessage, OpenAIClient, AnthropicClient, OllamaClient};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
@@ -209,7 +209,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create the agent
     let agent = create_agent_from_dir(&agent_dir).await?;
     let agent = Arc::new(Mutex::new(agent));
-    let history = Arc::new(Mutex::new(Vec::<ChatMessage>::new()));
 
     // Create Unix socket listener
     let listener = UnixListener::bind(&config.socket_path)?;
@@ -244,7 +243,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Set up timer if configured
     let timer_handle = if let Some(ref timer_config) = config.timer {
         let agent_clone = agent.clone();
-        let history_clone = history.clone();
         let persona = config.persona.clone();
         let always = config.always.clone();
         let timer_config = timer_config.clone();
@@ -260,41 +258,19 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                     _ = interval.tick() => {
                         println!("[timer] Firing timer trigger...");
 
-                        let history_snapshot = history_clone.lock().await.clone();
+                        let mut agent_guard = agent_clone.lock().await;
+
                         let options = ThinkOptions {
                             system_prompt: persona.clone(),
                             always_prompt: always.clone(),
-                            conversation_history: if history_snapshot.is_empty() {
-                                None
-                            } else {
-                                Some(history_snapshot)
-                            },
+                            // conversation_history is managed internally by the agent
                             ..Default::default()
                         };
 
-                        let mut agent_guard = agent_clone.lock().await;
                         match agent_guard.think_with_options(&timer_config.message, options).await {
-                            Ok(response) => {
-                                println!("[timer] Response: {}", response);
-
-                                // Update history
-                                let mut history = history_clone.lock().await;
-                                history.push(ChatMessage {
-                                    role: "user".to_string(),
-                                    content: Some(timer_config.message.clone()),
-                                    tool_call_id: None,
-                                    tool_calls: None,
-                                });
-                                history.push(ChatMessage {
-                                    role: "assistant".to_string(),
-                                    content: Some(response),
-                                    tool_call_id: None,
-                                    tool_calls: None,
-                                });
-                                // Cap history
-                                while history.len() > 20 {
-                                    history.remove(0);
-                                }
+                            Ok(result) => {
+                                println!("[timer] Response: {}", result.response);
+                                // History is now managed internally by the agent
                             }
                             Err(e) => {
                                 eprintln!("[timer] Error: {}", e);
@@ -318,7 +294,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok((stream, _)) => {
                         let agent_clone = agent.clone();
-                        let history_clone = history.clone();
                         let persona = config.persona.clone();
                         let always = config.always.clone();
                         let shutdown_clone = shutdown.clone();
@@ -328,7 +303,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = handle_connection(
                                 api,
                                 agent_clone,
-                                history_clone,
                                 persona,
                                 always,
                                 shutdown_clone,
@@ -435,7 +409,6 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
 async fn handle_connection(
     mut api: SocketApi,
     agent: Arc<Mutex<Agent>>,
-    history: Arc<Mutex<Vec<ChatMessage>>>,
     persona: Option<String>,
     always: Option<String>,
     shutdown: Arc<tokio::sync::Notify>,
@@ -462,40 +435,18 @@ async fn handle_connection(
             Request::Message { ref content } => {
                 println!("[socket] Received message: {}", content);
 
-                let history_snapshot = history.lock().await.clone();
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
                     always_prompt: always.clone(),
-                    conversation_history: if history_snapshot.is_empty() {
-                        None
-                    } else {
-                        Some(history_snapshot)
-                    },
+                    // conversation_history is managed internally by the agent
                     ..Default::default()
                 };
 
                 let mut agent_guard = agent.lock().await;
                 match agent_guard.think_with_options(&content, options).await {
-                    Ok(response) => {
-                        // Update history
-                        let mut hist = history.lock().await;
-                        hist.push(ChatMessage {
-                            role: "user".to_string(),
-                            content: Some(content.clone()),
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
-                        hist.push(ChatMessage {
-                            role: "assistant".to_string(),
-                            content: Some(response.clone()),
-                            tool_call_id: None,
-                            tool_calls: None,
-                        });
-                        while hist.len() > 20 {
-                            hist.remove(0);
-                        }
-
-                        Response::Message { content: response }
+                    Ok(result) => {
+                        // History is now managed internally by the agent
+                        Response::Message { content: result.response }
                     }
                     Err(e) => {
                         Response::Error { message: e.to_string() }
@@ -504,10 +455,10 @@ async fn handle_connection(
             }
 
             Request::Status => {
-                let hist = history.lock().await;
+                let agent_guard = agent.lock().await;
                 Response::Status {
                     running: true,
-                    history_len: hist.len(),
+                    history_len: agent_guard.history_len(),
                 }
             }
 
@@ -519,8 +470,8 @@ async fn handle_connection(
 
             Request::Clear => {
                 println!("[socket] Clearing conversation history");
-                let mut hist = history.lock().await;
-                hist.clear();
+                let mut agent_guard = agent.lock().await;
+                agent_guard.clear_history();
                 Response::Ok
             }
         };
@@ -733,6 +684,11 @@ api_key = "sk-test"
 
     #[test]
     fn test_daemon_config_always_file_missing() {
+        // Use a fake HOME so the global ~/.anima/agents/always.md fallback doesn't interfere
+        let fake_home = tempdir().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -749,6 +705,12 @@ api_key = "sk-test"
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
 
         // Should be None when file is missing (backward compatible)
         assert!(daemon_config.always.is_none());
