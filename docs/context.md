@@ -171,6 +171,11 @@ cargo test
 anima restart arya
 ```
 
+**Version bumping:** Bump patch version (e.g., 2.6.1 → 2.6.2) with each commit:
+```bash
+# In Cargo.toml: version = "2.6.X"
+```
+
 ## Development Workflow
 
 **Use the `coding-task` skill** for all code changes to anima.
