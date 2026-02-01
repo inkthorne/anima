@@ -513,7 +513,13 @@ impl Repl {
 
         // Load persona
         let persona_content = match agent_dir.load_persona() {
-            Ok(p) => p,
+            Ok(Some(content)) => Some(content),
+            Ok(None) => {
+                // Fallback to base persona.md
+                dirs::home_dir()
+                    .map(|home| home.join(".anima").join("agents").join("persona.md"))
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+            }
             Err(e) => {
                 println!("\x1b[31mFailed to load persona: {}\x1b[0m", e);
                 return;
