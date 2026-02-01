@@ -1,6 +1,7 @@
 pub mod add;
 pub mod echo;
 pub mod http;
+pub mod list_agents;
 pub mod read_file;
 pub mod send_message;
 pub mod shell;
@@ -11,8 +12,9 @@ pub mod write_file;
 pub use add::AddTool;
 pub use echo::EchoTool;
 pub use http::HttpTool;
+pub use list_agents::DaemonListAgentsTool;
 pub use read_file::ReadFileTool;
-pub use send_message::{SendMessageTool, ListAgentsTool};
+pub use send_message::{SendMessageTool, ListAgentsTool, DaemonSendMessageTool};
 pub use shell::ShellTool;
 pub use spawn_child::SpawnChildTool;
 pub use wait_for_child::WaitForChildTool;

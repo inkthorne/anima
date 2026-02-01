@@ -1,6 +1,6 @@
 use anima::{
     Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
-    InMemoryStore, SqliteMemory, LLM, Memory,
+    InMemoryStore, SqliteMemory, LLM,
 };
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
@@ -8,7 +8,7 @@ use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
 use anima::repl::Repl;
 use anima::socket_api::{SocketApi, Request, Response};
-use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
+use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
@@ -580,84 +580,17 @@ async fn clear_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run an agent from a directory and start an interactive REPL
+/// In daemon mode, this starts the daemon (if needed) and connects via REPL.
 async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     let agent_path = resolve_agent_path(agent);
 
-    // Load the agent directory
+    // Load the agent directory to verify it exists
     let agent_dir = AgentDir::load(&agent_path)?;
     let agent_name = agent_dir.config.agent.name.clone();
 
-    // Load persona if configured
-    let persona = agent_dir.load_persona()?;
-
-    // Load always content if configured
-    let always = agent_dir.load_always()?;
-
-    // Get API key
-    let api_key = agent_dir.api_key()?;
-
-    // Create LLM from config
-    let llm: Arc<dyn LLM> = match agent_dir.config.llm.provider.as_str() {
-        "openai" => {
-            let key = api_key.ok_or("OpenAI API key not configured")?;
-            Arc::new(OpenAIClient::new(key).with_model(&agent_dir.config.llm.model))
-        }
-        "anthropic" => {
-            let key = api_key.ok_or("Anthropic API key not configured")?;
-            Arc::new(AnthropicClient::new(key).with_model(&agent_dir.config.llm.model))
-        }
-        "ollama" => {
-            Arc::new(
-                OllamaClient::new()
-                    .with_model(&agent_dir.config.llm.model)
-                    .with_thinking(agent_dir.config.llm.thinking)
-            )
-        }
-        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
-    };
-
-    // Create memory from config
-    let memory: Box<dyn Memory> = if let Some(mem_path) = agent_dir.memory_path() {
-        // Ensure parent directory exists
-        if let Some(parent) = mem_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Box::new(SqliteMemory::open(
-            mem_path.to_str().ok_or("Invalid memory path")?,
-            &agent_name,
-        )?)
-    } else {
-        Box::new(InMemoryStore::new())
-    };
-
-    // Create runtime and agent
-    let mut runtime = Runtime::new();
-    let mut agent = runtime.spawn_agent(agent_name.clone()).await;
-
-    // Register tools
-    agent.register_tool(Arc::new(AddTool));
-    agent.register_tool(Arc::new(EchoTool));
-    agent.register_tool(Arc::new(ReadFileTool));
-    agent.register_tool(Arc::new(WriteFileTool));
-    agent.register_tool(Arc::new(HttpTool::new()));
-    agent.register_tool(Arc::new(ShellTool::new()));
-
-    // Register messaging tools
-    let router = runtime.router().clone();
-    agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), agent_name.clone())));
-    agent.register_tool(Arc::new(ListAgentsTool::new(router)));
-
-    // Apply LLM and memory
-    agent = agent.with_llm(llm);
-    agent = agent.with_memory(memory);
-
-    // Add observer (non-verbose for cleaner REPL output)
-    let observer = Arc::new(ConsoleObserver::new(false));
-    agent = agent.with_observer(observer);
-
-    // Start interactive REPL with the loaded agent
-    let mut repl = Repl::with_agent(agent_name.clone(), agent, persona, always);
-    println!("\x1b[32m✓ Loaded agent '{}' from {}\x1b[0m", agent_name, agent_path.display());
+    // Start a REPL connected to this agent (will start daemon if needed)
+    let mut repl = Repl::with_agent(agent_name.clone()).await;
+    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent_name);
 
     repl.run().await?;
     Ok(())

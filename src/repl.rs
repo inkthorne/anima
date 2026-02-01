@@ -1,9 +1,12 @@
+//! REPL for interacting with agent daemons.
+//!
+//! In the daemon architecture, agents always run as separate processes.
+//! The REPL connects to running daemons via Unix sockets.
+
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::process::Command;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -11,61 +14,12 @@ use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{Editor, Helper};
-use tokio::sync::Mutex;
+use tokio::net::UnixStream;
 
-use crate::agent_dir::{AgentDir, AgentDirError};
+use crate::agent::strip_thinking;
 use crate::debug;
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ChatMessage};
-use crate::memory::{Memory, SqliteMemory, InMemoryStore};
-use crate::observe::ConsoleObserver;
-use crate::runtime::Runtime;
-use crate::agent::{Agent, ThinkOptions, strip_thinking};
-use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
-
-/// Log conversation history state (truncated for readability)
-fn debug_log_history(agent_name: &str, history: &[ChatMessage]) {
-    if !debug::is_enabled() {
-        return;
-    }
-    debug::log(&format!("=== {} history ({} messages) ===", agent_name, history.len()));
-    for (i, msg) in history.iter().enumerate() {
-        let content = msg.content.as_deref().unwrap_or("<none>");
-        // Truncate long messages
-        let preview = if content.len() > 200 {
-            format!("{}... [truncated, {} chars total]", &content[..200], content.len())
-        } else {
-            content.to_string()
-        };
-        debug::log(&format!("  [{}] {}: {}", i, msg.role, preview));
-    }
-    debug::log("=== end history ===");
-}
-
-/// Parse a duration string like "30s", "5m", "1h" into a Duration.
-/// Returns None if the format is invalid.
-fn parse_duration(s: &str) -> Option<Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-
-    // Find where the numeric part ends
-    let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    if num_end == 0 {
-        return None;
-    }
-
-    let num: u64 = s[..num_end].parse().ok()?;
-    let unit = &s[num_end..];
-
-    match unit {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(Duration::from_secs(num)),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::from_secs(num * 60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::from_secs(num * 3600)),
-        "" => Some(Duration::from_secs(num)), // Default to seconds if no unit
-        _ => None,
-    }
-}
+use crate::discovery::{self, RunningAgent};
+use crate::socket_api::{SocketApi, Request, Response};
 
 /// Parse @mentions from input text.
 /// Pattern: `@([a-zA-Z][a-zA-Z0-9_-]*)`
@@ -88,7 +42,7 @@ const BANNER_ART: &str = r#"
 
 fn print_banner() {
     println!("{}", BANNER_ART);
-    println!("Interactive REPL v{} - Type '/help' for commands\n", env!("CARGO_PKG_VERSION"));
+    println!("Interactive REPL v{} (daemon mode) - Type '/help' for commands\n", env!("CARGO_PKG_VERSION"));
 }
 
 /// REPL helper for tab completion
@@ -127,8 +81,8 @@ impl Completer for ReplHelper {
         if line.starts_with('/') {
             let cmd_partial = &line[1..pos]; // Skip the leading /
             let slash_commands = [
-                "/load", "/start", "/stop", "/status", "/list", "/history", "/clear",
-                "/set llm", "/agent create", "/agent list", "/help", "/quit", "/exit"
+                "/load", "/start", "/stop", "/status", "/list", "/clear",
+                "/help", "/quit", "/exit"
             ];
 
             for cmd in &slash_commands {
@@ -143,8 +97,7 @@ impl Completer for ReplHelper {
 
             // Complete agent names after commands that use them
             if line.starts_with("/load ") || line.starts_with("/start ") ||
-               line.starts_with("/stop ") || line.starts_with("/clear ") ||
-               line.starts_with("/memory ") {
+               line.starts_with("/stop ") || line.starts_with("/clear ") {
                 for name in &self.agent_names {
                     if name.starts_with(partial) {
                         completions.push(Pair {
@@ -195,58 +148,41 @@ impl Highlighter for ReplHelper {}
 impl Validator for ReplHelper {}
 impl Helper for ReplHelper {}
 
-/// Agent persona configuration
-#[derive(Debug, Clone, Default)]
-struct AgentPersona {
-    /// System prompt that defines the agent's personality
-    system_prompt: Option<String>,
-    /// Always prompt injected as system message just before user message (recency bias)
-    always_prompt: Option<String>,
-    /// Initial memories to preload
-    initial_memories: Vec<(String, String)>,
-}
-
-/// Agent entry stored in the REPL
-struct ReplAgent {
-    agent: Arc<Mutex<Agent>>,
-    llm_name: String,
-    persona: AgentPersona,
-}
-
-/// Timer configuration for running agents
+/// Connection to a running agent daemon
 #[derive(Debug, Clone)]
-struct TimerConfig {
-    /// How often the timer fires
-    interval: Duration,
-    /// Message to think with when timer fires
-    message: String,
+struct AgentConnection {
+    /// Path to the Unix socket
+    socket_path: PathBuf,
 }
 
-/// Info about a running agent
-struct RunningAgentInfo {
-    abort_handle: tokio::task::AbortHandle,
-    timer: Option<TimerConfig>,
+impl AgentConnection {
+    fn from_running(agent: &RunningAgent) -> Self {
+        Self {
+            socket_path: agent.socket_path.clone(),
+        }
+    }
+
+    /// Connect to the agent's daemon socket
+    async fn connect(&self) -> Result<SocketApi, Box<dyn Error + Send + Sync>> {
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        Ok(SocketApi::new(stream))
+    }
 }
 
 pub struct Repl {
-    runtime: Runtime,
-    agents: HashMap<String, ReplAgent>,
-    default_llm: Option<String>,
+    /// Active connections to running daemons
+    connections: HashMap<String, AgentConnection>,
+    /// History file path
     history_file: Option<PathBuf>,
-    running_agents: HashMap<String, RunningAgentInfo>,
 }
 
 impl Repl {
     pub fn new() -> Self {
-        // Set up history file in home directory
         let history_file = dirs::home_dir().map(|h| h.join(".anima_history"));
 
         Repl {
-            runtime: Runtime::new(),
-            agents: HashMap::new(),
-            default_llm: None,
+            connections: HashMap::new(),
             history_file,
-            running_agents: HashMap::new(),
         }
     }
 
@@ -254,33 +190,68 @@ impl Repl {
     pub fn with_logging(self, enabled: bool) -> Self {
         if enabled {
             debug::enable();
-            debug::log("=== REPL session started ===");
+            debug::log("=== REPL session started (daemon mode) ===");
         }
         self
     }
 
-    /// Create a REPL with a pre-loaded agent.
-    /// This is used when running `anima run <agent>` to start a REPL with an agent already loaded.
-    pub fn with_agent(name: String, agent: Agent, persona: Option<String>, always: Option<String>) -> Self {
+    /// Create a REPL with a pre-loaded agent (ensures daemon is running and connects to it).
+    pub async fn with_agent(name: String) -> Self {
         let history_file = dirs::home_dir().map(|h| h.join(".anima_history"));
 
-        let mut agents = HashMap::new();
-        let mut persona_config = AgentPersona::default();
-        persona_config.system_prompt = persona;
-        persona_config.always_prompt = always;
-
-        agents.insert(name.clone(), ReplAgent {
-            agent: Arc::new(Mutex::new(agent)),
-            llm_name: "configured".to_string(),
-            persona: persona_config,
-        });
-
-        Repl {
-            runtime: Runtime::new(),
-            agents,
-            default_llm: None,
+        let mut repl = Repl {
+            connections: HashMap::new(),
             history_file,
-            running_agents: HashMap::new(),
+        };
+
+        // Ensure the daemon is running and connect to it
+        repl.ensure_daemon_running(&name).await;
+        if let Some(agent) = discovery::get_running_agent(&name) {
+            repl.connections.insert(name.clone(), AgentConnection::from_running(&agent));
+        }
+
+        repl
+    }
+
+    /// Ensure a daemon is running for the given agent name.
+    /// Starts the daemon if it's not already running.
+    async fn ensure_daemon_running(&self, name: &str) -> bool {
+        if discovery::is_agent_running(name) {
+            return true;
+        }
+
+        // Start the daemon in background
+        println!("\x1b[33mStarting daemon for '{}'...\x1b[0m", name);
+
+        // Get the path to the current executable
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                println!("\x1b[31mFailed to get executable path: {}\x1b[0m", e);
+                return false;
+            }
+        };
+
+        // Start daemon as background process
+        match Command::new(&exe)
+            .args(["start", name])
+            .spawn()
+        {
+            Ok(_) => {
+                // Wait a bit for daemon to start
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if discovery::is_agent_running(name) {
+                        return true;
+                    }
+                }
+                println!("\x1b[31mDaemon failed to start in time\x1b[0m");
+                false
+            }
+            Err(e) => {
+                println!("\x1b[31mFailed to start daemon: {}\x1b[0m", e);
+                false
+            }
         }
     }
 
@@ -297,9 +268,16 @@ impl Repl {
         }
 
         loop {
-            // Update helper with current agent names
+            // Update helper with current agent names (connected + running daemons)
             if let Some(h) = rl.helper_mut() {
-                h.update_agents(self.agents.keys().cloned().collect());
+                let mut names: Vec<String> = self.connections.keys().cloned().collect();
+                // Also include discovered running agents not yet connected
+                for agent in discovery::discover_running_agents() {
+                    if !names.contains(&agent.name) {
+                        names.push(agent.name);
+                    }
+                }
+                h.update_agents(names);
             }
 
             let readline = rl.readline("\x1b[36manima>\x1b[0m ");
@@ -361,55 +339,29 @@ impl Repl {
         debug::log(&format!("CMD: /{}", input));
 
         // Parse command
-        if input.starts_with("agent create ") {
-            self.cmd_agent_create(&input[13..]).await;
-        } else if input == "load" || input.starts_with("load ") {
+        if input == "load" || input.starts_with("load ") {
             let name = if input == "load" { "" } else { &input[5..] };
-            self.cmd_agent_load(name).await;
-        } else if input.starts_with("agent load ") {
-            self.cmd_agent_load(&input[11..]).await;
-        } else if input == "agent list" || input == "list" {
-            self.cmd_agent_list().await;
-        } else if input == "agent list-saved" {
-            self.cmd_agent_list_saved();
-        } else if input.starts_with("agent remove ") {
-            self.cmd_agent_remove(&input[13..]).await;
+            self.cmd_load(name).await;
         } else if input == "start" || input.starts_with("start ") {
-            let args = if input == "start" { "" } else { &input[6..] };
-            self.cmd_agent_start(args).await;
-        } else if input.starts_with("agent start ") {
-            self.cmd_agent_start(&input[12..]).await;
+            let name = if input == "start" { "" } else { &input[6..] };
+            self.cmd_start(name).await;
         } else if input == "stop" || input.starts_with("stop ") {
             let name = if input == "stop" { "" } else { &input[5..] };
-            if name.is_empty() {
-                println!("\x1b[31mUsage: /stop <name>\x1b[0m");
-            } else {
-                self.cmd_agent_stop(name);
-            }
-        } else if input.starts_with("agent stop ") {
-            self.cmd_agent_stop(&input[11..]);
-        } else if input == "status" || input == "agent status" {
-            self.cmd_agent_status();
-        } else if input.starts_with("agent clear ") {
-            self.cmd_history_clear(&input[12..]).await;
+            self.cmd_stop(name).await;
+        } else if input == "status" {
+            self.cmd_status();
+        } else if input == "list" {
+            self.cmd_list();
         } else if input.starts_with("clear ") {
-            self.cmd_history_clear(&input[6..]).await;
+            self.cmd_clear(&input[6..]).await;
         } else if input == "clear" {
-            // Clear with no args - if single agent, clear it
-            if self.agents.len() == 1 {
-                let name = self.agents.keys().next().unwrap().clone();
-                self.cmd_history_clear(&name).await;
+            // Clear with no args - if single connection, clear it
+            if self.connections.len() == 1 {
+                let name = self.connections.keys().next().unwrap().clone();
+                self.cmd_clear(&name).await;
             } else {
                 println!("\x1b[31mUsage: /clear <name>\x1b[0m");
             }
-        } else if input == "history" {
-            self.cmd_history().await;
-        } else if input.starts_with("memory ") {
-            self.cmd_memory(&input[7..]).await;
-        } else if input.starts_with("history clear ") {
-            self.cmd_history_clear(&input[14..]).await;
-        } else if input.starts_with("set llm ") {
-            self.cmd_set_llm(&input[8..]);
         } else if input == "help" {
             self.cmd_help();
         } else if input == "quit" || input == "exit" {
@@ -426,39 +378,39 @@ impl Repl {
 
         // Determine which agents to send to
         let target_agents: Vec<String> = if mentions.iter().any(|m| m == "all") {
-            // @all means all running/started agents
-            if self.running_agents.is_empty() {
-                // Fall back to all loaded agents if none are running
-                self.agents.keys().cloned().collect()
-            } else {
-                self.running_agents.keys().cloned().collect()
-            }
+            // @all means all connected agents
+            self.connections.keys().cloned().collect()
         } else if !mentions.is_empty() {
-            // Filter to only valid agent names
-            mentions.iter()
-                .filter(|m| self.agents.contains_key(*m))
-                .cloned()
-                .collect()
+            // Filter to only connected agent names (or auto-connect if running)
+            let mut targets = Vec::new();
+            for mention in &mentions {
+                if self.connections.contains_key(mention) {
+                    targets.push(mention.clone());
+                } else if discovery::is_agent_running(mention) {
+                    // Auto-connect to running agent
+                    if let Some(agent) = discovery::get_running_agent(mention) {
+                        self.connections.insert(mention.to_string(), AgentConnection::from_running(&agent));
+                        println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
+                        targets.push(mention.clone());
+                    }
+                } else {
+                    println!("\x1b[31mAgent '{}' is not running\x1b[0m", mention);
+                }
+            }
+            targets
         } else {
-            // No mentions - use single agent if exactly one is loaded/running
-            if self.agents.len() == 1 {
-                self.agents.keys().cloned().collect()
-            } else if self.agents.is_empty() {
-                println!("\x1b[31mNo agents loaded. Use /load <name> to load an agent.\x1b[0m");
+            // No mentions - use single agent if exactly one is connected
+            if self.connections.len() == 1 {
+                self.connections.keys().cloned().collect()
+            } else if self.connections.is_empty() {
+                println!("\x1b[31mNo agents connected. Use /load <name> to connect to an agent.\x1b[0m");
                 return;
             } else {
-                println!("\x1b[31mMultiple agents loaded. Use @name to specify recipient.\x1b[0m");
-                println!("\x1b[33mLoaded agents: {}\x1b[0m", self.agents.keys().cloned().collect::<Vec<_>>().join(", "));
+                println!("\x1b[31mMultiple agents connected. Use @name to specify recipient.\x1b[0m");
+                println!("\x1b[33mConnected agents: {}\x1b[0m", self.connections.keys().cloned().collect::<Vec<_>>().join(", "));
                 return;
             }
         };
-
-        // Check if any mentioned agents don't exist
-        for mention in &mentions {
-            if mention != "all" && !self.agents.contains_key(mention) {
-                println!("\x1b[31mAgent '{}' not found\x1b[0m", mention);
-            }
-        }
 
         if target_agents.is_empty() {
             println!("\x1b[31mNo valid agents to send to\x1b[0m");
@@ -467,941 +419,341 @@ impl Repl {
 
         // Send the message to each target agent
         for agent_name in target_agents {
-            self.send_conversation_message(&agent_name, input).await;
+            self.send_message_to_daemon(&agent_name, input).await;
         }
     }
 
-    /// Send a conversation message to a single agent and display the response
-    async fn send_conversation_message(&mut self, agent_name: &str, message: &str) {
-        // Get agent info (immutable borrow for validation)
-        let (agent_arc, system_prompt, always_prompt) = {
-            let entry = match self.agents.get(agent_name) {
-                Some(a) => a,
-                None => {
-                    println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
-                    return;
-                }
-            };
-
-            // Check if agent has an LLM
-            if entry.llm_name == "none" {
-                println!("\x1b[31mAgent '{}' has no LLM configured\x1b[0m", agent_name);
+    /// Send a conversation message to a daemon and display the response
+    async fn send_message_to_daemon(&self, agent_name: &str, message: &str) {
+        let connection = match self.connections.get(agent_name) {
+            Some(c) => c,
+            None => {
+                println!("\x1b[31mAgent '{}' not connected\x1b[0m", agent_name);
                 return;
             }
-
-            (entry.agent.clone(), entry.persona.system_prompt.clone(), entry.persona.always_prompt.clone())
         };
 
         // Format the message with [user] prefix for the agent
         let formatted_message = format!("[user] {}", message);
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
-
-        // Use streaming for real-time output
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
-
         debug::log(&format!("CONV: {} -> {}", agent_name, message));
 
-        // Log current history state
-        {
-            let agent = agent_arc.lock().await;
-            debug_log_history(agent_name, agent.history());
-        }
-
-        let options = ThinkOptions {
-            stream: true,
-            system_prompt,
-            always_prompt,
-            ..Default::default()
+        // Connect to daemon
+        let mut api = match connection.connect().await {
+            Ok(api) => api,
+            Err(e) => {
+                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
+                return;
+            }
         };
 
-        // Spawn task to print tokens and collect the response
-        let agent_name_clone = agent_name.to_string();
-        let print_task = tokio::spawn(async move {
-            let mut full_response = String::new();
-            let mut first_token = true;
-            while let Some(token) = rx.recv().await {
-                if first_token {
-                    // Print agent name prefix before first token
-                    print!("\x1b[33m[{}]\x1b[0m ", agent_name_clone);
-                    first_token = false;
-                }
-                print!("{}", token);
-                let _ = io::stdout().flush();
-                full_response.push_str(&token);
+        // Send message request
+        let request = Request::Message { content: formatted_message };
+        if let Err(e) = api.write_request(&request).await {
+            println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
+            return;
+        }
+
+        // Read response
+        match api.read_response().await {
+            Ok(Some(Response::Message { content })) => {
+                let stripped = strip_thinking(&content);
+                debug::log(&format!("RESPONSE (raw, {} chars): {}", content.len(),
+                    if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));
+                debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
+                    if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+
+                println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
             }
-            println!(); // Final newline
-            full_response
-        });
-
-        // Run the thinking (agent manages history internally)
-        let mut agent = agent_arc.lock().await;
-        match agent.think_streaming_with_options(&formatted_message, options, tx).await {
-            Ok(_) => {
-                // Wait for print task and get the full response for logging
-                if let Ok(response) = print_task.await {
-                    let stripped = strip_thinking(&response);
-                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(),
-                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
-                    debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
-                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-
-                    debug::log(&format!("HISTORY updated: {} messages", agent.history_len()));
-                }
+            Ok(Some(Response::Error { message })) => {
+                println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, message);
+            }
+            Ok(Some(_)) => {
+                println!("\x1b[31mUnexpected response from '{}'\x1b[0m", agent_name);
+            }
+            Ok(None) => {
+                println!("\x1b[31mConnection closed by '{}'\x1b[0m", agent_name);
             }
             Err(e) => {
-                println!("\x1b[31mError: {}\x1b[0m", e);
+                println!("\x1b[31mFailed to read response from '{}': {}\x1b[0m", agent_name, e);
             }
         }
     }
 
-    async fn cmd_agent_create(&mut self, args: &str) {
-        // Parse: <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.is_empty() {
-            println!("\x1b[31mUsage: agent create <name> [--llm <provider/model>] [--persona <file>] [--system <prompt>]\x1b[0m");
-            return;
-        }
-
-        let name = parts[0].to_string();
-
-        // Check for duplicate
-        if self.agents.contains_key(&name) {
-            println!("\x1b[31mAgent '{}' already exists\x1b[0m", name);
-            return;
-        }
-
-        // Parse flags
-        let mut llm_spec: Option<String> = None;
-        let mut persona_file: Option<String> = None;
-        let mut system_prompt: Option<String> = None;
-        
-        let mut i = 1;
-        while i < parts.len() {
-            match parts[i] {
-                "--llm" if i + 1 < parts.len() => {
-                    llm_spec = Some(parts[i + 1].to_string());
-                    i += 2;
-                }
-                "--persona" if i + 1 < parts.len() => {
-                    persona_file = Some(parts[i + 1].to_string());
-                    i += 2;
-                }
-                "--system" if i + 1 < parts.len() => {
-                    // Collect remaining args as system prompt
-                    system_prompt = Some(parts[i + 1..].join(" "));
-                    break;
-                }
-                _ => i += 1,
-            }
-        }
-        
-        // Use default LLM if not specified
-        let llm_spec = llm_spec.or_else(|| self.default_llm.clone());
-
-        let llm_name = llm_spec.clone().unwrap_or_else(|| "none".to_string());
-
-        // Build persona
-        let mut persona = AgentPersona::default();
-
-        // Load from file if specified
-        if let Some(ref file) = persona_file {
-            match self.load_persona_file(file) {
-                Ok(p) => persona = p,
-                Err(e) => {
-                    println!("\x1b[31mFailed to load persona file: {}\x1b[0m", e);
-                    return;
-                }
-            }
-        } else if system_prompt.is_none() {
-            // No --persona or --system provided, try to load base persona from ~/.anima/agents/persona.md
-            if let Some(base_persona_path) = dirs::home_dir().map(|h| h.join(".anima").join("agents").join("persona.md")) {
-                if base_persona_path.exists() {
-                    match std::fs::read_to_string(&base_persona_path) {
-                        Ok(content) => {
-                            persona.system_prompt = Some(content);
-                        }
-                        Err(e) => {
-                            println!("\x1b[31mWarning: Failed to read base persona file: {}\x1b[0m", e);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Override with --system if provided
-        if let Some(prompt) = system_prompt {
-            persona.system_prompt = Some(prompt);
-        }
-
-        // Create the LLM client if specified
-        let llm: Option<Arc<dyn LLM>> = if let Some(spec) = &llm_spec {
-            match self.create_llm_from_spec(spec) {
-                Ok(l) => Some(l),
-                Err(e) => {
-                    println!("\x1b[31mFailed to create LLM: {}\x1b[0m", e);
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-
-        // Create agent with runtime (registers with message router)
-        let mut agent = self.runtime.spawn_agent(name.clone()).await;
-
-        // Register default tools
-        agent.register_tool(Arc::new(AddTool));
-        agent.register_tool(Arc::new(EchoTool));
-        agent.register_tool(Arc::new(ReadFileTool));
-        agent.register_tool(Arc::new(WriteFileTool));
-        agent.register_tool(Arc::new(HttpTool::new()));
-        agent.register_tool(Arc::new(ShellTool::new()));
-
-        // Register messaging tools
-        let router = self.runtime.router().clone();
-        agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), name.clone())));
-        agent.register_tool(Arc::new(ListAgentsTool::new(router)));
-
-        // Add persistent memory (SQLite)
-        let memory_dir = dirs::home_dir()
-            .map(|h| h.join(".anima").join("memory"))
-            .expect("Could not determine home directory");
-        if let Err(e) = std::fs::create_dir_all(&memory_dir) {
-            println!("\x1b[31mWarning: Could not create memory directory: {}\x1b[0m", e);
-        }
-        let memory_path = memory_dir.join(format!("{}.db", name));
-        let memory: Box<dyn Memory> = match SqliteMemory::open(
-            memory_path.to_str().unwrap(),
-            &name,
-        ) {
-            Ok(m) => Box::new(m),
-            Err(e) => {
-                println!("\x1b[31mWarning: Could not open persistent memory: {}. Using in-memory.\x1b[0m", e);
-                Box::new(InMemoryStore::new())
-            }
-        };
-        agent = agent.with_memory(memory);
-
-        // Add observer (non-verbose for cleaner REPL output)
-        let observer = Arc::new(ConsoleObserver::new(false));
-        agent = agent.with_observer(observer);
-
-        // Add LLM if specified
-        if let Some(l) = llm {
-            agent = agent.with_llm(l);
-        }
-
-        self.agents.insert(name.clone(), ReplAgent {
-            agent: Arc::new(Mutex::new(agent)),
-            llm_name: llm_name.clone(),
-            persona: persona.clone(),
-        });
-
-        let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
-        println!("\x1b[32m✓ Created agent '{}' (llm: {}{})\x1b[0m", name, llm_name, persona_info);
-    }
-
-    async fn cmd_agent_load(&mut self, name: &str) {
+    /// Load/connect to an agent daemon. Starts the daemon if not running.
+    async fn cmd_load(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() {
-            println!("\x1b[31mUsage: agent load <name>\x1b[0m");
+            println!("\x1b[31mUsage: /load <name>\x1b[0m");
             return;
         }
 
-        // Check for duplicate
-        if self.agents.contains_key(name) {
-            println!("\x1b[31mAgent '{}' already exists in this session\x1b[0m", name);
+        // Check if already connected
+        if self.connections.contains_key(name) {
+            println!("\x1b[33mAlready connected to '{}'\x1b[0m", name);
             return;
         }
 
-        // Get path to agent directory
-        let agent_path = match dirs::home_dir() {
-            Some(home) => home.join(".anima").join("agents").join(name),
-            None => {
-                println!("\x1b[31mCould not determine home directory\x1b[0m");
-                return;
-            }
-        };
-
-        // Load agent directory config
-        let agent_dir = match AgentDir::load(&agent_path) {
-            Ok(dir) => dir,
-            Err(AgentDirError::ConfigNotFound(path)) => {
-                println!("\x1b[31mAgent '{}' not found at {}\x1b[0m", name, path.display());
-                return;
-            }
-            Err(e) => {
-                println!("\x1b[31mFailed to load agent config: {}\x1b[0m", e);
-                return;
-            }
-        };
-
-        // Load persona
-        let persona_content = match agent_dir.load_persona() {
-            Ok(Some(content)) => Some(content),
-            Ok(None) => {
-                // Fallback to base persona.md
-                dirs::home_dir()
-                    .map(|home| home.join(".anima").join("agents").join("persona.md"))
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-            }
-            Err(e) => {
-                println!("\x1b[31mFailed to load persona: {}\x1b[0m", e);
-                return;
-            }
-        };
-
-        // Load always content
-        let always_content = match agent_dir.load_always() {
-            Ok(content) => content,
-            Err(e) => {
-                println!("\x1b[31mFailed to load always: {}\x1b[0m", e);
-                return;
-            }
-        };
-
-        // Get API key
-        let api_key = match agent_dir.api_key() {
-            Ok(key) => key,
-            Err(e) => {
-                println!("\x1b[31mFailed to get API key: {}\x1b[0m", e);
-                return;
-            }
-        };
-
-        // Create LLM based on config
-        let provider = &agent_dir.config.llm.provider;
-        let model = &agent_dir.config.llm.model;
-        let llm: Arc<dyn LLM> = match provider.as_str() {
-            "openai" => {
-                let key = match api_key {
-                    Some(k) => k,
-                    None => {
-                        println!("\x1b[31mOpenAI API key not found. Set OPENAI_API_KEY or configure api_key in config.toml\x1b[0m");
-                        return;
-                    }
-                };
-                let client = OpenAIClient::new(key).with_model(model);
-                Arc::new(client)
-            }
-            "anthropic" => {
-                let key = match api_key {
-                    Some(k) => k,
-                    None => {
-                        println!("\x1b[31mAnthropic API key not found. Set ANTHROPIC_API_KEY or configure api_key in config.toml\x1b[0m");
-                        return;
-                    }
-                };
-                let client = AnthropicClient::new(key).with_model(model);
-                Arc::new(client)
-            }
-            "ollama" => {
-                let client = OllamaClient::new()
-                    .with_model(model)
-                    .with_thinking(agent_dir.config.llm.thinking);
-                Arc::new(client)
-            }
-            _ => {
-                println!("\x1b[31mUnsupported LLM provider: {} (use 'openai', 'anthropic', or 'ollama')\x1b[0m", provider);
-                return;
-            }
-        };
-
-        let llm_name = format!("{}/{}", provider, model);
-
-        // Build persona
-        let mut persona = AgentPersona::default();
-        persona.system_prompt = persona_content;
-        persona.always_prompt = always_content;
-
-        // Create agent with runtime
-        let agent_name = agent_dir.config.agent.name.clone();
-        let mut agent = self.runtime.spawn_agent(agent_name.clone()).await;
-
-        // Register default tools
-        agent.register_tool(Arc::new(AddTool));
-        agent.register_tool(Arc::new(EchoTool));
-        agent.register_tool(Arc::new(ReadFileTool));
-        agent.register_tool(Arc::new(WriteFileTool));
-        agent.register_tool(Arc::new(HttpTool::new()));
-        agent.register_tool(Arc::new(ShellTool::new()));
-
-        // Register messaging tools
-        let router = self.runtime.router().clone();
-        agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), agent_name.clone())));
-        agent.register_tool(Arc::new(ListAgentsTool::new(router)));
-
-        // Add memory - use agent directory's memory path if configured, else default location
-        let memory_path = agent_dir.memory_path().unwrap_or_else(|| {
-            dirs::home_dir()
-                .map(|h| h.join(".anima").join("memory").join(format!("{}.db", agent_name)))
-                .expect("Could not determine home directory")
-        });
-
-        // Ensure parent directory exists
-        if let Some(parent) = memory_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                println!("\x1b[31mWarning: Could not create memory directory: {}\x1b[0m", e);
-            }
-        }
-
-        let memory: Box<dyn Memory> = match SqliteMemory::open(
-            memory_path.to_str().unwrap(),
-            &agent_name,
-        ) {
-            Ok(m) => Box::new(m),
-            Err(e) => {
-                println!("\x1b[31mWarning: Could not open persistent memory: {}. Using in-memory.\x1b[0m", e);
-                Box::new(InMemoryStore::new())
-            }
-        };
-        agent = agent.with_memory(memory);
-
-        // Add observer
-        let observer = Arc::new(ConsoleObserver::new(false));
-        agent = agent.with_observer(observer);
-
-        // Add LLM
-        agent = agent.with_llm(llm);
-
-        self.agents.insert(agent_name.clone(), ReplAgent {
-            agent: Arc::new(Mutex::new(agent)),
-            llm_name: llm_name.clone(),
-            persona: persona.clone(),
-        });
-
-        let persona_info = if persona.system_prompt.is_some() { " with persona" } else { "" };
-        println!("\x1b[32m✓ Loaded agent '{}' from {}{}\x1b[0m", agent_name, agent_path.display(), persona_info);
-    }
-
-    fn create_llm_from_spec(&self, spec: &str) -> Result<Arc<dyn LLM>, Box<dyn Error>> {
-        // Parse spec: "provider/model" or just "provider"
-        let parts: Vec<&str> = spec.splitn(2, '/').collect();
-        let provider = parts[0];
-        let model = parts.get(1).copied();
-
-        match provider {
-            "openai" => {
-                let api_key = std::env::var("OPENAI_API_KEY")
-                    .map_err(|_| "OPENAI_API_KEY not set")?;
-                let mut client = OpenAIClient::new(api_key);
-                if let Some(m) = model {
-                    client = client.with_model(m);
-                }
-                Ok(Arc::new(client))
-            }
-            "anthropic" => {
-                let api_key = std::env::var("ANTHROPIC_API_KEY")
-                    .map_err(|_| "ANTHROPIC_API_KEY not set")?;
-                let mut client = AnthropicClient::new(api_key);
-                if let Some(m) = model {
-                    client = client.with_model(m);
-                }
-                Ok(Arc::new(client))
-            }
-            "ollama" => {
-                let mut client = OllamaClient::new();
-                if let Some(m) = model {
-                    client = client.with_model(m);
-                }
-                Ok(Arc::new(client))
-            }
-            _ => Err(format!("Unknown provider: {} (use 'openai', 'anthropic', or 'ollama')", provider).into()),
-        }
-    }
-
-    fn load_persona_file(&self, path: &str) -> Result<AgentPersona, Box<dyn Error>> {
-        let content = std::fs::read_to_string(path)?;
-        
-        // Simple TOML-like parsing for persona files
-        // Format:
-        // system_prompt = """
-        // Your prompt here
-        // """
-        // memory.key = value
-        
-        let mut persona = AgentPersona::default();
-        let mut in_system_prompt = false;
-        let mut system_prompt_lines: Vec<String> = Vec::new();
-        
-        for line in content.lines() {
-            let trimmed = line.trim();
-            
-            if trimmed.starts_with("system_prompt") && trimmed.contains("\"\"\"") {
-                in_system_prompt = true;
-                continue;
-            }
-            
-            if in_system_prompt {
-                if trimmed == "\"\"\"" {
-                    in_system_prompt = false;
-                    persona.system_prompt = Some(system_prompt_lines.join("\n"));
-                } else {
-                    system_prompt_lines.push(line.to_string());
-                }
-                continue;
-            }
-            
-            // Parse memory.key = value
-            if trimmed.starts_with("memory.") {
-                if let Some(eq_pos) = trimmed.find('=') {
-                    let key = trimmed[7..eq_pos].trim().to_string();
-                    let value = trimmed[eq_pos + 1..].trim().trim_matches('"').to_string();
-                    persona.initial_memories.push((key, value));
-                }
-            }
-        }
-        
-        Ok(persona)
-    }
-
-    async fn cmd_agent_list(&self) {
-        if self.agents.is_empty() {
-            println!("\x1b[33mNo agents created yet. Use 'agent create <name>' to create one.\x1b[0m");
+        // Check if agent config exists
+        let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
+        if !agent_exists {
+            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
             return;
         }
 
-        println!("\x1b[1mAgents:\x1b[0m");
-        for (name, entry) in &self.agents {
-            let agent = entry.agent.lock().await;
-            let history_len = agent.history_len();
-            let history_info = if history_len == 0 {
-                String::new()
-            } else {
-                format!(", {} msgs", history_len)
-            };
-            println!("  \x1b[36m{}\x1b[0m (llm: {}{})", name, entry.llm_name, history_info);
-        }
-    }
-
-    fn cmd_agent_list_saved(&self) {
-        let memory_dir = match dirs::home_dir() {
-            Some(h) => h.join(".anima").join("memory"),
-            None => {
-                println!("\x1b[31mCould not determine home directory\x1b[0m");
-                return;
-            }
-        };
-
-        if !memory_dir.exists() {
-            println!("\x1b[33mNo saved agents yet. Memory directory doesn't exist.\x1b[0m");
+        // Ensure daemon is running
+        if !self.ensure_daemon_running(name).await {
+            println!("\x1b[31mFailed to start daemon for '{}'\x1b[0m", name);
             return;
         }
 
-        let entries: Vec<_> = match std::fs::read_dir(&memory_dir) {
-            Ok(dir) => dir
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map(|ext| ext == "db").unwrap_or(false))
-                .collect(),
-            Err(e) => {
-                println!("\x1b[31mCould not read memory directory: {}\x1b[0m", e);
-                return;
-            }
-        };
-
-        if entries.is_empty() {
-            println!("\x1b[33mNo saved agents found.\x1b[0m");
-            return;
-        }
-
-        println!("\x1b[1mSaved agents (with persistent memory):\x1b[0m");
-        for entry in entries {
-            let path = entry.path();
-            let name = path.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown");
-            let loaded = if self.agents.contains_key(name) { " (loaded)" } else { "" };
-            println!("  \x1b[36m{}\x1b[0m{}", name, loaded);
-        }
-    }
-
-    async fn cmd_agent_remove(&mut self, name: &str) {
-        let name = name.trim();
-        if self.agents.remove(name).is_some() {
-            self.runtime.remove_agent(name).await;
-            println!("\x1b[32m✓ Removed agent '{}'\x1b[0m", name);
+        // Connect
+        if let Some(agent) = discovery::get_running_agent(name) {
+            self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
+            println!("\x1b[32m✓ Connected to '{}'\x1b[0m", name);
         } else {
-            println!("\x1b[31mAgent '{}' not found\x1b[0m", name);
+            println!("\x1b[31mFailed to connect to '{}'\x1b[0m", name);
         }
     }
 
-    async fn cmd_memory(&mut self, agent_name: &str) {
-        let agent_name = agent_name.trim();
-
-        let entry = match self.agents.get(agent_name) {
-            Some(a) => a,
-            None => {
-                println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
-                return;
-            }
-        };
-
-        // We need to access memory through the agent's recall interface
-        // Since we can't directly access the memory, we'll list what keys we know about
-        // For now, show a message about memory inspection limitations
-
-        // Use a workaround: try to recall some common keys
-        println!("\x1b[1mMemory for '{}'\x1b[0m", agent_name);
-        println!("\x1b[33m(Note: Memory inspection requires direct Memory trait access.)\x1b[0m");
-        println!("\x1b[33mUse the agent to recall specific keys with a task.\x1b[0m");
-
-        // Try to recall a few test keys
-        let test_keys = ["task", "context", "history", "state"];
-        let mut found_any = false;
-        let agent = entry.agent.lock().await;
-        for key in &test_keys {
-            if let Some(value) = agent.recall(key).await {
-                if !found_any {
-                    println!("\n\x1b[1mStored values:\x1b[0m");
-                    found_any = true;
-                }
-                println!("  \x1b[36m{}\x1b[0m: {}", key, value);
-            }
-        }
-
-        if !found_any {
-            println!("\x1b[33mNo memories stored yet.\x1b[0m");
-        }
-    }
-
-    async fn cmd_history_clear(&mut self, agent_name: &str) {
-        let agent_name = agent_name.trim();
-
-        match self.agents.get(agent_name) {
-            Some(entry) => {
-                let mut agent = entry.agent.lock().await;
-                let count = agent.history_len();
-                agent.clear_history();
-                println!("\x1b[32m✓ Cleared {} messages from '{}' conversation history\x1b[0m", count, agent_name);
-            }
-            None => {
-                println!("\x1b[31mAgent '{}' not found\x1b[0m", agent_name);
-            }
-        }
-    }
-
-    async fn cmd_history(&self) {
-        if self.agents.is_empty() {
-            println!("\x1b[33mNo agents loaded.\x1b[0m");
+    /// Start an agent daemon (alias for load).
+    async fn cmd_start(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            println!("\x1b[31mUsage: /start <name>\x1b[0m");
             return;
         }
 
-        for (name, entry) in &self.agents {
-            let agent = entry.agent.lock().await;
-            let history = agent.history();
-            println!("\x1b[1m{}\x1b[0m ({} messages):", name, history.len());
-            for msg in history {
-                let role_color = match msg.role.as_str() {
-                    "user" => "\x1b[36m",      // cyan
-                    "assistant" => "\x1b[33m", // yellow
-                    "system" => "\x1b[35m",    // magenta
-                    _ => "\x1b[0m",
-                };
-                let content = msg.content.as_deref().unwrap_or("<none>");
-                let preview = if content.len() > 100 {
-                    format!("{}...", &content[..100])
-                } else {
-                    content.to_string()
-                };
-                println!("  {}[{}]\x1b[0m {}", role_color, msg.role, preview);
-            }
-            println!();
-        }
-    }
-
-    async fn cmd_agent_start(&mut self, args: &str) {
-        // Parse: <name> [--every <duration>] [--on-timer <message>]
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        if parts.is_empty() {
-            println!("\x1b[31mUsage: agent start <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
+        // Check if agent config exists
+        let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
+        if !agent_exists {
+            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
             return;
         }
-
-        let name = parts[0].trim().to_string();
-
-        // Parse flags
-        let mut timer_interval: Option<Duration> = None;
-        let mut timer_message: Option<String> = None;
-
-        let mut i = 1;
-        while i < parts.len() {
-            match parts[i] {
-                "--every" if i + 1 < parts.len() => {
-                    match parse_duration(parts[i + 1]) {
-                        Some(d) => timer_interval = Some(d),
-                        None => {
-                            println!("\x1b[31mInvalid duration '{}'. Use format like 30s, 5m, 1h\x1b[0m", parts[i + 1]);
-                            return;
-                        }
-                    }
-                    i += 2;
-                }
-                "--on-timer" if i + 1 < parts.len() => {
-                    // Collect remaining args as timer message
-                    timer_message = Some(parts[i + 1..].join(" "));
-                    break;
-                }
-                _ => i += 1,
-            }
-        }
-
-        // Check if agent exists
-        let entry = match self.agents.get(&name) {
-            Some(a) => a,
-            None => {
-                println!("\x1b[31mAgent '{}' not found\x1b[0m", name);
-                return;
-            }
-        };
 
         // Check if already running
-        if self.running_agents.contains_key(&name) {
-            println!("\x1b[31mAgent '{}' is already running\x1b[0m", name);
-            return;
-        }
-
-        // Check if agent has an LLM
-        if entry.llm_name == "none" {
-            println!("\x1b[31mAgent '{}' has no LLM configured. Recreate with --llm flag.\x1b[0m", name);
-            return;
-        }
-
-        // Clone the Arc<Mutex<Agent>> for the spawned task
-        let agent = entry.agent.clone();
-        let agent_name = name.clone();
-        // Clone persona for the background task
-        let persona = entry.persona.clone();
-
-        // Build timer config if interval was specified
-        let timer_config = timer_interval.map(|interval| TimerConfig {
-            interval,
-            message: timer_message.clone().unwrap_or_else(|| "Timer trigger".to_string()),
-        });
-
-        // Clone timer config for the spawned task
-        let task_timer = timer_config.clone();
-
-        // Spawn a background task that loops: check inbox, optionally fire timer
-        let handle = tokio::spawn(async move {
-            // Set up timer interval if configured
-            let mut timer = task_timer.as_ref().map(|t| tokio::time::interval(t.interval));
-
-            // Skip the first immediate tick if we have a timer
-            if let Some(ref mut t) = timer {
-                t.tick().await;
+        if discovery::is_agent_running(name) {
+            // Just connect if not already
+            if !self.connections.contains_key(name) {
+                if let Some(agent) = discovery::get_running_agent(name) {
+                    self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
+                    println!("\x1b[32m✓ Connected to already-running '{}'\x1b[0m", name);
+                    return;
+                }
             }
+            println!("\x1b[33m'{}' is already running\x1b[0m", name);
+            return;
+        }
 
-            loop {
-                // Use select! to handle both timer and inbox checking
-                tokio::select! {
-                    // Timer branch (only if timer is configured)
-                    _ = async {
-                        if let Some(ref mut t) = timer {
-                            t.tick().await
-                        } else {
-                            // If no timer, never resolve this branch
-                            std::future::pending::<tokio::time::Instant>().await
-                        }
-                    } => {
-                        // Timer fired
-                        if let Some(ref tc) = task_timer {
-                            debug::log(&format!("TIMER: {} fired with message: {}", agent_name, tc.message));
+        // Start and connect
+        self.cmd_load(name).await;
+    }
 
-                            let mut agent_guard = agent.lock().await;
+    /// Stop an agent daemon.
+    async fn cmd_stop(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            println!("\x1b[31mUsage: /stop <name>\x1b[0m");
+            return;
+        }
 
-                            // Log current history state (agent manages its own history)
-                            debug_log_history(&agent_name, agent_guard.history());
+        // Check if running
+        if !discovery::is_agent_running(name) {
+            println!("\x1b[31m'{}' is not running\x1b[0m", name);
+            return;
+        }
 
-                            let options = ThinkOptions {
-                                system_prompt: persona.system_prompt.clone(),
-                                always_prompt: persona.always_prompt.clone(),
-                                // conversation_history is managed internally by the agent
-                                ..Default::default()
-                            };
+        // Get connection (or create temporary one)
+        let socket_path = match discovery::agent_socket_path(name) {
+            Some(p) => p,
+            None => {
+                println!("\x1b[31mFailed to determine socket path for '{}'\x1b[0m", name);
+                return;
+            }
+        };
 
-                            println!("\n\x1b[35m[{}]\x1b[0m timer fired, thinking...", agent_name);
-                            match agent_guard.think_with_options(&tc.message, options).await {
-                                Ok(result) => {
-                                    let stripped = strip_thinking(&result.response);
-                                    debug::log(&format!("TIMER RESPONSE (raw, {} chars): {}", result.response.len(),
-                                        if result.response.len() > 300 { format!("{}...", &result.response[..300]) } else { result.response.clone() }));
-                                    debug::log(&format!("TIMER RESPONSE (stripped, {} chars): {}", stripped.len(),
-                                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-
-                                    println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, result.response);
-
-                                    // History is now managed internally by the agent
-                                    debug::log(&format!("TIMER HISTORY updated: {} messages", agent_guard.history_len()));
-                                }
-                                Err(e) => {
-                                    debug::log(&format!("TIMER ERROR: {} - {}", agent_name, e));
-                                    println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
-                                }
-                            }
-                            print!("\x1b[36manima>\x1b[0m ");
-                            let _ = io::stdout().flush();
-                        }
+        // Send shutdown request
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                let mut api = SocketApi::new(stream);
+                if let Err(e) = api.write_request(&Request::Shutdown).await {
+                    println!("\x1b[31mFailed to send shutdown: {}\x1b[0m", e);
+                    return;
+                }
+                // Wait for response
+                match api.read_response().await {
+                    Ok(Some(Response::Ok)) => {
+                        println!("\x1b[32m✓ Stopped '{}'\x1b[0m", name);
                     }
-
-                    // Inbox check branch (always runs on a 1-second interval)
-                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
-                        // Lock the agent and check for messages
-                        let mut agent_guard = agent.lock().await;
-
-                        // Check if there are pending messages by trying to receive one
-                        if let Some(msg) = agent_guard.receive_message().await {
-                            debug::log(&format!("MSG RECV: {} <- {} : {}", agent_name, msg.from, msg.content));
-                            // Display received message: [recipient] from sender: message
-                            println!("\n\x1b[33m[{}]\x1b[0m from {}: {}", agent_name, msg.from, msg.content);
-
-                            // Process the message using new [sender] format
-                            let task = format!("[{}] {}", msg.from, msg.content);
-
-                            debug::log(&format!("MSG TASK: {} processing message", agent_name));
-                            debug_log_history(&agent_name, agent_guard.history());
-
-                            let options = ThinkOptions {
-                                system_prompt: persona.system_prompt.clone(),
-                                always_prompt: persona.always_prompt.clone(),
-                                // conversation_history is managed internally by the agent
-                                ..Default::default()
-                            };
-
-                            match agent_guard.think_with_options(&task, options).await {
-                                Ok(result) => {
-                                    let stripped = strip_thinking(&result.response);
-                                    debug::log(&format!("MSG RESPONSE (raw, {} chars): {}", result.response.len(),
-                                        if result.response.len() > 300 { format!("{}...", &result.response[..300]) } else { result.response.clone() }));
-                                    debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
-                                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
-
-                                    // Always print agent's response
-                                    if !stripped.is_empty() {
-                                        println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, stripped);
-                                    }
-
-                                    // History is now managed internally by the agent
-                                    debug::log(&format!("MSG HISTORY updated: {} messages", agent_guard.history_len()));
-                                }
-                                Err(e) => {
-                                    debug::log(&format!("MSG ERROR: {} - {}", agent_name, e));
-                                    println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
-                                }
-                            }
-                            print!("\x1b[36manima>\x1b[0m ");
-                            let _ = io::stdout().flush();
-                        }
+                    _ => {
+                        println!("\x1b[33mShutdown sent to '{}'\x1b[0m", name);
                     }
                 }
             }
-        });
-
-        // Store the abort handle and timer config
-        self.running_agents.insert(name.clone(), RunningAgentInfo {
-            abort_handle: handle.abort_handle(),
-            timer: timer_config.clone(),
-        });
-
-        // Build status message
-        let timer_info = if let Some(tc) = timer_config {
-            format!(" with timer every {:?}", tc.interval)
-        } else {
-            String::new()
-        };
-        println!("\x1b[32m✓ Started agent '{}' (running in background{})\x1b[0m", name, timer_info);
-    }
-
-    fn cmd_agent_stop(&mut self, name: &str) {
-        let name = name.trim();
-
-        // Get and remove the running agent info
-        match self.running_agents.remove(name) {
-            Some(info) => {
-                info.abort_handle.abort();
-                println!("\x1b[32m✓ Stopped agent '{}'\x1b[0m", name);
-            }
-            None => {
-                println!("\x1b[31mAgent '{}' is not running\x1b[0m", name);
+            Err(e) => {
+                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", name, e);
             }
         }
+
+        // Remove from connections
+        self.connections.remove(name);
     }
 
-    fn cmd_agent_status(&self) {
-        if self.agents.is_empty() {
-            println!("\x1b[33mNo agents created yet. Use 'agent create <name>' to create one.\x1b[0m");
+    /// Show status of all agents.
+    fn cmd_status(&self) {
+        let running = discovery::discover_running_agents();
+        let saved = discovery::list_saved_agents();
+
+        if saved.is_empty() && running.is_empty() {
+            println!("\x1b[33mNo agents found in ~/.anima/agents/\x1b[0m");
             return;
         }
 
         println!("\x1b[1mAgent Status:\x1b[0m");
-        for (name, entry) in &self.agents {
-            let (status, timer_info) = if let Some(info) = self.running_agents.get(name) {
-                let timer_str = if let Some(ref tc) = info.timer {
-                    format!(" [timer: every {:?}, msg: \"{}\"]", tc.interval, tc.message)
-                } else {
-                    String::new()
-                };
-                (format!("\x1b[32m(running)\x1b[0m{}", timer_str), String::new())
+
+        for name in &saved {
+            let is_running = running.iter().any(|a| &a.name == name);
+            let is_connected = self.connections.contains_key(name);
+
+            let status = if is_running && is_connected {
+                "\x1b[32m(running, connected)\x1b[0m"
+            } else if is_running {
+                "\x1b[32m(running)\x1b[0m"
             } else {
-                ("\x1b[33m(stopped)\x1b[0m".to_string(), String::new())
+                "\x1b[33m(stopped)\x1b[0m"
             };
-            println!("  \x1b[36m{}\x1b[0m {} (llm: {}){}", name, status, entry.llm_name, timer_info);
+
+            println!("  \x1b[36m{}\x1b[0m {}", name, status);
+        }
+
+        // Show any running agents not in saved (shouldn't happen normally)
+        for agent in &running {
+            if !saved.contains(&agent.name) {
+                let status = if self.connections.contains_key(&agent.name) {
+                    "\x1b[32m(running, connected)\x1b[0m"
+                } else {
+                    "\x1b[32m(running)\x1b[0m"
+                };
+                println!("  \x1b[36m{}\x1b[0m {} (orphan?)", agent.name, status);
+            }
         }
     }
 
-    fn cmd_set_llm(&mut self, spec: &str) {
-        let spec = spec.trim();
-        if spec.is_empty() {
-            println!("\x1b[31mUsage: set llm <provider/model>\x1b[0m");
-            println!("  Examples: set llm openai/gpt-4o");
-            println!("            set llm anthropic/claude-sonnet-4-20250514");
+    /// List connected agents.
+    fn cmd_list(&self) {
+        let running = discovery::discover_running_agents();
+
+        if self.connections.is_empty() && running.is_empty() {
+            println!("\x1b[33mNo agents connected or running. Use /load <name> to connect.\x1b[0m");
             return;
         }
 
-        // Validate the spec
-        let parts: Vec<&str> = spec.splitn(2, '/').collect();
-        let provider = parts[0];
-        if provider != "openai" && provider != "anthropic" && provider != "ollama" {
-            println!("\x1b[31mUnknown provider '{}'. Use 'openai', 'anthropic', or 'ollama'.\x1b[0m", provider);
+        println!("\x1b[1mConnected:\x1b[0m");
+        if self.connections.is_empty() {
+            println!("  (none)");
+        } else {
+            for name in self.connections.keys() {
+                println!("  \x1b[36m{}\x1b[0m", name);
+            }
+        }
+
+        // Show running but not connected
+        let not_connected: Vec<_> = running.iter()
+            .filter(|a| !self.connections.contains_key(&a.name))
+            .collect();
+
+        if !not_connected.is_empty() {
+            println!("\n\x1b[1mRunning (not connected):\x1b[0m");
+            for agent in not_connected {
+                println!("  \x1b[36m{}\x1b[0m", agent.name);
+            }
+        }
+    }
+
+    /// Clear conversation history for an agent.
+    async fn cmd_clear(&self, name: &str) {
+        let name = name.trim();
+
+        let connection = match self.connections.get(name) {
+            Some(c) => c,
+            None => {
+                // Try to connect if running
+                if discovery::is_agent_running(name) {
+                    if let Some(socket_path) = discovery::agent_socket_path(name) {
+                        match UnixStream::connect(&socket_path).await {
+                            Ok(stream) => {
+                                let mut api = SocketApi::new(stream);
+                                if let Err(e) = api.write_request(&Request::Clear).await {
+                                    println!("\x1b[31mFailed to send clear: {}\x1b[0m", e);
+                                    return;
+                                }
+                                match api.read_response().await {
+                                    Ok(Some(Response::Ok)) => {
+                                        println!("\x1b[32m✓ Cleared history for '{}'\x1b[0m", name);
+                                    }
+                                    _ => {
+                                        println!("\x1b[31mFailed to clear history for '{}'\x1b[0m", name);
+                                    }
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", name, e);
+                                return;
+                            }
+                        }
+                    }
+                }
+                println!("\x1b[31mAgent '{}' not connected\x1b[0m", name);
+                return;
+            }
+        };
+
+        // Send clear request
+        let mut api = match connection.connect().await {
+            Ok(api) => api,
+            Err(e) => {
+                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", name, e);
+                return;
+            }
+        };
+
+        if let Err(e) = api.write_request(&Request::Clear).await {
+            println!("\x1b[31mFailed to send clear: {}\x1b[0m", e);
             return;
         }
 
-        self.default_llm = Some(spec.to_string());
-        println!("\x1b[32m✓ Default LLM set to '{}'\x1b[0m", spec);
+        match api.read_response().await {
+            Ok(Some(Response::Ok)) => {
+                println!("\x1b[32m✓ Cleared history for '{}'\x1b[0m", name);
+            }
+            _ => {
+                println!("\x1b[31mFailed to clear history for '{}'\x1b[0m", name);
+            }
+        }
     }
 
     fn cmd_help(&self) {
-        println!("\x1b[1mAnima REPL - Slash Commands:\x1b[0m");
+        println!("\x1b[1mAnima REPL (Daemon Mode) - Slash Commands:\x1b[0m");
         println!();
         println!("  \x1b[36m/load <name>\x1b[0m");
-        println!("      Load an agent from ~/.anima/agents/<name>/");
+        println!("      Start daemon (if needed) and connect to agent");
         println!();
-        println!("  \x1b[36m/start <name>\x1b[0m [--every <duration>] [--on-timer <message>]");
-        println!("      Start an agent in background loop (processes inbox)");
-        println!("      --every: timer interval (e.g., 30s, 5m, 1h)");
-        println!("      --on-timer: message when timer fires");
+        println!("  \x1b[36m/start <name>\x1b[0m");
+        println!("      Alias for /load");
         println!();
         println!("  \x1b[36m/stop <name>\x1b[0m");
-        println!("      Stop a running background agent");
+        println!("      Stop an agent daemon");
         println!();
         println!("  \x1b[36m/status\x1b[0m");
-        println!("      Show running/stopped status for all agents");
+        println!("      Show status of all agents");
         println!();
         println!("  \x1b[36m/list\x1b[0m");
-        println!("      List active agents in this session");
-        println!();
-        println!("  \x1b[36m/history\x1b[0m");
-        println!("      Show conversation history for all agents");
+        println!("      List connected and running agents");
         println!();
         println!("  \x1b[36m/clear [name]\x1b[0m");
-        println!("      Clear conversation history (name optional if single agent)");
-        println!();
-        println!("  \x1b[36m/set llm <provider/model>\x1b[0m");
-        println!("      Set default LLM for new agents");
-        println!("      Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3");
-        println!();
-        println!("  \x1b[36m/agent create <name>\x1b[0m [--llm <provider/model>] [--persona <file>]");
-        println!("      Create a new agent with optional configuration");
+        println!("      Clear conversation history");
         println!();
         println!("  \x1b[36m/help\x1b[0m");
         println!("      Show this help message");
@@ -1412,10 +764,14 @@ impl Repl {
         println!("\x1b[1mConversation (no slash):\x1b[0m");
         println!();
         println!("  \x1b[36m@name message\x1b[0m      Send message to specific agent");
-        println!("  \x1b[36m@all message\x1b[0m       Send to all running agents");
-        println!("  \x1b[36mmessage\x1b[0m            Send to single loaded agent (if only one)");
+        println!("  \x1b[36m@all message\x1b[0m       Send to all connected agents");
+        println!("  \x1b[36mmessage\x1b[0m            Send to single connected agent (if only one)");
         println!();
-        println!("\x1b[33mNote: Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or OLLAMA_HOST environment variables.\x1b[0m");
+        println!("\x1b[1mAgent Management:\x1b[0m");
+        println!();
+        println!("  Agents are stored in ~/.anima/agents/<name>/");
+        println!("  Each agent runs as a separate daemon process.");
+        println!("  Use 'anima start <name>' from command line to start daemons.");
     }
 }
 
@@ -1447,36 +803,13 @@ mod tests {
     #[test]
     fn test_repl_new() {
         let repl = Repl::new();
-        assert!(repl.agents.is_empty());
-        assert!(repl.default_llm.is_none());
+        assert!(repl.connections.is_empty());
     }
 
     #[test]
     fn test_repl_default() {
         let repl = Repl::default();
-        assert!(repl.agents.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_cmd_agent_list_empty() {
-        let repl = Repl::new();
-        // This just verifies it doesn't panic
-        repl.cmd_agent_list().await;
-    }
-
-    #[test]
-    fn test_cmd_set_llm() {
-        let mut repl = Repl::new();
-        repl.cmd_set_llm("openai/gpt-4o");
-        assert_eq!(repl.default_llm, Some("openai/gpt-4o".to_string()));
-    }
-
-    #[test]
-    fn test_cmd_set_llm_invalid_provider() {
-        let mut repl = Repl::new();
-        repl.cmd_set_llm("invalid/model");
-        // Should not set the default
-        assert!(repl.default_llm.is_none());
+        assert!(repl.connections.is_empty());
     }
 
     #[test]
@@ -1487,99 +820,17 @@ mod tests {
     }
 
     #[test]
-    fn test_repl_running_agents_empty() {
-        let repl = Repl::new();
-        assert!(repl.running_agents.is_empty());
-    }
-
-    #[test]
-    fn test_cmd_agent_status_empty() {
+    fn test_cmd_status_empty() {
         let repl = Repl::new();
         // Just verify it doesn't panic with no agents
-        repl.cmd_agent_status();
+        repl.cmd_status();
     }
 
     #[test]
-    fn test_cmd_agent_stop_not_running() {
-        let mut repl = Repl::new();
-        // Stopping a non-existent agent should not panic
-        repl.cmd_agent_stop("nonexistent");
-    }
-
-    #[test]
-    fn test_parse_duration_seconds() {
-        assert_eq!(parse_duration("30s"), Some(Duration::from_secs(30)));
-        assert_eq!(parse_duration("1sec"), Some(Duration::from_secs(1)));
-        assert_eq!(parse_duration("5secs"), Some(Duration::from_secs(5)));
-    }
-
-    #[test]
-    fn test_parse_duration_minutes() {
-        assert_eq!(parse_duration("5m"), Some(Duration::from_secs(300)));
-        assert_eq!(parse_duration("1min"), Some(Duration::from_secs(60)));
-        assert_eq!(parse_duration("2mins"), Some(Duration::from_secs(120)));
-    }
-
-    #[test]
-    fn test_parse_duration_hours() {
-        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
-        assert_eq!(parse_duration("2hr"), Some(Duration::from_secs(7200)));
-        assert_eq!(parse_duration("3hrs"), Some(Duration::from_secs(10800)));
-    }
-
-    #[test]
-    fn test_parse_duration_no_unit() {
-        // Defaults to seconds
-        assert_eq!(parse_duration("60"), Some(Duration::from_secs(60)));
-    }
-
-    #[test]
-    fn test_parse_duration_invalid() {
-        assert_eq!(parse_duration(""), None);
-        assert_eq!(parse_duration("abc"), None);
-        assert_eq!(parse_duration("5x"), None);
-    }
-
-    #[test]
-    fn test_parse_duration_whitespace() {
-        assert_eq!(parse_duration("  30s  "), Some(Duration::from_secs(30)));
-    }
-
-    #[tokio::test]
-    async fn test_cmd_agent_load_not_found() {
-        let mut repl = Repl::new();
-        // Loading a non-existent agent should not panic and should print error
-        repl.cmd_agent_load("nonexistent_agent_12345").await;
-        // Agent should not be in the list
-        assert!(!repl.agents.contains_key("nonexistent_agent_12345"));
-    }
-
-    #[tokio::test]
-    async fn test_cmd_agent_load_empty_name() {
-        let mut repl = Repl::new();
-        // Loading with empty name should not panic
-        repl.cmd_agent_load("").await;
-        repl.cmd_agent_load("   ").await;
-    }
-
-    #[tokio::test]
-    async fn test_cmd_agent_load_duplicate() {
-        // We can't easily test the full load without mocking home_dir,
-        // but we can test duplicate detection by adding an agent first
-        let mut repl = Repl::new();
-
-        // Manually add an agent with same name using runtime
-        let agent = repl.runtime.spawn_agent("test-agent".to_string()).await;
-        repl.agents.insert("test-agent".to_string(), ReplAgent {
-            agent: std::sync::Arc::new(tokio::sync::Mutex::new(agent)),
-            llm_name: "test".to_string(),
-            persona: AgentPersona::default(),
-        });
-
-        // Trying to load should fail due to duplicate
-        repl.cmd_agent_load("test-agent").await;
-        // Should still have just the one agent
-        assert_eq!(repl.agents.len(), 1);
+    fn test_cmd_list_empty() {
+        let repl = Repl::new();
+        // Just verify it doesn't panic
+        repl.cmd_list();
     }
 
     #[test]
@@ -1665,7 +916,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_conversation_no_agents() {
         let mut repl = Repl::new();
-        // No agents loaded, should print error but not panic
+        // No agents connected, should print error but not panic
         repl.handle_conversation("hello").await;
     }
 
@@ -1674,5 +925,14 @@ mod tests {
         let mut repl = Repl::new();
         // Mention unknown agent, should print error but not panic
         repl.handle_conversation("@unknown hello").await;
+    }
+
+    #[test]
+    fn test_agent_connection_clone() {
+        let conn = AgentConnection {
+            socket_path: PathBuf::from("/tmp/test.sock"),
+        };
+        let cloned = conn.clone();
+        assert_eq!(conn.socket_path, cloned.socket_path);
     }
 }

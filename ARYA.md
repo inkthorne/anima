@@ -1,32 +1,47 @@
 # ARYA.md — Current Task
 
-## Status: v2.5.1 Complete ✅
+## Status: v2.6 In Progress 🔨
 
-All core features shipped:
+**Goal:** REPL as thin client connecting to agent daemons via Unix sockets
+
+### Phases
+
+1. **Daemon discovery** (`src/discovery.rs`) ← CURRENT
+   - Scan `~/.anima/agents/*/daemon.pid` files
+   - Check process alive (kill -0)
+   - Return DaemonInfo: name, pid, socket_path, is_alive
+
+2. **REPL connects to daemons**
+   - Remove in-memory agents from REPL
+   - Connect to daemon sockets instead
+   - Track socket connections
+
+3. **Inter-daemon send_message**
+   - `messaging.rs` uses sockets instead of MessageRouter
+   - Daemons can message each other
+
+4. **list_agents tool**
+   - Uses discovery module
+   - Returns all running agents
+
+5. **Cleanup**
+   - Remove unused in-memory code
+   - Update tests
+
+### Key Files
+- `src/discovery.rs` (NEW)
+- `src/repl.rs`
+- `src/tools/messaging.rs`
+- `src/socket_api.rs`
+- `src/daemon.rs`
+
+## Previous (v2.5.1) ✅
+
 - Agent directories (`~/.anima/agents/<name>/`)
 - Daemon mode with Unix socket API
 - Full CLI: create/start/stop/status/clear/ask/send/chat
-- REPL with slash commands and @mentions (59551fa)
-
-## Recent Work (v2.5.1)
-
-REPL refactor completed:
-- All commands require `/` prefix (`/load`, `/start`, `/stop`, `/status`, `/list`, `/history`, `/clear`, `/help`, `/quit`)
-- Conversation uses `@mentions` (`@arya hello`, `@all hello`)
-- Message format: `[sender] content`
+- REPL with slash commands and @mentions
 - 288 tests passing
-
-## Test Status
-
-288 tests passing.
-
-## What's Next (v2.6)
-
-Pick a direction:
-1. **Telegram** — Channel into daemon
-2. **Web UI** — Browser interface
-3. **Tool plugins** — Extensible tools
-4. **Streaming** — Real-time response output
 
 ## Key Commands
 
@@ -35,19 +50,7 @@ Pick a direction:
 anima create/start/stop/status/clear
 anima ask/send/chat/run
 
-# REPL (slash commands)
-/load <name>     - Load agent from ~/.anima/agents/
-/start <name>    - Start background loop
-/stop <name>     - Stop background agent
-/status          - Show agent status
-/list            - List active agents
-/history         - Show conversation history
-/clear [name]    - Clear history
-/help            - Show help
-/quit            - Exit REPL
-
-# REPL (conversation)
-@arya hello      - Message specific agent
-@all hello       - Message all running agents
-hello            - Message single loaded agent
+# REPL
+/load, /start, /stop, /status, /list, /history, /clear, /help, /quit
+@arya hello, @all hello
 ```

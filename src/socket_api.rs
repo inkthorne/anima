@@ -11,8 +11,15 @@ use tokio::net::UnixStream;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    /// Send a message to the agent and get a response.
+    /// Send a message to the agent and get a response (from user/REPL).
     Message {
+        content: String,
+    },
+    /// Incoming message from another agent (inter-daemon communication).
+    IncomingMessage {
+        /// The sender agent's name
+        from: String,
+        /// The message content
         content: String,
     },
     /// Get the current status of the daemon.
@@ -21,6 +28,8 @@ pub enum Request {
     Shutdown,
     /// Clear the agent's conversation history.
     Clear,
+    /// List all agents visible to this daemon.
+    ListAgents,
 }
 
 /// Response types for the socket API.
@@ -35,6 +44,10 @@ pub enum Response {
     Status {
         running: bool,
         history_len: usize,
+    },
+    /// Response to a list_agents request.
+    Agents {
+        agents: Vec<String>,
     },
     /// Generic OK response.
     Ok,
@@ -280,5 +293,58 @@ mod tests {
             serde_json::from_str::<Request>("invalid json").unwrap_err()
         );
         assert!(json_error.to_string().contains("JSON error"));
+    }
+
+    #[test]
+    fn test_request_incoming_message_serialization() {
+        let request = Request::IncomingMessage {
+            from: "agent-1".to_string(),
+            content: "Hello from agent-1!".to_string(),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"incoming_message\""));
+        assert!(json.contains("\"from\":\"agent-1\""));
+        assert!(json.contains("\"content\":\"Hello from agent-1!\""));
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::IncomingMessage { from, content } => {
+                assert_eq!(from, "agent-1");
+                assert_eq!(content, "Hello from agent-1!");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_list_agents_serialization() {
+        let request = Request::ListAgents;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"list_agents"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::ListAgents));
+    }
+
+    #[test]
+    fn test_response_agents_serialization() {
+        let response = Response::Agents {
+            agents: vec!["agent-1".to_string(), "agent-2".to_string()],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"agents\""));
+        assert!(json.contains("\"agents\""));
+        assert!(json.contains("agent-1"));
+        assert!(json.contains("agent-2"));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Agents { agents } => {
+                assert_eq!(agents.len(), 2);
+                assert!(agents.contains(&"agent-1".to_string()));
+                assert!(agents.contains(&"agent-2".to_string()));
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }

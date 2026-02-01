@@ -1,9 +1,12 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::net::UnixStream;
 
+use crate::discovery;
 use crate::error::ToolError;
 use crate::messaging::{AgentMessage, MessageRouter};
+use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
 use serde_json::Value;
 
@@ -128,6 +131,117 @@ impl Tool for ListAgentsTool {
             "agents": agents,
             "count": agents.len()
         }))
+    }
+}
+
+/// Daemon-aware tool that sends messages to other agents via Unix sockets.
+/// Used by daemons to communicate with other daemons.
+pub struct DaemonSendMessageTool {
+    /// The ID of the agent using this tool
+    agent_id: String,
+}
+
+impl DaemonSendMessageTool {
+    /// Create a new DaemonSendMessageTool
+    pub fn new(agent_id: String) -> Self {
+        DaemonSendMessageTool { agent_id }
+    }
+}
+
+impl std::fmt::Debug for DaemonSendMessageTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonSendMessageTool")
+            .field("agent_id", &self.agent_id)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonSendMessageTool {
+    fn name(&self) -> &str {
+        "send_message"
+    }
+
+    fn description(&self) -> &str {
+        "Send a message to another agent. Use this to communicate with peer agents running as daemons."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "The name of the agent to send the message to"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The content of the message to send"
+                }
+            },
+            "required": ["to", "message"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, ToolError> {
+        let to = input
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'to' field".to_string()))?;
+
+        let message = input
+            .get("message")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'message' field".to_string()))?;
+
+        // Check if the target agent is running
+        if !discovery::is_agent_running(to) {
+            return Err(ToolError::ExecutionFailed(format!(
+                "Agent '{}' is not running. Start it with 'anima start {}'",
+                to, to
+            )));
+        }
+
+        // Get socket path
+        let socket_path = discovery::agent_socket_path(to)
+            .ok_or_else(|| ToolError::ExecutionFailed("Could not determine agent socket path".to_string()))?;
+
+        // Connect to the target daemon
+        let stream = UnixStream::connect(&socket_path)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to connect to agent '{}': {}", to, e)))?;
+
+        let mut api = SocketApi::new(stream);
+
+        // Send the incoming message request
+        let request = Request::IncomingMessage {
+            from: self.agent_id.clone(),
+            content: message.to_string(),
+        };
+
+        api.write_request(&request)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to send message: {}", e)))?;
+
+        // Read the response
+        let response = api.read_response()
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {}", e)))?;
+
+        match response {
+            Some(Response::Ok) => Ok(serde_json::json!({
+                "sent": true,
+                "to": to
+            })),
+            Some(Response::Message { content }) => Ok(serde_json::json!({
+                "sent": true,
+                "to": to,
+                "response": content
+            })),
+            Some(Response::Error { message }) => Err(ToolError::ExecutionFailed(message)),
+            None => Err(ToolError::ExecutionFailed("Connection closed unexpectedly".to_string())),
+            _ => Err(ToolError::ExecutionFailed("Unexpected response from agent".to_string())),
+        }
     }
 }
 

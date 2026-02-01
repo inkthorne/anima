@@ -12,12 +12,15 @@ use tokio::sync::Mutex;
 
 use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError};
+use crate::discovery;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
-use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
+use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
+use crate::tools::send_message::DaemonSendMessageTool;
+use crate::tools::list_agents::DaemonListAgentsTool;
 
 /// Configuration for the daemon, derived from AgentDir.
 #[derive(Debug, Clone)]
@@ -389,10 +392,9 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
     agent.register_tool(Arc::new(HttpTool::new()));
     agent.register_tool(Arc::new(ShellTool::new()));
 
-    // Register messaging tools
-    let router = runtime.router().clone();
-    agent.register_tool(Arc::new(SendMessageTool::new(router.clone(), agent_name.clone())));
-    agent.register_tool(Arc::new(ListAgentsTool::new(router)));
+    // Register daemon-aware messaging tools (use socket communication instead of in-memory router)
+    agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
+    agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
 
     // Apply LLM and memory
     agent = agent.with_llm(llm);
@@ -454,6 +456,30 @@ async fn handle_connection(
                 }
             }
 
+            Request::IncomingMessage { ref from, ref content } => {
+                println!("[socket] Incoming message from {}: {}", from, content);
+
+                // Format the message with [sender] prefix for the agent
+                let formatted_message = format!("[{}] {}", from, content);
+
+                let options = ThinkOptions {
+                    system_prompt: persona.clone(),
+                    always_prompt: always.clone(),
+                    ..Default::default()
+                };
+
+                let mut agent_guard = agent.lock().await;
+                match agent_guard.think_with_options(&formatted_message, options).await {
+                    Ok(result) => {
+                        println!("[socket] Response to {}: {}", from, result.response);
+                        Response::Message { content: result.response }
+                    }
+                    Err(e) => {
+                        Response::Error { message: e.to_string() }
+                    }
+                }
+            }
+
             Request::Status => {
                 let agent_guard = agent.lock().await;
                 Response::Status {
@@ -473,6 +499,15 @@ async fn handle_connection(
                 let mut agent_guard = agent.lock().await;
                 agent_guard.clear_history();
                 Response::Ok
+            }
+
+            Request::ListAgents => {
+                println!("[socket] Listing agents");
+                let agents: Vec<String> = discovery::discover_running_agents()
+                    .into_iter()
+                    .map(|a| a.name)
+                    .collect();
+                Response::Agents { agents }
             }
         };
 
