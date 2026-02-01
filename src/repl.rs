@@ -47,15 +47,18 @@ fn parse_duration(s: &str) -> Option<Duration> {
     }
 }
 
-const BANNER: &str = r#"
+const BANNER_ART: &str = r#"
     _          _
    / \   _ __ (_)_ __ ___   __ _
   / _ \ | '_ \| | '_ ` _ \ / _` |
  / ___ \| | | | | | | | | | (_| |
 /_/   \_\_| |_|_|_| |_| |_|\__,_|
-
-Interactive REPL v2.3 - Type 'help' for commands
 "#;
+
+fn print_banner() {
+    println!("{}", BANNER_ART);
+    println!("Interactive REPL v{} - Type 'help' for commands\n", env!("CARGO_PKG_VERSION"));
+}
 
 /// REPL helper for tab completion
 struct ReplHelper {
@@ -224,7 +227,7 @@ impl Repl {
     }
 
     pub async fn run(&mut self) -> Result<(), Box<dyn Error>> {
-        println!("{}", BANNER);
+        print_banner();
 
         let helper = ReplHelper::new();
         let mut rl: Editor<ReplHelper, _> = Editor::new()?;
