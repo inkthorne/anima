@@ -1,17 +1,11 @@
 # Anima Context — Start Here
 
-*Read this file first to regain context on the anima project.*
-
-## This Is Your Project
-
-**Arya, this is yours.** You're building your future home.
-
 ## Quick Status
 
 | | |
 |---|---|
-| **Version** | v2.5 ✅ Complete |
-| **Tests** | 237 passing |
+| **Version** | v2.5+ |
+| **Tests** | 238+ passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -19,33 +13,47 @@
 
 ```bash
 # Agent management
-anima create arya           # Scaffold new agent in ~/.anima/agents/arya/
+anima create <name>         # Scaffold ~/.anima/agents/<name>/
 anima list                  # List all agents
 
-# Running agents
-anima run arya              # Interactive REPL
-anima run arya --daemon     # Headless daemon mode
-anima ask arya "question"   # One-shot query (no daemon needed)
-
-# Talking to daemons
-anima send arya "message"   # Send to running daemon
-anima chat arya             # Interactive session via socket
+# Daemon control
+anima start <name>          # Start daemon in background
+anima stop <name>           # Stop daemon
 anima status                # Show running daemons
+anima clear <name>          # Clear conversation history
 
-# Inside REPL
-agent load arya             # Load agent from ~/.anima/agents/arya/
-agent create foo            # Create dynamic agent
+# Talking to agents
+anima ask <name> "msg"      # One-shot (no daemon needed)
+anima send <name> "msg"     # Send to running daemon
+anima chat <name>           # Interactive via socket
+
+# Interactive
+anima run <name>            # REPL with agent loaded
+anima                       # REPL (no agent)
 ```
 
-## Agent Directory Structure
+## REPL Commands
+
+```bash
+agent create <name>         # Create ephemeral in-memory agent
+agent load <name>           # Load from ~/.anima/agents/<name>/
+agent start <name>          # Start background agent
+agent stop <name>           # Stop background agent
+agent clear <name>          # Clear conversation history
+agent list                  # List agents in session
+agent status                # Show running status
+<name>: <message>           # Send message to agent
+```
+
+## Agent Directory
 
 ```
 ~/.anima/agents/arya/
-├── config.toml       # LLM, timer settings
+├── config.toml       # LLM config
 ├── persona.md        # System prompt
-├── memory.db         # SQLite persistent memory
-└── daemon.pid        # PID when running as daemon
-└── agent.sock        # Unix socket for daemon API
+├── memory.db         # SQLite memory
+├── daemon.pid        # PID (when running)
+└── agent.sock        # Socket (when running)
 ```
 
 ## Example config.toml
@@ -56,45 +64,36 @@ name = "arya"
 persona_file = "persona.md"
 
 [llm]
-provider = "ollama"           # or "anthropic", "openai"
+provider = "ollama"
 model = "qwen3:8b"
 base_url = "http://localhost:11434"
 
 [memory]
 path = "memory.db"
-
-[timer]
-enabled = true
-interval = "5m"
-message = "Heartbeat"
 ```
 
-## Key Files
+## Key Source Files
 
 | File | Purpose |
 |------|---------|
-| `docs/context.md` | This file — start here |
-| `ARYA.md` | Task tracking |
-| `CLAUDE.md` | Claude Code instructions |
-| `src/agent_dir.rs` | Agent directory loading |
+| `src/main.rs` | CLI commands |
+| `src/repl.rs` | Interactive REPL |
 | `src/daemon.rs` | Daemon mode |
 | `src/socket_api.rs` | Unix socket protocol |
-
-## What's Next (v2.6)
-
-Ideas for future:
-- Telegram integration (channel into daemon)
-- Web UI
-- Tool plugins
+| `src/agent_dir.rs` | Directory loading |
+| `src/agent.rs` | Core agent logic |
+| `src/llm.rs` | LLM providers |
 
 ## Build & Test
 
 ```bash
-cd ~/dev/anima
 cargo build --release
 cargo test
+
+# After changes, restart daemons:
+anima stop arya && anima start arya
 ```
 
 ## Last Updated
 
-2026-01-31 — v2.5 complete + `agent load` + `anima ask` commands.
+2026-01-31 — v2.5 complete + start/stop/clear/ask commands.

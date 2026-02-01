@@ -86,7 +86,7 @@ impl Completer for ReplHelper {
         let mut completions = Vec::new();
 
         // Commands that can be completed
-        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "memory", "set llm", "help", "exit", "quit"];
+        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "agent clear", "memory", "set llm", "help", "exit", "quit"];
 
         // Find the word being typed
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -103,7 +103,7 @@ impl Completer for ReplHelper {
         }
 
         // Complete agent names for commands that use them
-        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.contains(": ") {
+        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.starts_with("agent clear ") || line.contains(": ") {
             for name in &self.agent_names {
                 if name.starts_with(partial) {
                     completions.push(Pair {
@@ -299,6 +299,8 @@ impl Repl {
             self.cmd_agent_stop(&input[11..]);
         } else if input == "agent status" {
             self.cmd_agent_status();
+        } else if input.starts_with("agent clear ") {
+            self.cmd_history_clear(&input[12..]).await;
         } else if input.starts_with("memory ") {
             self.cmd_memory(&input[7..]).await;
         } else if input.starts_with("history clear ") {
@@ -1244,7 +1246,7 @@ impl Repl {
         println!("  \x1b[36mmemory <agent>\x1b[0m");
         println!("      Show an agent's memory");
         println!();
-        println!("  \x1b[36mhistory clear <agent>\x1b[0m");
+        println!("  \x1b[36magent clear <name>\x1b[0m / \x1b[36mhistory clear <name>\x1b[0m");
         println!("      Clear an agent's conversation history");
         println!();
         println!("  \x1b[36m<agent>: ask <other> \"<question>\"\x1b[0m");
