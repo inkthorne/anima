@@ -232,7 +232,13 @@ impl Repl {
         // Format as multiline string
         unseen
             .iter()
-            .map(|entry| format!("- {}: {}", entry.sender, entry.content))
+            .map(|entry| {
+                let escaped = entry.content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", entry.sender, escaped)
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1174,7 +1180,7 @@ mod tests {
 
         // First time getting context for gendry - should get full log
         let context = repl.get_context_for_agent("gendry");
-        assert_eq!(context, "- user: @arya hello\n- arya: hey there!");
+        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@arya hello\"}\n{\"from\": \"arya\", \"text\": \"hey there!\"}");
         assert_eq!(repl.agent_cursors.get("gendry"), Some(&2));
     }
 
@@ -1185,7 +1191,7 @@ mod tests {
 
         // arya gets the first message
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "- user: @arya hello");
+        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@arya hello\"}");
         assert_eq!(repl.agent_cursors.get("arya"), Some(&1));
 
         // Add more messages
@@ -1194,7 +1200,7 @@ mod tests {
 
         // arya should only see the new messages
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "- arya: hey there!\n- user: @arya ask gendry");
+        assert_eq!(context, "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}");
         assert_eq!(repl.agent_cursors.get("arya"), Some(&3));
     }
 
@@ -1218,9 +1224,9 @@ mod tests {
         // User: @arya hello
         repl.log_message("user", "@arya hello");
 
-        // arya receives: "- user: @arya hello"
+        // arya receives JSON formatted context
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "- user: @arya hello");
+        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@arya hello\"}");
 
         // arya responds: "hey there!"
         repl.log_message("arya", "hey there!");
@@ -1230,7 +1236,7 @@ mod tests {
 
         // arya receives only new messages
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "- arya: hey there!\n- user: @arya ask gendry");
+        assert_eq!(context, "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}");
 
         // arya responds: "@gendry what do you think?"
         repl.log_message("arya", "@gendry what do you think?");
@@ -1239,7 +1245,7 @@ mod tests {
         let context = repl.get_context_for_agent("gendry");
         assert_eq!(
             context,
-            "- user: @arya hello\n- arya: hey there!\n- user: @arya ask gendry\n- arya: @gendry what do you think?"
+            "{\"from\": \"user\", \"text\": \"@arya hello\"}\n{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}\n{\"from\": \"arya\", \"text\": \"@gendry what do you think?\"}"
         );
     }
 }
