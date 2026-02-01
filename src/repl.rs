@@ -1117,7 +1117,7 @@ impl Repl {
                                      agent_name, msg.from, msg.content);
 
                             // Process the message by thinking about it
-                            let task = format!("You received a message from {}: {}", msg.from, msg.content);
+                            let task = format!("You received a message from agent '{}': {}\n\nTo reply, use the send_message tool with to=\"{}\".", msg.from, msg.content, msg.from);
 
                             // Get history snapshot and build options with persona
                             let history = history_arc.lock().await.clone();
