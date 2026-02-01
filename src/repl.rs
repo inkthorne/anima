@@ -149,6 +149,15 @@ impl Highlighter for ReplHelper {}
 impl Validator for ReplHelper {}
 impl Helper for ReplHelper {}
 
+/// A single entry in the shared conversation log.
+#[derive(Debug, Clone)]
+struct ConversationEntry {
+    /// Who sent the message: "user" or an agent name
+    sender: String,
+    /// The message content
+    content: String,
+}
+
 /// Connection to a running agent daemon
 #[derive(Debug, Clone)]
 struct AgentConnection {
@@ -175,6 +184,10 @@ pub struct Repl {
     connections: HashMap<String, AgentConnection>,
     /// History file path
     history_file: Option<PathBuf>,
+    /// Shared conversation log - all messages from user and agents
+    conversation_log: Vec<ConversationEntry>,
+    /// Per-agent cursor into conversation_log (last seen index)
+    agent_cursors: HashMap<String, usize>,
 }
 
 impl Repl {
@@ -184,6 +197,8 @@ impl Repl {
         Repl {
             connections: HashMap::new(),
             history_file,
+            conversation_log: Vec::new(),
+            agent_cursors: HashMap::new(),
         }
     }
 
@@ -196,6 +211,32 @@ impl Repl {
         self
     }
 
+    /// Log a message to the conversation log.
+    fn log_message(&mut self, sender: &str, content: &str) {
+        self.conversation_log.push(ConversationEntry {
+            sender: sender.to_string(),
+            content: content.to_string(),
+        });
+        debug::log(&format!("LOG: {} entries, added from {}", self.conversation_log.len(), sender));
+    }
+
+    /// Get unseen conversation context for an agent and update their cursor.
+    /// Returns formatted context string (each line is "sender: content").
+    fn get_context_for_agent(&mut self, agent_name: &str) -> String {
+        let cursor = self.agent_cursors.get(agent_name).copied().unwrap_or(0);
+        let unseen = &self.conversation_log[cursor..];
+
+        // Update cursor to current log length
+        self.agent_cursors.insert(agent_name.to_string(), self.conversation_log.len());
+
+        // Format as multiline string
+        unseen
+            .iter()
+            .map(|entry| format!("{}: {}", entry.sender, entry.content))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Create a REPL with a pre-loaded agent (ensures daemon is running and connects to it).
     pub async fn with_agent(name: String) -> Self {
         let history_file = dirs::home_dir().map(|h| h.join(".anima_history"));
@@ -203,6 +244,8 @@ impl Repl {
         let mut repl = Repl {
             connections: HashMap::new(),
             history_file,
+            conversation_log: Vec::new(),
+            agent_cursors: HashMap::new(),
         };
 
         // Ensure the daemon is running and connect to it
@@ -424,22 +467,26 @@ impl Repl {
             return;
         }
 
+        // Log the user message to the conversation log
+        self.log_message("user", input);
+
         // Send the message to each target agent
         for agent_name in target_agents {
-            self.send_message_to_daemon(&agent_name, input).await;
+            self.send_message_to_daemon(&agent_name).await;
         }
     }
 
     /// Send a conversation message to a daemon and display the response.
-    async fn send_message_to_daemon(&mut self, agent_name: &str, message: &str) {
-        self.send_message_to_daemon_inner(agent_name, message, 0).await;
+    /// Uses the shared conversation log to provide context.
+    async fn send_message_to_daemon(&mut self, agent_name: &str) {
+        self.send_message_to_daemon_inner(agent_name, 0).await;
     }
 
     /// Inner implementation that uses depth limit to prevent runaway loops.
+    /// Gets unseen context from conversation_log and updates the agent's cursor.
     async fn send_message_to_daemon_inner(
         &mut self,
         agent_name: &str,
-        message: &str,
         depth: u32,
     ) {
         // Safety limit: stop after 15 hops to prevent runaway loops
@@ -455,11 +502,15 @@ impl Repl {
             }
         };
 
-        // Format the message with [user] prefix for the agent
-        let formatted_message = format!("user: {}", message);
+        // Get unseen conversation context for this agent
+        let context = self.get_context_for_agent(agent_name);
+        if context.is_empty() {
+            debug::log(&format!("No new context for {}, skipping", agent_name));
+            return;
+        }
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
-        debug::log(&format!("CONV: {} -> {}", agent_name, message));
+        debug::log(&format!("CONV: {} <- context ({} chars)", agent_name, context.len()));
 
         // Connect to daemon
         let mut api = match connection.connect().await {
@@ -470,8 +521,8 @@ impl Repl {
             }
         };
 
-        // Send message request
-        let request = Request::Message { content: formatted_message };
+        // Send message request with conversation context
+        let request = Request::Message { content: context };
         if let Err(e) = api.write_request(&request).await {
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
             return;
@@ -488,6 +539,9 @@ impl Repl {
 
                 println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
 
+                // Log the agent's response to the conversation log
+                self.log_message(agent_name, &stripped);
+
                 // Check for @mentions in response and forward to mentioned agents
                 let mentions = parse_mentions(&stripped);
                 for mention in mentions {
@@ -503,9 +557,8 @@ impl Repl {
                             .cloned()
                             .collect();
                         for other in others {
-                            let forwarded_message = format!("{}: {}", agent_name, stripped);
-                            debug::log(&format!("FORWARD (@all): {} -> {} (from {})", other, forwarded_message, agent_name));
-                            Box::pin(self.send_message_to_daemon_inner(&other, &forwarded_message, depth + 1)).await;
+                            debug::log(&format!("FORWARD (@all): {} (from {})", other, agent_name));
+                            Box::pin(self.send_message_to_daemon_inner(&other, depth + 1)).await;
                         }
                         continue;
                     }
@@ -526,11 +579,8 @@ impl Repl {
                         }
                     }
 
-                    // Forward message with sender context
-                    let forwarded_message = format!("{}: {}", agent_name, stripped);
-                    debug::log(&format!("FORWARD: {} -> {} (from {})", mention, forwarded_message, agent_name));
-
-                    Box::pin(self.send_message_to_daemon_inner(&mention, &forwarded_message, depth + 1)).await;
+                    debug::log(&format!("FORWARD: {} (from {})", mention, agent_name));
+                    Box::pin(self.send_message_to_daemon_inner(&mention, depth + 1)).await;
                 }
             }
             Ok(Some(Response::Error { message })) => {
@@ -1083,5 +1133,113 @@ mod tests {
         };
         let cloned = conn.clone();
         assert_eq!(conn.socket_path, cloned.socket_path);
+    }
+
+    #[test]
+    fn test_conversation_entry_clone() {
+        let entry = ConversationEntry {
+            sender: "user".to_string(),
+            content: "hello".to_string(),
+        };
+        let cloned = entry.clone();
+        assert_eq!(entry.sender, cloned.sender);
+        assert_eq!(entry.content, cloned.content);
+    }
+
+    #[test]
+    fn test_repl_new_initializes_conversation_log() {
+        let repl = Repl::new();
+        assert!(repl.conversation_log.is_empty());
+        assert!(repl.agent_cursors.is_empty());
+    }
+
+    #[test]
+    fn test_log_message() {
+        let mut repl = Repl::new();
+        repl.log_message("user", "hello @arya");
+        repl.log_message("arya", "hey there!");
+
+        assert_eq!(repl.conversation_log.len(), 2);
+        assert_eq!(repl.conversation_log[0].sender, "user");
+        assert_eq!(repl.conversation_log[0].content, "hello @arya");
+        assert_eq!(repl.conversation_log[1].sender, "arya");
+        assert_eq!(repl.conversation_log[1].content, "hey there!");
+    }
+
+    #[test]
+    fn test_get_context_for_agent_first_time() {
+        let mut repl = Repl::new();
+        repl.log_message("user", "@arya hello");
+        repl.log_message("arya", "hey there!");
+
+        // First time getting context for gendry - should get full log
+        let context = repl.get_context_for_agent("gendry");
+        assert_eq!(context, "user: @arya hello\narya: hey there!");
+        assert_eq!(repl.agent_cursors.get("gendry"), Some(&2));
+    }
+
+    #[test]
+    fn test_get_context_for_agent_incremental() {
+        let mut repl = Repl::new();
+        repl.log_message("user", "@arya hello");
+
+        // arya gets the first message
+        let context = repl.get_context_for_agent("arya");
+        assert_eq!(context, "user: @arya hello");
+        assert_eq!(repl.agent_cursors.get("arya"), Some(&1));
+
+        // Add more messages
+        repl.log_message("arya", "hey there!");
+        repl.log_message("user", "@arya ask gendry");
+
+        // arya should only see the new messages
+        let context = repl.get_context_for_agent("arya");
+        assert_eq!(context, "arya: hey there!\nuser: @arya ask gendry");
+        assert_eq!(repl.agent_cursors.get("arya"), Some(&3));
+    }
+
+    #[test]
+    fn test_get_context_for_agent_empty_when_up_to_date() {
+        let mut repl = Repl::new();
+        repl.log_message("user", "@arya hello");
+
+        // arya gets the message
+        let _ = repl.get_context_for_agent("arya");
+
+        // No new messages, context should be empty
+        let context = repl.get_context_for_agent("arya");
+        assert!(context.is_empty());
+    }
+
+    #[test]
+    fn test_get_context_full_flow() {
+        let mut repl = Repl::new();
+
+        // User: @arya hello
+        repl.log_message("user", "@arya hello");
+
+        // arya receives: "user: @arya hello"
+        let context = repl.get_context_for_agent("arya");
+        assert_eq!(context, "user: @arya hello");
+
+        // arya responds: "hey there!"
+        repl.log_message("arya", "hey there!");
+
+        // User: @arya ask gendry
+        repl.log_message("user", "@arya ask gendry");
+
+        // arya receives only new messages
+        let context = repl.get_context_for_agent("arya");
+        assert_eq!(context, "arya: hey there!\nuser: @arya ask gendry");
+
+        // arya responds: "@gendry what do you think?"
+        repl.log_message("arya", "@gendry what do you think?");
+
+        // gendry has never received anything, gets full log
+        let context = repl.get_context_for_agent("gendry");
+        assert_eq!(
+            context,
+            "user: @arya hello\narya: hey there!\nuser: @arya ask gendry\narya: @gendry what do you think?"
+        );
     }
 }
