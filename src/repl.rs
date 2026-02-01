@@ -456,7 +456,7 @@ impl Repl {
         };
 
         // Format the message with [user] prefix for the agent
-        let formatted_message = format!("[user] {}", message);
+        let formatted_message = format!("user: {}", message);
 
         println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
         debug::log(&format!("CONV: {} -> {}", agent_name, message));
