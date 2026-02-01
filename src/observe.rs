@@ -80,8 +80,10 @@ impl Observer for ConsoleObserver {
                 }
             }
             Event::AgentComplete { agent_id, duration_ms, success } => {
-                let status = if *success { "completed" } else { "failed" };
-                eprintln!("[AGENT] {} {} in {}ms", agent_id, status, duration_ms);
+                if self.verbose || !success {
+                    let status = if *success { "completed" } else { "failed" };
+                    eprintln!("[AGENT] {} {} in {}ms", agent_id, status, duration_ms);
+                }
             }
             Event::LlmCall { model, tokens_in, tokens_out, duration_ms } => {
                 if self.verbose {
