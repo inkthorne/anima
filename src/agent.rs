@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use regex::Regex;
+
 use crate::error::ToolError;
 use crate::tool::Tool;
 use crate::message::Message;
@@ -15,6 +17,13 @@ use tokio::sync::Mutex;
 use serde_json::Value;
 use crate::supervision::{ChildHandle, ChildConfig, ChildStatus};
 use tokio::sync::oneshot;
+
+/// Strip thinking tags from LLM response content for conversation history storage.
+/// Removes `<think>...</think>` and `<thinking>...</thinking>` blocks (case-insensitive).
+fn strip_thinking(content: &str) -> String {
+    let re = Regex::new(r"(?si)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
+    re.replace_all(content, "").trim().to_string()
+}
 
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
@@ -568,10 +577,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 return Ok(final_response);
             }
 
-            // Add assistant message with tool calls
+            // Add assistant message with tool calls (strip thinking tags for storage)
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: response.content.clone(),
+                content: response.content.as_ref().map(|c| strip_thinking(c)),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             });
@@ -763,10 +772,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
             }
 
-            // Add assistant message with tool calls
+            // Add assistant message with tool calls (strip thinking tags for storage)
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: response.content.clone(),
+                content: response.content.as_ref().map(|c| strip_thinking(c)),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             });
@@ -1678,5 +1687,44 @@ mod tests {
 
         // No more messages
         assert!(agent2.receive_message().await.is_none());
+    }
+
+    // =========================================================================
+    // strip_thinking tests
+    // =========================================================================
+
+    #[test]
+    fn test_strip_thinking_single_block() {
+        let input = "<think>\nreasoning here\n</think>\n\nActual response";
+        let result = strip_thinking(input);
+        assert_eq!(result, "Actual response");
+    }
+
+    #[test]
+    fn test_strip_thinking_multiple_blocks() {
+        let input = "<think>first thought</think>Some text<thinking>second thought</thinking>More text";
+        let result = strip_thinking(input);
+        assert_eq!(result, "Some textMore text");
+    }
+
+    #[test]
+    fn test_strip_thinking_no_block() {
+        let input = "Just a regular response with no thinking tags";
+        let result = strip_thinking(input);
+        assert_eq!(result, "Just a regular response with no thinking tags");
+    }
+
+    #[test]
+    fn test_strip_thinking_mixed_case_tags() {
+        let input = "<THINK>uppercase</THINK>\n\nResponse\n\n<ThInKiNg>mixed</ThInKiNg>";
+        let result = strip_thinking(input);
+        assert_eq!(result, "Response");
+    }
+
+    #[test]
+    fn test_strip_thinking_empty_result() {
+        let input = "<think>only thinking, nothing else</think>";
+        let result = strip_thinking(input);
+        assert_eq!(result, "");
     }
 }
