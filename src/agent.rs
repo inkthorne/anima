@@ -466,7 +466,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("You have messages from other agents:\n{}\n\nCurrent task: {}", inbox_text, task)
+            format!("You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}", inbox_text, task)
         };
 
         let llm = self.llm.as_ref().ok_or_else(||
@@ -669,7 +669,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("You have messages from other agents:\n{}\n\nCurrent task: {}", inbox_text, task)
+            format!("You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}", inbox_text, task)
         };
 
         let llm = self.llm.as_ref().ok_or_else(||
