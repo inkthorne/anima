@@ -99,6 +99,7 @@ pub struct ReflectionResult {
 pub struct Agent {
     pub id: String,
     tools: HashMap<String, Arc<dyn Tool>>,
+    #[allow(dead_code)]
     inbox: mpsc::Receiver<Message>,
     memory: Option<Box<dyn Memory>>,
     llm: Option<Arc<dyn LLM>>,

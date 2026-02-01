@@ -32,7 +32,7 @@ impl Runtime {
 
     /// Spawn a new agent with the given ID (auto-registers with message router)
     pub async fn spawn_agent(&mut self, id: String) -> Agent {
-        let (tx, rx) = mpsc::channel(32);
+        let (_tx, rx) = mpsc::channel(32);
 
         // Register with message router
         let message_rx = {
