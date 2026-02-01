@@ -81,7 +81,7 @@ impl Completer for ReplHelper {
         if line.starts_with('/') {
             let cmd_partial = &line[1..pos]; // Skip the leading /
             let slash_commands = [
-                "/start", "/load", "/stop", "/create", "/status", "/list", "/clear",
+                "/start", "/load", "/stop", "/restart", "/create", "/status", "/list", "/clear",
                 "/help", "/quit", "/exit"
             ];
 
@@ -97,7 +97,8 @@ impl Completer for ReplHelper {
 
             // Complete agent names after commands that use them
             if line.starts_with("/load ") || line.starts_with("/start ") ||
-               line.starts_with("/stop ") || line.starts_with("/clear ") {
+               line.starts_with("/stop ") || line.starts_with("/restart ") ||
+               line.starts_with("/clear ") {
                 for name in &self.agent_names {
                     if name.starts_with(partial) {
                         completions.push(Pair {
@@ -348,6 +349,9 @@ impl Repl {
         } else if input == "stop" || input.starts_with("stop ") {
             let name = if input == "stop" { "" } else { &input[5..] };
             self.cmd_stop(name).await;
+        } else if input == "restart" || input.starts_with("restart ") {
+            let name = if input == "restart" { "" } else { &input[8..] };
+            self.cmd_restart(name).await;
         } else if input == "status" {
             self.cmd_status();
         } else if input == "list" {
@@ -613,6 +617,66 @@ impl Repl {
         self.cmd_load(name).await;
     }
 
+    /// Restart an agent daemon (stop then start), reconnecting afterward.
+    async fn cmd_restart(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            println!("\x1b[31mUsage: /restart <name>\x1b[0m");
+            return;
+        }
+
+        // Check if agent config exists
+        let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
+        if !agent_exists {
+            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
+            return;
+        }
+
+        // Stop if running
+        if discovery::is_agent_running(name) {
+            println!("Stopping {}...", name);
+
+            // Send shutdown request
+            if let Some(socket_path) = discovery::agent_socket_path(name) {
+                if let Ok(stream) = UnixStream::connect(&socket_path).await {
+                    let mut api = SocketApi::new(stream);
+                    let _ = api.write_request(&Request::Shutdown).await;
+                    // Wait for response (brief)
+                    let _ = api.read_response().await;
+                }
+            }
+
+            // Remove from connections
+            self.connections.remove(name);
+
+            // Wait for daemon to stop
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !discovery::is_agent_running(name) {
+                    break;
+                }
+            }
+        }
+
+        // Brief wait to ensure clean shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Start and connect
+        println!("Starting {}...", name);
+        if !self.ensure_daemon_running(name).await {
+            println!("\x1b[31mFailed to start daemon for '{}'\x1b[0m", name);
+            return;
+        }
+
+        // Connect
+        if let Some(agent) = discovery::get_running_agent(name) {
+            self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
+            println!("\x1b[32m✓ Connected to '{}'\x1b[0m", name);
+        } else {
+            println!("\x1b[31mFailed to connect to '{}'\x1b[0m", name);
+        }
+    }
+
     /// Stop an agent daemon.
     async fn cmd_stop(&mut self, name: &str) {
         let name = name.trim();
@@ -827,6 +891,9 @@ impl Repl {
         println!();
         println!("  \x1b[36m/stop <name>\x1b[0m");
         println!("      Stop an agent daemon");
+        println!();
+        println!("  \x1b[36m/restart <name>\x1b[0m");
+        println!("      Restart an agent daemon (stop then start)");
         println!();
         println!("  \x1b[36m/status\x1b[0m");
         println!("      Show status of all agents");

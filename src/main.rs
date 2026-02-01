@@ -98,6 +98,11 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
+    /// Restart a running agent daemon (stop then start)
+    Restart {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+    },
 }
 
 #[tokio::main]
@@ -176,6 +181,12 @@ async fn main() {
         }
         Commands::Clear { agent } => {
             if let Err(e) = clear_agent(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Restart { agent } => {
+            if let Err(e) = restart_agent(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -549,6 +560,32 @@ async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!("Stopped {}", agent);
+    Ok(())
+}
+
+/// Restart a running agent daemon (stop then start).
+async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    // Check if agent directory exists
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    // Check if currently running
+    let was_running = PidFile::is_running(&pid_path);
+
+    if was_running {
+        println!("Stopping {}...", agent);
+        stop_agent(agent).await?;
+        // Brief wait to ensure clean shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    println!("Starting {}...", agent);
+    start_agent(agent)?;
+
     Ok(())
 }
 
