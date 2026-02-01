@@ -21,7 +21,7 @@ libc = "0.2"
 toml = "0.9"
 rustyline = "14"
 dirs = "6"
-thiserror = "1"
+thiserror = "2"
 regex = "1"
 
 [dev-dependencies]
