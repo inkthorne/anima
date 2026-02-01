@@ -4,35 +4,24 @@
 
 | | |
 |---|---|
-| **Version** | v2.6-dev |
-| **Tests** | 274 passing |
+| **Version** | v2.6 |
+| **Tests** | 293 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
-## Recent Changes (2026-02-01)
+## Architecture (v2.6)
 
-### Agent-Internal History
-- Agent now manages its own conversation history internally
-- Proper message structure preserved: user → assistant(tool_calls) → tool → assistant
-- REPL/daemon no longer manage history externally
-- Fixes echo loops in multi-agent conversations
+**REPL-as-Frontend:** Agents always run as daemons. REPL is a thin client.
 
-### always.md Feature
-- Persistent reminders injected before each user message (recency bias)
-- Agent-specific: `~/.anima/agents/<name>/always.md`
-- Global fallback: `~/.anima/agents/always.md`
-- Agent-specific overrides global completely
+```
+Daemon: arya (process, ~/.anima/agents/arya/agent.sock)
+Daemon: gendry (process, ~/.anima/agents/gendry/agent.sock)
+REPL (thin client, connects via sockets)
+```
 
-### ThinkResult Struct
-- `think_with_options()` returns `ThinkResult` with:
-  - `response: String` — final text
-  - `tools_used: bool` — whether tools were called
-  - `tool_names: Vec<String>` — which tools
+**Daemon Discovery:** Agents found by scanning `~/.anima/agents/*/daemon.pid`
 
-### REPL Changes (in progress)
-- Slash commands: `/load`, `/start`, `/help`, etc.
-- @mentions for conversation: `hello @arya`, `@all thoughts?`
-- Cleaner message format: `[sender] content`
+**Inter-Agent Messaging:** Daemons communicate via sockets, not shared memory.
 
 ## CLI Commands
 
@@ -53,18 +42,20 @@ anima send <name> "msg"     # Send to running daemon
 anima chat <name>           # Interactive via socket
 
 # Interactive
-anima run <name>            # REPL with agent loaded
+anima run <name>            # REPL with agent connected
 anima                       # REPL (no agent)
 ```
 
 ## REPL Commands (slash-prefix)
 
 ```bash
-/load <name>                # Load from ~/.anima/agents/<name>/
-/start <name>               # Start background agent
-/stop <name>                # Stop background agent
-/status                     # Show running status
+/load <name>                # Start daemon if needed, connect
+/start <name>               # Start daemon in background
+/stop <name>                # Stop daemon
+/status                     # Show running daemons (connected/not)
+/list                       # List all agent directories
 /clear [name]               # Clear conversation history
+/history                    # Show conversation history
 /help                       # Show commands
 /quit, /exit                # Exit REPL
 
@@ -83,8 +74,8 @@ hello @arya                 # Send to arya
 ├── persona.md        # System prompt (identity)
 ├── always.md         # Persistent reminders (recency bias)
 ├── memory.db         # SQLite memory
-├── daemon.pid        # PID (when running)
-└── agent.sock        # Socket (when running)
+├── daemon.pid        # PID file (when running)
+└── agent.sock        # Unix socket (when running)
 
 ~/.anima/agents/
 └── always.md         # Global always.md fallback
@@ -112,40 +103,53 @@ path = "memory.db"
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | CLI commands |
-| `src/repl.rs` | Interactive REPL |
-| `src/daemon.rs` | Daemon mode |
+| `src/repl.rs` | REPL (thin client, socket connections) |
+| `src/daemon.rs` | Daemon mode, socket server |
+| `src/discovery.rs` | Find running daemons via pid files |
 | `src/socket_api.rs` | Unix socket protocol |
 | `src/agent_dir.rs` | Directory loading, always.md |
 | `src/agent.rs` | Core agent logic, internal history |
+| `src/tools/send_message.rs` | Inter-daemon messaging |
 | `src/llm.rs` | LLM providers |
 
-## Architecture Notes
+## Key Features
+
+### always.md (Persistent Reminders)
+- Injected as system message before each user message
+- Exploits recency bias to keep instructions salient
+- Agent-specific overrides global fallback
+
+### Agent-Internal History
+- Agent manages its own conversation history
+- Proper structure: user → assistant(tool_calls) → tool → assistant
+- Fixes echo loops in multi-agent conversations
 
 ### Multi-Party Conversations
-- "user" role = external input (with speaker tag)
-- "assistant" role = this agent's responses
-- Format: `[speaker] content`
-- @mentions route messages: `@arya`, `@all`
-- Agents invoked only when mentioned (efficient)
+- "user" role = external input with speaker tag
+- Format: `[sender] content`
+- @mentions route messages: `@arya`, `@gendry`, `@all`
+- Agents invoked only when mentioned
 
-### Message Flow (Agent-to-Agent)
-```
-[chris] @arya ask gendry about rust
-→ arya invoked, sees [chris] message
-→ arya calls send_message tool
-→ gendry receives, sees [arya] message
-→ gendry responds via send_message
-→ arya sees [gendry] response
+### Daemon Discovery
+```rust
+discover_running_agents()  // Scan pid files, return running agents
+is_agent_running(name)     // Check specific agent
+agent_socket_path(name)    // Get socket path
 ```
 
-### History Structure
-```
-user: "[chris] hello"
-assistant: "" (tool_calls: [send_message])
-tool: {"sent": true}
-assistant: "message sent"
-user: "[gendry] hey there!"
-assistant: "gendry says hi"
+## Workflow
+
+```bash
+# Start agents as daemons
+anima start arya
+anima start gendry
+
+# Connect via REPL
+anima
+> /status                    # See running agents
+> hello @arya                # Talk to arya
+> @arya ask @gendry about rust  # Multi-agent
+> @all thoughts?             # Broadcast
 ```
 
 ## Build & Test
@@ -160,4 +164,4 @@ anima stop arya && anima start arya
 
 ## Last Updated
 
-2026-02-01 — Agent-internal history, always.md, slash commands, @mentions.
+2026-02-01 — v2.6: REPL-as-frontend, daemon discovery, slash commands, @mentions.
