@@ -347,6 +347,7 @@ These reminders are injected before every user message to stay salient in long c
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::tempdir;
 
@@ -751,6 +752,7 @@ model = "gpt-4"
     }
 
     #[test]
+    #[serial]
     fn test_load_always_none() {
         // Create fake home directory WITHOUT global always.md
         let fake_home = tempdir().unwrap();
@@ -786,6 +788,7 @@ model = "gpt-4"
     }
 
     #[test]
+    #[serial]
     fn test_load_always_file_missing() {
         // Create fake home directory WITHOUT global always.md
         let fake_home = tempdir().unwrap();
@@ -898,6 +901,7 @@ model = "gpt-4"
     /// Note: This test creates a mock global always.md in a temp dir and temporarily
     /// overrides HOME. Since dirs::home_dir() uses the HOME env var on Unix, we can test this.
     #[test]
+    #[serial]
     fn test_load_always_agent_overrides_global() {
         // Create fake home directory
         let fake_home = tempdir().unwrap();
@@ -938,6 +942,7 @@ model = "gpt-4"
 
     /// Test: Falls back to global when agent-specific doesn't exist
     #[test]
+    #[serial]
     fn test_load_always_global_fallback() {
         // Create fake home directory with global always.md
         let fake_home = tempdir().unwrap();
@@ -977,6 +982,7 @@ model = "gpt-4"
 
     /// Test: Returns None when neither agent-specific nor global exists
     #[test]
+    #[serial]
     fn test_load_always_neither_exists() {
         // Create fake home directory WITHOUT global always.md
         let fake_home = tempdir().unwrap();
@@ -1016,6 +1022,7 @@ model = "gpt-4"
 
     /// Test: Global always.md supports include directives
     #[test]
+    #[serial]
     fn test_load_always_global_with_include() {
         // Create fake home directory with global always.md that uses includes
         let fake_home = tempdir().unwrap();

@@ -528,6 +528,7 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
 
     #[test]
@@ -609,6 +610,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_daemon_config_from_agent_dir() {
         let dir = tempdir().unwrap();
         let config_content = r#"
@@ -648,6 +650,7 @@ message = "heartbeat"
     }
 
     #[test]
+    #[serial]
     fn test_daemon_config_no_timer() {
         let dir = tempdir().unwrap();
         let config_content = r#"
@@ -669,6 +672,7 @@ api_key = "sk-test"
     }
 
     #[test]
+    #[serial]
     fn test_daemon_config_timer_disabled() {
         let dir = tempdir().unwrap();
         let config_content = r#"
@@ -693,6 +697,7 @@ interval = "5m"
     }
 
     #[test]
+    #[serial]
     fn test_daemon_config_with_always() {
         let dir = tempdir().unwrap();
         let config_content = r#"
@@ -718,6 +723,7 @@ api_key = "sk-test"
     }
 
     #[test]
+    #[serial]
     fn test_daemon_config_always_file_missing() {
         // Use a fake HOME so the global ~/.anima/agents/always.md fallback doesn't interfere
         let fake_home = tempdir().unwrap();
