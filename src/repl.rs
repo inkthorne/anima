@@ -67,6 +67,10 @@ fn parse_duration(s: &str) -> Option<Duration> {
     }
 }
 
+/// Parse an auto-send pattern from agent response text.
+/// Pattern: `recipient: message content` at the start of response or on its own line.
+/// Agent name must start with a letter, can contain alphanumeric, underscore, hyphen.
+/// Returns (recipient, message) if pattern matches, None otherwise.
 const BANNER_ART: &str = r#"
     _          _
    / \   _ __ (_)_ __ ___   __ _
@@ -1190,7 +1194,8 @@ impl Repl {
                         // Check if there are pending messages by trying to receive one
                         if let Some(msg) = agent_guard.receive_message().await {
                             debug::log(&format!("MSG RECV: {} <- {} : {}", agent_name, msg.from, msg.content));
-                            println!("\n\x1b[33m[{}]\x1b[0m {}: {}", msg.from, agent_name, msg.content);
+                            // Display received message: [recipient] from sender: message
+                            println!("\n\x1b[33m[{}]\x1b[0m from {}: {}", agent_name, msg.from, msg.content);
 
                             // Process the message by thinking about it
                             let task = format!("Message from {}: \"{}\"\n\nRespond to {} using send_message. Your response here should be empty or minimal after sending.", msg.from, msg.content, msg.from);
@@ -1215,7 +1220,10 @@ impl Repl {
                                     debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
                                         if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
 
-                                    // Don't print response here - it's already shown when recipient receives via send_message
+                                    // Always print agent's response
+                                    if !stripped.is_empty() {
+                                        println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, stripped);
+                                    }
                                     // Update conversation history
                                     let mut history = history_arc.lock().await;
                                     history.push(ChatMessage {
