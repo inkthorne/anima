@@ -11,6 +11,7 @@ use anima::socket_api::{SocketApi, Request, Response};
 use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::io::{self, Write};
 use tokio::net::UnixStream;
@@ -78,6 +79,16 @@ enum Commands {
         /// Message to send to the agent
         message: String,
     },
+    /// Start an agent daemon in the background
+    Start {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+    },
+    /// Stop a running agent daemon
+    Stop {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +149,18 @@ async fn main() {
         }
         Commands::Ask { agent, message } => {
             if let Err(e) = ask_agent(&agent, &message).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Start { agent } => {
+            if let Err(e) = start_agent(&agent) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Stop { agent } => {
+            if let Err(e) = stop_agent(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -399,6 +422,100 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
         println!("{}", content);
     }
 
+    Ok(())
+}
+
+/// Start an agent daemon in the background.
+fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    // Check if agent directory exists
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    // Check if already running
+    if PidFile::is_running(&pid_path) {
+        let pid = PidFile::read(&pid_path).unwrap_or(0);
+        return Err(format!("Agent '{}' is already running (pid {})", agent, pid).into());
+    }
+
+    // Get path to current executable
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to get current executable: {}", e))?;
+
+    // Spawn daemon process in background
+    // Use `run --daemon` for the actual daemon logic
+    let child = Command::new(&exe)
+        .arg("run")
+        .arg(agent)
+        .arg("--daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
+
+    let pid = child.id();
+    println!("Started {} (pid {})", agent, pid);
+
+    Ok(())
+}
+
+/// Stop a running agent daemon.
+async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    // Check if running
+    if !PidFile::is_running(&pid_path) {
+        println!("Agent '{}' is not running", agent);
+        return Ok(());
+    }
+
+    let pid = PidFile::read(&pid_path).unwrap_or(0);
+
+    // Try to send shutdown via socket first (graceful shutdown)
+    match connect_to_agent(agent).await {
+        Ok(mut api) => {
+            // Send shutdown request
+            if let Err(e) = api.write_request(&Request::Shutdown).await {
+                eprintln!("Warning: Failed to send shutdown request: {}", e);
+            } else {
+                // Wait briefly for graceful shutdown
+                for _ in 0..10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    if !PidFile::is_running(&pid_path) {
+                        println!("Stopped {}", agent);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not connect to agent socket: {}", e);
+        }
+    }
+
+    // If socket shutdown didn't work, send SIGTERM
+    unsafe {
+        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
+            // Wait for process to terminate
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if !PidFile::is_running(&pid_path) {
+                    println!("Stopped {}", agent);
+                    return Ok(());
+                }
+            }
+            eprintln!("Warning: Agent did not stop within timeout");
+        } else {
+            eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
+        }
+    }
+
+    println!("Stopped {}", agent);
     Ok(())
 }
 
