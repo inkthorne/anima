@@ -32,6 +32,10 @@ fn parse_mentions(input: &str) -> Vec<String> {
         .collect()
 }
 
+/// Maximum number of entries to keep in the conversation log.
+/// Prevents unbounded memory growth in long sessions.
+const MAX_CONVERSATION_LOG: usize = 100;
+
 const BANNER_ART: &str = r#"
     _          _
    / \   _ __ (_)_ __ ___   __ _
@@ -217,6 +221,19 @@ impl Repl {
             sender: sender.to_string(),
             content: content.to_string(),
         });
+
+        // Trim oldest entries if over limit
+        if self.conversation_log.len() > MAX_CONVERSATION_LOG {
+            let trim_count = self.conversation_log.len() - MAX_CONVERSATION_LOG;
+            self.conversation_log.drain(0..trim_count);
+
+            // Adjust all cursors (they now point to wrong indices)
+            for cursor in self.agent_cursors.values_mut() {
+                *cursor = cursor.saturating_sub(trim_count);
+            }
+            debug::log(&format!("LOG: trimmed {} entries, {} remain", trim_count, self.conversation_log.len()));
+        }
+
         debug::log(&format!("LOG: {} entries, added from {}", self.conversation_log.len(), sender));
     }
 
@@ -1473,5 +1490,56 @@ mod tests {
         // Now if we get fresh context for gendry (without snapshot), it would include arya's response
         let gendry_fresh = repl.get_context_for_agent("gendry");
         assert_eq!(gendry_fresh, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}\n{\"from\": \"arya\", \"text\": \"I think it's great!\"}");
+    }
+
+    #[test]
+    fn test_conversation_log_trimming() {
+        let mut repl = Repl::new();
+
+        // Add MAX_CONVERSATION_LOG + 5 messages
+        for i in 0..(MAX_CONVERSATION_LOG + 5) {
+            repl.log_message("user", &format!("message {}", i));
+        }
+
+        // Should be trimmed to MAX_CONVERSATION_LOG
+        assert_eq!(repl.conversation_log.len(), MAX_CONVERSATION_LOG);
+
+        // First message should now be "message 5" (oldest 5 were trimmed)
+        assert_eq!(repl.conversation_log[0].content, "message 5");
+
+        // Last message should be the most recent
+        assert_eq!(
+            repl.conversation_log[MAX_CONVERSATION_LOG - 1].content,
+            format!("message {}", MAX_CONVERSATION_LOG + 4)
+        );
+    }
+
+    #[test]
+    fn test_conversation_log_trimming_adjusts_cursors() {
+        let mut repl = Repl::new();
+
+        // Add some messages
+        for i in 0..50 {
+            repl.log_message("user", &format!("message {}", i));
+        }
+
+        // Set cursor for arya at position 30
+        repl.agent_cursors.insert("arya".to_string(), 30);
+        // Set cursor for gendry at position 10
+        repl.agent_cursors.insert("gendry".to_string(), 10);
+
+        // Add more messages to trigger trimming (need to exceed MAX_CONVERSATION_LOG)
+        for i in 50..(MAX_CONVERSATION_LOG + 10) {
+            repl.log_message("user", &format!("message {}", i));
+        }
+
+        // Log should be at MAX_CONVERSATION_LOG
+        assert_eq!(repl.conversation_log.len(), MAX_CONVERSATION_LOG);
+
+        // Cursors should be adjusted down by trim_count (10)
+        // arya was at 30, now at 20
+        assert_eq!(repl.agent_cursors.get("arya"), Some(&20));
+        // gendry was at 10, now at 0 (saturating_sub prevents underflow)
+        assert_eq!(repl.agent_cursors.get("gendry"), Some(&0));
     }
 }
