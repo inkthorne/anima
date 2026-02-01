@@ -36,9 +36,9 @@ anima                       # REPL (no agent)
 
 ```bash
 agent create <name>         # Create ephemeral in-memory agent
-agent load <name>           # Load from ~/.anima/agents/<name>/
-agent start <name>          # Start background agent
-agent stop <name>           # Stop background agent
+load <name>                 # Load from ~/.anima/agents/<name>/
+start <name>                # Start background agent
+stop <name>                 # Stop background agent
 agent clear <name>          # Clear conversation history
 agent list                  # List agents in session
 agent status                # Show running status

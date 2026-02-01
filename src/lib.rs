@@ -2,6 +2,7 @@ pub mod agent;
 pub mod agent_dir;
 pub mod config;
 pub mod daemon;
+pub mod debug;
 pub mod error;
 pub mod llm;
 pub mod memory;

@@ -20,9 +20,15 @@ use tokio::sync::oneshot;
 
 /// Strip thinking tags from LLM response content for conversation history storage.
 /// Removes `<think>...</think>` and `<thinking>...</thinking>` blocks (case-insensitive).
-fn strip_thinking(content: &str) -> String {
+/// Also removes stray opening/closing tags that may appear without their pair.
+pub fn strip_thinking(content: &str) -> String {
+    // First, remove complete think blocks
     let re = Regex::new(r"(?si)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
-    re.replace_all(content, "").trim().to_string()
+    let result = re.replace_all(content, "");
+    
+    // Then remove any stray opening or closing tags
+    let stray_tags = Regex::new(r"(?i)</?\s*think(?:ing)?\s*/?>").unwrap();
+    stray_tags.replace_all(&result, "").trim().to_string()
 }
 
 /// Options for the think() agentic loop

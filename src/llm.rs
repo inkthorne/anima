@@ -25,6 +25,7 @@ pub trait LLM: Send + Sync {
     fn model_name(&self) -> &str;
 }
 
+/// Format tool calls for OpenAI-compatible API (arguments as JSON string)
 fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
     tool_calls.iter().map(|tc| {
         serde_json::json!({
@@ -33,6 +34,20 @@ fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> 
             "function": {
                 "name": tc.name,
                 "arguments": tc.arguments.to_string()
+            }
+        })
+    }).collect()
+}
+
+/// Format tool calls for native Ollama API (arguments as object, not string)
+fn format_tool_calls_for_ollama(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
+    tool_calls.iter().map(|tc| {
+        serde_json::json!({
+            "id": tc.id,
+            "type": "function",
+            "function": {
+                "name": tc.name,
+                "arguments": tc.arguments
             }
         })
     }).collect()
@@ -811,7 +826,8 @@ impl LLM for OllamaClient {
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<LLMResponse, LLMError> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        // Use native Ollama API for proper `think` parameter support
+        let url = format!("{}/api/chat", self.base_url);
 
         // Find thinking override from the last user message
         let mut thinking_override: Option<bool> = None;
@@ -843,7 +859,8 @@ impl LLM for OllamaClient {
             }
             if let Some(ref tool_calls) = message.tool_calls {
                 if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(tool_calls);
+                    // Use native Ollama format (arguments as object, not string)
+                    let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
                     formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
                 }
             }
@@ -853,9 +870,12 @@ impl LLM for OllamaClient {
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": formatted_messages,
-            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"],
+            "stream": false,
             "think": thinking
         });
+
+        // Debug log the request (before adding tools for cleaner output)
+        crate::debug::log_json("OLLAMA REQUEST (chat_complete)", &request_body);
 
         if let Some(tool_list) = tools {
             let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
@@ -904,30 +924,48 @@ impl LLM for OllamaClient {
                 LLMError::permanent(format!("Failed to parse response: {}", e))
             })?;
 
-        let content = ollama_response["choices"][0]["message"]["content"]
+        // Debug log the response
+        crate::debug::log_json("OLLAMA RESPONSE (chat_complete)", &ollama_response);
+
+        // Native Ollama API returns message directly, not in choices array
+        let content = ollama_response["message"]["content"]
             .as_str()
             .map(|s| s.to_string());
 
-        let tool_calls = ollama_response["choices"][0]["message"]["tool_calls"]
+        let tool_calls = ollama_response["message"]["tool_calls"]
             .as_array()
             .map(|tool_calls_array| {
                 tool_calls_array
                     .iter()
                     .filter_map(|tool_call| {
-                        let id = tool_call["id"].as_str().map(|s| s.to_string())?;
+                        let id = tool_call["id"].as_str()
+                            .or_else(|| tool_call["function"]["name"].as_str()) // fallback to name if no id
+                            .map(|s| s.to_string())?;
                         let name = tool_call["function"]["name"].as_str().map(|s| s.to_string())?;
-                        let arguments_str = tool_call["function"]["arguments"].as_str()?;
-                        let arguments: serde_json::Value = serde_json::from_str(arguments_str).ok()?;
+                        // Arguments might be a string (OpenAI style) or object (Ollama native)
+                        let arguments = if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
+                            serde_json::from_str(args_str).ok()?
+                        } else {
+                            tool_call["function"]["arguments"].clone()
+                        };
                         Some(ToolCall { id, name, arguments })
                     })
                     .collect()
             })
             .unwrap_or_default();
 
-        let usage = ollama_response["usage"].as_object().map(|u| UsageInfo {
-            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        });
+        // Native Ollama uses eval_count/prompt_eval_count instead of usage
+        let usage = if let Some(usage_obj) = ollama_response["usage"].as_object() {
+            Some(UsageInfo {
+                prompt_tokens: usage_obj.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                completion_tokens: usage_obj.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            })
+        } else {
+            Some(UsageInfo {
+                prompt_tokens: ollama_response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
+                completion_tokens: ollama_response["eval_count"].as_u64().unwrap_or(0) as u32,
+            })
+        };
 
         Ok(LLMResponse {
             content,
@@ -944,7 +982,8 @@ impl LLM for OllamaClient {
     ) -> Result<LLMResponse, LLMError> {
         use futures_util::StreamExt;
 
-        let url = format!("{}/v1/chat/completions", self.base_url);
+        // Use native Ollama API for proper `think` parameter support
+        let url = format!("{}/api/chat", self.base_url);
 
         // Find thinking override from the last user message
         let mut thinking_override: Option<bool> = None;
@@ -976,7 +1015,8 @@ impl LLM for OllamaClient {
             }
             if let Some(ref tool_calls) = message.tool_calls {
                 if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(tool_calls);
+                    // Use native Ollama format (arguments as object, not string)
+                    let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
                     formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
                 }
             }
@@ -987,9 +1027,11 @@ impl LLM for OllamaClient {
             "model": self.model,
             "messages": formatted_messages,
             "stream": true,
-            "stop": ["\n\nUser:", "\n\nHuman:", "\nUser:", "\nHuman:", "<|im_end|>", "<|eot_id|>"],
             "think": thinking
         });
+
+        // Debug log the request (before adding tools for cleaner output)
+        crate::debug::log_json("OLLAMA REQUEST (chat_complete_stream)", &request_body);
 
         if let Some(tool_list) = tools {
             let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
@@ -1037,40 +1079,47 @@ impl LLM for OllamaClient {
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
+            // Native Ollama API streams as JSONL (no "data: " prefix)
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
 
-                if line.is_empty() || line.starts_with(':') {
+                if line.is_empty() {
                     continue;
                 }
 
-                if line == "data: [DONE]" {
-                    break;
-                }
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
+                    // Check if stream is done
+                    if parsed["done"].as_bool() == Some(true) {
+                        break;
+                    }
 
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                    // Native Ollama: message.content (not delta)
+                    if let Some(content) = parsed["message"]["content"].as_str() {
+                        if !content.is_empty() {
                             full_content.push_str(content);
                             let _ = tx.send(content.to_string()).await;
                         }
+                    }
 
-                        if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
-                            for tc in tc_array {
-                                let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                                let entry = tool_call_builders.entry(index)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                    // Handle tool calls in native format
+                    if let Some(tc_array) = parsed["message"]["tool_calls"].as_array() {
+                        for tc in tc_array {
+                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                            let entry = tool_call_builders.entry(index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
 
-                                if let Some(id) = tc["id"].as_str() {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    entry.1.push_str(name);
-                                }
-                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                    entry.2.push_str(args);
-                                }
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.0 = id.to_string();
+                            }
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                entry.1.push_str(name);
+                            }
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                entry.2.push_str(args);
+                            } else if !tc["function"]["arguments"].is_null() {
+                                // Arguments might be an object directly
+                                entry.2 = tc["function"]["arguments"].to_string();
                             }
                         }
                     }

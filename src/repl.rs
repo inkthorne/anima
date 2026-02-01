@@ -14,12 +14,32 @@ use rustyline::{Editor, Helper};
 use tokio::sync::Mutex;
 
 use crate::agent_dir::{AgentDir, AgentDirError};
+use crate::debug;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ChatMessage};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
-use crate::agent::{Agent, ThinkOptions};
+use crate::agent::{Agent, ThinkOptions, strip_thinking};
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SendMessageTool, ListAgentsTool};
+
+/// Log conversation history state (truncated for readability)
+fn debug_log_history(agent_name: &str, history: &[ChatMessage]) {
+    if !debug::is_enabled() {
+        return;
+    }
+    debug::log(&format!("=== {} history ({} messages) ===", agent_name, history.len()));
+    for (i, msg) in history.iter().enumerate() {
+        let content = msg.content.as_deref().unwrap_or("<none>");
+        // Truncate long messages
+        let preview = if content.len() > 200 {
+            format!("{}... [truncated, {} chars total]", &content[..200], content.len())
+        } else {
+            content.to_string()
+        };
+        debug::log(&format!("  [{}] {}: {}", i, msg.role, preview));
+    }
+    debug::log("=== end history ===");
+}
 
 /// Parse a duration string like "30s", "5m", "1h" into a Duration.
 /// Returns None if the format is invalid.
@@ -89,7 +109,7 @@ impl Completer for ReplHelper {
         let mut completions = Vec::new();
 
         // Commands that can be completed
-        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "agent clear", "memory", "set llm", "help", "exit", "quit"];
+        let commands = ["agent create", "agent load", "agent list", "agent remove", "agent start", "agent stop", "agent status", "agent clear", "load", "start", "stop", "memory", "set llm", "help", "exit", "quit"];
 
         // Find the word being typed
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
@@ -106,7 +126,7 @@ impl Completer for ReplHelper {
         }
 
         // Complete agent names for commands that use them
-        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.starts_with("agent clear ") || line.contains(": ") {
+        if line.starts_with("memory ") || line.starts_with("agent remove ") || line.starts_with("agent start ") || line.starts_with("agent stop ") || line.starts_with("agent clear ") || line.starts_with("load ") || line.starts_with("start ") || line.starts_with("stop ") || line.contains(": ") {
             for name in &self.agent_names {
                 if name.starts_with(partial) {
                     completions.push(Pair {
@@ -201,6 +221,15 @@ impl Repl {
         }
     }
 
+    /// Enable debug logging to ~/.anima/anima.log
+    pub fn with_logging(self, enabled: bool) -> Self {
+        if enabled {
+            debug::enable();
+            debug::log("=== REPL session started ===");
+        }
+        self
+    }
+
     /// Create a REPL with a pre-loaded agent.
     /// This is used when running `anima run <agent>` to start a REPL with an agent already loaded.
     pub fn with_agent(name: String, agent: Agent, persona: Option<String>) -> Self {
@@ -285,9 +314,13 @@ impl Repl {
     }
 
     async fn handle_command(&mut self, input: &str) {
+        debug::log(&format!("CMD: {}", input));
+        
         // Parse command
         if input.starts_with("agent create ") {
             self.cmd_agent_create(&input[13..]).await;
+        } else if input.starts_with("load ") {
+            self.cmd_agent_load(&input[5..]).await;
         } else if input.starts_with("agent load ") {
             self.cmd_agent_load(&input[11..]).await;
         } else if input == "agent list" {
@@ -296,8 +329,12 @@ impl Repl {
             self.cmd_agent_list_saved();
         } else if input.starts_with("agent remove ") {
             self.cmd_agent_remove(&input[13..]).await;
+        } else if input.starts_with("start ") {
+            self.cmd_agent_start(&input[6..]).await;
         } else if input.starts_with("agent start ") {
             self.cmd_agent_start(&input[12..]).await;
+        } else if input.starts_with("stop ") {
+            self.cmd_agent_stop(&input[5..]);
         } else if input.starts_with("agent stop ") {
             self.cmd_agent_stop(&input[11..]);
         } else if input == "agent status" {
@@ -820,6 +857,10 @@ impl Repl {
 
         // Get a snapshot of the history for the options
         let history = history_arc.lock().await.clone();
+        
+        debug::log(&format!("TASK: {} -> {}", agent_name, task));
+        debug_log_history(agent_name, &history);
+        
         let options = ThinkOptions {
             stream: true,
             system_prompt,
@@ -845,6 +886,12 @@ impl Repl {
             Ok(_) => {
                 // Wait for print task and get the full response
                 if let Ok(response) = print_task.await {
+                    let stripped = strip_thinking(&response);
+                    debug::log(&format!("RESPONSE (raw, {} chars): {}", response.len(), 
+                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                    debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
+                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+                    
                     // Update conversation history
                     let mut history = history_arc.lock().await;
                     // Add user message
@@ -854,10 +901,10 @@ impl Repl {
                         tool_call_id: None,
                         tool_calls: None,
                     });
-                    // Add assistant response
+                    // Add assistant response (strip thinking tags to keep history clean)
                     history.push(ChatMessage {
                         role: "assistant".to_string(),
-                        content: Some(response),
+                        content: Some(stripped),
                         tool_call_id: None,
                         tool_calls: None,
                     });
@@ -865,6 +912,8 @@ impl Repl {
                     while history.len() > 20 {
                         history.remove(0);
                     }
+                    
+                    debug::log(&format!("HISTORY updated: {} messages", history.len()));
                 }
             }
             Err(e) => {
@@ -952,7 +1001,7 @@ impl Repl {
             return;
         }
 
-        println!("\x1b[33m[{}]\x1b[0m asking \x1b[36m{}\x1b[0m: \"{}\"", from_agent, to_agent, question);
+        println!("\x1b[33m[{}]\x1b[0m {}: {}", from_agent, to_agent, question);
 
         // Send message from one agent to another
         let from_entry = self.agents.get(from_agent).unwrap();
@@ -1065,8 +1114,12 @@ impl Repl {
                     } => {
                         // Timer fired
                         if let Some(ref tc) = task_timer {
+                            debug::log(&format!("TIMER: {} fired with message: {}", agent_name, tc.message));
+                            
                             // Get history snapshot and build options with persona
                             let history = history_arc.lock().await.clone();
+                            debug_log_history(&agent_name, &history);
+                            
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
                                 conversation_history: if history.is_empty() { None } else { Some(history) },
@@ -1077,6 +1130,12 @@ impl Repl {
                             println!("\n\x1b[35m[{}]\x1b[0m timer fired, thinking...", agent_name);
                             match agent_guard.think_with_options(&tc.message, options).await {
                                 Ok(response) => {
+                                    let stripped = strip_thinking(&response);
+                                    debug::log(&format!("TIMER RESPONSE (raw, {} chars): {}", response.len(),
+                                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                                    debug::log(&format!("TIMER RESPONSE (stripped, {} chars): {}", stripped.len(),
+                                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+                                    
                                     println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
                                     // Update conversation history
                                     let mut history = history_arc.lock().await;
@@ -1088,7 +1147,7 @@ impl Repl {
                                     });
                                     history.push(ChatMessage {
                                         role: "assistant".to_string(),
-                                        content: Some(response),
+                                        content: Some(stripped),
                                         tool_call_id: None,
                                         tool_calls: None,
                                     });
@@ -1096,8 +1155,10 @@ impl Repl {
                                     while history.len() > 20 {
                                         history.remove(0);
                                     }
+                                    debug::log(&format!("TIMER HISTORY updated: {} messages", history.len()));
                                 }
                                 Err(e) => {
+                                    debug::log(&format!("TIMER ERROR: {} - {}", agent_name, e));
                                     println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
                                 }
                             }
@@ -1113,14 +1174,17 @@ impl Repl {
 
                         // Check if there are pending messages by trying to receive one
                         if let Some(msg) = agent_guard.receive_message().await {
-                            println!("\n\x1b[33m[{}]\x1b[0m received message from \x1b[36m{}\x1b[0m: {}",
-                                     agent_name, msg.from, msg.content);
+                            debug::log(&format!("MSG RECV: {} <- {} : {}", agent_name, msg.from, msg.content));
+                            println!("\n\x1b[33m[{}]\x1b[0m {}: {}", msg.from, agent_name, msg.content);
 
                             // Process the message by thinking about it
-                            let task = format!("You received a message from agent '{}': {}\n\nTo reply, use the send_message tool with to=\"{}\".", msg.from, msg.content, msg.from);
+                            let task = format!("Message from {}: \"{}\"\n\nRespond to {} using send_message. Your response here should be empty or minimal after sending.", msg.from, msg.content, msg.from);
 
                             // Get history snapshot and build options with persona
                             let history = history_arc.lock().await.clone();
+                            debug::log(&format!("MSG TASK: {} processing message", agent_name));
+                            debug_log_history(&agent_name, &history);
+                            
                             let options = ThinkOptions {
                                 system_prompt: persona.system_prompt.clone(),
                                 conversation_history: if history.is_empty() { None } else { Some(history) },
@@ -1129,6 +1193,12 @@ impl Repl {
 
                             match agent_guard.think_with_options(&task, options).await {
                                 Ok(response) => {
+                                    let stripped = strip_thinking(&response);
+                                    debug::log(&format!("MSG RESPONSE (raw, {} chars): {}", response.len(),
+                                        if response.len() > 300 { format!("{}...", &response[..300]) } else { response.clone() }));
+                                    debug::log(&format!("MSG RESPONSE (stripped, {} chars): {}", stripped.len(),
+                                        if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+                                    
                                     println!("\x1b[33m[{}]\x1b[0m: {}", agent_name, response);
                                     // Update conversation history
                                     let mut history = history_arc.lock().await;
@@ -1140,7 +1210,7 @@ impl Repl {
                                     });
                                     history.push(ChatMessage {
                                         role: "assistant".to_string(),
-                                        content: Some(response),
+                                        content: Some(stripped),
                                         tool_call_id: None,
                                         tool_calls: None,
                                     });
@@ -1148,8 +1218,10 @@ impl Repl {
                                     while history.len() > 20 {
                                         history.remove(0);
                                     }
+                                    debug::log(&format!("MSG HISTORY updated: {} messages", history.len()));
                                 }
                                 Err(e) => {
+                                    debug::log(&format!("MSG ERROR: {} - {}", agent_name, e));
                                     println!("\x1b[31m[{}] Error: {}\x1b[0m", agent_name, e);
                                 }
                             }
@@ -1242,7 +1314,7 @@ impl Repl {
         println!("      --persona: load system prompt from file");
         println!("      --system: inline system prompt (rest of line)");
         println!();
-        println!("  \x1b[36magent load <name>\x1b[0m");
+        println!("  \x1b[36mload <name>\x1b[0m / \x1b[36magent load <name>\x1b[0m");
         println!("      Load an agent from ~/.anima/agents/<name>/");
         println!();
         println!("  \x1b[36magent list\x1b[0m");
@@ -1254,12 +1326,12 @@ impl Repl {
         println!("  \x1b[36magent remove <name>\x1b[0m");
         println!("      Remove an agent from session (memory persists)");
         println!();
-        println!("  \x1b[36magent start <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
+        println!("  \x1b[36mstart <name> [--every <duration>] [--on-timer <message>]\x1b[0m");
         println!("      Start an agent in background loop (processes inbox automatically)");
         println!("      --every: timer interval (e.g., 30s, 5m, 1h) for periodic wake-ups");
         println!("      --on-timer: message to think with when timer fires (default: 'Timer trigger')");
         println!();
-        println!("  \x1b[36magent stop <name>\x1b[0m");
+        println!("  \x1b[36mstop <name>\x1b[0m");
         println!("      Stop a running background agent");
         println!();
         println!("  \x1b[36magent status\x1b[0m");

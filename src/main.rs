@@ -21,6 +21,10 @@ use tokio::net::UnixStream;
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+    
+    /// Enable debug logging to ~/.anima/repl.log (for REPL/run commands)
+    #[arg(long, global = true)]
+    log: bool,
 }
 
 #[derive(Subcommand)]
@@ -131,7 +135,7 @@ async fn main() {
             }
         }
         Commands::Repl => {
-            let mut repl = Repl::new();
+            let mut repl = Repl::new().with_logging(cli.log);
             if let Err(e) = repl.run().await {
                 eprintln!("REPL error: {}", e);
                 std::process::exit(1);

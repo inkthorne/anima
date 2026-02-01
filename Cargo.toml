@@ -23,6 +23,7 @@ rustyline = "17"
 dirs = "6"
 thiserror = "2"
 regex = "1"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"
