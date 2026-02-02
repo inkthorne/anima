@@ -1,6 +1,6 @@
 use anima::{
     Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
-    InMemoryStore, SqliteMemory, LLM, ConversationStore, canonical_1to1_id, canonical_group_id,
+    InMemoryStore, SqliteMemory, LLM, ConversationStore,
     parse_mentions, expand_all_mention, notify_mentioned_agents_parallel, NotifyResult,
 };
 use anima::agent_dir::AgentDir;
@@ -149,8 +149,8 @@ enum Commands {
 enum ConvCommands {
     /// Create a new conversation with participants
     New {
-        /// Name for the conversation
-        name: String,
+        /// Name for the conversation (optional, generates fun name if not provided)
+        name: Option<String>,
         /// Comma-separated list of agent names to include
         #[arg(long = "with")]
         participants: String,
@@ -356,15 +356,15 @@ const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 
 /// Start an interactive chat session with agents using persistent conversation storage.
 ///
-/// - With a single agent: creates/reuses implicit "1:1:{agent}:user" conversation
+/// - With a single agent: creates/reuses implicit conversation (generates fun name)
 ///   - Messages are sent directly to the agent
-/// - With multiple agents: creates/reuses implicit "group:{sorted_names}" conversation
+/// - With multiple agents: creates/reuses implicit group conversation (generates fun name)
 ///   - Messages are ONLY sent to @mentioned agents
 ///   - If no @mentions, user is warned
-/// - With --conv flag: uses the specified existing conversation
+/// - With --conv flag: uses the specified existing conversation by name
 async fn chat_with_conversation(
     agents: &[String],
-    conv_name: Option<&str>,
+    conv_name_arg: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize conversation store
     let store = ConversationStore::init()?;
@@ -372,46 +372,41 @@ async fn chat_with_conversation(
     // Determine if this is a group chat (multiple agents)
     let is_group_chat = agents.len() > 1;
 
-    // Determine conversation ID and participants
-    let (conv_id, participants) = if let Some(name) = conv_name {
+    // Determine conversation name and participants
+    let (conv_name, participants) = if let Some(name) = conv_name_arg {
         // Explicit conversation - must exist
         let conv = store.find_by_name(name)?
             .ok_or_else(|| format!("Conversation '{}' not found", name))?;
-        let parts = store.get_participants(&conv.id)?;
+        let parts = store.get_participants(&conv.name)?;
         let agent_names: Vec<String> = parts.iter()
             .filter(|p| p.agent != "user")
             .map(|p| p.agent.clone())
             .collect();
-        (conv.id, agent_names)
+        (conv.name, agent_names)
     } else if agents.len() == 1 {
-        // 1:1 conversation
+        // 1:1 conversation - find or create by participants
         let agent = &agents[0];
-        let id = canonical_1to1_id(agent);
         let parts: Vec<&str> = vec![agent.as_str(), "user"];
-        // Get or create the conversation
-        store.get_or_create_conversation(&id, &parts)?;
-        (id, vec![agent.clone()])
+        let conv = store.get_or_create_conversation(&parts)?;
+        (conv.name, vec![agent.clone()])
     } else {
-        // Group conversation
-        let agent_refs: Vec<&str> = agents.iter().map(|s| s.as_str()).collect();
-        let id = canonical_group_id(&agent_refs);
-        let mut parts = agent_refs.clone();
+        // Group conversation - find or create by participants
+        let mut parts: Vec<&str> = agents.iter().map(|s| s.as_str()).collect();
         if !parts.contains(&"user") {
             parts.push("user");
         }
-        // Get or create the conversation
-        store.get_or_create_conversation(&id, &parts)?;
-        (id, agents.to_vec())
+        let conv = store.get_or_create_conversation(&parts)?;
+        (conv.name, agents.to_vec())
     };
 
     // Print connection info
     if is_group_chat {
         println!("\x1b[32m✓ Group chat with: {}\x1b[0m", participants.join(", "));
-        println!("\x1b[90mConversation: {}\x1b[0m", conv_id);
+        println!("\x1b[90mConversation: {}\x1b[0m", conv_name);
         println!("\x1b[33mNote: In group chat, use @mentions to notify agents (e.g., @arya @gendry)\x1b[0m");
     } else {
         println!("\x1b[32m✓ Chat with '{}'\x1b[0m", participants[0]);
-        println!("\x1b[90mConversation: {}\x1b[0m", conv_id);
+        println!("\x1b[90mConversation: {}\x1b[0m", conv_name);
     }
     println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
 
@@ -452,7 +447,7 @@ async fn chat_with_conversation(
                 let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
 
                 // Store user message in conversation with mentions
-                let user_msg_id = store.add_message(&conv_id, "user", line, &mention_refs)?;
+                let user_msg_id = store.add_message(&conv_name, "user", line, &mention_refs)?;
 
                 // Determine which agents to notify
                 let agents_to_notify: Vec<String> = if is_group_chat {
@@ -465,7 +460,7 @@ async fn chat_with_conversation(
 
                 // Notify agents in parallel and collect responses
                 if !agents_to_notify.is_empty() {
-                    let notify_results = notify_mentioned_agents_parallel(&store, &conv_id, user_msg_id, &agents_to_notify).await;
+                    let notify_results = notify_mentioned_agents_parallel(&store, &conv_name, user_msg_id, &agents_to_notify).await;
 
                     // Display results for each agent and check for @mentions in their responses
                     let mut agent_mentions_to_notify: Vec<(i64, Vec<String>)> = Vec::new();
@@ -474,7 +469,7 @@ async fn chat_with_conversation(
                         match result {
                             NotifyResult::Notified { response_message_id } => {
                                 // Fetch and display the agent's response
-                                if let Ok(msgs) = store.get_messages(&conv_id, Some(DEFAULT_CONTEXT_MESSAGES)) {
+                                if let Ok(msgs) = store.get_messages(&conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
                                     if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                         println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
 
@@ -506,12 +501,12 @@ async fn chat_with_conversation(
 
                     // Notify agents mentioned in agent responses (agent-to-agent communication)
                     for (msg_id, mentions) in agent_mentions_to_notify {
-                        let followup_results = notify_mentioned_agents_parallel(&store, &conv_id, msg_id, &mentions).await;
+                        let followup_results = notify_mentioned_agents_parallel(&store, &conv_name, msg_id, &mentions).await;
 
                         for (agent, result) in &followup_results {
                             match result {
                                 NotifyResult::Notified { response_message_id } => {
-                                    if let Ok(msgs) = store.get_messages(&conv_id, Some(DEFAULT_CONTEXT_MESSAGES)) {
+                                    if let Ok(msgs) = store.get_messages(&conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
                                         if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                             println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
                                         }
@@ -885,8 +880,8 @@ fn handle_conv_command(command: ConvCommands) -> Result<(), Box<dyn std::error::
                 return Err("At least one participant is required".into());
             }
 
-            let id = store.create_conversation(Some(&name), &agents)?;
-            println!("Created conversation '\x1b[36m{}\x1b[0m' (id: {})", name, id);
+            let conv_name = store.create_conversation(name.as_deref(), &agents)?;
+            println!("Created conversation '\x1b[36m{}\x1b[0m'", conv_name);
             println!("Participants: {}", agents.join(", "));
         }
         ConvCommands::List => {
@@ -899,32 +894,50 @@ fn handle_conv_command(command: ConvCommands) -> Result<(), Box<dyn std::error::
                 return Ok(());
             }
 
-            println!("\x1b[1m{:<20} {:<18} {}\x1b[0m", "NAME", "ID", "PARTICIPANTS");
-            println!("{}", "-".repeat(60));
+            // Improved formatting: wider NAME column, show UPDATED time
+            println!("\x1b[1m{:<30} {:<30} {}\x1b[0m", "NAME", "PARTICIPANTS", "UPDATED");
+            println!("{}", "-".repeat(80));
 
             for conv in conversations {
-                let participants = store.get_participants(&conv.id)?;
+                let participants = store.get_participants(&conv.name)?;
                 let agents: Vec<_> = participants.iter().map(|p| p.agent.as_str()).collect();
-                let name = conv.name.unwrap_or_else(|| "(unnamed)".to_string());
 
-                // Truncate ID for display
-                let short_id = if conv.id.len() > 16 {
-                    &conv.id[..16]
-                } else {
-                    &conv.id
-                };
+                // Format updated_at as relative time
+                let updated = format_relative_time(conv.updated_at);
 
                 println!(
-                    "{:<20} {:<18} {}",
-                    name,
-                    short_id,
-                    agents.join(", ")
+                    "{:<30} {:<30} {}",
+                    conv.name,
+                    agents.join(", "),
+                    updated
                 );
             }
         }
     }
 
     Ok(())
+}
+
+/// Format a Unix timestamp as relative time (e.g., "2h ago", "3d ago").
+fn format_relative_time(timestamp: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    let diff = now - timestamp;
+
+    if diff < 60 {
+        "just now".to_string()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 604800 {
+        format!("{}d ago", diff / 86400)
+    } else {
+        format!("{}w ago", diff / 604800)
+    }
 }
 
 /// Run an agent from a directory and start an interactive REPL

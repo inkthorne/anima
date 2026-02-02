@@ -601,10 +601,10 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                     logger.log(&format!("Processing {} pending notifications...", pending.len()));
                     for notification in &pending {
                         logger.log(&format!("  Processing notification: conv={} msg_id={}",
-                            notification.conv_id, notification.message_id));
+                            notification.conv_name, notification.message_id));
 
                         let response = handle_notify(
-                            &notification.conv_id,
+                            &notification.conv_name,
                             notification.message_id,
                             &agent,
                             &config.name,
