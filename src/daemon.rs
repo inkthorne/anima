@@ -1209,6 +1209,14 @@ async fn handle_connection(
                                 break;
                             }
 
+                            // Send ToolCall event to client before executing
+                            if let Err(e) = api.write_response(&Response::ToolCall {
+                                tool: tc.tool.clone(),
+                                params: tc.params.clone(),
+                            }).await {
+                                logger.log(&format!("[socket] Error writing ToolCall: {}", e));
+                            }
+
                             logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
 
                             // Look up the tool definition to get allowed_commands

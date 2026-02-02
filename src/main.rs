@@ -16,6 +16,30 @@ use std::sync::Arc;
 use std::io::{self, Write};
 use tokio::net::UnixStream;
 
+/// Format tool params for display in a brief, readable way.
+fn format_tool_params(params: &serde_json::Value) -> String {
+    // For shell commands, show the command
+    if let Some(cmd) = params.get("command").and_then(|c| c.as_str()) {
+        return cmd.to_string();
+    }
+    // For file operations, show the path
+    if let Some(path) = params.get("path").and_then(|p| p.as_str()) {
+        return path.to_string();
+    }
+    // For HTTP requests, show method and URL
+    if let Some(url) = params.get("url").and_then(|u| u.as_str()) {
+        let method = params.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+        return format!("{} {}", method, url);
+    }
+    // Fallback: compact JSON, truncated
+    let json = serde_json::to_string(params).unwrap_or_default();
+    if json.len() > 60 {
+        format!("{}...", &json[..57])
+    } else {
+        json
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "anima", about = "The animating spirit - AI agent runtime")]
 struct Cli {
@@ -264,6 +288,11 @@ async fn send_message(agent: &str, message: &str) -> Result<(), Box<dyn std::err
                 print!("{}", text);
                 io::stdout().flush()?;
             }
+            Some(Response::ToolCall { tool, params }) => {
+                // Show tool call: " - [tool] safe_shell: ls -la ~/dev"
+                let param_summary = format_tool_params(&params);
+                eprintln!(" - [tool] {}: {}", tool, param_summary);
+            }
             Some(Response::Done) => {
                 // Streaming complete
                 println!();  // Final newline
@@ -328,6 +357,11 @@ async fn chat_with_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> 
                             // Streaming: print tokens as they arrive
                             print!("{}", text);
                             let _ = io::stdout().flush();
+                        }
+                        Ok(Some(Response::ToolCall { tool, params })) => {
+                            // Show tool call: " - [tool] safe_shell: ls -la ~/dev"
+                            let param_summary = format_tool_params(&params);
+                            eprintln!(" - [tool] {}: {}", tool, param_summary);
                         }
                         Ok(Some(Response::Done)) => {
                             // Streaming complete

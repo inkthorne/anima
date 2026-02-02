@@ -65,6 +65,11 @@ pub enum Response {
     Chunk {
         text: String,
     },
+    /// Streaming: tool is being executed.
+    ToolCall {
+        tool: String,
+        params: serde_json::Value,
+    },
     /// Streaming: complete.
     Done,
 }
@@ -414,5 +419,26 @@ mod tests {
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::Done));
+    }
+
+    #[test]
+    fn test_response_tool_call_serialization() {
+        let response = Response::ToolCall {
+            tool: "safe_shell".to_string(),
+            params: serde_json::json!({"command": "ls -la"}),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"tool_call\""));
+        assert!(json.contains("\"tool\":\"safe_shell\""));
+        assert!(json.contains("\"command\":\"ls -la\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::ToolCall { tool, params } => {
+                assert_eq!(tool, "safe_shell");
+                assert_eq!(params.get("command").and_then(|c| c.as_str()), Some("ls -la"));
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }
