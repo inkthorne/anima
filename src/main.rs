@@ -464,7 +464,9 @@ async fn chat_with_conversation(
                 if !agents_to_notify.is_empty() {
                     let notify_results = notify_mentioned_agents_parallel(&store, &conv_id, user_msg_id, &agents_to_notify).await;
 
-                    // Display results for each agent
+                    // Display results for each agent and check for @mentions in their responses
+                    let mut agent_mentions_to_notify: Vec<(i64, Vec<String>)> = Vec::new();
+
                     for (agent, result) in &notify_results {
                         match result {
                             NotifyResult::Notified { response_message_id } => {
@@ -472,6 +474,18 @@ async fn chat_with_conversation(
                                 if let Ok(msgs) = store.get_messages(&conv_id, Some(DEFAULT_CONTEXT_MESSAGES)) {
                                     if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                         println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
+
+                                        // Parse @mentions from the agent's response
+                                        let response_mentions = parse_mentions(&response_msg.content);
+                                        // Filter out self and "user"
+                                        let filtered_mentions: Vec<String> = response_mentions
+                                            .into_iter()
+                                            .filter(|m| m != agent && m != "user")
+                                            .collect();
+
+                                        if !filtered_mentions.is_empty() {
+                                            agent_mentions_to_notify.push((*response_message_id, filtered_mentions));
+                                        }
                                     }
                                 }
                             }
@@ -480,6 +494,29 @@ async fn chat_with_conversation(
                             }
                             NotifyResult::Failed { reason } => {
                                 eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
+                            }
+                        }
+                    }
+
+                    // Notify agents mentioned in agent responses (agent-to-agent communication)
+                    for (msg_id, mentions) in agent_mentions_to_notify {
+                        let followup_results = notify_mentioned_agents_parallel(&store, &conv_id, msg_id, &mentions).await;
+
+                        for (agent, result) in &followup_results {
+                            match result {
+                                NotifyResult::Notified { response_message_id } => {
+                                    if let Ok(msgs) = store.get_messages(&conv_id, Some(DEFAULT_CONTEXT_MESSAGES)) {
+                                        if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
+                                            println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
+                                        }
+                                    }
+                                }
+                                NotifyResult::Queued { notification_id: _ } => {
+                                    eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
+                                }
+                                NotifyResult::Failed { reason } => {
+                                    eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
+                                }
                             }
                         }
                     }
