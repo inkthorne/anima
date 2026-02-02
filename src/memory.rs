@@ -524,19 +524,24 @@ impl SemanticMemoryStore {
     /// For embedding-based search, use `recall_with_embedding` instead.
     #[deprecated(note = "Use recall_with_embedding for semantic search")]
     pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
-        self.recall_with_embedding(query, limit, None)
+        Ok(self.recall_with_embedding(query, limit, None)?
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect())
     }
 
     /// Recall relevant memories using embedding-based semantic search.
     ///
     /// When `query_embedding` is provided, uses cosine similarity for scoring.
     /// When `query_embedding` is None, returns empty (embeddings are required for recall).
+    ///
+    /// Returns entries paired with their relevance scores (higher = more relevant).
     pub fn recall_with_embedding(
         &self,
         query: &str,
         limit: usize,
         query_embedding: Option<&[f32]>,
-    ) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
+    ) -> Result<Vec<(SemanticMemoryEntry, f64)>, MemoryError> {
         use crate::embedding::cosine_similarity;
 
         debug::log(&format!("[memory] RECALL query=\"{}\" limit={} has_embedding={}",
@@ -633,7 +638,7 @@ impl SemanticMemoryStore {
             self.mark_accessed_internal(&conn, *id)?;
         }
 
-        Ok(scored.into_iter().map(|(m, _)| m).collect())
+        Ok(scored)
     }
 
     fn mark_accessed_internal(&self, conn: &Connection, id: i64) -> Result<(), MemoryError> {
@@ -1185,8 +1190,10 @@ mod tests {
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
         let results = store.recall_with_embedding("dark mode preference", 5, Some(&query_emb)).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].content.contains("dark mode"));
-        assert!((results[0].importance - 0.9).abs() < 0.01);
+        let (entry, score) = &results[0];
+        assert!(entry.content.contains("dark mode"));
+        assert!((entry.importance - 0.9).abs() < 0.01);
+        assert!(*score > 0.0); // Score should be positive
     }
 
     #[test]
@@ -1206,7 +1213,7 @@ mod tests {
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
         let results = store.recall_with_embedding("dark theme preference", 5, Some(&query_emb)).unwrap();
         assert!(!results.is_empty());
-        assert!(results[0].content.contains("dark"));
+        assert!(results[0].0.content.contains("dark"));
     }
 
     #[test]
@@ -1267,7 +1274,7 @@ mod tests {
         let results = store.recall_with_embedding("coding fact", 5, Some(&embedding)).unwrap();
         assert!(!results.is_empty());
         // Higher importance should rank higher (when other factors are equal)
-        assert!(results[0].importance > 0.9);
+        assert!(results[0].0.importance > 0.9);
     }
 
     #[test]
@@ -1279,15 +1286,15 @@ mod tests {
 
         // First recall
         let results1 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
-        assert_eq!(results1[0].access_count, 0); // Not incremented yet at read time
+        assert_eq!(results1[0].0.access_count, 0); // Not incremented yet at read time
 
         // Second recall should show incremented count
         let results2 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
-        assert_eq!(results2[0].access_count, 1);
+        assert_eq!(results2[0].0.access_count, 1);
 
         // Third recall
         let results3 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
-        assert_eq!(results3[0].access_count, 2);
+        assert_eq!(results3[0].0.access_count, 2);
     }
 
     #[test]
@@ -1446,7 +1453,7 @@ mod tests {
         let results = store.recall_with_embedding("dark theme", 5, Some(&query_emb)).unwrap();
 
         assert!(!results.is_empty());
-        assert!(results[0].content.contains("dark mode"));
+        assert!(results[0].0.content.contains("dark mode"));
     }
 
     #[test]
@@ -1539,7 +1546,7 @@ mod tests {
         let query_emb = vec![0.1, 0.2, 0.3, 0.4];
         let results = store.recall_with_embedding("test", 5, Some(&query_emb)).unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].embedding.is_some());
+        assert!(results[0].0.embedding.is_some());
     }
 
     #[test]

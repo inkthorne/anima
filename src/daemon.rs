@@ -667,11 +667,12 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 Ok(memories) => {
                                     if !memories.is_empty() {
                                         timer_logger.memory(&format!("Recall: {} memories for timer", memories.len()));
-                                        for m in &memories {
-                                            timer_logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                        for (m, score) in &memories {
+                                            timer_logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
                                         }
                                     }
-                                    build_memory_injection(&memories)
+                                    let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                                    build_memory_injection(&entries)
                                 }
                                 Err(e) => {
                                     timer_logger.log(&format!("[timer] Memory recall error: {}", e));
@@ -1001,11 +1002,12 @@ async fn handle_connection(
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for query", memories.len()));
-                                for m in &memories {
-                                    logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                for (m, score) in &memories {
+                                    logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
                                 }
                             }
-                            build_memory_injection(&memories)
+                            let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                            build_memory_injection(&entries)
                         }
                         Err(e) => {
                             logger.log(&format!("[socket] Memory recall error: {}", e));
@@ -1210,11 +1212,12 @@ async fn handle_connection(
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for incoming", memories.len()));
-                                for m in &memories {
-                                    logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                for (m, score) in &memories {
+                                    logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
                                 }
                             }
-                            build_memory_injection(&memories)
+                            let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                            build_memory_injection(&entries)
                         }
                         Err(e) => {
                             logger.log(&format!("[socket] Memory recall error: {}", e));
