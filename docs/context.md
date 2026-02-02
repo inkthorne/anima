@@ -68,34 +68,34 @@ hello @arya                 # Send to arya
 @all anyone?                # Send to all running agents
 ```
 
-## Agent Directory
+## Directory Structure
 
 ```
-~/.anima/agents/arya/
-├── config.toml       # LLM config
-├── persona.md        # System prompt (identity)
-├── always.md         # Persistent reminders (recency bias)
-├── memory.db         # SQLite memory (semantic + key-value)
-├── agent.log         # Agent-specific log file (when running)
-├── daemon.pid        # PID file (when running)
-└── agent.sock        # Unix socket (when running)
-
-~/.anima/agents/
-└── always.md         # Global always.md fallback
+~/.anima/
+├── models/
+│   └── gemma-27b.toml   # Shared model definitions
+└── agents/
+    ├── always.md         # Global always.md fallback
+    └── arya/
+        ├── config.toml       # Agent config (references model)
+        ├── persona.md        # System prompt (identity)
+        ├── always.md         # Agent-specific reminders (optional)
+        ├── memory.db         # SQLite memory (semantic + key-value)
+        ├── agent.log         # Agent-specific log (when running)
+        ├── daemon.pid        # PID file (when running)
+        └── agent.sock        # Unix socket (when running)
 ```
 
 ## Example config.toml
 
 ```toml
 [agent]
-name = "arya"
+name = "gendry"
 persona_file = "persona.md"
-always_file = "always.md"
 
 [llm]
-provider = "ollama"
-model = "qwen3:8b"
-base_url = "http://localhost:11434"
+model_file = "gemma-27b"   # References ~/.anima/models/gemma-27b.toml
+# num_ctx = 65536          # Optional: override model's default
 
 [memory]
 path = "memory.db"
@@ -105,6 +105,17 @@ enabled = true
 path = "memory.db"
 recall_limit = 5        # Max memories injected per turn
 min_importance = 0.1    # Filter threshold
+```
+
+## Example model file
+
+```toml
+# ~/.anima/models/gemma-27b.toml
+provider = "ollama"
+model = "gemma3:27b"
+num_ctx = 65536          # 64k context
+tools = false            # Model doesn't support native tools
+thinking = false
 ```
 
 ## Key Source Files
@@ -135,7 +146,22 @@ min_importance = 0.1    # Filter threshold
 - Keyword-based search with scoring: relevance × recency × importance
 - 7-day half-life decay for recency
 - Explicit saves get high importance (0.9), auto-captures get default (0.5)
+- Memory reinforcement: duplicate saves boost importance instead of creating copies
 - Works for all models — Gemma, Qwen, Claude, etc.
+
+### Tool Execution (Non-Tool-Calling Models)
+- Models output JSON blocks: `{"tool": "read_file", "params": {"path": "..."}}`
+- Daemon parses, executes, returns result to agent
+- Multi-turn loop: agent can chain tool calls
+- Tilde (~) expansion supported in paths
+- Available: `read_file` (more coming)
+
+### Shared Model Definitions
+- Define models in `~/.anima/models/*.toml`
+- Agents reference via `model_file = "gemma-27b"` in config
+- Override specific fields per-agent (num_ctx, thinking, etc.)
+- Single model in VRAM, multiple agent personalities
+- Configurable context size via `num_ctx` (runtime, no model modification)
 
 ### Agent-Internal History
 - Agent manages its own conversation history
@@ -211,4 +237,4 @@ This keeps Arya's context clean and available while Claude Code does the heavy l
 
 ## Last Updated
 
-2026-02-01 — v2.6.2: Semantic memory system (auto-recall, [REMEMBER:] tags, keyword search), agent-specific logging (agent.log).
+2026-02-01 — v2.7.4: Tool execution for non-tool-calling models, shared model definitions, configurable context size, memory reinforcement, tilde expansion.

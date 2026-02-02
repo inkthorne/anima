@@ -121,6 +121,19 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
                 Err(e) => Err(format!("Tool error: {}", e))
             }
         }
+        "write_file" => {
+            let tool = WriteFileTool::default();
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
+                        Ok(msg.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
     }
 }
