@@ -30,6 +30,8 @@ pub enum Request {
     Clear,
     /// List all agents visible to this daemon.
     ListAgents,
+    /// Get the system prompt (persona) for this agent.
+    System,
 }
 
 /// Response types for the socket API.
@@ -48,6 +50,10 @@ pub enum Response {
     /// Response to a list_agents request.
     Agents {
         agents: Vec<String>,
+    },
+    /// Response to a system prompt request.
+    System {
+        persona: String,
     },
     /// Generic OK response.
     Ok,
@@ -343,6 +349,34 @@ mod tests {
                 assert_eq!(agents.len(), 2);
                 assert!(agents.contains(&"agent-1".to_string()));
                 assert!(agents.contains(&"agent-2".to_string()));
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_system_serialization() {
+        let request = Request::System;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"system"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::System));
+    }
+
+    #[test]
+    fn test_response_system_serialization() {
+        let response = Response::System {
+            persona: "You are a helpful assistant.".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"system\""));
+        assert!(json.contains("\"persona\":\"You are a helpful assistant.\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::System { persona } => {
+                assert_eq!(persona, "You are a helpful assistant.");
             }
             _ => panic!("Wrong variant"),
         }

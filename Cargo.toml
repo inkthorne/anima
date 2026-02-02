@@ -1,6 +1,6 @@
 [package]
 name = "anima"
-version = "2.8.0"
+version = "2.9.0"
 edition = "2024"
 license = "MIT"
 authors = ["Arya <arya@inkthorne.com>"]
@@ -24,6 +24,7 @@ dirs = "6"
 thiserror = "2"
 regex = "1"
 chrono = "0.4"
+gethostname = "1.0"
 
 [dev-dependencies]
 tempfile = "3"

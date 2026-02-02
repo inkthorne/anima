@@ -365,6 +365,17 @@ impl DaemonConfig {
         let model_always = llm_config.always;
         let allowed_tools = llm_config.allowed_tools;
 
+        // Build runtime context and append to persona
+        let host = gethostname::gethostname()
+            .to_string_lossy()
+            .to_string();
+        let runtime_context = build_runtime_context(&name, &llm_config.model, &host, llm_config.tools);
+
+        let persona = match persona {
+            Some(p) => Some(format!("{}\n\n{}", p, runtime_context)),
+            None => Some(runtime_context),
+        };
+
         Ok(Self {
             name,
             agent_dir: dir_path,
@@ -378,6 +389,16 @@ impl DaemonConfig {
             allowed_tools,
         })
     }
+}
+
+/// Build the runtime context string that is appended to the persona.
+/// This gives agents self-awareness about their environment.
+fn build_runtime_context(agent: &str, model: &str, host: &str, tools_native: bool) -> String {
+    let tools_mode = if tools_native { "native" } else { "json-block" };
+    format!(
+        "You are running inside Anima, a multi-agent runtime.\n\nRuntime: agent={} | model={} | host={} | tools={}",
+        agent, model, host, tools_mode
+    )
 }
 
 /// Parse a duration string like "30s", "5m", "1h" into a Duration.
@@ -1280,6 +1301,12 @@ async fn handle_connection(
                     .collect();
                 Response::Agents { agents }
             }
+
+            Request::System => {
+                logger.log("[socket] System prompt requested");
+                let persona_content = persona.clone().unwrap_or_else(|| "(no persona configured)".to_string());
+                Response::System { persona: persona_content }
+            }
         };
 
         if let Err(e) = api.write_response(&response).await {
@@ -1417,7 +1444,13 @@ message = "heartbeat"
         assert_eq!(timer.interval, Duration::from_secs(300));
         assert_eq!(timer.message, "heartbeat");
 
-        assert_eq!(daemon_config.persona, Some("Test persona".to_string()));
+        // Persona should start with original content and include runtime context
+        let persona = daemon_config.persona.unwrap();
+        assert!(persona.starts_with("Test persona"));
+        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
+        assert!(persona.contains("agent=test-agent"));
+        assert!(persona.contains("model=gpt-4"));
+        assert!(persona.contains("tools=native"));
     }
 
     #[test]
@@ -1439,7 +1472,10 @@ api_key = "sk-test"
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
 
         assert!(daemon_config.timer.is_none());
-        assert!(daemon_config.persona.is_none());
+        // Even without a persona file, runtime context is injected
+        let persona = daemon_config.persona.unwrap();
+        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
+        assert!(persona.contains("agent=test-agent"));
     }
 
     #[test]
@@ -1489,7 +1525,10 @@ api_key = "sk-test"
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
 
-        assert_eq!(daemon_config.persona, Some("Test persona".to_string()));
+        // Persona should start with original content and include runtime context
+        let persona = daemon_config.persona.unwrap();
+        assert!(persona.starts_with("Test persona"));
+        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
         assert_eq!(daemon_config.always, Some("Always be concise.".to_string()));
     }
 

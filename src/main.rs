@@ -103,6 +103,11 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
+    /// Show the system prompt for a running agent daemon
+    System {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+    },
 }
 
 #[tokio::main]
@@ -187,6 +192,12 @@ async fn main() {
         }
         Commands::Restart { agent } => {
             if let Err(e) = restart_agent(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::System { agent } => {
+            if let Err(e) = show_system_prompt(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -616,6 +627,33 @@ async fn clear_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
         Some(Response::Ok) => {
             println!("Cleared conversation for {}", agent);
+        }
+        Some(Response::Error { message }) => {
+            return Err(format!("Error from agent: {}", message).into());
+        }
+        Some(other) => {
+            return Err(format!("Unexpected response: {:?}", other).into());
+        }
+        None => {
+            return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show the system prompt for a running agent daemon.
+async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    // Send system request
+    api.write_request(&Request::System).await
+        .map_err(|e| format!("Failed to send system request: {}", e))?;
+
+    // Read the response
+    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+        Some(Response::System { persona }) => {
+            println!("{}", persona);
         }
         Some(Response::Error { message }) => {
             return Err(format!("Error from agent: {}", message).into());
