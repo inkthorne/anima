@@ -20,6 +20,8 @@ pub struct ToolDefinition {
     pub keywords: Vec<String>,
     /// Optional category (e.g., "filesystem", "system")
     pub category: Option<String>,
+    /// Optional list of allowed commands (for shell tools)
+    pub allowed_commands: Option<Vec<String>>,
 }
 
 /// TOML file structure for tools.toml.
@@ -94,6 +96,11 @@ impl ToolRegistry {
     /// Get all tools in the registry.
     pub fn all_tools(&self) -> &[ToolDefinition] {
         &self.tools
+    }
+
+    /// Find a tool by its exact name.
+    pub fn find_by_name(&self, name: &str) -> Option<&ToolDefinition> {
+        self.tools.iter().find(|t| t.name == name)
     }
 
     /// Find tools relevant to a query using keyword matching.
@@ -378,6 +385,7 @@ category = "system"
             params: serde_json::json!({"path": "string"}),
             keywords: vec!["read".to_string()],
             category: Some("filesystem".to_string()),
+            allowed_commands: None,
         };
 
         let formatted = ToolRegistry::format_for_prompt(&[&tool]);
@@ -403,5 +411,68 @@ category = "system"
         let all = registry.all_tools();
 
         assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_allowed_commands_parsing() {
+        let toml_content = r#"
+[[tool]]
+name = "safe_shell"
+description = "Run safe shell commands"
+params = { command = "string" }
+keywords = ["shell", "ls", "grep"]
+category = "system"
+allowed_commands = ["ls", "grep", "find", "cat"]
+"#;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        std::fs::write(&path, toml_content).unwrap();
+
+        let registry = ToolRegistry::load_from_file(&path).unwrap();
+        assert_eq!(registry.tools.len(), 1);
+
+        let tool = &registry.tools[0];
+        assert_eq!(tool.name, "safe_shell");
+        assert!(tool.allowed_commands.is_some());
+
+        let allowed = tool.allowed_commands.as_ref().unwrap();
+        assert_eq!(allowed.len(), 4);
+        assert!(allowed.contains(&"ls".to_string()));
+        assert!(allowed.contains(&"grep".to_string()));
+        assert!(allowed.contains(&"find".to_string()));
+        assert!(allowed.contains(&"cat".to_string()));
+    }
+
+    #[test]
+    fn test_allowed_commands_not_set() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        std::fs::write(&path, sample_tools_toml()).unwrap();
+
+        let registry = ToolRegistry::load_from_file(&path).unwrap();
+
+        // Regular shell tool should not have allowed_commands
+        let shell_tool = registry.tools.iter().find(|t| t.name == "shell").unwrap();
+        assert!(shell_tool.allowed_commands.is_none());
+    }
+
+    #[test]
+    fn test_find_by_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tools.toml");
+        std::fs::write(&path, sample_tools_toml()).unwrap();
+
+        let registry = ToolRegistry::load_from_file(&path).unwrap();
+
+        let tool = registry.find_by_name("read_file");
+        assert!(tool.is_some());
+        assert_eq!(tool.unwrap().name, "read_file");
+
+        let tool = registry.find_by_name("shell");
+        assert!(tool.is_some());
+        assert_eq!(tool.unwrap().name, "shell");
+
+        let tool = registry.find_by_name("nonexistent");
+        assert!(tool.is_none());
     }
 }

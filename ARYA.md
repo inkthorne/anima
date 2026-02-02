@@ -1,125 +1,83 @@
-# Task: Embedding-Based Semantic Memory
+# Task: Sandboxed Safe Shell Tool
 
-**Goal:** Replace keyword-based recall with embedding-based semantic search using Ollama.
+**Goal:** Create a `safe_shell` tool that only allows read-only, non-destructive commands. Replace `shell` with `safe_shell` in model configs.
 
 **Build:** `cargo build --release && cargo test`
 
-## Config Changes
+## Changes to `~/.anima/tools.toml`
 
-`~/.anima/agents/<name>/config.toml`:
+Add new tool definition:
 ```toml
-[semantic_memory]
-enabled = true
-
-[semantic_memory.embedding]
-provider = "ollama"
-model = "nomic-embed-text"
-url = "http://localhost:11434"  # optional, defaults to localhost
+[[tool]]
+name = "safe_shell"
+description = "Run read-only shell commands (ls, grep, find, cat, head, tail, wc, pwd, file, stat, du, df)"
+params = { command = "string" }
+keywords = ["shell", "command", "run", "ls", "grep", "find", "list", "search", "directory"]
+category = "system"
+allowed_commands = ["ls", "grep", "find", "cat", "head", "tail", "wc", "pwd", "echo", "which", "file", "stat", "du", "df", "env", "date", "whoami", "hostname", "uname"]
 ```
 
-## Schema Changes
+Keep the original `shell` tool for trusted models, but remove dangerous keywords to reduce recall.
 
-Add to `semantic_memories` table:
-```sql
-ALTER TABLE semantic_memories ADD COLUMN embedding BLOB;
-```
+## Changes to `src/tool_registry.rs`
 
-Add metadata table for tracking embedding model:
-```sql
-CREATE TABLE IF NOT EXISTS memory_meta (
-    key TEXT PRIMARY KEY,
-    value TEXT
-);
--- Store: ("embedding_model", "nomic-embed-text")
-```
-
-## New Module: `src/embedding.rs`
-
+Update `ToolDefinition` struct to include optional `allowed_commands`:
 ```rust
-pub struct EmbeddingClient {
-    url: String,
-    model: String,
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub params: HashMap<String, String>,
+    pub keywords: HashSet<String>,
+    pub category: Option<String>,
+    pub allowed_commands: Option<Vec<String>>,  // NEW
 }
-
-impl EmbeddingClient {
-    pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
-    pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError>;
-}
-
-pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32;
 ```
 
-Ollama API: `POST /api/embeddings { "model": "...", "prompt": "..." }`
+Update TOML parsing to handle `allowed_commands`.
 
-## Changes to `src/memory.rs`
+## Changes to `src/daemon.rs` (tool execution)
 
-**SemanticMemoryStore:**
-- `save()` — Accept optional embedding, store in BLOB column
-- `recall()` — If embeddings enabled, load all embeddings, compute cosine similarity, rank and return top N
-- `backfill_embeddings()` — For migration: find rows with NULL embedding, compute and update
-- `get_embedding_model()` / `set_embedding_model()` — Track current model in metadata
-- Remove keyword-based recall code path entirely
-
-## Changes to `src/daemon.rs`
-
-On startup (if semantic_memory.embedding configured):
-1. Create `EmbeddingClient` from config
-2. Check `memory_meta` for stored model vs config model
-3. If mismatch or NULL embeddings exist → backfill all
-4. Store client in daemon state
-
-On message handling:
-- Before save: `let embedding = client.embed(&memory_text).await?`
-- Pass embedding to `store.save()`
-- On recall: `let query_embedding = client.embed(&query).await?`
-- Pass to `store.recall()`
-
-## Changes to `src/agent_dir.rs`
-
-Add config structs:
+When executing a tool, check if `allowed_commands` is set:
 ```rust
-pub struct EmbeddingConfig {
-    pub provider: String,  // "ollama" for now
-    pub model: String,
-    pub url: Option<String>,
+fn execute_tool(tool: &ToolDefinition, params: &Value) -> Result<String, ToolError> {
+    match tool.name.as_str() {
+        "shell" | "safe_shell" => {
+            let command = params["command"].as_str().unwrap();
+            
+            // If allowed_commands is set, validate the command
+            if let Some(allowed) = &tool.allowed_commands {
+                let first_word = command.split_whitespace().next().unwrap_or("");
+                if !allowed.contains(&first_word.to_string()) {
+                    return Err(ToolError::Forbidden(format!(
+                        "Command '{}' not in allowed list. Allowed: {:?}", 
+                        first_word, allowed
+                    )));
+                }
+            }
+            
+            // Execute the command...
+        }
+        // ... other tools
+    }
 }
 ```
 
-Parse from `[semantic_memory.embedding]` section.
+## Changes to model configs
 
-## Migration Flow
-
-```
-Daemon starts
-→ semantic_memory.embedding configured?
-  → No: semantic memory disabled, skip
-  → Yes: 
-    → Check memory_meta.embedding_model
-    → If different from config OR any NULL embeddings:
-      → Log "Backfilling embeddings..."
-      → For each memory: embed(content), UPDATE embedding
-      → Update memory_meta.embedding_model
-    → Continue with embedded recall
+Update `~/.anima/models/gemma-27b.toml`:
+```toml
+allowed_tools = ["read_file", "write_file", "safe_shell"]  # safe_shell instead of shell
 ```
 
-## Files to Modify
-
-| File | Changes |
-|------|---------|
-| `src/embedding.rs` | **NEW** — EmbeddingClient, cosine_similarity |
-| `src/memory.rs` | Add embedding column handling, remove keyword recall |
-| `src/daemon.rs` | Integrate embedding client, backfill logic |
-| `src/agent_dir.rs` | Parse EmbeddingConfig |
-| `src/lib.rs` | Export new module |
+Update any other model configs (qwen, etc.) similarly.
 
 ## Checklist
 
-- [x] Create `src/embedding.rs` with EmbeddingClient and cosine_similarity
-- [x] Update `src/agent_dir.rs` with EmbeddingConfig parsing
-- [x] Update `src/memory.rs` schema and recall logic
-- [x] Update `src/daemon.rs` to integrate embeddings
-- [x] Update `src/lib.rs` exports
-- [x] Remove keyword-based recall code
-- [x] Add tests for embedding module
+- [x] Add `allowed_commands` field to `ToolDefinition` in `src/tool_registry.rs`
+- [x] Update TOML parsing for `allowed_commands`
+- [x] Add command validation in tool execution in `src/daemon.rs`
+- [x] Add `safe_shell` tool to `~/.anima/tools.toml`
+- [x] Update `~/.anima/models/gemma-27b.toml` to use `safe_shell`
+- [x] Add tests for command filtering
 - [x] Verify build passes
-- [x] Verify tests pass
+- [x] Verify tests pass (367 + 11 = 378 tests passing)

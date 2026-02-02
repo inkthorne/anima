@@ -150,8 +150,9 @@ fn build_effective_always(
     }
 }
 
-/// Execute a tool call and return the result as a string
-async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
+/// Execute a tool call and return the result as a string.
+/// If a tool_def is provided, command validation is performed for shell tools.
+async fn execute_tool_call(tool_call: &ToolCall, tool_def: Option<&ToolDefinition>) -> Result<String, String> {
     match tool_call.tool.as_str() {
         "read_file" => {
             let tool = ReadFileTool::default();
@@ -179,7 +180,23 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
                 Err(e) => Err(format!("Tool error: {}", e))
             }
         }
-        "shell" => {
+        "shell" | "safe_shell" => {
+            // Validate command against allowed_commands if set
+            if let Some(def) = tool_def {
+                if let Some(ref allowed) = def.allowed_commands {
+                    let command = tool_call.params.get("command")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let first_word = command.split_whitespace().next().unwrap_or("");
+                    if !allowed.iter().any(|a| a == first_word) {
+                        return Err(format!(
+                            "Command '{}' not in allowed list. Allowed: {:?}",
+                            first_word, allowed
+                        ));
+                    }
+                }
+            }
+
             let tool = ShellTool::default();
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
@@ -187,7 +204,7 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
                     let stdout = result.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
                     let stderr = result.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
                     let exit_code = result.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0);
-                    
+
                     let mut output = String::new();
                     if !stdout.is_empty() {
                         output.push_str(stdout);
@@ -1083,8 +1100,12 @@ async fn handle_connection(
                                     }
                                     
                                     logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
-                                    
-                                    match execute_tool_call(&tc).await {
+
+                                    // Look up the tool definition to get allowed_commands
+                                    let tool_def = tool_registry.as_ref()
+                                        .and_then(|r| r.find_by_name(&tc.tool));
+
+                                    match execute_tool_call(&tc, tool_def).await {
                                         Ok(tool_result) => {
                                             logger.tool(&format!("Result: {} bytes", tool_result.len()));
                                             current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
@@ -1519,5 +1540,89 @@ api_key = "sk-test"
     fn test_resolve_agent_path_relative() {
         let path = resolve_agent_path("./myagent");
         assert_eq!(path, PathBuf::from("./myagent"));
+    }
+
+    #[tokio::test]
+    async fn test_safe_shell_allowed_command() {
+        use crate::tool_registry::ToolDefinition;
+
+        let tool_def = ToolDefinition {
+            name: "safe_shell".to_string(),
+            description: "Safe shell".to_string(),
+            params: serde_json::json!({"command": "string"}),
+            keywords: vec!["shell".to_string()],
+            category: Some("system".to_string()),
+            allowed_commands: Some(vec!["ls".to_string(), "grep".to_string(), "cat".to_string()]),
+        };
+
+        let tool_call = ToolCall {
+            tool: "safe_shell".to_string(),
+            params: serde_json::json!({"command": "ls -la"}),
+        };
+
+        // Should succeed - "ls" is in allowed list
+        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_safe_shell_blocked_command() {
+        use crate::tool_registry::ToolDefinition;
+
+        let tool_def = ToolDefinition {
+            name: "safe_shell".to_string(),
+            description: "Safe shell".to_string(),
+            params: serde_json::json!({"command": "string"}),
+            keywords: vec!["shell".to_string()],
+            category: Some("system".to_string()),
+            allowed_commands: Some(vec!["ls".to_string(), "grep".to_string(), "cat".to_string()]),
+        };
+
+        let tool_call = ToolCall {
+            tool: "safe_shell".to_string(),
+            params: serde_json::json!({"command": "rm -rf /"}),
+        };
+
+        // Should fail - "rm" is not in allowed list
+        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("not in allowed list"));
+        assert!(err.contains("rm"));
+    }
+
+    #[tokio::test]
+    async fn test_regular_shell_no_restrictions() {
+        use crate::tool_registry::ToolDefinition;
+
+        let tool_def = ToolDefinition {
+            name: "shell".to_string(),
+            description: "Regular shell".to_string(),
+            params: serde_json::json!({"command": "string"}),
+            keywords: vec!["shell".to_string()],
+            category: Some("system".to_string()),
+            allowed_commands: None,  // No restrictions
+        };
+
+        let tool_call = ToolCall {
+            tool: "shell".to_string(),
+            params: serde_json::json!({"command": "echo hello"}),
+        };
+
+        // Should succeed - no allowed_commands restriction
+        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_shell_without_tool_def() {
+        let tool_call = ToolCall {
+            tool: "shell".to_string(),
+            params: serde_json::json!({"command": "echo hello"}),
+        };
+
+        // Should succeed - no tool_def means no restrictions
+        let result = execute_tool_call(&tool_call, None).await;
+        assert!(result.is_ok());
     }
 }
