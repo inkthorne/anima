@@ -1021,7 +1021,7 @@ async fn handle_connection(
                 // Combine tools, memory injection, and always prompt
                 let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
-                let mut agent_guard = agent.lock().await;
+                let agent_guard = agent.lock().await;
 
                 if use_native_tools {
                     // Native tool mode with streaming: Agent handles tool calling internally
@@ -1107,12 +1107,14 @@ async fn handle_connection(
                     // Continue to next request (don't send Response::Message)
                     continue;
                 } else {
-                    // JSON-block mode: Daemon parses and executes tool calls
+                    // JSON-block mode with streaming: Daemon parses and executes tool calls
+                    // We need to drop the agent_guard so we can re-acquire it in the loop
+                    drop(agent_guard);
+
                     let mut current_message = content.clone();
-                    let mut final_response = String::new();
                     let max_tool_calls = 10;
                     let mut tool_call_count = 0;
-                    
+
                     loop {
                         let options = ThinkOptions {
                             system_prompt: persona.clone(),
@@ -1120,87 +1122,123 @@ async fn handle_connection(
                             external_tools: None,
                             ..Default::default()
                         };
-                        
-                        match agent_guard.think_with_options(&current_message, options).await {
-                            Ok(result) => {
-                                // Strip thinking tags and extract [REMEMBER: ...] tags
-                                let without_thinking = strip_thinking_tags(&result.response);
-                                let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
-                                if !memories_to_save.is_empty() {
-                                    if let Some(ref mem_store) = semantic_memory {
-                                        let store = mem_store.lock().await;
-                                        for memory in &memories_to_save {
-                                            // Generate embedding if we have a client
-                                            let embedding = if let Some(ref emb_client) = embedding_client {
-                                                match emb_client.embed(memory).await {
-                                                    Ok(emb) => Some(emb),
-                                                    Err(e) => {
-                                                        logger.log(&format!("[socket] Failed to generate embedding: {}", e));
-                                                        None
-                                                    }
-                                                }
-                                            } else {
-                                                None
-                                            };
+                        // Create channel for streaming tokens
+                        let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
 
-                                            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                                                Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                                Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
-                                            }
-                                        }
-                                    }
-                                }
+                        // Clone things needed in the spawned task
+                        let agent_clone = agent.clone();
+                        let current_message_clone = current_message.clone();
 
-                                // Check for tool calls (JSON-block parsing)
-                                let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
-                                
-                                if let Some(tc) = tool_call {
-                                    tool_call_count += 1;
-                                    if tool_call_count > max_tool_calls {
-                                        logger.tool("Max tool calls reached, stopping");
-                                        final_response = format!("{}\n\n[Tool limit reached]", cleaned_response);
-                                        break;
-                                    }
-                                    
-                                    logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
+                        // Spawn thinking in background
+                        let think_handle = tokio::spawn(async move {
+                            let mut agent_guard = agent_clone.lock().await;
+                            agent_guard.think_streaming_with_options(&current_message_clone, options, token_tx).await
+                        });
 
-                                    // Look up the tool definition to get allowed_commands
-                                    let tool_def = tool_registry.as_ref()
-                                        .and_then(|r| r.find_by_name(&tc.tool));
-
-                                    match execute_tool_call(&tc, tool_def).await {
-                                        Ok(tool_result) => {
-                                            logger.tool(&format!("Result: {} bytes", tool_result.len()));
-                                            current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
-                                            if !cleaned_response.is_empty() {
-                                                if !final_response.is_empty() {
-                                                    final_response.push_str("\n");
-                                                }
-                                                final_response.push_str(&cleaned_response);
-                                            }
-                                        }
-                                        Err(e) => {
-                                            logger.tool(&format!("Error: {}", e));
-                                            current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
-                                        }
-                                    }
-                                } else {
-                                    if !final_response.is_empty() {
-                                        final_response.push_str("\n");
-                                    }
-                                    final_response.push_str(&cleaned_response);
-                                    break;
-                                }
-                            }
-                            Err(e) => {
-                                final_response = format!("Error: {}", e);
+                        // Forward tokens to socket as they arrive
+                        while let Some(token) = token_rx.recv().await {
+                            if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
+                                logger.log(&format!("[socket] Error writing chunk: {}", e));
                                 break;
                             }
                         }
+
+                        // Wait for completion and get the full response
+                        let result = think_handle.await;
+
+                        let llm_response = match result {
+                            Ok(Ok(response)) => response,
+                            Ok(Err(e)) => {
+                                logger.log(&format!("[socket] LLM error: {}", e));
+                                if let Err(e) = api.write_response(&Response::Done).await {
+                                    logger.log(&format!("[socket] Error writing Done: {}", e));
+                                }
+                                continue; // Move to next request
+                            }
+                            Err(e) => {
+                                logger.log(&format!("[socket] Task panic: {}", e));
+                                if let Err(e) = api.write_response(&Response::Done).await {
+                                    logger.log(&format!("[socket] Error writing Done: {}", e));
+                                }
+                                continue; // Move to next request
+                            }
+                        };
+
+                        // Strip thinking tags and extract [REMEMBER: ...] tags
+                        let without_thinking = strip_thinking_tags(&llm_response);
+                        let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+
+                        if !memories_to_save.is_empty() {
+                            if let Some(ref mem_store) = semantic_memory {
+                                let store = mem_store.lock().await;
+                                for memory in &memories_to_save {
+                                    // Generate embedding if we have a client
+                                    let embedding = if let Some(ref emb_client) = embedding_client {
+                                        match emb_client.embed(memory).await {
+                                            Ok(emb) => Some(emb),
+                                            Err(e) => {
+                                                logger.log(&format!("[socket] Failed to generate embedding: {}", e));
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
+                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check for tool calls (JSON-block parsing)
+                        let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+
+                        if let Some(tc) = tool_call {
+                            tool_call_count += 1;
+                            if tool_call_count > max_tool_calls {
+                                logger.tool("Max tool calls reached, stopping");
+                                // Send Done to signal stream complete
+                                if let Err(e) = api.write_response(&Response::Done).await {
+                                    logger.log(&format!("[socket] Error writing Done: {}", e));
+                                }
+                                break;
+                            }
+
+                            logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
+
+                            // Look up the tool definition to get allowed_commands
+                            let tool_def = tool_registry.as_ref()
+                                .and_then(|r| r.find_by_name(&tc.tool));
+
+                            match execute_tool_call(&tc, tool_def).await {
+                                Ok(tool_result) => {
+                                    logger.tool(&format!("Result: {} bytes", tool_result.len()));
+                                    current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                                    // Continue to next iteration - don't send Done yet
+                                }
+                                Err(e) => {
+                                    logger.tool(&format!("Error: {}", e));
+                                    current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                                    // Continue to next iteration to let LLM handle the error
+                                }
+                            }
+                        } else {
+                            // No more tool calls - done
+                            if let Err(e) = api.write_response(&Response::Done).await {
+                                logger.log(&format!("[socket] Error writing Done: {}", e));
+                            }
+                            logger.log(&format!("[socket] Final response: {} bytes", cleaned_response.len()));
+                            break;
+                        }
                     }
-                    Response::Message { content: final_response }
+
+                    // Continue to next request (don't send Response::Message - already streamed)
+                    continue;
                 }
             }
 
