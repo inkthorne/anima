@@ -320,6 +320,15 @@ pub struct SemanticMemoryEntry {
     pub last_accessed: Option<i64>,
 }
 
+/// Result of a memory save operation.
+#[derive(Debug, Clone)]
+pub enum SaveResult {
+    /// New memory created (id)
+    New(i64),
+    /// Existing memory reinforced (id, old_importance, new_importance)
+    Reinforced(i64, f64, f64),
+}
+
 /// Semantic memory store with keyword-based search and relevance scoring.
 pub struct SemanticMemoryStore {
     conn: Arc<Mutex<Connection>>,
@@ -441,22 +450,45 @@ impl SemanticMemoryStore {
         Ok(())
     }
 
-    /// Save a new semantic memory.
-    pub fn save(&self, content: &str, importance: f64, source: &str) -> Result<i64, MemoryError> {
+    /// Save a new semantic memory, or reinforce an existing one if duplicate.
+    /// Reinforcing boosts importance by 0.05 (capped at 1.0) and refreshes timestamp.
+    pub fn save(&self, content: &str, importance: f64, source: &str) -> Result<SaveResult, MemoryError> {
         let keywords = extract_keywords(content).join(",");
         let timestamp = now();
 
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO semantic_memories (agent_id, created_at, content, importance, source, keywords, access_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
-            params![self.agent_id, timestamp, content, importance, source, keywords]
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        
+        // Check for existing exact match
+        let existing: Option<(i64, f64)> = conn.query_row(
+            "SELECT id, importance FROM semantic_memories WHERE agent_id = ?1 AND content = ?2",
+            params![self.agent_id, content],
+            |row| Ok((row.get(0)?, row.get(1)?))
+        ).ok();
+        
+        if let Some((id, old_importance)) = existing {
+            // Reinforce: boost importance by 0.05 (cap at 1.0) and refresh timestamp
+            let new_importance = (old_importance + 0.05).min(1.0);
+            conn.execute(
+                "UPDATE semantic_memories SET importance = ?1, created_at = ?2 WHERE id = ?3",
+                params![new_importance, timestamp, id]
+            ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            
+            debug::log(&format!("[memory] REINFORCE #{}: \"{}\" (importance {} → {})", 
+                id, content, old_importance, new_importance));
+            Ok(SaveResult::Reinforced(id, old_importance, new_importance))
+        } else {
+            // New memory
+            conn.execute(
+                "INSERT INTO semantic_memories (agent_id, created_at, content, importance, source, keywords, access_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+                params![self.agent_id, timestamp, content, importance, source, keywords]
+            ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        let id = conn.last_insert_rowid();
-        debug::log(&format!("[memory] SAVE #{}: \"{}\" (importance={}, source={}, keywords={})", 
-            id, content, importance, source, keywords));
-        Ok(id)
+            let id = conn.last_insert_rowid();
+            debug::log(&format!("[memory] SAVE #{}: \"{}\" (importance={}, source={}, keywords={})", 
+                id, content, importance, source, keywords));
+            Ok(SaveResult::New(id))
+        }
     }
 
     /// Recall relevant memories for a query, scored by relevance × recency × importance.
@@ -1046,7 +1078,11 @@ mod tests {
         let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
 
         // Save a memory
-        let id = store.save("User prefers dark mode for coding", 0.9, "explicit").unwrap();
+        let result = store.save("User prefers dark mode for coding", 0.9, "explicit").unwrap();
+        let id = match result {
+            SaveResult::New(id) => id,
+            SaveResult::Reinforced(id, _, _) => id,
+        };
         assert!(id > 0);
 
         // Recall with matching query

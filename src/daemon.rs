@@ -59,7 +59,7 @@ use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection};
 use crate::discovery;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
-use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, extract_remember_tags, build_memory_injection};
+use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
@@ -372,7 +372,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                         let store = mem_store.lock().await;
                                         for memory in &memories_to_save {
                                             match store.save(memory, 0.9, "explicit") {
-                                                Ok(id) => timer_logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                                Ok(SaveResult::New(id)) => timer_logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                                Ok(SaveResult::Reinforced(id, old, new)) => timer_logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                                 Err(e) => timer_logger.log(&format!("[timer] Failed to save memory: {}", e)),
                                             }
                                         }
@@ -446,7 +447,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_file(&config.socket_path);
     }
 
-    println!("Daemon stopped.");
+    logger.log("Daemon stopped.");
     Ok(())
 }
 
@@ -598,7 +599,8 @@ async fn handle_connection(
                                 let store = mem_store.lock().await;
                                 for memory in &memories_to_save {
                                     match store.save(memory, 0.9, "explicit") {
-                                        Ok(id) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                         Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
                                     }
                                 }
@@ -666,7 +668,8 @@ async fn handle_connection(
                                 let store = mem_store.lock().await;
                                 for memory in &memories_to_save {
                                     match store.save(memory, 0.9, "explicit") {
-                                        Ok(id) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                         Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
                                     }
                                 }

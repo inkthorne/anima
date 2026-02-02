@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | v2.6 |
-| **Tests** | 295 passing |
+| **Version** | v2.6.2 |
+| **Tests** | 320 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -75,7 +75,8 @@ hello @arya                 # Send to arya
 ├── config.toml       # LLM config
 ├── persona.md        # System prompt (identity)
 ├── always.md         # Persistent reminders (recency bias)
-├── memory.db         # SQLite memory
+├── memory.db         # SQLite memory (semantic + key-value)
+├── agent.log         # Agent-specific log file (when running)
 ├── daemon.pid        # PID file (when running)
 └── agent.sock        # Unix socket (when running)
 
@@ -98,6 +99,12 @@ base_url = "http://localhost:11434"
 
 [memory]
 path = "memory.db"
+
+[semantic_memory]
+enabled = true
+path = "memory.db"
+recall_limit = 5        # Max memories injected per turn
+min_importance = 0.1    # Filter threshold
 ```
 
 ## Key Source Files
@@ -106,11 +113,12 @@ path = "memory.db"
 |------|---------|
 | `src/main.rs` | CLI commands |
 | `src/repl.rs` | REPL (thin client, socket connections) |
-| `src/daemon.rs` | Daemon mode, socket server |
+| `src/daemon.rs` | Daemon mode, socket server, AgentLogger |
 | `src/discovery.rs` | Find running daemons via pid files |
 | `src/socket_api.rs` | Unix socket protocol |
 | `src/agent_dir.rs` | Directory loading, always.md, create_agent() |
 | `src/agent.rs` | Core agent logic, internal history |
+| `src/memory.rs` | Semantic memory (recall, save, keyword search) |
 | `src/tools/send_message.rs` | Inter-daemon messaging |
 | `src/llm.rs` | LLM providers |
 
@@ -120,6 +128,14 @@ path = "memory.db"
 - Injected as system message before each user message
 - Exploits recency bias to keep instructions salient
 - Agent-specific overrides global fallback
+
+### Semantic Memory
+- Auto-injected relevant memories before each turn (no tools required)
+- Agent saves memories via `[REMEMBER: ...]` tags in responses (tags stripped from output)
+- Keyword-based search with scoring: relevance × recency × importance
+- 7-day half-life decay for recency
+- Explicit saves get high importance (0.9), auto-captures get default (0.5)
+- Works for all models — Gemma, Qwen, Claude, etc.
 
 ### Agent-Internal History
 - Agent manages its own conversation history
@@ -195,4 +211,4 @@ This keeps Arya's context clean and available while Claude Code does the heavy l
 
 ## Last Updated
 
-2026-02-01 — v2.6: Shared conversation log, JSONL context format, @mention forwarding, /restart, /create, CLI/REPL parity.
+2026-02-01 — v2.6.2: Semantic memory system (auto-recall, [REMEMBER:] tags, keyword search), agent-specific logging (agent.log).
