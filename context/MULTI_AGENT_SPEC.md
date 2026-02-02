@@ -25,20 +25,15 @@ Currently, agents can only talk to each other via the REPL:
 
 ---
 
-## Still Open
-
-| # | Question | Options |
-|---|----------|---------|
-| 1 | Shared memories | Can agents share semantic memories in group convos? |
-| 2 | Message ordering | Timestamps sufficient? Or need vector clocks? |
-| 3 | Context window config | Per-agent `conversation_context_messages` setting |
-
 ## Additional Decisions
 
 | # | Decision | Choice | Rationale |
 |---|----------|--------|-----------|
 | 8 | Message TTL | **7 days default** | Messages expire; important info should be [REMEMBER]'d to semantic memory |
 | 9 | Cleanup policy | **Full deletion** | When all messages expire, delete conversation entirely. Keep things clean. |
+| 10 | Shared memories | **Private only** | Each agent has own memory.db; [REMEMBER] is private. Share by saying it in conversation. |
+| 11 | Message ordering | **Timestamps** | Simple `created_at` ordering; parallel responses don't need strict ordering |
+| 12 | Context window | **Per-agent config** | `conversation_context_messages` in agent config.toml; default 20 |
 
 ---
 
