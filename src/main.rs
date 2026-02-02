@@ -256,22 +256,35 @@ async fn send_message(agent: &str, message: &str) -> Result<(), Box<dyn std::err
         content: message.to_string(),
     }).await.map_err(|e| format!("Failed to send message: {}", e))?;
 
-    // Read the response
-    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
-        Some(Response::Message { content }) => {
-            println!("{}", content);
-        }
-        Some(Response::Error { message }) => {
-            eprintln!("Error from agent: {}", message);
-            std::process::exit(1);
-        }
-        Some(other) => {
-            eprintln!("Unexpected response: {:?}", other);
-            std::process::exit(1);
-        }
-        None => {
-            eprintln!("Connection closed unexpectedly");
-            std::process::exit(1);
+    // Read responses (may be streaming or non-streaming)
+    loop {
+        match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+            Some(Response::Chunk { text }) => {
+                // Streaming: print tokens as they arrive
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            Some(Response::Done) => {
+                // Streaming complete
+                println!();  // Final newline
+                break;
+            }
+            Some(Response::Message { content }) => {
+                // Fallback for non-streaming responses (JSON-block mode)
+                println!("{}", content);
+                break;
+            }
+            Some(Response::Error { message }) => {
+                eprintln!("Error from agent: {}", message);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Connection closed unexpectedly");
+                std::process::exit(1);
+            }
+            _ => {
+                // Ignore other response types
+            }
         }
     }
 
@@ -307,24 +320,41 @@ async fn chat_with_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> 
                     break;
                 }
 
-                // Read the response
-                match api.read_response().await {
-                    Ok(Some(Response::Message { content })) => {
-                        println!("\n{}\n", content);
-                    }
-                    Ok(Some(Response::Error { message })) => {
-                        eprintln!("\x1b[31mError: {}\x1b[0m\n", message);
-                    }
-                    Ok(Some(other)) => {
-                        eprintln!("\x1b[31mUnexpected response: {:?}\x1b[0m\n", other);
-                    }
-                    Ok(None) => {
-                        println!("\n\x1b[33mConnection closed by agent.\x1b[0m");
-                        break;
-                    }
-                    Err(e) => {
-                        eprintln!("\x1b[31mFailed to read response: {}\x1b[0m", e);
-                        break;
+                // Read responses (may be streaming or non-streaming)
+                println!();  // Newline before response
+                loop {
+                    match api.read_response().await {
+                        Ok(Some(Response::Chunk { text })) => {
+                            // Streaming: print tokens as they arrive
+                            print!("{}", text);
+                            let _ = io::stdout().flush();
+                        }
+                        Ok(Some(Response::Done)) => {
+                            // Streaming complete
+                            println!("\n");  // Final newlines
+                            break;
+                        }
+                        Ok(Some(Response::Message { content })) => {
+                            // Fallback for non-streaming responses (JSON-block mode)
+                            println!("{}\n", content);
+                            break;
+                        }
+                        Ok(Some(Response::Error { message })) => {
+                            eprintln!("\x1b[31mError: {}\x1b[0m\n", message);
+                            break;
+                        }
+                        Ok(None) => {
+                            println!("\n\x1b[33mConnection closed by agent.\x1b[0m");
+                            // Break out of both loops
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            eprintln!("\x1b[31mFailed to read response: {}\x1b[0m", e);
+                            return Err(e.into());
+                        }
+                        _ => {
+                            // Ignore other response types
+                        }
                     }
                 }
             }

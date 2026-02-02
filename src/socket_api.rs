@@ -61,6 +61,12 @@ pub enum Response {
     Error {
         message: String,
     },
+    /// Streaming: partial text chunk.
+    Chunk {
+        text: String,
+    },
+    /// Streaming: complete.
+    Done,
 }
 
 /// Socket API handler for reading and writing protocol messages.
@@ -380,5 +386,33 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_response_chunk_serialization() {
+        let response = Response::Chunk {
+            text: "Hello".to_string(),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"chunk\""));
+        assert!(json.contains("\"text\":\"Hello\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Chunk { text } => {
+                assert_eq!(text, "Hello");
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_done_serialization() {
+        let response = Response::Done;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"type":"done"}"#);
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::Done));
     }
 }

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use tokio::net::UnixListener;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 /// Agent-specific logger that writes to {agent_dir}/agent.log
 pub struct AgentLogger {
@@ -1023,24 +1023,47 @@ async fn handle_connection(
 
                 let mut agent_guard = agent.lock().await;
 
-                let final_response = if use_native_tools {
-                    // Native tool mode: Agent handles tool calling internally
+                if use_native_tools {
+                    // Native tool mode with streaming: Agent handles tool calling internally
                     let options = ThinkOptions {
                         system_prompt: persona.clone(),
                         always_prompt: effective_always.clone(),
                         external_tools: external_tools.clone(),
                         ..Default::default()
                     };
-                    
-                    match agent_guard.think_with_options(content, options).await {
-                        Ok(result) => {
-                            // Log tools used (native mode)
-                            for tool_name in &result.tool_names {
-                                logger.tool(&format!("Executed: {}", tool_name));
-                            }
-                            
+
+                    // Create channel for streaming tokens
+                    let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
+
+                    // We need to drop the agent_guard so we can spawn the thinking task
+                    drop(agent_guard);
+
+                    // Clone things needed in the spawned task
+                    let agent_clone = agent.clone();
+                    let content_clone = content.clone();
+
+                    // Spawn thinking in background
+                    let think_handle = tokio::spawn(async move {
+                        let mut agent_guard = agent_clone.lock().await;
+                        agent_guard.think_streaming_with_options(&content_clone, options, token_tx).await
+                    });
+
+                    // Forward tokens to socket as they arrive
+                    while let Some(token) = token_rx.recv().await {
+                        if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
+                            logger.log(&format!("[socket] Error writing chunk: {}", e));
+                            break;
+                        }
+                    }
+
+                    // Wait for completion
+                    let result = think_handle.await;
+
+                    // Handle the result
+                    let final_response = match result {
+                        Ok(Ok(response)) => {
                             // Strip thinking tags and extract [REMEMBER: ...] tags
-                            let without_thinking = strip_thinking_tags(&result.response);
+                            let without_thinking = strip_thinking_tags(&response);
                             let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
                             if !memories_to_save.is_empty() {
                                 if let Some(ref mem_store) = semantic_memory {
@@ -1069,8 +1092,20 @@ async fn handle_connection(
                             }
                             after_remember
                         }
-                        Err(e) => format!("Error: {}", e),
+                        Ok(Err(e)) => format!("Error: {}", e),
+                        Err(e) => format!("Error: task panicked: {}", e),
+                    };
+
+                    // Send Done to signal stream complete
+                    if let Err(e) = api.write_response(&Response::Done).await {
+                        logger.log(&format!("[socket] Error writing Done: {}", e));
                     }
+
+                    // Log the final response (but don't send it - already streamed)
+                    logger.log(&format!("[socket] Final response: {} bytes", final_response.len()));
+
+                    // Continue to next request (don't send Response::Message)
+                    continue;
                 } else {
                     // JSON-block mode: Daemon parses and executes tool calls
                     let mut current_message = content.clone();
@@ -1165,10 +1200,8 @@ async fn handle_connection(
                             }
                         }
                     }
-                    final_response
-                };
-                
-                Response::Message { content: final_response }
+                    Response::Message { content: final_response }
+                }
             }
 
             Request::IncomingMessage { ref from, ref content } => {
