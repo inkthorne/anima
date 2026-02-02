@@ -2,7 +2,21 @@ use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
 use serde_json::Value;
-use std::path::Path;
+use std::path::PathBuf;
+
+/// Expand tilde (~) in path to home directory
+fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
 
 /// Tool for reading file contents from the filesystem.
 #[derive(Debug, Default)]
@@ -32,14 +46,14 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        let path = input
+        let path_str = input
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'path' field".to_string()))?;
 
-        let path = Path::new(path);
+        let path = expand_tilde(path_str);
 
-        let contents = tokio::fs::read_to_string(path)
+        let contents = tokio::fs::read_to_string(&path)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file '{}': {}", path.display(), e)))?;
 

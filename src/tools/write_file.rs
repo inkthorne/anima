@@ -2,7 +2,21 @@ use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
 use serde_json::Value;
-use std::path::Path;
+use std::path::PathBuf;
+
+/// Expand tilde (~) in path to home directory
+fn expand_tilde(path: &str) -> PathBuf {
+    if path.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(&path[2..]);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
 
 /// Tool for writing content to a file on the filesystem.
 #[derive(Debug, Default)]
@@ -36,7 +50,7 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        let path = input
+        let path_str = input
             .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'path' field".to_string()))?;
@@ -46,7 +60,7 @@ impl Tool for WriteFileTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'content' field".to_string()))?;
 
-        let path = Path::new(path);
+        let path = expand_tilde(path_str);
 
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
@@ -57,7 +71,7 @@ impl Tool for WriteFileTool {
             }
         }
 
-        tokio::fs::write(path, content)
+        tokio::fs::write(&path, content)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e)))?;
 
