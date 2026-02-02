@@ -13,42 +13,84 @@ Anima is an agent runtime built from first principles. It provides the core prim
 ## Goals
 
 - **Minimal but complete** — Everything you need, nothing you don't
-- **Actor-based** — Agents are isolated, communicate via messages
+- **Daemon-per-agent** — Agents are persistent processes, not ephemeral calls
 - **Tool-first** — Tools are the primary way agents affect the world
-- **Pluggable memory** — Swap storage backends without changing agent code
+- **Semantic memory** — Embedding-based recall, not just keyword matching
 - **Async-native** — Built on Tokio for real-world concurrency
-- **Embeddable** — Use as a library or standalone runtime
+- **Multi-agent** — Agents talk to each other via @mentions
 
 ## Status
 
-🎉 **v2.4** — The runtime is production-ready with:
+🎉 **v2.9.0** — Production-ready with:
 
 | Feature | Description |
 |---------|-------------|
-| Real tools | File, HTTP, shell execution |
-| Persistent memory | SQLite-backed, survives restarts |
-| Streaming | Real-time response output |
-| Error recovery | Retry with backoff |
-| Observability | Events, metrics, logging |
-| CLI + Config | `anima run config.toml "task"` |
-| Interactive REPL | Create agents, send tasks, explore |
-| LLM providers | OpenAI, Anthropic, Ollama |
-| Agent messaging | Inbox processing, agent-to-agent |
-| Long-running agents | Background loops, start/stop |
-| Persona config | System prompts, personality |
-| Conversation history | Multi-turn context |
-| Timer triggers | Heartbeat, periodic thinking |
+| **Daemon architecture** | Agents run as persistent background processes |
+| **Socket API** | REPL/CLI are thin clients, agents are servers |
+| **Semantic memory** | Embedding-based recall via Ollama |
+| **Hybrid tools** | Keyword recall + native or JSON-block execution |
+| **Runtime context** | Agents know their name, model, host, capabilities |
+| **Multi-agent** | @mention routing between agents |
+| **Safe shell** | Command allowlist filtering |
+| **LLM providers** | OpenAI, Anthropic, Ollama |
+| **Timer triggers** | Heartbeat, periodic thinking |
+| **Conversation history** | Multi-turn context with persistence |
 
-**190 tests passing.**
+**378 tests passing.**
 
 ## Quick Start
 
 ```bash
-# Run the REPL
-cargo run
+# Build
+cargo build --release
 
-# Or run with a config file
-anima run config.toml "What's in my inbox?"
+# Create an agent
+anima create myagent
+
+# Start it as a daemon
+anima start myagent
+
+# Chat with it
+anima chat myagent
+
+# Or one-shot query
+anima ask myagent "What can you do?"
+
+# See its system prompt
+anima system myagent
+
+# Stop it
+anima stop myagent
+```
+
+## Agent Structure
+
+```
+~/.anima/
+├── models/*.toml        # Shared model definitions
+├── tools.toml           # Tool registry for keyword recall
+└── agents/
+    └── myagent/
+        ├── config.toml  # Agent config
+        ├── persona.md   # System prompt (who they are)
+        ├── always.md    # Persistent reminders (recency bias)
+        └── memory.db    # Semantic memory
+```
+
+## CLI Reference
+
+```bash
+anima start <name>      # Start agent daemon
+anima stop <name>       # Stop agent daemon
+anima restart <name>    # Restart agent daemon
+anima status            # Show all agents (running/stopped)
+anima chat <name>       # Interactive session
+anima ask <name> "msg"  # One-shot query
+anima send <name> "msg" # Send to running daemon
+anima system <name>     # Show assembled system prompt
+anima create <name>     # Scaffold new agent
+anima list              # List available agents
+anima clear <name>      # Clear conversation history
 ```
 
 ## Author
