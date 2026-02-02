@@ -10,7 +10,7 @@ Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this i
 
 ## Quick Context
 
-**Read `docs/context.md` first** — full architecture and command reference.
+**Read `context/context.md` first** — full architecture and command reference.
 
 ## Project Structure
 
@@ -159,6 +159,6 @@ cargo test            # Run tests (378 tests)
 
 ## Documentation
 
-- **`docs/context.md`** — Start here — architecture and commands
-- `docs/VISION.md` — Roadmap and philosophy
-- `docs/DESIGN.md` — Architecture deep-dive
+- **`context/context.md`** — Start here — architecture and commands
+- `context/VISION.md` — Roadmap and philosophy
+- `context/DESIGN.md` — Architecture deep-dive
