@@ -160,6 +160,34 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
                 Err(e) => Err(format!("Tool error: {}", e))
             }
         }
+        "shell" => {
+            let tool = ShellTool::default();
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    // Shell returns stdout, stderr, and exit_code
+                    let stdout = result.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
+                    let stderr = result.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
+                    let exit_code = result.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0);
+                    
+                    let mut output = String::new();
+                    if !stdout.is_empty() {
+                        output.push_str(stdout);
+                    }
+                    if !stderr.is_empty() {
+                        if !output.is_empty() {
+                            output.push_str("\n");
+                        }
+                        output.push_str("[stderr] ");
+                        output.push_str(stderr);
+                    }
+                    if exit_code != 0 {
+                        output.push_str(&format!("\n[exit code: {}]", exit_code));
+                    }
+                    Ok(output)
+                }
+                Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
     }
 }
