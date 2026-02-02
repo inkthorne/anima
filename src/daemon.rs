@@ -21,11 +21,13 @@ pub struct AgentLogger {
 
 impl AgentLogger {
     /// Create a new logger for the agent, writing to agent_dir/agent.log
+    /// Truncates the log on each daemon restart for cleaner debugging.
     pub fn new(agent_dir: &Path, agent_name: &str) -> std::io::Result<Self> {
         let log_path = agent_dir.join("agent.log");
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)  // Fresh log each restart
             .open(&log_path)?;
         
         Ok(Self {
