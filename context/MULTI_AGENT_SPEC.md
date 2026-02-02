@@ -29,10 +29,16 @@ Currently, agents can only talk to each other via the REPL:
 
 | # | Question | Options |
 |---|----------|---------|
-| 1 | Conversation cleanup | Never delete vs auto-archive vs manual only |
-| 2 | Shared memories | Can agents share semantic memories in group convos? |
-| 3 | Message ordering | Timestamps sufficient? Or need vector clocks? |
-| 4 | Context window config | Per-agent `conversation_context_messages` setting |
+| 1 | Shared memories | Can agents share semantic memories in group convos? |
+| 2 | Message ordering | Timestamps sufficient? Or need vector clocks? |
+| 3 | Context window config | Per-agent `conversation_context_messages` setting |
+
+## Additional Decisions
+
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 8 | Message TTL | **7 days default** | Messages expire; important info should be [REMEMBER]'d to semantic memory |
+| 9 | Cleanup policy | **Full deletion** | When all messages expire, delete conversation entirely. Keep things clean. |
 
 ---
 
@@ -114,6 +120,7 @@ CREATE TABLE messages (
     content TEXT NOT NULL,
     mentions TEXT,  -- JSON array: ["arya", "gendry"]
     created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,  -- TTL: default 7 days from created_at
     FOREIGN KEY (conv_id) REFERENCES conversations(id)
 );
 
