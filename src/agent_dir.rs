@@ -107,7 +107,8 @@ fn default_semantic_memory_path() -> String {
 }
 
 fn default_embedding_url() -> String {
-    "http://localhost:11434".to_string()
+    std::env::var("OLLAMA_HOST")
+        .unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
 
 /// Configuration for embedding-based semantic search.
