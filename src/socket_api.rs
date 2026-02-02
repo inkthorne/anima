@@ -22,6 +22,14 @@ pub enum Request {
         /// The message content
         content: String,
     },
+    /// Notify agent about a new message in a conversation (multi-agent communication).
+    /// The agent should fetch context from the conversation store and respond.
+    Notify {
+        /// The conversation ID
+        conv_id: String,
+        /// The message ID that triggered this notification
+        message_id: i64,
+    },
     /// Get the current status of the daemon.
     Status,
     /// Request a graceful shutdown.
@@ -72,6 +80,11 @@ pub enum Response {
     },
     /// Streaming: complete.
     Done,
+    /// Response to a Notify request - agent has processed the notification.
+    Notified {
+        /// The message ID of the agent's response (stored in conversation)
+        response_message_id: i64,
+    },
 }
 
 /// Socket API handler for reading and writing protocol messages.
@@ -437,6 +450,45 @@ mod tests {
             Response::ToolCall { tool, params } => {
                 assert_eq!(tool, "safe_shell");
                 assert_eq!(params.get("command").and_then(|c| c.as_str()), Some("ls -la"));
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_notify_serialization() {
+        let request = Request::Notify {
+            conv_id: "1:1:arya:user".to_string(),
+            message_id: 42,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"type\":\"notify\""));
+        assert!(json.contains("\"conv_id\":\"1:1:arya:user\""));
+        assert!(json.contains("\"message_id\":42"));
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::Notify { conv_id, message_id } => {
+                assert_eq!(conv_id, "1:1:arya:user");
+                assert_eq!(message_id, 42);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_notified_serialization() {
+        let response = Response::Notified {
+            response_message_id: 123,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"notified\""));
+        assert!(json.contains("\"response_message_id\":123"));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Notified { response_message_id } => {
+                assert_eq!(response_message_id, 123);
             }
             _ => panic!("Wrong variant"),
         }

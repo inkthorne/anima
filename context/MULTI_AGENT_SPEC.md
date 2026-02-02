@@ -138,22 +138,22 @@ CREATE INDEX idx_pending_agent ON pending_notifications(agent);
 
 ## Implementation Phases
 
-### Phase 1: Conversation Store
+### Phase 1: Conversation Store ✅
 - New `conversation.rs` module
 - SQLite schema + CRUD operations
 - CLI: `anima conv new`, `anima conv list`
 
-### Phase 2: CLI Integration  
+### Phase 2: CLI Integration ✅
 - Update `anima chat` to use store
 - Implicit 1:1 conversations
 - `--conv` flag for explicit
 
-### Phase 3: Daemon Notifications
+### Phase 3: Daemon Notifications ✅
 - `Request::Notify { conv_id, from }` in socket API
 - Daemon checks pending on wake
 - Real-time ping for running agents
 
-### Phase 4: Group Conversations
+### Phase 4: Group Conversations ✅
 - Multiple participants
 - @mention routing
 - Parallel response handling

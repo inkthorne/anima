@@ -1,6 +1,7 @@
 use anima::{
     Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
-    InMemoryStore, SqliteMemory, LLM,
+    InMemoryStore, SqliteMemory, LLM, ConversationStore, canonical_1to1_id, canonical_group_id,
+    parse_mentions, notify_mentioned_agents_parallel, NotifyResult,
 };
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
@@ -93,10 +94,14 @@ enum Commands {
         /// Message to send
         message: String,
     },
-    /// Start an interactive chat session with a running agent daemon
+    /// Start an interactive chat session with agent(s), using persistent conversation storage
     Chat {
-        /// Agent name (from ~/.anima/agents/)
-        agent: String,
+        /// Agent name(s) (from ~/.anima/agents/). Multiple agents create a group conversation.
+        #[arg(required_unless_present = "conv")]
+        agents: Vec<String>,
+        /// Use an existing conversation by name/id instead of creating implicit conversation
+        #[arg(long)]
+        conv: Option<String>,
     },
     /// Show status of all agents (running/stopped)
     #[clap(alias = "ps")]
@@ -133,6 +138,25 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
+    /// Manage conversations
+    Conv {
+        #[command(subcommand)]
+        command: ConvCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConvCommands {
+    /// Create a new conversation with participants
+    New {
+        /// Name for the conversation
+        name: String,
+        /// Comma-separated list of agent names to include
+        #[arg(long = "with")]
+        participants: String,
+    },
+    /// List all conversations
+    List,
 }
 
 #[tokio::main]
@@ -182,8 +206,8 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Chat { agent } => {
-            if let Err(e) = chat_with_agent(&agent).await {
+        Commands::Chat { agents, conv } => {
+            if let Err(e) = chat_with_conversation(&agents, conv.as_deref()).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -223,6 +247,12 @@ async fn main() {
         }
         Commands::System { agent } => {
             if let Err(e) = show_system_prompt(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Conv { command } => {
+            if let Err(e) = handle_conv_command(command) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -321,18 +351,82 @@ async fn send_message(agent: &str, message: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// Start an interactive chat session with a running agent daemon.
-async fn chat_with_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut api = connect_to_agent(agent).await?;
+/// Default number of context messages to load from conversation history.
+const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 
-    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent);
+/// Start an interactive chat session with agents using persistent conversation storage.
+///
+/// - With a single agent: creates/reuses implicit "1:1:{agent}:user" conversation
+///   - Messages are sent directly to the agent
+/// - With multiple agents: creates/reuses implicit "group:{sorted_names}" conversation
+///   - Messages are ONLY sent to @mentioned agents
+///   - If no @mentions, user is warned
+/// - With --conv flag: uses the specified existing conversation
+async fn chat_with_conversation(
+    agents: &[String],
+    conv_name: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize conversation store
+    let store = ConversationStore::init()?;
+
+    // Determine if this is a group chat (multiple agents)
+    let is_group_chat = agents.len() > 1;
+
+    // Determine conversation ID and participants
+    let (conv_id, participants) = if let Some(name) = conv_name {
+        // Explicit conversation - must exist
+        let conv = store.find_by_name(name)?
+            .ok_or_else(|| format!("Conversation '{}' not found", name))?;
+        let parts = store.get_participants(&conv.id)?;
+        let agent_names: Vec<String> = parts.iter()
+            .filter(|p| p.agent != "user")
+            .map(|p| p.agent.clone())
+            .collect();
+        (conv.id, agent_names)
+    } else if agents.len() == 1 {
+        // 1:1 conversation
+        let agent = &agents[0];
+        let id = canonical_1to1_id(agent);
+        let parts: Vec<&str> = vec![agent.as_str(), "user"];
+        // Get or create the conversation
+        store.get_or_create_conversation(&id, &parts)?;
+        (id, vec![agent.clone()])
+    } else {
+        // Group conversation
+        let agent_refs: Vec<&str> = agents.iter().map(|s| s.as_str()).collect();
+        let id = canonical_group_id(&agent_refs);
+        let mut parts = agent_refs.clone();
+        if !parts.contains(&"user") {
+            parts.push("user");
+        }
+        // Get or create the conversation
+        store.get_or_create_conversation(&id, &parts)?;
+        (id, agents.to_vec())
+    };
+
+    // Print connection info
+    if is_group_chat {
+        println!("\x1b[32m✓ Group chat with: {}\x1b[0m", participants.join(", "));
+        println!("\x1b[90mConversation: {}\x1b[0m", conv_id);
+        println!("\x1b[33mNote: In group chat, use @mentions to notify agents (e.g., @arya @gendry)\x1b[0m");
+    } else {
+        println!("\x1b[32m✓ Chat with '{}'\x1b[0m", participants[0]);
+        println!("\x1b[90mConversation: {}\x1b[0m", conv_id);
+    }
     println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
 
     // Use rustyline for interactive input
     let mut rl = rustyline::DefaultEditor::new()?;
 
+    // Prompt format differs for group vs 1:1
+    let prompt = if is_group_chat {
+        "\x1b[36myou>\x1b[0m ".to_string()
+    } else {
+        format!("\x1b[36m{}>\x1b[0m ", participants[0])
+    };
+
     loop {
-        match rl.readline(&format!("\x1b[36m{}>\x1b[0m ", agent)) {
+        match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -342,53 +436,51 @@ async fn chat_with_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> 
                 // Add to history
                 let _ = rl.add_history_entry(line);
 
-                // Send the message
-                if let Err(e) = api.write_request(&Request::Message {
-                    content: line.to_string(),
-                }).await {
-                    eprintln!("\x1b[31mFailed to send message: {}\x1b[0m", e);
-                    break;
+                // Parse @mentions from user message
+                let mentions = parse_mentions(line);
+
+                // In group chat, require @mentions
+                if is_group_chat && mentions.is_empty() {
+                    eprintln!("\x1b[33m⚠ In group chat, you must @mention agents to notify them.\x1b[0m");
+                    eprintln!("\x1b[33m  Example: @{} what do you think?\x1b[0m", participants[0]);
+                    continue;
                 }
 
-                // Read responses (may be streaming or non-streaming)
-                println!();  // Newline before response
-                loop {
-                    match api.read_response().await {
-                        Ok(Some(Response::Chunk { text })) => {
-                            // Streaming: print tokens as they arrive
-                            print!("{}", text);
-                            let _ = io::stdout().flush();
-                        }
-                        Ok(Some(Response::ToolCall { tool, params })) => {
-                            // Show tool call: " - [tool] safe_shell: ls -la ~/dev"
-                            let param_summary = format_tool_params(&params);
-                            eprintln!(" - [tool] {}: {}", tool, param_summary);
-                        }
-                        Ok(Some(Response::Done)) => {
-                            // Streaming complete
-                            println!("\n");  // Final newlines
-                            break;
-                        }
-                        Ok(Some(Response::Message { content })) => {
-                            // Fallback for non-streaming responses (JSON-block mode)
-                            println!("{}\n", content);
-                            break;
-                        }
-                        Ok(Some(Response::Error { message })) => {
-                            eprintln!("\x1b[31mError: {}\x1b[0m\n", message);
-                            break;
-                        }
-                        Ok(None) => {
-                            println!("\n\x1b[33mConnection closed by agent.\x1b[0m");
-                            // Break out of both loops
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            eprintln!("\x1b[31mFailed to read response: {}\x1b[0m", e);
-                            return Err(e.into());
-                        }
-                        _ => {
-                            // Ignore other response types
+                let mention_refs: Vec<&str> = mentions.iter().map(|s| s.as_str()).collect();
+
+                // Store user message in conversation with mentions
+                let user_msg_id = store.add_message(&conv_id, "user", line, &mention_refs)?;
+
+                // Determine which agents to notify
+                let agents_to_notify: Vec<String> = if is_group_chat {
+                    // Group chat: only notify @mentioned agents
+                    mentions.clone()
+                } else {
+                    // 1:1 chat: always notify the single agent
+                    participants.clone()
+                };
+
+                // Notify agents in parallel and collect responses
+                if !agents_to_notify.is_empty() {
+                    let notify_results = notify_mentioned_agents_parallel(&store, &conv_id, user_msg_id, &agents_to_notify).await;
+
+                    // Display results for each agent
+                    for (agent, result) in &notify_results {
+                        match result {
+                            NotifyResult::Notified { response_message_id } => {
+                                // Fetch and display the agent's response
+                                if let Ok(msgs) = store.get_messages(&conv_id, Some(DEFAULT_CONTEXT_MESSAGES)) {
+                                    if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
+                                        println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
+                                    }
+                                }
+                            }
+                            NotifyResult::Queued { notification_id: _ } => {
+                                eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
+                            }
+                            NotifyResult::Failed { reason } => {
+                                eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
+                            }
                         }
                     }
                 }
@@ -728,6 +820,61 @@ async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error
         }
         None => {
             return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle conversation subcommands.
+fn handle_conv_command(command: ConvCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        ConvCommands::New { name, participants } => {
+            let store = ConversationStore::init()?;
+
+            // Parse comma-separated participants
+            let agents: Vec<&str> = participants.split(',').map(|s| s.trim()).collect();
+
+            if agents.is_empty() {
+                return Err("At least one participant is required".into());
+            }
+
+            let id = store.create_conversation(Some(&name), &agents)?;
+            println!("Created conversation '\x1b[36m{}\x1b[0m' (id: {})", name, id);
+            println!("Participants: {}", agents.join(", "));
+        }
+        ConvCommands::List => {
+            let store = ConversationStore::init()?;
+            let conversations = store.list_conversations()?;
+
+            if conversations.is_empty() {
+                println!("\x1b[33mNo conversations found.\x1b[0m");
+                println!("Create one with: \x1b[36manima conv new <name> --with <agents>\x1b[0m");
+                return Ok(());
+            }
+
+            println!("\x1b[1m{:<20} {:<18} {}\x1b[0m", "NAME", "ID", "PARTICIPANTS");
+            println!("{}", "-".repeat(60));
+
+            for conv in conversations {
+                let participants = store.get_participants(&conv.id)?;
+                let agents: Vec<_> = participants.iter().map(|p| p.agent.as_str()).collect();
+                let name = conv.name.unwrap_or_else(|| "(unnamed)".to_string());
+
+                // Truncate ID for display
+                let short_id = if conv.id.len() > 16 {
+                    &conv.id[..16]
+                } else {
+                    &conv.id
+                };
+
+                println!(
+                    "{:<20} {:<18} {}",
+                    name,
+                    short_id,
+                    agents.join(", ")
+                );
+            }
         }
     }
 

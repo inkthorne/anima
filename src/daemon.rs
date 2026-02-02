@@ -107,6 +107,7 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
 
 use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
+use crate::conversation::ConversationStore;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, strip_thinking_tags};
@@ -592,6 +593,57 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Process pending notifications (queued while agent was offline)
+    if let Ok(conv_store) = ConversationStore::init() {
+        match conv_store.get_pending_notifications(&config.name) {
+            Ok(pending) => {
+                if !pending.is_empty() {
+                    logger.log(&format!("Processing {} pending notifications...", pending.len()));
+                    for notification in &pending {
+                        logger.log(&format!("  Processing notification: conv={} msg_id={}",
+                            notification.conv_id, notification.message_id));
+
+                        let response = handle_notify(
+                            &notification.conv_id,
+                            notification.message_id,
+                            &agent,
+                            &config.name,
+                            &config.persona,
+                            &config.always,
+                            &config.model_always,
+                            &config.allowed_tools,
+                            &semantic_memory_store,
+                            &embedding_client,
+                            &tool_registry,
+                            use_native_tools,
+                            &logger,
+                            config.semantic_memory.recall_limit,
+                        ).await;
+
+                        match response {
+                            Response::Notified { response_message_id } => {
+                                logger.log(&format!("  Responded with msg_id={}", response_message_id));
+                            }
+                            Response::Error { message } => {
+                                logger.log(&format!("  Failed: {}", message));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Clear processed notifications
+                    if let Err(e) = conv_store.clear_pending_notifications(&config.name) {
+                        logger.log(&format!("Failed to clear pending notifications: {}", e));
+                    } else {
+                        logger.log("Pending notifications cleared");
+                    }
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("Failed to get pending notifications: {}", e));
+            }
+        }
+    }
+
     // Create Unix socket listener
     let listener = UnixListener::bind(&config.socket_path)?;
     logger.log(&format!("Listening on {}", config.socket_path.display()));
@@ -765,6 +817,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok((stream, _)) => {
                         let agent_clone = agent.clone();
+                        let agent_name = config.name.clone();
                         let persona = config.persona.clone();
                         let always = config.always.clone();
                         let model_always = config.model_always.clone();
@@ -781,6 +834,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             if let Err(e) = handle_connection(
                                 api,
                                 agent_clone,
+                                agent_name,
                                 persona,
                                 always,
                                 model_always,
@@ -917,10 +971,151 @@ fn create_llm_from_config(
     Ok(llm)
 }
 
+/// Handle a Notify request: fetch conversation context, generate response, store it.
+async fn handle_notify(
+    conv_id: &str,
+    _message_id: i64,
+    agent: &Arc<Mutex<Agent>>,
+    agent_name: &str,
+    persona: &Option<String>,
+    always: &Option<String>,
+    model_always: &Option<String>,
+    allowed_tools: &Option<Vec<String>>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    logger: &Arc<AgentLogger>,
+    recall_limit: usize,
+) -> Response {
+    // Open conversation store
+    let store = match ConversationStore::init() {
+        Ok(s) => s,
+        Err(e) => {
+            logger.log(&format!("[notify] Failed to open conversation store: {}", e));
+            return Response::Error { message: format!("Failed to open conversation store: {}", e) };
+        }
+    };
+
+    // Fetch recent messages from conversation for context
+    let context_messages = match store.get_messages(conv_id, Some(recall_limit)) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            logger.log(&format!("[notify] Failed to get messages: {}", e));
+            return Response::Error { message: format!("Failed to get messages: {}", e) };
+        }
+    };
+
+    if context_messages.is_empty() {
+        logger.log("[notify] No messages in conversation");
+        return Response::Error { message: "No messages in conversation".to_string() };
+    }
+
+    // Format context for the agent (JSON format)
+    let context = context_messages
+        .iter()
+        .map(|msg| {
+            let escaped = msg.content
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", msg.from_agent, escaped)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    logger.log(&format!("[notify] Context: {} messages", context_messages.len()));
+
+    // Get relevant tools from registry
+    let relevant_tools = if let Some(registry) = tool_registry {
+        let relevant = registry.find_relevant(&context, recall_limit);
+        filter_by_allowlist(relevant, allowed_tools)
+    } else {
+        Vec::new()
+    };
+
+    // Build tools injection
+    let tools_injection = if use_native_tools {
+        String::new()
+    } else {
+        ToolRegistry::format_for_prompt(&relevant_tools)
+    };
+
+    // Get memory injection
+    let memory_injection = if let Some(mem_store) = semantic_memory {
+        let query_embedding = if let Some(emb_client) = embedding_client {
+            emb_client.embed(&context).await.ok()
+        } else {
+            None
+        };
+
+        let store_guard = mem_store.lock().await;
+        match store_guard.recall_with_embedding(&context, recall_limit, query_embedding.as_deref()) {
+            Ok(memories) => {
+                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                build_memory_injection(&entries)
+            }
+            Err(_) => String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+
+    let options = ThinkOptions {
+        system_prompt: persona.clone(),
+        always_prompt: effective_always,
+        ..Default::default()
+    };
+
+    // Generate response
+    let mut agent_guard = agent.lock().await;
+    match agent_guard.think_with_options(&context, options).await {
+        Ok(result) => {
+            // Strip thinking tags and extract [REMEMBER: ...] tags
+            let without_thinking = strip_thinking_tags(&result.response);
+            let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
+
+            // Save memories
+            if !memories_to_save.is_empty() {
+                if let Some(mem_store) = semantic_memory {
+                    let store_guard = mem_store.lock().await;
+                    for memory in &memories_to_save {
+                        let embedding = if let Some(emb_client) = embedding_client {
+                            emb_client.embed(memory).await.ok()
+                        } else {
+                            None
+                        };
+                        let _ = store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
+                    }
+                }
+            }
+
+            // Store response in conversation
+            match store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
+                Ok(response_msg_id) => {
+                    logger.log(&format!("[notify] Stored response as msg_id={}", response_msg_id));
+                    Response::Notified { response_message_id: response_msg_id }
+                }
+                Err(e) => {
+                    logger.log(&format!("[notify] Failed to store response: {}", e));
+                    Response::Error { message: format!("Failed to store response: {}", e) }
+                }
+            }
+        }
+        Err(e) => {
+            logger.log(&format!("[notify] Agent error: {}", e));
+            Response::Error { message: e.to_string() }
+        }
+    }
+}
+
 /// Handle a single connection from a client.
 async fn handle_connection(
     mut api: SocketApi,
     agent: Arc<Mutex<Agent>>,
+    agent_name: String,
     persona: Option<String>,
     always: Option<String>,
     model_always: Option<String>,
@@ -1413,6 +1608,28 @@ async fn handle_connection(
                         Response::Error { message: e.to_string() }
                     }
                 }
+            }
+
+            Request::Notify { ref conv_id, message_id } => {
+                logger.log(&format!("[socket] Notify: conv={} msg_id={}", conv_id, message_id));
+
+                // Handle notification - use a helper function to keep the match arm cleaner
+                handle_notify(
+                    conv_id,
+                    message_id,
+                    &agent,
+                    &agent_name,
+                    &persona,
+                    &always,
+                    &model_always,
+                    &allowed_tools,
+                    &semantic_memory,
+                    &embedding_client,
+                    &tool_registry,
+                    use_native_tools,
+                    &logger,
+                    recall_limit,
+                ).await
             }
 
             Request::Status => {
