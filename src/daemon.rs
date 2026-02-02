@@ -641,18 +641,19 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
     let mut runtime = Runtime::new();
     let mut agent = runtime.spawn_agent(agent_name.clone()).await;
 
-    // Always register tools for JSON-block execution (works with any model).
-    // The llm_config.tools flag only controls native tool calling API support.
-    agent.register_tool(Arc::new(AddTool));
-    agent.register_tool(Arc::new(EchoTool));
-    agent.register_tool(Arc::new(ReadFileTool));
-    agent.register_tool(Arc::new(WriteFileTool));
-    agent.register_tool(Arc::new(HttpTool::new()));
-    agent.register_tool(Arc::new(ShellTool::new()));
+    // Register native tools only if model supports tool calling API
+    if llm_config.tools {
+        agent.register_tool(Arc::new(AddTool));
+        agent.register_tool(Arc::new(EchoTool));
+        agent.register_tool(Arc::new(ReadFileTool));
+        agent.register_tool(Arc::new(WriteFileTool));
+        agent.register_tool(Arc::new(HttpTool::new()));
+        agent.register_tool(Arc::new(ShellTool::new()));
 
-    // Register daemon-aware messaging tools (use socket communication instead of in-memory router)
-    agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
-    agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
+        // Register daemon-aware messaging tools
+        agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
+    }
 
     // Apply LLM and memory
     agent = agent.with_llm(llm);
