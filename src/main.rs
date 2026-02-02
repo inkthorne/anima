@@ -789,6 +789,7 @@ async fn run_agent_task(config_path: &str, task: &str, stream: bool, verbose_cli
         stream,
         retry_policy: Some(config.retry.to_policy()),
         conversation_history: None,
+        external_tools: None, // One-shot mode uses registered tools
     };
 
     // 6. Run agent with streaming or non-streaming based on flag

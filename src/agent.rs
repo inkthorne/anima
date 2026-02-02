@@ -50,6 +50,10 @@ pub struct ThinkOptions {
     /// Optional "always" prompt injected as system message just before the user message.
     /// This exploits recency bias to keep critical instructions salient in long conversations.
     pub always_prompt: Option<String>,
+    /// Optional external tools to pass to the LLM. When set, these override the agent's
+    /// registered tools for this call. Used for hybrid tool calling where tools are
+    /// dynamically selected via keyword recall.
+    pub external_tools: Option<Vec<ToolSpec>>,
 }
 
 impl Default for ThinkOptions {
@@ -63,6 +67,7 @@ impl Default for ThinkOptions {
             retry_policy: Some(RetryPolicy::default()),
             conversation_history: None,
             always_prompt: None,
+            external_tools: None,
         }
     }
 }
@@ -523,7 +528,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools_list = self.list_tools_for_llm();
+        // Use external_tools if provided (hybrid mode), otherwise use registered tools
+        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
         let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
@@ -785,7 +791,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools_list = self.list_tools_for_llm();
+        // Use external_tools if provided (hybrid mode), otherwise use registered tools
+        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
         let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
@@ -1030,6 +1037,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 stream: false, // Reflection doesn't use streaming
                 retry_policy: options.retry_policy.clone(),
                 conversation_history: options.conversation_history.clone(),
+                external_tools: options.external_tools.clone(),
             };
             
             current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
@@ -1048,7 +1056,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let llm = self.llm.as_ref().ok_or_else(||
             crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-        let tools_list = self.list_tools_for_llm();
+        // Use external_tools if provided (hybrid mode), otherwise use registered tools
+        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
         let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
 
@@ -1468,6 +1477,7 @@ mod tests {
             stream: false,
             retry_policy: None,
             conversation_history: None,
+            external_tools: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2122,6 +2132,7 @@ mod tests {
             stream: false,
             retry_policy: None,
             conversation_history: None,
+            external_tools: None,
         };
         assert!(opts.always_prompt.is_some());
         assert_eq!(opts.always_prompt.as_ref().unwrap(), "Always be concise.");

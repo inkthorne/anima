@@ -95,13 +95,13 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
 use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
 use crate::discovery;
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
-use crate::tool_registry::ToolRegistry;
+use crate::tool_registry::{ToolRegistry, ToolDefinition};
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
@@ -201,6 +201,54 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
         }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
     }
+}
+
+/// Convert ToolDefinition params to JSON Schema format for native tool calling.
+fn convert_params_to_json_schema(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => {
+            let mut properties = serde_json::Map::new();
+            let mut required = Vec::new();
+
+            for (name, type_info) in map {
+                let type_str = match type_info {
+                    serde_json::Value::String(s) => s.as_str(),
+                    _ => "string",
+                };
+
+                let is_optional = type_str.to_lowercase().contains("optional");
+                let base_type = type_str.split_whitespace().next().unwrap_or("string");
+
+                properties.insert(name.clone(), serde_json::json!({"type": base_type}));
+
+                if !is_optional {
+                    required.push(serde_json::Value::String(name.clone()));
+                }
+            }
+
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            })
+        }
+        _ => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        })
+    }
+}
+
+/// Convert ToolDefinitions from registry to ToolSpecs for native LLM tool calling.
+fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
+    definitions.iter().map(|def| {
+        ToolSpec {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            parameters: convert_params_to_json_schema(&def.params),
+        }
+    }).collect()
 }
 
 /// Configuration for the daemon, derived from AgentDir.
@@ -397,8 +445,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create the agent
-    let agent = create_agent_from_dir(&agent_dir).await?;
+    let (agent, use_native_tools) = create_agent_from_dir(&agent_dir).await?;
     let agent = Arc::new(Mutex::new(agent));
+    logger.log(&format!("  Native tools: {}", use_native_tools));
 
     // Create semantic memory store if enabled
     let semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>> = if config.semantic_memory.enabled {
@@ -578,6 +627,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 always,
                                 semantic_memory,
                                 conn_registry,
+                                use_native_tools,
                                 shutdown_clone,
                                 conn_logger,
                             ).await {
@@ -612,11 +662,13 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Create an agent from an AgentDir configuration.
-async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn std::error::Error>> {
+/// Returns (Agent, use_native_tools) where use_native_tools indicates hybrid tool calling mode.
+async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<(Agent, bool), Box<dyn std::error::Error>> {
     let agent_name = agent_dir.config.agent.name.clone();
 
     // Resolve LLM config (loads model file if specified, applies overrides)
     let llm_config = agent_dir.resolve_llm_config()?;
+    let use_native_tools = llm_config.tools;
 
     // Get API key using resolved config
     let api_key = AgentDir::api_key_for_config(&llm_config)?;
@@ -663,7 +715,7 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
     let observer = Arc::new(ConsoleObserver::new(true));
     agent = agent.with_observer(observer);
 
-    Ok(agent)
+    Ok((agent, use_native_tools))
 }
 
 /// Create an LLM client from resolved configuration.
@@ -711,6 +763,7 @@ async fn handle_connection(
     always: Option<String>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     tool_registry: Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -736,8 +789,8 @@ async fn handle_connection(
             Request::Message { ref content } => {
                 logger.log(&format!("[socket] Received message: {}", content));
 
-                // Inject relevant tools if registry is available
-                let tools_injection = if let Some(ref registry) = tool_registry {
+                // Get relevant tools from registry (used for both modes)
+                let relevant_tools = if let Some(ref registry) = tool_registry {
                     let relevant = registry.find_relevant(content, 5);
                     if !relevant.is_empty() {
                         logger.tool(&format!("Recall: {} tools for query", relevant.len()));
@@ -745,9 +798,21 @@ async fn handle_connection(
                             logger.tool(&format!("  - {}", t.name));
                         }
                     }
-                    ToolRegistry::format_for_prompt(&relevant)
+                    relevant
                 } else {
-                    String::new()
+                    Vec::new()
+                };
+
+                // Build tools injection for JSON-block mode, or tool specs for native mode
+                let (tools_injection, external_tools) = if use_native_tools {
+                    let specs = if !relevant_tools.is_empty() {
+                        Some(tool_definitions_to_specs(&relevant_tools))
+                    } else {
+                        None
+                    };
+                    (String::new(), specs)
+                } else {
+                    (ToolRegistry::format_for_prompt(&relevant_tools), None)
                 };
 
                 // Inject relevant memories if enabled
@@ -776,24 +841,25 @@ async fn handle_connection(
                 let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
 
                 let mut agent_guard = agent.lock().await;
-                // Tool execution loop - keep going while agent makes tool calls
-                let mut current_message = content.clone();
-                let mut final_response = String::new();
-                let max_tool_calls = 10; // Prevent infinite loops
-                let mut tool_call_count = 0;
                 
-                loop {
+                let final_response = if use_native_tools {
+                    // Native tool mode: Agent handles tool calling internally
                     let options = ThinkOptions {
                         system_prompt: persona.clone(),
                         always_prompt: effective_always.clone(),
+                        external_tools: external_tools.clone(),
                         ..Default::default()
                     };
                     
-                    match agent_guard.think_with_options(&current_message, options).await {
+                    match agent_guard.think_with_options(content, options).await {
                         Ok(result) => {
+                            // Log tools used (native mode)
+                            for tool_name in &result.tool_names {
+                                logger.tool(&format!("Executed: {}", tool_name));
+                            }
+                            
                             // Extract and store [REMEMBER: ...] tags
                             let (after_remember, memories_to_save) = extract_remember_tags(&result.response);
-
                             if !memories_to_save.is_empty() {
                                 if let Some(ref mem_store) = semantic_memory {
                                     let store = mem_store.lock().await;
@@ -806,55 +872,88 @@ async fn handle_connection(
                                     }
                                 }
                             }
+                            after_remember
+                        }
+                        Err(e) => format!("Error: {}", e),
+                    }
+                } else {
+                    // JSON-block mode: Daemon parses and executes tool calls
+                    let mut current_message = content.clone();
+                    let mut final_response = String::new();
+                    let max_tool_calls = 10;
+                    let mut tool_call_count = 0;
+                    
+                    loop {
+                        let options = ThinkOptions {
+                            system_prompt: persona.clone(),
+                            always_prompt: effective_always.clone(),
+                            external_tools: None,
+                            ..Default::default()
+                        };
+                        
+                        match agent_guard.think_with_options(&current_message, options).await {
+                            Ok(result) => {
+                                // Extract and store [REMEMBER: ...] tags
+                                let (after_remember, memories_to_save) = extract_remember_tags(&result.response);
 
-                            // Check for tool calls
-                            let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
-                            
-                            if let Some(tc) = tool_call {
-                                tool_call_count += 1;
-                                if tool_call_count > max_tool_calls {
-                                    logger.tool("Max tool calls reached, stopping");
-                                    final_response = format!("{}\n\n[Tool limit reached]", cleaned_response);
+                                if !memories_to_save.is_empty() {
+                                    if let Some(ref mem_store) = semantic_memory {
+                                        let store = mem_store.lock().await;
+                                        for memory in &memories_to_save {
+                                            match store.save(memory, 0.9, "explicit") {
+                                                Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
+                                                Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check for tool calls (JSON-block parsing)
+                                let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+                                
+                                if let Some(tc) = tool_call {
+                                    tool_call_count += 1;
+                                    if tool_call_count > max_tool_calls {
+                                        logger.tool("Max tool calls reached, stopping");
+                                        final_response = format!("{}\n\n[Tool limit reached]", cleaned_response);
+                                        break;
+                                    }
+                                    
+                                    logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
+                                    
+                                    match execute_tool_call(&tc).await {
+                                        Ok(tool_result) => {
+                                            logger.tool(&format!("Result: {} bytes", tool_result.len()));
+                                            current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                                            if !cleaned_response.is_empty() {
+                                                if !final_response.is_empty() {
+                                                    final_response.push_str("\n");
+                                                }
+                                                final_response.push_str(&cleaned_response);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            logger.tool(&format!("Error: {}", e));
+                                            current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                                        }
+                                    }
+                                } else {
+                                    if !final_response.is_empty() {
+                                        final_response.push_str("\n");
+                                    }
+                                    final_response.push_str(&cleaned_response);
                                     break;
                                 }
-                                
-                                logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
-                                
-                                match execute_tool_call(&tc).await {
-                                    Ok(tool_result) => {
-                                        logger.tool(&format!("Result: {} bytes", tool_result.len()));
-                                        // Send result back to agent
-                                        current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
-                                        // Accumulate non-tool text
-                                        if !cleaned_response.is_empty() {
-                                            if !final_response.is_empty() {
-                                                final_response.push_str("\n");
-                                            }
-                                            final_response.push_str(&cleaned_response);
-                                        }
-                                        // Continue loop
-                                    }
-                                    Err(e) => {
-                                        logger.tool(&format!("Error: {}", e));
-                                        current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
-                                        // Continue loop so agent can handle error
-                                    }
-                                }
-                            } else {
-                                // No tool call, we're done
-                                if !final_response.is_empty() {
-                                    final_response.push_str("\n");
-                                }
-                                final_response.push_str(&cleaned_response);
+                            }
+                            Err(e) => {
+                                final_response = format!("Error: {}", e);
                                 break;
                             }
                         }
-                        Err(e) => {
-                            final_response = format!("Error: {}", e);
-                            break;
-                        }
                     }
-                }
+                    final_response
+                };
                 
                 Response::Message { content: final_response }
             }

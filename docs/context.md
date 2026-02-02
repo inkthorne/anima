@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v2.7.10 |
+| **Version** | v2.7.11 |
 | **Tests** | 320 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
@@ -237,4 +237,4 @@ This keeps Arya's context clean and available while Claude Code does the heavy l
 
 ## Last Updated
 
-2026-02-01 — v2.7.10: HTTP tool for web requests. Tool execution for non-tool-calling models, shared model definitions, configurable context size, memory reinforcement, tilde expansion.
+2026-02-01 — v2.7.11: HTTP tool for web requests. Tool execution for non-tool-calling models, shared model definitions, configurable context size, memory reinforcement, tilde expansion.
