@@ -256,6 +256,17 @@ fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
     }).collect()
 }
 
+/// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
+fn filter_by_allowlist<'a>(
+    tools: Vec<&'a ToolDefinition>,
+    allowed_tools: &Option<Vec<String>>,
+) -> Vec<&'a ToolDefinition> {
+    match allowed_tools {
+        Some(allowed) => tools.into_iter().filter(|t| allowed.contains(&t.name)).collect(),
+        None => Vec::new(),  // No allowlist = no tools
+    }
+}
+
 /// Configuration for the daemon, derived from AgentDir.
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -277,6 +288,8 @@ pub struct DaemonConfig {
     pub model_always: Option<String>,
     /// Semantic memory configuration
     pub semantic_memory: SemanticMemorySection,
+    /// Allowlist of tool names. If set, only these tools are available.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -316,8 +329,10 @@ impl DaemonConfig {
         // Load always content
         let always = agent_dir.load_always()?;
 
-        // Load model-specific always from resolved LLM config
-        let model_always = agent_dir.resolve_llm_config()?.always;
+        // Load model-specific config from resolved LLM config
+        let llm_config = agent_dir.resolve_llm_config()?;
+        let model_always = llm_config.always;
+        let allowed_tools = llm_config.allowed_tools;
 
         Ok(Self {
             name,
@@ -329,6 +344,7 @@ impl DaemonConfig {
             always,
             model_always,
             semantic_memory: agent_dir.config.semantic_memory.clone(),
+            allowed_tools,
         })
     }
 }
@@ -518,6 +534,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let persona = config.persona.clone();
         let always = config.always.clone();
         let model_always = config.model_always.clone();
+        let allowed_tools = config.allowed_tools.clone();
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
         let semantic_memory = semantic_memory_store.clone();
@@ -559,6 +576,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         // Inject relevant tools if registry is available
                         let tools_injection = if let Some(ref registry) = timer_registry {
                             let relevant = registry.find_relevant(&timer_config.message, 5);
+                            let relevant = filter_by_allowlist(relevant, &allowed_tools);
                             if !relevant.is_empty() {
                                 timer_logger.tool(&format!("Recall: {} tools for timer", relevant.len()));
                                 for t in &relevant {
@@ -626,6 +644,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let persona = config.persona.clone();
                         let always = config.always.clone();
                         let model_always = config.model_always.clone();
+                        let allowed_tools = config.allowed_tools.clone();
                         let shutdown_clone = shutdown.clone();
                         let semantic_memory = semantic_memory_store.clone();
                         let conn_registry = tool_registry.clone();
@@ -639,6 +658,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 persona,
                                 always,
                                 model_always,
+                                allowed_tools,
                                 semantic_memory,
                                 conn_registry,
                                 use_native_tools,
@@ -776,6 +796,7 @@ async fn handle_connection(
     persona: Option<String>,
     always: Option<String>,
     model_always: Option<String>,
+    allowed_tools: Option<Vec<String>>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     tool_registry: Option<Arc<ToolRegistry>>,
     use_native_tools: bool,
@@ -807,6 +828,7 @@ async fn handle_connection(
                 // Get relevant tools from registry (used for both modes)
                 let relevant_tools = if let Some(ref registry) = tool_registry {
                     let relevant = registry.find_relevant(content, 5);
+                    let relevant = filter_by_allowlist(relevant, &allowed_tools);
                     if !relevant.is_empty() {
                         logger.tool(&format!("Recall: {} tools for query", relevant.len()));
                         for t in &relevant {
@@ -982,6 +1004,7 @@ async fn handle_connection(
                 // Inject relevant tools if registry is available
                 let tools_injection = if let Some(ref registry) = tool_registry {
                     let relevant = registry.find_relevant(content, 5);
+                    let relevant = filter_by_allowlist(relevant, &allowed_tools);
                     if !relevant.is_empty() {
                         logger.tool(&format!("Recall: {} tools for incoming", relevant.len()));
                         for t in &relevant {

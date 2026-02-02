@@ -58,6 +58,10 @@ pub struct LlmSection {
     /// Model-specific always text appended to agent always prompt
     #[serde(default)]
     pub always: Option<String>,
+    /// Allowlist of tool names. If set, only these tools are available.
+    /// If None, all tools are allowed.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -73,6 +77,9 @@ pub struct ResolvedLlmConfig {
     pub num_ctx: Option<u32>,
     /// Model-specific always text appended to agent always prompt
     pub always: Option<String>,
+    /// Allowlist of tool names. If set, only these tools are available.
+    /// If None, all tools are allowed.
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,6 +406,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
     let thinking = llm_section.thinking.or(base_config.thinking);
     let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
     let always = llm_section.always.clone().or(base_config.always.clone());
+    let allowed_tools = llm_section.allowed_tools.clone().or(base_config.allowed_tools.clone());
 
     // tools: agent override takes precedence, then model file, then default true
     let tools = llm_section.tools
@@ -414,6 +422,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
         tools,
         num_ctx,
         always,
+        allowed_tools,
     })
 }
 
