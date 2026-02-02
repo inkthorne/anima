@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v2.7.7 |
+| **Version** | v2.7.8 |
 | **Tests** | 320 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
@@ -154,7 +154,7 @@ thinking = false
 - Daemon parses, executes, returns result to agent
 - Multi-turn loop: agent can chain tool calls
 - Tilde (~) expansion supported in paths
-- Available: `read_file` (more coming)
+- Available: `read_file`, `write_file`, `shell`, `http`
 
 ### Shared Model Definitions
 - Define models in `~/.anima/models/*.toml`
@@ -237,4 +237,4 @@ This keeps Arya's context clean and available while Claude Code does the heavy l
 
 ## Last Updated
 
-2026-02-01 — v2.7.7: Tool execution for non-tool-calling models, shared model definitions, configurable context size, memory reinforcement, tilde expansion.
+2026-02-01 — v2.7.8: HTTP tool for web requests. Tool execution for non-tool-calling models, shared model definitions, configurable context size, memory reinforcement, tilde expansion.

@@ -188,6 +188,17 @@ async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
                 Err(e) => Err(format!("Tool error: {}", e))
             }
         }
+        "http" => {
+            let tool = HttpTool::new();
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    let status = result.get("status").and_then(|s| s.as_u64()).unwrap_or(0);
+                    let body = result.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                    Ok(format!("[HTTP {}]\n{}", status, body))
+                }
+                Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
     }
 }
