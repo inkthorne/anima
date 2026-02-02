@@ -72,20 +72,33 @@ pub struct ToolCall {
 /// Extract a JSON tool block from agent output.
 /// Returns (cleaned_output, Option<ToolCall>)
 pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
-    // Look for ```json ... ``` blocks containing a tool call
-    let re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
+    // Try ```json ... ``` blocks first
+    let fenced_re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
     
-    if let Some(cap) = re.captures(output) {
+    if let Some(cap) = fenced_re.captures(output) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
-            // Check if it's a tool call (has "tool" field)
             if let Some(tool_name) = json.get("tool").and_then(|t| t.as_str()) {
                 let params = json.get("params").cloned().unwrap_or(serde_json::json!({}));
-                let cleaned = re.replace(output, "").trim().to_string();
+                let cleaned = fenced_re.replace(output, "").trim().to_string();
                 return (cleaned, Some(ToolCall {
                     tool: tool_name.to_string(),
                     params,
                 }));
             }
+        }
+    }
+    
+    // Fall back to raw JSON: {"tool": "...", "params": {...}}
+    let raw_re = regex::Regex::new(r#"\{"tool"\s*:\s*"([^"]+)"\s*,\s*"params"\s*:\s*(\{[^}]*\})\}"#).unwrap();
+    
+    if let Some(cap) = raw_re.captures(output) {
+        let tool_name = &cap[1];
+        if let Ok(params) = serde_json::from_str::<serde_json::Value>(&cap[2]) {
+            let cleaned = raw_re.replace(output, "").trim().to_string();
+            return (cleaned, Some(ToolCall {
+                tool: tool_name.to_string(),
+                params,
+            }));
         }
     }
     
@@ -95,6 +108,7 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
 use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
 use crate::discovery;
+use crate::embedding::EmbeddingClient;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
@@ -476,11 +490,53 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     let agent = Arc::new(Mutex::new(agent));
     logger.log(&format!("  Native tools: {}", use_native_tools));
 
+    // Create embedding client if configured
+    let embedding_client: Option<Arc<EmbeddingClient>> = if let Some(ref emb_config) = config.semantic_memory.embedding {
+        if emb_config.provider == "ollama" {
+            let client = EmbeddingClient::new(&emb_config.model, Some(&emb_config.url));
+            logger.log(&format!("  Embedding client: {} via {} at {}",
+                emb_config.model, emb_config.provider, emb_config.url));
+            Some(Arc::new(client))
+        } else {
+            logger.log(&format!("  Embedding client: unsupported provider '{}'", emb_config.provider));
+            None
+        }
+    } else {
+        None
+    };
+
     // Create semantic memory store if enabled
     let semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>> = if config.semantic_memory.enabled {
         let mem_path = config.agent_dir.join(&config.semantic_memory.path);
         let store = SemanticMemoryStore::open(&mem_path, &config.name)?;
         logger.log(&format!("  Semantic memory: {}", mem_path.display()));
+
+        // Backfill embeddings if needed
+        if let Some(ref emb_client) = embedding_client {
+            if store.needs_backfill(emb_client.model())? {
+                logger.log("  Backfilling embeddings...");
+                let memories = store.get_memories_needing_embeddings()?;
+                logger.log(&format!("    {} memories need embeddings", memories.len()));
+
+                for (id, content) in memories {
+                    match emb_client.embed(&content).await {
+                        Ok(embedding) => {
+                            if let Err(e) = store.update_embedding(id, &embedding) {
+                                logger.log(&format!("    Failed to update embedding for #{}: {}", id, e));
+                            }
+                        }
+                        Err(e) => {
+                            logger.log(&format!("    Failed to generate embedding for #{}: {}", id, e));
+                        }
+                    }
+                }
+
+                // Update the stored model
+                store.set_embedding_model(emb_client.model())?;
+                logger.log("  Backfill complete");
+            }
+        }
+
         Some(Arc::new(Mutex::new(store)))
     } else {
         None
@@ -538,6 +594,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
         let semantic_memory = semantic_memory_store.clone();
+        let timer_embedding_client = embedding_client.clone();
         let timer_registry = tool_registry.clone();
         let timer_logger = logger.clone();
 
@@ -553,8 +610,21 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                         // Inject relevant memories if enabled
                         let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                            // Generate query embedding if we have an embedding client
+                            let query_embedding = if let Some(ref emb_client) = timer_embedding_client {
+                                match emb_client.embed(&timer_config.message).await {
+                                    Ok(emb) => Some(emb),
+                                    Err(e) => {
+                                        timer_logger.log(&format!("[timer] Failed to generate query embedding: {}", e));
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+
                             let store = mem_store.lock().await;
-                            match store.recall(&timer_config.message, 5) {
+                            match store.recall_with_embedding(&timer_config.message, 5, query_embedding.as_deref()) {
                                 Ok(memories) => {
                                     if !memories.is_empty() {
                                         timer_logger.memory(&format!("Recall: {} memories for timer", memories.len()));
@@ -608,7 +678,20 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                     if let Some(ref mem_store) = semantic_memory {
                                         let store = mem_store.lock().await;
                                         for memory in &memories_to_save {
-                                            match store.save(memory, 0.9, "explicit") {
+                                            // Generate embedding if we have a client
+                                            let embedding = if let Some(ref emb_client) = timer_embedding_client {
+                                                match emb_client.embed(memory).await {
+                                                    Ok(emb) => Some(emb),
+                                                    Err(e) => {
+                                                        timer_logger.log(&format!("[timer] Failed to generate embedding: {}", e));
+                                                        None
+                                                    }
+                                                }
+                                            } else {
+                                                None
+                                            };
+
+                                            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
                                                 Ok(SaveResult::New(id)) => timer_logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
                                                 Ok(SaveResult::Reinforced(id, old, new)) => timer_logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                                 Err(e) => timer_logger.log(&format!("[timer] Failed to save memory: {}", e)),
@@ -647,6 +730,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let allowed_tools = config.allowed_tools.clone();
                         let shutdown_clone = shutdown.clone();
                         let semantic_memory = semantic_memory_store.clone();
+                        let conn_embedding_client = embedding_client.clone();
                         let conn_registry = tool_registry.clone();
                         let conn_logger = logger.clone();
 
@@ -660,6 +744,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 model_always,
                                 allowed_tools,
                                 semantic_memory,
+                                conn_embedding_client,
                                 conn_registry,
                                 use_native_tools,
                                 shutdown_clone,
@@ -798,6 +883,7 @@ async fn handle_connection(
     model_always: Option<String>,
     allowed_tools: Option<Vec<String>>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
     tool_registry: Option<Arc<ToolRegistry>>,
     use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
@@ -854,8 +940,21 @@ async fn handle_connection(
 
                 // Inject relevant memories if enabled
                 let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                    // Generate query embedding if we have an embedding client
+                    let query_embedding = if let Some(ref emb_client) = embedding_client {
+                        match emb_client.embed(content).await {
+                            Ok(emb) => Some(emb),
+                            Err(e) => {
+                                logger.log(&format!("[socket] Failed to generate query embedding: {}", e));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let store = mem_store.lock().await;
-                    match store.recall(content, 5) {
+                    match store.recall_with_embedding(content, 5, query_embedding.as_deref()) {
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for query", memories.len()));
@@ -901,7 +1000,20 @@ async fn handle_connection(
                                 if let Some(ref mem_store) = semantic_memory {
                                     let store = mem_store.lock().await;
                                     for memory in &memories_to_save {
-                                        match store.save(memory, 0.9, "explicit") {
+                                        // Generate embedding if we have a client
+                                        let embedding = if let Some(ref emb_client) = embedding_client {
+                                            match emb_client.embed(memory).await {
+                                                Ok(emb) => Some(emb),
+                                                Err(e) => {
+                                                    logger.log(&format!("[socket] Failed to generate embedding: {}", e));
+                                                    None
+                                                }
+                                            }
+                                        } else {
+                                            None
+                                        };
+
+                                        match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
                                             Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
                                             Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                             Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
@@ -937,7 +1049,20 @@ async fn handle_connection(
                                     if let Some(ref mem_store) = semantic_memory {
                                         let store = mem_store.lock().await;
                                         for memory in &memories_to_save {
-                                            match store.save(memory, 0.9, "explicit") {
+                                            // Generate embedding if we have a client
+                                            let embedding = if let Some(ref emb_client) = embedding_client {
+                                                match emb_client.embed(memory).await {
+                                                    Ok(emb) => Some(emb),
+                                                    Err(e) => {
+                                                        logger.log(&format!("[socket] Failed to generate embedding: {}", e));
+                                                        None
+                                                    }
+                                                }
+                                            } else {
+                                                None
+                                            };
+
+                                            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
                                                 Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
                                                 Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                                 Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
@@ -1018,8 +1143,21 @@ async fn handle_connection(
 
                 // Inject relevant memories if enabled
                 let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                    // Generate query embedding if we have an embedding client
+                    let query_embedding = if let Some(ref emb_client) = embedding_client {
+                        match emb_client.embed(content).await {
+                            Ok(emb) => Some(emb),
+                            Err(e) => {
+                                logger.log(&format!("[socket] Failed to generate query embedding: {}", e));
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     let store = mem_store.lock().await;
-                    match store.recall(content, 5) {
+                    match store.recall_with_embedding(content, 5, query_embedding.as_deref()) {
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for incoming", memories.len()));
@@ -1057,7 +1195,20 @@ async fn handle_connection(
                             if let Some(ref mem_store) = semantic_memory {
                                 let store = mem_store.lock().await;
                                 for memory in &memories_to_save {
-                                    match store.save(memory, 0.9, "explicit") {
+                                    // Generate embedding if we have a client
+                                    let embedding = if let Some(ref emb_client) = embedding_client {
+                                        match emb_client.embed(memory).await {
+                                            Ok(emb) => Some(emb),
+                                            Err(e) => {
+                                                logger.log(&format!("[socket] Failed to generate embedding: {}", e));
+                                                None
+                                            }
+                                        }
+                                    } else {
+                                        None
+                                    };
+
+                                    match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
                                         Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
                                         Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
                                         Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),

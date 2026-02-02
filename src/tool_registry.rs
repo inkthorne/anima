@@ -136,6 +136,7 @@ impl ToolRegistry {
                 format_params(&tool.params)
             ));
         }
+        output.push_str("\n**Only use tools listed above. Do not invent tool names.**\n");
         output
     }
 }

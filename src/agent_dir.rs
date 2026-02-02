@@ -106,6 +106,22 @@ fn default_semantic_memory_path() -> String {
     "memory.db".to_string()
 }
 
+fn default_embedding_url() -> String {
+    "http://localhost:11434".to_string()
+}
+
+/// Configuration for embedding-based semantic search.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Embedding provider (currently only "ollama" is supported)
+    pub provider: String,
+    /// Embedding model name (e.g., "nomic-embed-text")
+    pub model: String,
+    /// Base URL for the embedding API (optional, defaults to localhost)
+    #[serde(default = "default_embedding_url")]
+    pub url: String,
+}
+
 /// Configuration for the semantic memory system.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticMemorySection {
@@ -121,6 +137,9 @@ pub struct SemanticMemorySection {
     /// Minimum importance score to include (0.0-1.0)
     #[serde(default = "default_min_importance")]
     pub min_importance: f64,
+    /// Embedding configuration for semantic search
+    #[serde(default)]
+    pub embedding: Option<EmbeddingConfig>,
 }
 
 impl Default for SemanticMemorySection {
@@ -130,6 +149,7 @@ impl Default for SemanticMemorySection {
             path: default_semantic_memory_path(),
             recall_limit: default_recall_limit(),
             min_importance: default_min_importance(),
+            embedding: None,
         }
     }
 }
