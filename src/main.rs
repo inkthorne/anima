@@ -99,6 +99,7 @@ enum Commands {
         agent: String,
     },
     /// Show status of all agents (running/stopped)
+    #[clap(alias = "ps")]
     Status,
     /// One-shot query to an agent (no daemon required)
     Ask {
