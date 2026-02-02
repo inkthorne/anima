@@ -150,6 +150,12 @@ pub fn list_saved_agents() -> Vec<String> {
     }
 }
 
+/// Check if an agent exists (has a config.toml in ~/.anima/agents/{name}/).
+pub fn agent_exists(name: &str) -> bool {
+    let config_path = agents_dir().join(name).join("config.toml");
+    config_path.exists()
+}
+
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
     // Use kill(pid, 0) to check if process exists

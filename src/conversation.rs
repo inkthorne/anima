@@ -535,6 +535,33 @@ pub fn parse_mentions(content: &str) -> Vec<String> {
     mentions
 }
 
+/// Expand @all mention to all participants except "user".
+///
+/// If mentions contains "all", it is replaced with all agents from participants
+/// (excluding "user"). Returns the expanded and deduplicated list.
+pub fn expand_all_mention(mentions: &[String], participants: &[String]) -> Vec<String> {
+    let has_all = mentions.iter().any(|m| m == "all");
+
+    if !has_all {
+        return mentions.to_vec();
+    }
+
+    // Start with non-"all" mentions
+    let mut expanded: Vec<String> = mentions.iter().filter(|m| *m != "all").cloned().collect();
+
+    // Add all participants except "user"
+    for p in participants {
+        if p != "user" && !expanded.contains(p) {
+            expanded.push(p.clone());
+        }
+    }
+
+    // Sort and deduplicate
+    expanded.sort();
+    expanded.dedup();
+    expanded
+}
+
 /// Result of attempting to notify an agent.
 #[derive(Debug)]
 pub enum NotifyResult {
@@ -542,6 +569,8 @@ pub enum NotifyResult {
     Notified { response_message_id: i64 },
     /// Agent was not running; notification queued
     Queued { notification_id: i64 },
+    /// Agent does not exist (no config.toml found)
+    UnknownAgent,
     /// Notification failed
     Failed { reason: String },
 }
@@ -615,7 +644,11 @@ pub async fn notify_mentioned_agents(
                 }
                 Err(_e) => {
                     // Socket connection failed - agent may have just stopped
-                    // Queue the notification instead
+                    // Only queue if agent exists
+                    if !discovery::agent_exists(agent_name) {
+                        results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
+                        continue;
+                    }
                     match store.add_pending_notification(agent_name, conv_id, message_id) {
                         Ok(notification_id) => {
                             results.insert(agent_name.clone(), NotifyResult::Queued {
@@ -631,7 +664,11 @@ pub async fn notify_mentioned_agents(
                 }
             }
         } else {
-            // Agent is not running - queue notification
+            // Agent is not running - only queue if agent exists
+            if !discovery::agent_exists(agent_name) {
+                results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
+                continue;
+            }
             match store.add_pending_notification(agent_name, conv_id, message_id) {
                 Ok(notification_id) => {
                     results.insert(agent_name.clone(), NotifyResult::Queued {
@@ -764,12 +801,17 @@ pub async fn notify_mentioned_agents_parallel(
                 // If agent wasn't reachable or not running, queue the notification
                 let final_result = match &result {
                     NotifyResult::Failed { reason } if reason.contains("not running") || reason.contains("not reachable") => {
-                        // Queue the notification for when agent comes online
-                        match store.add_pending_notification(&agent_name, conv_id, message_id) {
-                            Ok(notification_id) => NotifyResult::Queued { notification_id },
-                            Err(e) => NotifyResult::Failed {
-                                reason: format!("Failed to queue notification: {}", e),
-                            },
+                        // Only queue if agent actually exists
+                        if !crate::discovery::agent_exists(&agent_name) {
+                            NotifyResult::UnknownAgent
+                        } else {
+                            // Queue the notification for when agent comes online
+                            match store.add_pending_notification(&agent_name, conv_id, message_id) {
+                                Ok(notification_id) => NotifyResult::Queued { notification_id },
+                                Err(e) => NotifyResult::Failed {
+                                    reason: format!("Failed to queue notification: {}", e),
+                                },
+                            }
                         }
                     }
                     _ => result,
@@ -1079,5 +1121,58 @@ mod tests {
     fn test_parse_mentions_in_sentence() {
         let mentions = parse_mentions("I think @arya is right, but @gendry has a point too.");
         assert_eq!(mentions, vec!["arya", "gendry"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_basic() {
+        let mentions = vec!["all".to_string()];
+        let participants = vec!["arya".to_string(), "gendry".to_string(), "user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        assert_eq!(expanded, vec!["arya", "gendry"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_with_other_mentions() {
+        let mentions = vec!["all".to_string(), "sansa".to_string()];
+        let participants = vec!["arya".to_string(), "gendry".to_string(), "user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        // Should include both participants and the extra mention
+        assert_eq!(expanded, vec!["arya", "gendry", "sansa"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_no_all() {
+        let mentions = vec!["arya".to_string()];
+        let participants = vec!["arya".to_string(), "gendry".to_string(), "user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        // Should return unchanged when no @all
+        assert_eq!(expanded, vec!["arya"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_excludes_user() {
+        let mentions = vec!["all".to_string()];
+        let participants = vec!["arya".to_string(), "user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        // Should not include "user"
+        assert_eq!(expanded, vec!["arya"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_deduplicates() {
+        let mentions = vec!["all".to_string(), "arya".to_string()];
+        let participants = vec!["arya".to_string(), "gendry".to_string(), "user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        // arya should only appear once
+        assert_eq!(expanded, vec!["arya", "gendry"]);
+    }
+
+    #[test]
+    fn test_expand_all_mention_empty_participants() {
+        let mentions = vec!["all".to_string()];
+        let participants: Vec<String> = vec!["user".to_string()];
+        let expanded = expand_all_mention(&mentions, &participants);
+        // Only user in participants, so nothing to expand to
+        assert!(expanded.is_empty());
     }
 }

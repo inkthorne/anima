@@ -1,7 +1,7 @@
 use anima::{
     Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
     InMemoryStore, SqliteMemory, LLM, ConversationStore, canonical_1to1_id, canonical_group_id,
-    parse_mentions, notify_mentioned_agents_parallel, NotifyResult,
+    parse_mentions, expand_all_mention, notify_mentioned_agents_parallel, NotifyResult,
 };
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
@@ -446,15 +446,18 @@ async fn chat_with_conversation(
                     continue;
                 }
 
-                let mention_refs: Vec<&str> = mentions.iter().map(|s| s.as_str()).collect();
+                // Expand @all to all participants (excluding "user")
+                let expanded_mentions = expand_all_mention(&mentions, &participants);
+
+                let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
 
                 // Store user message in conversation with mentions
                 let user_msg_id = store.add_message(&conv_id, "user", line, &mention_refs)?;
 
                 // Determine which agents to notify
                 let agents_to_notify: Vec<String> = if is_group_chat {
-                    // Group chat: only notify @mentioned agents
-                    mentions.clone()
+                    // Group chat: only notify @mentioned agents (with @all already expanded)
+                    expanded_mentions.clone()
                 } else {
                     // 1:1 chat: always notify the single agent
                     participants.clone()
@@ -492,6 +495,9 @@ async fn chat_with_conversation(
                             NotifyResult::Queued { notification_id: _ } => {
                                 eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
                             }
+                            NotifyResult::UnknownAgent => {
+                                eprintln!("\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m", agent);
+                            }
                             NotifyResult::Failed { reason } => {
                                 eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
                             }
@@ -513,6 +519,9 @@ async fn chat_with_conversation(
                                 }
                                 NotifyResult::Queued { notification_id: _ } => {
                                     eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
+                                }
+                                NotifyResult::UnknownAgent => {
+                                    eprintln!("\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m", agent);
                                 }
                                 NotifyResult::Failed { reason } => {
                                     eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
