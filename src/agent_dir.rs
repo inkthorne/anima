@@ -95,7 +95,7 @@ pub struct TimerSection {
 }
 
 fn default_recall_limit() -> usize {
-    5
+    10
 }
 
 fn default_min_importance() -> f64 {

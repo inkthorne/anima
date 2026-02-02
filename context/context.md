@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v2.9.0 |
+| **Version** | v2.9.1 |
 | **Tests** | 378 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
@@ -92,4 +92,4 @@ anima restart <name>  # After changes
 
 ## Last Updated
 
-2026-02-02 — v2.9.0: Runtime context injection (agents now know their name, model, host, tools mode), `anima system <agent>` command to inspect assembled system prompt.
+2026-02-02 — v2.9.1: Runtime context injection (agents now know their name, model, host, tools mode), `anima system <agent>` command to inspect assembled system prompt.
