@@ -109,7 +109,7 @@ use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, strip_thinking_tags};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
@@ -688,8 +688,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                         match agent_guard.think_with_options(&timer_config.message, options).await {
                             Ok(result) => {
-                                // Extract and store [REMEMBER: ...] tags
-                                let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+                                // Strip thinking tags and extract [REMEMBER: ...] tags
+                                let without_thinking = strip_thinking_tags(&result.response);
+                                let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
 
                                 if !memories_to_save.is_empty() {
                                     if let Some(ref mem_store) = semantic_memory {
@@ -1011,8 +1012,9 @@ async fn handle_connection(
                                 logger.tool(&format!("Executed: {}", tool_name));
                             }
                             
-                            // Extract and store [REMEMBER: ...] tags
-                            let (after_remember, memories_to_save) = extract_remember_tags(&result.response);
+                            // Strip thinking tags and extract [REMEMBER: ...] tags
+                            let without_thinking = strip_thinking_tags(&result.response);
+                            let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
                             if !memories_to_save.is_empty() {
                                 if let Some(ref mem_store) = semantic_memory {
                                     let store = mem_store.lock().await;
@@ -1059,8 +1061,9 @@ async fn handle_connection(
                         
                         match agent_guard.think_with_options(&current_message, options).await {
                             Ok(result) => {
-                                // Extract and store [REMEMBER: ...] tags
-                                let (after_remember, memories_to_save) = extract_remember_tags(&result.response);
+                                // Strip thinking tags and extract [REMEMBER: ...] tags
+                                let without_thinking = strip_thinking_tags(&result.response);
+                                let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
                                 if !memories_to_save.is_empty() {
                                     if let Some(ref mem_store) = semantic_memory {
@@ -1209,8 +1212,9 @@ async fn handle_connection(
                 let mut agent_guard = agent.lock().await;
                 match agent_guard.think_with_options(&formatted_message, options).await {
                     Ok(result) => {
-                        // Extract and store [REMEMBER: ...] tags
-                        let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+                        // Strip thinking tags and extract [REMEMBER: ...] tags
+                        let without_thinking = strip_thinking_tags(&result.response);
+                        let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
 
                         if !memories_to_save.is_empty() {
                             if let Some(ref mem_store) = semantic_memory {

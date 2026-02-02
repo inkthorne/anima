@@ -5,8 +5,10 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
@@ -23,6 +25,18 @@ use crate::socket_api::{SocketApi, Request, Response};
 
 /// Parse @mentions from input text.
 /// Pattern: `@([a-zA-Z][a-zA-Z0-9_-]*)`
+/// Format elapsed duration as "Xm:Ys" or "X.Xs" for short durations.
+fn format_elapsed(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs >= 60 {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{}m:{}s", mins, remaining_secs)
+    } else {
+        format!("{:.1}s", duration.as_secs_f64())
+    }
+}
+
 /// Returns a Vec of mentioned agent names (without the @ prefix).
 /// Special case: "@all" is returned as-is.
 fn parse_mentions(input: &str) -> Vec<String> {
@@ -608,13 +622,16 @@ impl Repl {
             }
         };
 
-        println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+        print!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+        let _ = io::stdout().flush();
+        let start = Instant::now();
         debug::log(&format!("BROADCAST CONV: {} <- context ({} chars)", agent_name, context.len()));
 
         // Connect to daemon
         let mut api = match connection.connect().await {
             Ok(api) => api,
             Err(e) => {
+                println!("{}", format_elapsed(start.elapsed()));
                 println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
                 return None;
             }
@@ -623,6 +640,7 @@ impl Repl {
         // Send message request with conversation context
         let request = Request::Message { content: context.to_string() };
         if let Err(e) = api.write_request(&request).await {
+            println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
             return None;
         }
@@ -630,6 +648,7 @@ impl Repl {
         // Read response
         match api.read_response().await {
             Ok(Some(Response::Message { content })) => {
+                println!("{}", format_elapsed(start.elapsed()));
                 let stripped = strip_thinking(&content);
                 debug::log(&format!("BROADCAST RESPONSE (raw, {} chars): {}", content.len(),
                     if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));
@@ -691,13 +710,16 @@ impl Repl {
             return;
         }
 
-        println!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+        print!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
+        let _ = io::stdout().flush();
+        let start = Instant::now();
         debug::log(&format!("CONV: {} <- context ({} chars)", agent_name, context.len()));
 
         // Connect to daemon
         let mut api = match connection.connect().await {
             Ok(api) => api,
             Err(e) => {
+                println!("{}", format_elapsed(start.elapsed()));
                 println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
                 return;
             }
@@ -706,6 +728,7 @@ impl Repl {
         // Send message request with conversation context
         let request = Request::Message { content: context };
         if let Err(e) = api.write_request(&request).await {
+            println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
             return;
         }
@@ -713,6 +736,7 @@ impl Repl {
         // Read response
         match api.read_response().await {
             Ok(Some(Response::Message { content })) => {
+                println!("{}", format_elapsed(start.elapsed()));
                 let stripped = strip_thinking(&content);
                 debug::log(&format!("RESPONSE (raw, {} chars): {}", content.len(),
                     if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));

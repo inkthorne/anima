@@ -62,7 +62,8 @@ impl EmbeddingClient {
 
         let request_body = serde_json::json!({
             "model": self.model,
-            "prompt": text
+            "prompt": text,
+            "keep_alive": "1h"
         });
 
         let response = client

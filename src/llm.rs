@@ -771,6 +771,13 @@ fn parse_thinking_prefix(content: &str) -> (Option<bool>, &str) {
     }
 }
 
+/// Strip <think>...</think> blocks from model output.
+/// Returns the cleaned content with thinking removed.
+pub fn strip_thinking_tags(content: &str) -> String {
+    let re = regex::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
+    re.replace_all(content, "").trim().to_string()
+}
+
 /// Ollama client using OpenAI-compatible API.
 /// Configure with OLLAMA_HOST env var (defaults to http://localhost:11434)
 pub struct OllamaClient {
