@@ -101,9 +101,35 @@ use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
+use crate::tool_registry::ToolRegistry;
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
+
+/// Build the effective always prompt by combining tools, memory, and base always.
+fn build_effective_always(
+    tools_injection: &str,
+    memory_injection: &str,
+    base_always: &Option<String>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if !tools_injection.is_empty() {
+        parts.push(tools_injection.to_string());
+    }
+    if !memory_injection.is_empty() {
+        parts.push(memory_injection.to_string());
+    }
+    if let Some(base) = base_always {
+        parts.push(base.clone());
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
 
 /// Execute a tool call and return the result as a string
 async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
@@ -345,6 +371,18 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Load tool registry (if available)
+    let tool_registry: Option<Arc<ToolRegistry>> = match ToolRegistry::load_global() {
+        Ok(registry) => {
+            logger.log(&format!("  Tool registry: {} tools loaded", registry.all_tools().len()));
+            Some(Arc::new(registry))
+        }
+        Err(e) => {
+            logger.log(&format!("  Tool registry: not loaded ({})", e));
+            None
+        }
+    };
+
     // Create Unix socket listener
     let listener = UnixListener::bind(&config.socket_path)?;
     logger.log(&format!("Listening on {}", config.socket_path.display()));
@@ -383,6 +421,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
         let semantic_memory = semantic_memory_store.clone();
+        let timer_registry = tool_registry.clone();
         let timer_logger = logger.clone();
 
         Some(tokio::spawn(async move {
@@ -417,13 +456,22 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             String::new()
                         };
 
-                        // Combine memory injection with always prompt
-                        let effective_always = match (&always, memory_injection.is_empty()) {
-                            (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
-                            (Some(a), true) => Some(a.clone()),
-                            (None, false) => Some(memory_injection),
-                            (None, true) => None,
+                        // Inject relevant tools if registry is available
+                        let tools_injection = if let Some(ref registry) = timer_registry {
+                            let relevant = registry.find_relevant(&timer_config.message, 5);
+                            if !relevant.is_empty() {
+                                timer_logger.tool(&format!("Recall: {} tools for timer", relevant.len()));
+                                for t in &relevant {
+                                    timer_logger.tool(&format!("  - {}", t.name));
+                                }
+                            }
+                            ToolRegistry::format_for_prompt(&relevant)
+                        } else {
+                            String::new()
                         };
+
+                        // Combine tools, memory injection, and always prompt
+                        let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
 
                         let mut agent_guard = agent_clone.lock().await;
 
@@ -479,6 +527,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let always = config.always.clone();
                         let shutdown_clone = shutdown.clone();
                         let semantic_memory = semantic_memory_store.clone();
+                        let conn_registry = tool_registry.clone();
                         let conn_logger = logger.clone();
 
                         tokio::spawn(async move {
@@ -489,6 +538,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 persona,
                                 always,
                                 semantic_memory,
+                                conn_registry,
                                 shutdown_clone,
                                 conn_logger,
                             ).await {
@@ -621,6 +671,7 @@ async fn handle_connection(
     persona: Option<String>,
     always: Option<String>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    tool_registry: Option<Arc<ToolRegistry>>,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -646,6 +697,20 @@ async fn handle_connection(
             Request::Message { ref content } => {
                 logger.log(&format!("[socket] Received message: {}", content));
 
+                // Inject relevant tools if registry is available
+                let tools_injection = if let Some(ref registry) = tool_registry {
+                    let relevant = registry.find_relevant(content, 5);
+                    if !relevant.is_empty() {
+                        logger.tool(&format!("Recall: {} tools for query", relevant.len()));
+                        for t in &relevant {
+                            logger.tool(&format!("  - {}", t.name));
+                        }
+                    }
+                    ToolRegistry::format_for_prompt(&relevant)
+                } else {
+                    String::new()
+                };
+
                 // Inject relevant memories if enabled
                 let memory_injection = if let Some(ref mem_store) = semantic_memory {
                     let store = mem_store.lock().await;
@@ -668,13 +733,8 @@ async fn handle_connection(
                     String::new()
                 };
 
-                // Combine memory injection with always prompt
-                let effective_always = match (&always, memory_injection.is_empty()) {
-                    (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
-                    (Some(a), true) => Some(a.clone()),
-                    (None, false) => Some(memory_injection),
-                    (None, true) => None,
-                };
+                // Combine tools, memory injection, and always prompt
+                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
 
                 let mut agent_guard = agent.lock().await;
                 // Tool execution loop - keep going while agent makes tool calls
@@ -766,6 +826,20 @@ async fn handle_connection(
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
 
+                // Inject relevant tools if registry is available
+                let tools_injection = if let Some(ref registry) = tool_registry {
+                    let relevant = registry.find_relevant(content, 5);
+                    if !relevant.is_empty() {
+                        logger.tool(&format!("Recall: {} tools for incoming", relevant.len()));
+                        for t in &relevant {
+                            logger.tool(&format!("  - {}", t.name));
+                        }
+                    }
+                    ToolRegistry::format_for_prompt(&relevant)
+                } else {
+                    String::new()
+                };
+
                 // Inject relevant memories if enabled
                 let memory_injection = if let Some(ref mem_store) = semantic_memory {
                     let store = mem_store.lock().await;
@@ -788,13 +862,8 @@ async fn handle_connection(
                     String::new()
                 };
 
-                // Combine memory injection with always prompt
-                let effective_always = match (&always, memory_injection.is_empty()) {
-                    (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
-                    (Some(a), true) => Some(a.clone()),
-                    (None, false) => Some(memory_injection),
-                    (None, true) => None,
-                };
+                // Combine tools, memory injection, and always prompt
+                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
 
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),

@@ -16,6 +16,7 @@ pub mod runtime;
 pub mod socket_api;
 pub mod supervision;
 pub mod tool;
+pub mod tool_registry;
 pub mod tools;
 
 // Re-export main types for convenience
@@ -31,3 +32,4 @@ pub use tool::{Tool, ToolInfo};
 pub use tools::{SendMessageTool, ListAgentsTool};
 pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient, OllamaClient, UsageInfo};
 pub use supervision::{ChildHandle, ChildConfig, ChildStatus};
+pub use tool_registry::{ToolRegistry, ToolDefinition, ToolRegistryError};
