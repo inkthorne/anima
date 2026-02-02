@@ -55,6 +55,9 @@ pub struct LlmSection {
     /// Context window size (num_ctx) for Ollama models
     #[serde(default)]
     pub num_ctx: Option<u32>,
+    /// Model-specific always text appended to agent always prompt
+    #[serde(default)]
+    pub always: Option<String>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -68,6 +71,8 @@ pub struct ResolvedLlmConfig {
     pub thinking: Option<bool>,
     pub tools: bool,
     pub num_ctx: Option<u32>,
+    /// Model-specific always text appended to agent always prompt
+    pub always: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +398,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
     let base_url = llm_section.base_url.clone().or(base_config.base_url.clone());
     let thinking = llm_section.thinking.or(base_config.thinking);
     let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
+    let always = llm_section.always.clone().or(base_config.always.clone());
 
     // tools: agent override takes precedence, then model file, then default true
     let tools = llm_section.tools
@@ -407,6 +413,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
         thinking,
         tools,
         num_ctx,
+        always,
     })
 }
 

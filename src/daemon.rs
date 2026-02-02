@@ -106,11 +106,12 @@ use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, She
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
 
-/// Build the effective always prompt by combining tools, memory, and base always.
+/// Build the effective always prompt by combining tools, memory, base always, and model always.
 fn build_effective_always(
     tools_injection: &str,
     memory_injection: &str,
     base_always: &Option<String>,
+    model_always: &Option<String>,
 ) -> Option<String> {
     let mut parts = Vec::new();
 
@@ -122,6 +123,10 @@ fn build_effective_always(
     }
     if let Some(base) = base_always {
         parts.push(base.clone());
+    }
+    // Model-specific always is appended after agent always
+    if let Some(model) = model_always {
+        parts.push(model.clone());
     }
 
     if parts.is_empty() {
@@ -268,6 +273,8 @@ pub struct DaemonConfig {
     pub persona: Option<String>,
     /// Always content (injected before user messages for recency bias)
     pub always: Option<String>,
+    /// Model-specific always text (appended to agent always)
+    pub model_always: Option<String>,
     /// Semantic memory configuration
     pub semantic_memory: SemanticMemorySection,
 }
@@ -309,6 +316,9 @@ impl DaemonConfig {
         // Load always content
         let always = agent_dir.load_always()?;
 
+        // Load model-specific always from resolved LLM config
+        let model_always = agent_dir.resolve_llm_config()?.always;
+
         Ok(Self {
             name,
             agent_dir: dir_path,
@@ -317,6 +327,7 @@ impl DaemonConfig {
             timer,
             persona,
             always,
+            model_always,
             semantic_memory: agent_dir.config.semantic_memory.clone(),
         })
     }
@@ -506,6 +517,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let agent_clone = agent.clone();
         let persona = config.persona.clone();
         let always = config.always.clone();
+        let model_always = config.model_always.clone();
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
         let semantic_memory = semantic_memory_store.clone();
@@ -559,7 +571,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         // Combine tools, memory injection, and always prompt
-                        let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
+                        let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
                         let mut agent_guard = agent_clone.lock().await;
 
@@ -613,6 +625,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let agent_clone = agent.clone();
                         let persona = config.persona.clone();
                         let always = config.always.clone();
+                        let model_always = config.model_always.clone();
                         let shutdown_clone = shutdown.clone();
                         let semantic_memory = semantic_memory_store.clone();
                         let conn_registry = tool_registry.clone();
@@ -625,6 +638,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 agent_clone,
                                 persona,
                                 always,
+                                model_always,
                                 semantic_memory,
                                 conn_registry,
                                 use_native_tools,
@@ -761,6 +775,7 @@ async fn handle_connection(
     agent: Arc<Mutex<Agent>>,
     persona: Option<String>,
     always: Option<String>,
+    model_always: Option<String>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     tool_registry: Option<Arc<ToolRegistry>>,
     use_native_tools: bool,
@@ -838,10 +853,10 @@ async fn handle_connection(
                 };
 
                 // Combine tools, memory injection, and always prompt
-                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
+                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
                 let mut agent_guard = agent.lock().await;
-                
+
                 let final_response = if use_native_tools {
                     // Native tool mode: Agent handles tool calling internally
                     let options = ThinkOptions {
@@ -1001,7 +1016,7 @@ async fn handle_connection(
                 };
 
                 // Combine tools, memory injection, and always prompt
-                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always);
+                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
