@@ -779,6 +779,8 @@ pub struct OllamaClient {
     model: String,
     /// Enable thinking mode (Ollama "think" parameter)
     thinking: Option<bool>,
+    /// Context window size (num_ctx)
+    num_ctx: Option<u32>,
 }
 
 impl OllamaClient {
@@ -790,6 +792,7 @@ impl OllamaClient {
             base_url,
             model: "llama3".to_string(),
             thinking: None,
+            num_ctx: None,
         }
     }
 
@@ -805,6 +808,11 @@ impl OllamaClient {
 
     pub fn with_thinking(mut self, thinking: Option<bool>) -> Self {
         self.thinking = thinking;
+        self
+    }
+
+    pub fn with_num_ctx(mut self, num_ctx: Option<u32>) -> Self {
+        self.num_ctx = num_ctx;
         self
     }
 }
@@ -873,6 +881,13 @@ impl LLM for OllamaClient {
             "stream": false,
             "think": thinking
         });
+
+        // Add num_ctx option if configured
+        if let Some(ctx) = self.num_ctx {
+            request_body["options"] = serde_json::json!({
+                "num_ctx": ctx
+            });
+        }
 
         // Debug log the request (before adding tools for cleaner output)
         crate::debug::log_json("OLLAMA REQUEST (chat_complete)", &request_body);

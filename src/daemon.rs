@@ -55,19 +55,75 @@ impl AgentLogger {
     pub fn memory(&self, msg: &str) {
         self.log(&format!("[memory] {}", msg));
     }
+    
+    /// Log a tool-related event
+    pub fn tool(&self, msg: &str) {
+        self.log(&format!("[tool] {}", msg));
+    }
+}
+
+/// Parsed tool call from agent output
+#[derive(Debug)]
+pub struct ToolCall {
+    pub tool: String,
+    pub params: serde_json::Value,
+}
+
+/// Extract a JSON tool block from agent output.
+/// Returns (cleaned_output, Option<ToolCall>)
+pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
+    // Look for ```json ... ``` blocks containing a tool call
+    let re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
+    
+    if let Some(cap) = re.captures(output) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
+            // Check if it's a tool call (has "tool" field)
+            if let Some(tool_name) = json.get("tool").and_then(|t| t.as_str()) {
+                let params = json.get("params").cloned().unwrap_or(serde_json::json!({}));
+                let cleaned = re.replace(output, "").trim().to_string();
+                return (cleaned, Some(ToolCall {
+                    tool: tool_name.to_string(),
+                    params,
+                }));
+            }
+        }
+    }
+    
+    (output.to_string(), None)
 }
 
 use crate::agent::{Agent, ThinkOptions};
-use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection};
+use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
 use crate::discovery;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
+use crate::tool::Tool;
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
+
+/// Execute a tool call and return the result as a string
+async fn execute_tool_call(tool_call: &ToolCall) -> Result<String, String> {
+    match tool_call.tool.as_str() {
+        "read_file" => {
+            let tool = ReadFileTool::default();
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
+                        Ok(contents.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
+        _ => Err(format!("Unknown tool: {}", tool_call.tool))
+    }
+}
 
 /// Configuration for the daemon, derived from AgentDir.
 #[derive(Debug, Clone)]
@@ -457,28 +513,14 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn std::error::Error>> {
     let agent_name = agent_dir.config.agent.name.clone();
 
-    // Get API key
-    let api_key = agent_dir.api_key()?;
+    // Resolve LLM config (loads model file if specified, applies overrides)
+    let llm_config = agent_dir.resolve_llm_config()?;
 
-    // Create LLM from config
-    let llm: Arc<dyn LLM> = match agent_dir.config.llm.provider.as_str() {
-        "openai" => {
-            let key = api_key.ok_or("OpenAI API key not configured")?;
-            Arc::new(OpenAIClient::new(key).with_model(&agent_dir.config.llm.model))
-        }
-        "anthropic" => {
-            let key = api_key.ok_or("Anthropic API key not configured")?;
-            Arc::new(AnthropicClient::new(key).with_model(&agent_dir.config.llm.model))
-        }
-        "ollama" => {
-            Arc::new(
-                OllamaClient::new()
-                    .with_model(&agent_dir.config.llm.model)
-                    .with_thinking(agent_dir.config.llm.thinking)
-            )
-        }
-        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
-    };
+    // Get API key using resolved config
+    let api_key = AgentDir::api_key_for_config(&llm_config)?;
+
+    // Create LLM from resolved config
+    let llm: Arc<dyn LLM> = create_llm_from_config(&llm_config, api_key)?;
 
     // Create memory from config
     let memory: Box<dyn Memory> = if let Some(mem_path) = agent_dir.memory_path() {
@@ -498,7 +540,7 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
     let mut agent = runtime.spawn_agent(agent_name.clone()).await;
 
     // Register tools only if enabled in config (default: true)
-    if agent_dir.config.llm.tools {
+    if llm_config.tools {
         agent.register_tool(Arc::new(AddTool));
         agent.register_tool(Arc::new(EchoTool));
         agent.register_tool(Arc::new(ReadFileTool));
@@ -520,6 +562,43 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<Agent, Box<dyn st
     agent = agent.with_observer(observer);
 
     Ok(agent)
+}
+
+/// Create an LLM client from resolved configuration.
+fn create_llm_from_config(
+    config: &ResolvedLlmConfig,
+    api_key: Option<String>,
+) -> Result<Arc<dyn LLM>, Box<dyn std::error::Error>> {
+    let llm: Arc<dyn LLM> = match config.provider.as_str() {
+        "openai" => {
+            let key = api_key.ok_or("OpenAI API key not configured")?;
+            let mut client = OpenAIClient::new(key).with_model(&config.model);
+            if let Some(ref base_url) = config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+        "anthropic" => {
+            let key = api_key.ok_or("Anthropic API key not configured")?;
+            let mut client = AnthropicClient::new(key).with_model(&config.model);
+            if let Some(ref base_url) = config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+        "ollama" => {
+            let mut client = OllamaClient::new()
+                .with_model(&config.model)
+                .with_thinking(config.thinking)
+                .with_num_ctx(config.num_ctx);
+            if let Some(ref base_url) = config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
+    };
+    Ok(llm)
 }
 
 /// Handle a single connection from a client.
@@ -584,37 +663,88 @@ async fn handle_connection(
                     (None, true) => None,
                 };
 
-                let options = ThinkOptions {
-                    system_prompt: persona.clone(),
-                    always_prompt: effective_always,
-                    ..Default::default()
-                };
-
                 let mut agent_guard = agent.lock().await;
-                match agent_guard.think_with_options(content, options).await {
-                    Ok(result) => {
-                        // Extract and store [REMEMBER: ...] tags
-                        let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+                // Tool execution loop - keep going while agent makes tool calls
+                let mut current_message = content.clone();
+                let mut final_response = String::new();
+                let max_tool_calls = 10; // Prevent infinite loops
+                let mut tool_call_count = 0;
+                
+                loop {
+                    let options = ThinkOptions {
+                        system_prompt: persona.clone(),
+                        always_prompt: effective_always.clone(),
+                        ..Default::default()
+                    };
+                    
+                    match agent_guard.think_with_options(&current_message, options).await {
+                        Ok(result) => {
+                            // Extract and store [REMEMBER: ...] tags
+                            let (after_remember, memories_to_save) = extract_remember_tags(&result.response);
 
-                        if !memories_to_save.is_empty() {
-                            if let Some(ref mem_store) = semantic_memory {
-                                let store = mem_store.lock().await;
-                                for memory in &memories_to_save {
-                                    match store.save(memory, 0.9, "explicit") {
-                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                            if !memories_to_save.is_empty() {
+                                if let Some(ref mem_store) = semantic_memory {
+                                    let store = mem_store.lock().await;
+                                    for memory in &memories_to_save {
+                                        match store.save(memory, 0.9, "explicit") {
+                                            Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                            Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
+                                            Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        Response::Message { content: cleaned_response }
-                    }
-                    Err(e) => {
-                        Response::Error { message: e.to_string() }
+                            // Check for tool calls
+                            let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+                            
+                            if let Some(tc) = tool_call {
+                                tool_call_count += 1;
+                                if tool_call_count > max_tool_calls {
+                                    logger.tool("Max tool calls reached, stopping");
+                                    final_response = format!("{}\n\n[Tool limit reached]", cleaned_response);
+                                    break;
+                                }
+                                
+                                logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
+                                
+                                match execute_tool_call(&tc).await {
+                                    Ok(tool_result) => {
+                                        logger.tool(&format!("Result: {} bytes", tool_result.len()));
+                                        // Send result back to agent
+                                        current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                                        // Accumulate non-tool text
+                                        if !cleaned_response.is_empty() {
+                                            if !final_response.is_empty() {
+                                                final_response.push_str("\n");
+                                            }
+                                            final_response.push_str(&cleaned_response);
+                                        }
+                                        // Continue loop
+                                    }
+                                    Err(e) => {
+                                        logger.tool(&format!("Error: {}", e));
+                                        current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                                        // Continue loop so agent can handle error
+                                    }
+                                }
+                            } else {
+                                // No tool call, we're done
+                                if !final_response.is_empty() {
+                                    final_response.push_str("\n");
+                                }
+                                final_response.push_str(&cleaned_response);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            final_response = format!("Error: {}", e);
+                            break;
+                        }
                     }
                 }
+                
+                Response::Message { content: final_response }
             }
 
             Request::IncomingMessage { ref from, ref content } => {

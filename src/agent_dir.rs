@@ -26,23 +26,48 @@ pub enum AgentDirError {
     IncludeNotFound(PathBuf),
     #[error("Include cycle detected: {0}")]
     IncludeCycle(PathBuf),
+    #[error("Model file not found: {0}")]
+    ModelFileNotFound(PathBuf),
+    #[error("Model file missing required field '{field}' in {path}")]
+    ModelFileMissingField { field: String, path: PathBuf },
 }
 
-#[derive(Debug, Deserialize)]
+/// LLM configuration section in agent config.
+/// Can either reference a shared model file via `model_file`, or specify config directly.
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct LlmSection {
-    pub provider: String,
-    pub model: String,
+    /// Reference to a shared model file in ~/.anima/models/{name}.toml
+    pub model_file: Option<String>,
+    /// LLM provider (openai, anthropic, ollama). Required if not using model_file.
+    pub provider: Option<String>,
+    /// Model name. Required if not using model_file.
+    pub model: Option<String>,
+    /// API key (can use ${ENV_VAR} syntax)
     pub api_key: Option<String>,
+    /// Base URL for the API (optional, for custom endpoints)
+    pub base_url: Option<String>,
     /// Enable thinking mode for Ollama models (default: None = false)
     #[serde(default)]
     pub thinking: Option<bool>,
-    /// Enable tool support (default: true). Set to false for models that don't support tools.
-    #[serde(default = "default_tools_enabled")]
-    pub tools: bool,
+    /// Enable tool support. Set to false for models that don't support tools.
+    #[serde(default)]
+    pub tools: Option<bool>,
+    /// Context window size (num_ctx) for Ollama models
+    #[serde(default)]
+    pub num_ctx: Option<u32>,
 }
 
-fn default_tools_enabled() -> bool {
-    true
+/// Resolved LLM configuration after loading model file and applying overrides.
+/// This struct has all required fields guaranteed to be present.
+#[derive(Debug, Clone)]
+pub struct ResolvedLlmConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub thinking: Option<bool>,
+    pub tools: bool,
+    pub num_ctx: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,10 +293,21 @@ impl AgentDir {
         self.config.memory.as_ref().map(|m| self.path.join(&m.path))
     }
 
+    /// Resolve the LLM configuration, loading model file if specified.
+    pub fn resolve_llm_config(&self) -> Result<ResolvedLlmConfig, AgentDirError> {
+        resolve_llm_config(&self.config.llm)
+    }
+
     /// Get the API key, expanding environment variables if needed.
     /// Falls back to provider-specific env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY).
     pub fn api_key(&self) -> Result<Option<String>, AgentDirError> {
-        match &self.config.llm.api_key {
+        let resolved = self.resolve_llm_config()?;
+        Self::api_key_for_config(&resolved)
+    }
+
+    /// Get the API key for a resolved LLM config.
+    pub fn api_key_for_config(config: &ResolvedLlmConfig) -> Result<Option<String>, AgentDirError> {
+        match &config.api_key {
             Some(key) => {
                 // Expand env vars in the key (e.g., "${ANTHROPIC_API_KEY}")
                 let expanded = Self::expand_env_vars(key)?;
@@ -279,7 +315,7 @@ impl AgentDir {
             }
             None => {
                 // Fallback to provider-specific env var
-                let env_var = match self.config.llm.provider.as_str() {
+                let env_var = match config.provider.as_str() {
                     "openai" => "OPENAI_API_KEY",
                     "anthropic" => "ANTHROPIC_API_KEY",
                     "ollama" => return Ok(None), // Ollama doesn't need an API key
@@ -297,6 +333,81 @@ pub fn agents_dir() -> PathBuf {
         .expect("Could not determine home directory")
         .join(".anima")
         .join("agents")
+}
+
+/// Get the models directory path (~/.anima/models/)
+pub fn models_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".anima")
+        .join("models")
+}
+
+/// Load a shared model definition file from ~/.anima/models/{name}.toml
+fn load_model_file(name: &str) -> Result<LlmSection, AgentDirError> {
+    let model_path = models_dir().join(format!("{}.toml", name));
+
+    if !model_path.exists() {
+        return Err(AgentDirError::ModelFileNotFound(model_path));
+    }
+
+    let content = std::fs::read_to_string(&model_path)?;
+    let config: LlmSection = toml::from_str(&content)?;
+    Ok(config)
+}
+
+/// Resolve LLM configuration by loading model file (if specified) and applying overrides.
+/// Returns a ResolvedLlmConfig with all required fields guaranteed.
+pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig, AgentDirError> {
+    // If model_file is specified, load it and merge with overrides
+    let base_config = if let Some(ref model_file) = llm_section.model_file {
+        load_model_file(model_file)?
+    } else {
+        // No model file - use the section directly as base
+        llm_section.clone()
+    };
+
+    // Apply overrides from agent config on top of base (model file or direct config)
+    // For model_file case: agent's llm_section values override model file values
+    // For direct config case: just use the values directly
+    let provider = llm_section.provider.clone()
+        .or(base_config.provider.clone())
+        .ok_or_else(|| AgentDirError::ModelFileMissingField {
+            field: "provider".to_string(),
+            path: llm_section.model_file.as_ref()
+                .map(|n| models_dir().join(format!("{}.toml", n)))
+                .unwrap_or_default(),
+        })?;
+
+    let model = llm_section.model.clone()
+        .or(base_config.model.clone())
+        .ok_or_else(|| AgentDirError::ModelFileMissingField {
+            field: "model".to_string(),
+            path: llm_section.model_file.as_ref()
+                .map(|n| models_dir().join(format!("{}.toml", n)))
+                .unwrap_or_default(),
+        })?;
+
+    // For optional fields, agent config overrides model file
+    let api_key = llm_section.api_key.clone().or(base_config.api_key.clone());
+    let base_url = llm_section.base_url.clone().or(base_config.base_url.clone());
+    let thinking = llm_section.thinking.or(base_config.thinking);
+    let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
+
+    // tools: agent override takes precedence, then model file, then default true
+    let tools = llm_section.tools
+        .or(base_config.tools)
+        .unwrap_or(true);
+
+    Ok(ResolvedLlmConfig {
+        provider,
+        model,
+        api_key,
+        base_url,
+        thinking,
+        tools,
+        num_ctx,
+    })
 }
 
 /// Scaffold a new agent directory with config.toml, persona.md, and always.md templates.
@@ -448,8 +559,8 @@ message = "heartbeat"
             agent_dir.config.agent.persona_file,
             Some(PathBuf::from("persona.md"))
         );
-        assert_eq!(agent_dir.config.llm.provider, "openai");
-        assert_eq!(agent_dir.config.llm.model, "gpt-4");
+        assert_eq!(agent_dir.config.llm.provider, Some("openai".to_string()));
+        assert_eq!(agent_dir.config.llm.model, Some("gpt-4".to_string()));
         assert_eq!(agent_dir.config.llm.api_key, Some("sk-test".to_string()));
         assert_eq!(
             agent_dir.config.memory.as_ref().unwrap().path,
@@ -1129,6 +1240,352 @@ model = "gpt-4"
 
         // Includes should be expanded in global always.md
         assert_eq!(always, Some("Global: Be kind.".to_string()));
+    }
+
+    // =========================================================================
+    // Shared model definitions tests
+    // =========================================================================
+
+    /// Test: Agent with model_file loads configuration from shared model file
+    #[test]
+    #[serial]
+    fn test_model_file_loading() {
+        // Create fake home directory with a model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("test-model.toml"),
+            r#"
+provider = "ollama"
+model = "gemma3:27b"
+num_ctx = 32768
+tools = false
+thinking = true
+"#,
+        )
+        .unwrap();
+
+        // Create agent directory with model_file reference
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "test-model"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.model, "gemma3:27b");
+        assert_eq!(resolved.num_ctx, Some(32768));
+        assert_eq!(resolved.tools, false);
+        assert_eq!(resolved.thinking, Some(true));
+    }
+
+    /// Test: Agent overrides are applied on top of model file
+    #[test]
+    #[serial]
+    fn test_model_file_with_overrides() {
+        // Create fake home directory with a model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("base-model.toml"),
+            r#"
+provider = "ollama"
+model = "gemma3:27b"
+num_ctx = 32768
+tools = false
+thinking = false
+"#,
+        )
+        .unwrap();
+
+        // Create agent directory with model_file reference AND overrides
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "base-model"
+num_ctx = 65536
+thinking = true
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Base values from model file
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.model, "gemma3:27b");
+        assert_eq!(resolved.tools, false);
+
+        // Overridden values from agent config
+        assert_eq!(resolved.num_ctx, Some(65536));
+        assert_eq!(resolved.thinking, Some(true));
+    }
+
+    /// Test: Legacy config without model_file still works
+    #[test]
+    fn test_legacy_direct_config() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key = "sk-test"
+tools = true
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        assert_eq!(resolved.provider, "anthropic");
+        assert_eq!(resolved.model, "claude-sonnet-4-20250514");
+        assert_eq!(resolved.api_key, Some("sk-test".to_string()));
+        assert_eq!(resolved.tools, true);
+    }
+
+    /// Test: Missing model file returns clear error
+    #[test]
+    #[serial]
+    fn test_model_file_not_found() {
+        // Create fake home directory WITHOUT the model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        // NO test-model.toml file
+
+        // Create agent directory with model_file reference
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "nonexistent-model"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let result = agent_dir.resolve_llm_config();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(matches!(result, Err(AgentDirError::ModelFileNotFound(_))));
+    }
+
+    /// Test: Model file with missing required field returns clear error
+    #[test]
+    #[serial]
+    fn test_model_file_missing_provider() {
+        // Create fake home directory with incomplete model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("incomplete.toml"),
+            r#"
+model = "gemma3:27b"
+"#,
+        )
+        .unwrap();
+
+        // Create agent directory with model_file reference
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "incomplete"
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let result = agent_dir.resolve_llm_config();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert!(matches!(result, Err(AgentDirError::ModelFileMissingField { .. })));
+    }
+
+    /// Test: Partial overrides - only specified fields are overridden
+    #[test]
+    #[serial]
+    fn test_partial_overrides() {
+        // Create fake home directory with a model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("full-model.toml"),
+            r#"
+provider = "ollama"
+model = "gemma3:27b"
+num_ctx = 32768
+tools = false
+thinking = true
+base_url = "http://localhost:11434"
+"#,
+        )
+        .unwrap();
+
+        // Create agent directory with only num_ctx override
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "full-model"
+num_ctx = 65536
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // All fields from model file except num_ctx
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.model, "gemma3:27b");
+        assert_eq!(resolved.tools, false);
+        assert_eq!(resolved.thinking, Some(true));
+        assert_eq!(resolved.base_url, Some("http://localhost:11434".to_string()));
+
+        // Only this field was overridden
+        assert_eq!(resolved.num_ctx, Some(65536));
+    }
+
+    /// Test: tools defaults to true when not specified
+    #[test]
+    fn test_tools_default_true() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        assert_eq!(resolved.tools, true);
+    }
+
+    /// Test: Agent can override model to different provider
+    #[test]
+    #[serial]
+    fn test_override_provider_and_model() {
+        // Create fake home directory with an ollama model file
+        let fake_home = tempdir().unwrap();
+        let models_dir = fake_home.path().join(".anima").join("models");
+        fs::create_dir_all(&models_dir).unwrap();
+        fs::write(
+            models_dir.join("ollama-base.toml"),
+            r#"
+provider = "ollama"
+model = "gemma3:27b"
+tools = false
+"#,
+        )
+        .unwrap();
+
+        // Create agent directory that overrides both provider and model
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+model_file = "ollama-base"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key = "sk-test"
+tools = true
+"#;
+        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+
+        // Override HOME temporarily
+        let original_home = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home.path()) };
+
+        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+        let resolved = agent_dir.resolve_llm_config().unwrap();
+
+        // Restore HOME
+        match original_home {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        // Everything is overridden
+        assert_eq!(resolved.provider, "anthropic");
+        assert_eq!(resolved.model, "claude-sonnet-4-20250514");
+        assert_eq!(resolved.api_key, Some("sk-test".to_string()));
+        assert_eq!(resolved.tools, true);
     }
 
     // =========================================================================

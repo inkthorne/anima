@@ -402,26 +402,41 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
     let always = agent_dir.load_always()
         .map_err(|e| format!("Failed to load always: {}", e))?;
 
-    // Get API key
-    let api_key = agent_dir.api_key()
+    // Resolve LLM config (loads model file if specified, applies overrides)
+    let llm_config = agent_dir.resolve_llm_config()
+        .map_err(|e| format!("Failed to resolve LLM config: {}", e))?;
+
+    // Get API key using resolved config
+    let api_key = AgentDir::api_key_for_config(&llm_config)
         .map_err(|e| format!("Failed to get API key: {}", e))?;
 
-    // Create LLM from config
-    let llm: Arc<dyn LLM> = match agent_dir.config.llm.provider.as_str() {
+    // Create LLM from resolved config
+    let llm: Arc<dyn LLM> = match llm_config.provider.as_str() {
         "openai" => {
             let key = api_key.ok_or("OpenAI API key not configured")?;
-            Arc::new(OpenAIClient::new(key).with_model(&agent_dir.config.llm.model))
+            let mut client = OpenAIClient::new(key).with_model(&llm_config.model);
+            if let Some(ref base_url) = llm_config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
         }
         "anthropic" => {
             let key = api_key.ok_or("Anthropic API key not configured")?;
-            Arc::new(AnthropicClient::new(key).with_model(&agent_dir.config.llm.model))
+            let mut client = AnthropicClient::new(key).with_model(&llm_config.model);
+            if let Some(ref base_url) = llm_config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
         }
         "ollama" => {
-            Arc::new(
-                OllamaClient::new()
-                    .with_model(&agent_dir.config.llm.model)
-                    .with_thinking(agent_dir.config.llm.thinking)
-            )
+            let mut client = OllamaClient::new()
+                .with_model(&llm_config.model)
+                .with_thinking(llm_config.thinking)
+                .with_num_ctx(llm_config.num_ctx);
+            if let Some(ref base_url) = llm_config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
         }
         other => return Err(format!("Unsupported LLM provider: {}", other).into()),
     };
@@ -674,9 +689,10 @@ fn list_agents() {
         // Try to load config to get more info
         let info = match AgentDir::load(entry.path()) {
             Ok(agent_dir) => {
-                let provider = &agent_dir.config.llm.provider;
-                let model = &agent_dir.config.llm.model;
-                format!(" ({}/{})", provider, model)
+                match agent_dir.resolve_llm_config() {
+                    Ok(resolved) => format!(" ({}/{})", resolved.provider, resolved.model),
+                    Err(_) => " (config error)".to_string(),
+                }
             }
             Err(_) => " (config error)".to_string(),
         };
