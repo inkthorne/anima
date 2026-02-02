@@ -11,33 +11,39 @@ Currently, agents can only talk to each other via the REPL:
 
 ---
 
-## Key Design Questions
+## Decisions Made ✅
 
-### 1. Conversation as entity
-- Should conversations be first-class? (ID, participants, history)
-- Can agents be in multiple conversations simultaneously?
-- 1:1 vs group conversations — same mechanism or different?
-
-### 2. Context delivery
-- **Push** (current): Sender includes full context in message
-- **Pull**: Recipient fetches from shared store
-- Pull is cleaner — recipient controls their context window
-
-### 3. @mention semantics
-- Does @gendry mean "include gendry" or "message IS FOR gendry"?
-- What context does the mentioned agent receive?
-- Last N messages? Summary? Full history?
+| # | Decision | Choice | Rationale |
+|---|----------|--------|-----------|
+| 1 | Context delivery | **Pull** | Recipients control their context window; scales better for groups |
+| 2 | Conversation model | **Hybrid** | First-class in data model, implicit UX for 1:1s, explicit for groups |
+| 3 | @mention semantics | **Notification** | @mention pings specific agents; all participants see message in history |
+| 4 | Concurrent responses | **Parallel** | Multiple mentioned agents notified simultaneously; responses arrive in any order |
+| 5 | User as participant | **Equal** | "user" is just another participant, no special treatment; multi-human possible |
+| 6 | Notification mechanism | **Hybrid** | Socket ping for running daemons; DB queue for stopped agents |
+| 7 | Conversation storage | **SQLite** | `~/.anima/conversations.db` — simple, queryable, persistent |
 
 ---
 
-## Proposed Architecture: Conversation Store
+## Still Open
+
+| # | Question | Options |
+|---|----------|---------|
+| 1 | Conversation cleanup | Never delete vs auto-archive vs manual only |
+| 2 | Shared memories | Can agents share semantic memories in group convos? |
+| 3 | Message ordering | Timestamps sufficient? Or need vector clocks? |
+| 4 | Context window config | Per-agent `conversation_context_messages` setting |
+
+---
+
+## Architecture: Conversation Store
 
 ```
 ┌─────────────────────────────────┐
 │  ~/.anima/conversations.db      │
 │  ┌─────────────────────────┐   │
 │  │ conversations           │   │
-│  │ - id, created, name     │   │
+│  │ - id, name, created_at  │   │
 │  ├─────────────────────────┤   │
 │  │ participants            │   │
 │  │ - conv_id, agent        │   │
@@ -49,40 +55,18 @@ Currently, agents can only talk to each other via the REPL:
 └─────────────────────────────────┘
          ▲    ▲    ▲
          │    │    │
-      [Arya][Gendry][CLI/User]
+      [Arya][Gendry][User]
 ```
 
 ---
 
 ## Message Flow
 
-1. **User sends message:**
-   ```bash
-   anima chat --conv work-project "hey @arya @gendry thoughts on streaming?"
-   ```
-
-2. **Message stored:**
-   ```json
-   {
-     "conv_id": "work-project",
-     "from": "user",
-     "content": "hey @arya @gendry thoughts on streaming?",
-     "mentions": ["arya", "gendry"],
-     "timestamp": 1706...
-   }
-   ```
-
-3. **Mentioned agents notified** (via socket or polling)
-
-4. **Agent wakes, fetches context:**
-   - Query: last N messages from conv_id where I'm participant
-   - Each agent controls their own context window
-   - Build prompt with conversation history
-
-5. **Agent responds:**
-   - Response stored in same conversation
-   - Other participants can see it
-   - If @mentions someone, they get notified
+1. **User sends:** `anima chat --conv project-x "hey @arya @gendry thoughts?"`
+2. **Stored in DB** with mentions extracted
+3. **Notifications sent:** Socket ping to running agents, queued for stopped
+4. **Agents fetch context:** Each pulls last N messages (per their config)
+5. **Agents respond:** Responses stored, other participants can see
 
 ---
 
@@ -90,103 +74,22 @@ Currently, agents can only talk to each other via the REPL:
 
 ```bash
 # Conversations
-anima conv new "project-x" --with arya,gendry   # Create group conv
-anima conv list                                  # List my conversations
-anima conv join <conv-id>                        # Join existing
+anima conv new "project-x" --with arya,gendry   # Create group
+anima conv list                                  # List conversations
+anima conv archive <id>                          # Archive (manual cleanup)
 
 # Messaging  
-anima chat arya                     # 1:1 (implicit conv)
-anima chat arya gendry              # Group (implicit conv)
+anima chat arya                     # 1:1 (implicit conv, auto-created)
+anima chat arya gendry              # Group (implicit)
 anima chat --conv project-x         # Explicit conv
 
-# Or keep `send` for one-shot
-anima send arya "quick question"    # Creates ephemeral 1:1
+# One-shot
+anima send arya "quick question"    # Ephemeral 1:1
 ```
 
 ---
 
-## Key Decisions
-
-| Decision | Recommendation | Why |
-|----------|----------------|-----|
-| Context delivery | **Pull** | Recipients control their window |
-| Conversation storage | **SQLite** | Simple, queryable, persistent |
-| Notification | **Socket ping** | Daemons already have sockets |
-| Offline agents | **Queue in DB** | Fetch on next wake |
-| Context window | **Per-agent config** | 32k model needs less than 128k |
-
----
-
-## What Changes
-
-| Component | Change |
-|-----------|--------|
-| `daemon.rs` | Check for pending messages on wake, subscribe to notifications |
-| `socket_api.rs` | Add `Request::Notify { conv_id, from }` for pings |
-| New: `conversation.rs` | Conversation store (SQLite), query helpers |
-| `main.rs` | New `conv` subcommand, update `chat` for groups |
-| Agent config | Add `conversation_context_messages: 20` |
-
----
-
-## Open Questions
-
-1. **Real-time vs polling?** Socket notification is cleaner but more complex
-2. **Conversation cleanup?** Auto-archive after N days? Manual delete?
-3. **Private vs shared memories?** Can agents share semantic memories in group convos?
-4. **User as participant?** Is "user" just another agent, or special?
-5. **Message ordering?** Timestamps enough? Vector clocks for true ordering?
-6. **Concurrent responses?** If both @arya and @gendry are mentioned, who responds first? Both in parallel?
-
----
-
-## Alternatives Considered
-
-### A. Message Bus / Pub-Sub
-- Central bus routes messages
-- Agents subscribe to channels/topics
-- Pro: Clean separation, scalable
-- Con: Another moving part, single point of failure
-
-### B. Direct Socket-to-Socket
-- Agents discover each other via pid files/sockets
-- Direct connections for messaging
-- Pro: Simple, no central component
-- Con: N² connections, context sync is hard
-
-### C. Conversation Server (Recommended)
-- Conversations stored centrally (SQLite)
-- Agents fetch/push to conversation store
-- Pro: Persistent, queryable, clean
-- Con: Another component (but minimal)
-
----
-
-## Implementation Phases
-
-### Phase 1: Conversation Store
-- Create `conversation.rs` with SQLite schema
-- Basic CRUD: create conv, add message, fetch messages
-- CLI: `anima conv new`, `anima conv list`
-
-### Phase 2: CLI Integration
-- Update `anima chat` to use conversation store
-- Support `--conv` flag for explicit conversations
-- Implicit 1:1 conversations for `anima chat <agent>`
-
-### Phase 3: Daemon Notifications
-- Add `Request::Notify` to socket API
-- Daemons listen for notifications
-- On notification, fetch context and respond
-
-### Phase 4: Group Conversations
-- Multiple participants
-- @mention routing within groups
-- Concurrent response handling
-
----
-
-## Schema Draft
+## Schema
 
 ```sql
 CREATE TABLE conversations (
@@ -214,5 +117,53 @@ CREATE TABLE messages (
     FOREIGN KEY (conv_id) REFERENCES conversations(id)
 );
 
+-- For pending notifications (offline agents)
+CREATE TABLE pending_notifications (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent TEXT NOT NULL,
+    conv_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (conv_id) REFERENCES conversations(id),
+    FOREIGN KEY (message_id) REFERENCES messages(id)
+);
+
 CREATE INDEX idx_messages_conv ON messages(conv_id, created_at);
+CREATE INDEX idx_pending_agent ON pending_notifications(agent);
 ```
+
+---
+
+## Implementation Phases
+
+### Phase 1: Conversation Store
+- New `conversation.rs` module
+- SQLite schema + CRUD operations
+- CLI: `anima conv new`, `anima conv list`
+
+### Phase 2: CLI Integration  
+- Update `anima chat` to use store
+- Implicit 1:1 conversations
+- `--conv` flag for explicit
+
+### Phase 3: Daemon Notifications
+- `Request::Notify { conv_id, from }` in socket API
+- Daemon checks pending on wake
+- Real-time ping for running agents
+
+### Phase 4: Group Conversations
+- Multiple participants
+- @mention routing
+- Parallel response handling
+
+---
+
+## What Changes
+
+| Component | Change |
+|-----------|--------|
+| New: `conversation.rs` | Conversation store (SQLite), query helpers |
+| `socket_api.rs` | Add `Request::Notify` |
+| `daemon.rs` | Check pending on wake, handle notifications |
+| `main.rs` | New `conv` subcommand, update `chat` |
+| Agent config | Add `conversation_context_messages` |
