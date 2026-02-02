@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | v2.7.12 |
-| **Tests** | 320 passing |
+| **Version** | v2.8.0 |
+| **Tests** | 378 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -92,4 +92,4 @@ anima restart <name>  # After changes
 
 ## Last Updated
 
-2026-02-01 — v2.7.12: Hybrid tool calling (keyword recall + native tools), model-specific always text, HTTP tool, Qwen3-Coder support with 256k context.
+2026-02-02 — v2.8.0: Embedding-based semantic memory (Ollama), safe_shell tool with command allowlist, OLLAMA_HOST env var support. Memory now uses cosine similarity for recall instead of keyword matching.
