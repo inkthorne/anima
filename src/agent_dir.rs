@@ -57,6 +57,46 @@ pub struct TimerSection {
     pub message: Option<String>,
 }
 
+fn default_recall_limit() -> usize {
+    5
+}
+
+fn default_min_importance() -> f64 {
+    0.1
+}
+
+fn default_semantic_memory_path() -> String {
+    "memory.db".to_string()
+}
+
+/// Configuration for the semantic memory system.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticMemorySection {
+    /// Enable semantic memory (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the memory database (relative to agent directory)
+    #[serde(default = "default_semantic_memory_path")]
+    pub path: String,
+    /// Maximum number of memories to inject per turn
+    #[serde(default = "default_recall_limit")]
+    pub recall_limit: usize,
+    /// Minimum importance score to include (0.0-1.0)
+    #[serde(default = "default_min_importance")]
+    pub min_importance: f64,
+}
+
+impl Default for SemanticMemorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_semantic_memory_path(),
+            recall_limit: default_recall_limit(),
+            min_importance: default_min_importance(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentSection {
     pub name: String,
@@ -70,6 +110,8 @@ pub struct AgentDirConfig {
     pub llm: LlmSection,
     pub memory: Option<MemorySection>,
     pub timer: Option<TimerSection>,
+    #[serde(default)]
+    pub semantic_memory: SemanticMemorySection,
 }
 
 #[derive(Debug)]

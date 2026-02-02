@@ -21,7 +21,7 @@ pub mod tools;
 // Re-export main types for convenience
 pub use agent::{Agent, ThinkOptions, ThinkResult, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
 pub use error::{AgentError, ToolError, ErrorContext};
-pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory};
+pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory, SemanticMemoryStore, SemanticMemoryEntry, extract_remember_tags, build_memory_injection, format_age};
 pub use message::Message;
 pub use messaging::{AgentMessage, AgentMailbox, MessageRouter, MessagingError};
 pub use observe::{Observer, Event, ConsoleObserver, MetricsCollector, MetricsSnapshot, MultiObserver};

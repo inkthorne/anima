@@ -3,18 +3,63 @@
 //! This module provides the infrastructure for running agents as background daemons,
 //! with Unix socket API for communication and timer trigger support.
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Local;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
+/// Agent-specific logger that writes to {agent_dir}/agent.log
+pub struct AgentLogger {
+    file: std::sync::Mutex<File>,
+    agent_name: String,
+}
+
+impl AgentLogger {
+    /// Create a new logger for the agent, writing to agent_dir/agent.log
+    pub fn new(agent_dir: &Path, agent_name: &str) -> std::io::Result<Self> {
+        let log_path = agent_dir.join("agent.log");
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+            agent_name: agent_name.to_string(),
+        })
+    }
+    
+    /// Log a message with timestamp
+    pub fn log(&self, msg: &str) {
+        let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        let line = format!("[{}] [{}] {}\n", timestamp, self.agent_name, msg);
+        
+        // Write to file
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+        
+        // Also print to stdout for interactive use
+        print!("{}", line);
+    }
+    
+    /// Log a memory-related event
+    pub fn memory(&self, msg: &str) {
+        self.log(&format!("[memory] {}", msg));
+    }
+}
+
 use crate::agent::{Agent, ThinkOptions};
-use crate::agent_dir::{AgentDir, AgentDirError};
+use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection};
 use crate::discovery;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient};
-use crate::memory::{Memory, SqliteMemory, InMemoryStore};
+use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
@@ -39,6 +84,8 @@ pub struct DaemonConfig {
     pub persona: Option<String>,
     /// Always content (injected before user messages for recency bias)
     pub always: Option<String>,
+    /// Semantic memory configuration
+    pub semantic_memory: SemanticMemorySection,
 }
 
 /// Timer configuration for periodic triggers.
@@ -86,6 +133,7 @@ impl DaemonConfig {
             timer,
             persona,
             always,
+            semantic_memory: agent_dir.config.semantic_memory.clone(),
         })
     }
 }
@@ -202,20 +250,33 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create PID file
     let _pid_file = PidFile::create(&config.pid_path)?;
 
-    println!("Starting daemon for agent '{}'", config.name);
-    println!("  PID file: {}", config.pid_path.display());
-    println!("  Socket: {}", config.socket_path.display());
+    // Create agent-specific logger
+    let logger = Arc::new(AgentLogger::new(&config.agent_dir, &config.name)?);
+    
+    logger.log(&format!("Starting daemon for agent '{}'", config.name));
+    logger.log(&format!("  PID file: {}", config.pid_path.display()));
+    logger.log(&format!("  Socket: {}", config.socket_path.display()));
     if let Some(ref timer) = config.timer {
-        println!("  Timer: every {:?}, message: \"{}\"", timer.interval, timer.message);
+        logger.log(&format!("  Timer: every {:?}, message: \"{}\"", timer.interval, timer.message));
     }
 
     // Create the agent
     let agent = create_agent_from_dir(&agent_dir).await?;
     let agent = Arc::new(Mutex::new(agent));
 
+    // Create semantic memory store if enabled
+    let semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>> = if config.semantic_memory.enabled {
+        let mem_path = config.agent_dir.join(&config.semantic_memory.path);
+        let store = SemanticMemoryStore::open(&mem_path, &config.name)?;
+        logger.log(&format!("  Semantic memory: {}", mem_path.display()));
+        Some(Arc::new(Mutex::new(store)))
+    } else {
+        None
+    };
+
     // Create Unix socket listener
     let listener = UnixListener::bind(&config.socket_path)?;
-    println!("Listening on {}", config.socket_path.display());
+    logger.log(&format!("Listening on {}", config.socket_path.display()));
 
     // Set up signal handling for graceful shutdown
     let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -250,6 +311,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let always = config.always.clone();
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
+        let semantic_memory = semantic_memory_store.clone();
+        let timer_logger = logger.clone();
 
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(timer_config.interval);
@@ -259,24 +322,67 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        println!("[timer] Firing timer trigger...");
+                        timer_logger.log("[timer] Firing timer trigger...");
+
+                        // Inject relevant memories if enabled
+                        let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                            let store = mem_store.lock().await;
+                            match store.recall(&timer_config.message, 5) {
+                                Ok(memories) => {
+                                    if !memories.is_empty() {
+                                        timer_logger.memory(&format!("Recall: {} memories for timer", memories.len()));
+                                        for m in &memories {
+                                            timer_logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                        }
+                                    }
+                                    build_memory_injection(&memories)
+                                }
+                                Err(e) => {
+                                    timer_logger.log(&format!("[timer] Memory recall error: {}", e));
+                                    String::new()
+                                }
+                            }
+                        } else {
+                            String::new()
+                        };
+
+                        // Combine memory injection with always prompt
+                        let effective_always = match (&always, memory_injection.is_empty()) {
+                            (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
+                            (Some(a), true) => Some(a.clone()),
+                            (None, false) => Some(memory_injection),
+                            (None, true) => None,
+                        };
 
                         let mut agent_guard = agent_clone.lock().await;
 
                         let options = ThinkOptions {
                             system_prompt: persona.clone(),
-                            always_prompt: always.clone(),
-                            // conversation_history is managed internally by the agent
+                            always_prompt: effective_always,
                             ..Default::default()
                         };
 
                         match agent_guard.think_with_options(&timer_config.message, options).await {
                             Ok(result) => {
-                                println!("[timer] Response: {}", result.response);
-                                // History is now managed internally by the agent
+                                // Extract and store [REMEMBER: ...] tags
+                                let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+
+                                if !memories_to_save.is_empty() {
+                                    if let Some(ref mem_store) = semantic_memory {
+                                        let store = mem_store.lock().await;
+                                        for memory in &memories_to_save {
+                                            match store.save(memory, 0.9, "explicit") {
+                                                Ok(id) => timer_logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                                Err(e) => timer_logger.log(&format!("[timer] Failed to save memory: {}", e)),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                timer_logger.log(&format!("[timer] Response: {}", cleaned_response));
                             }
                             Err(e) => {
-                                eprintln!("[timer] Error: {}", e);
+                                timer_logger.log(&format!("[timer] Error: {}", e));
                             }
                         }
                     }
@@ -300,6 +406,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let persona = config.persona.clone();
                         let always = config.always.clone();
                         let shutdown_clone = shutdown.clone();
+                        let semantic_memory = semantic_memory_store.clone();
+                        let conn_logger = logger.clone();
 
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
@@ -308,7 +416,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 agent_clone,
                                 persona,
                                 always,
+                                semantic_memory,
                                 shutdown_clone,
+                                conn_logger,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -320,7 +430,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             _ = shutdown.notified() => {
-                println!("Shutting down daemon...");
+                logger.log("Shutting down daemon...");
                 break;
             }
         }
@@ -415,7 +525,9 @@ async fn handle_connection(
     agent: Arc<Mutex<Agent>>,
     persona: Option<String>,
     always: Option<String>,
+    semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     shutdown: Arc<tokio::sync::Notify>,
+    logger: Arc<AgentLogger>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -437,20 +549,63 @@ async fn handle_connection(
 
         let response = match request {
             Request::Message { ref content } => {
-                println!("[socket] Received message: {}", content);
+                logger.log(&format!("[socket] Received message: {}", content));
+
+                // Inject relevant memories if enabled
+                let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                    let store = mem_store.lock().await;
+                    match store.recall(content, 5) {
+                        Ok(memories) => {
+                            if !memories.is_empty() {
+                                logger.memory(&format!("Recall: {} memories for query", memories.len()));
+                                for m in &memories {
+                                    logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                }
+                            }
+                            build_memory_injection(&memories)
+                        }
+                        Err(e) => {
+                            logger.log(&format!("[socket] Memory recall error: {}", e));
+                            String::new()
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Combine memory injection with always prompt
+                let effective_always = match (&always, memory_injection.is_empty()) {
+                    (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
+                    (Some(a), true) => Some(a.clone()),
+                    (None, false) => Some(memory_injection),
+                    (None, true) => None,
+                };
 
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
-                    always_prompt: always.clone(),
-                    // conversation_history is managed internally by the agent
+                    always_prompt: effective_always,
                     ..Default::default()
                 };
 
                 let mut agent_guard = agent.lock().await;
-                match agent_guard.think_with_options(&content, options).await {
+                match agent_guard.think_with_options(content, options).await {
                     Ok(result) => {
-                        // History is now managed internally by the agent
-                        Response::Message { content: result.response }
+                        // Extract and store [REMEMBER: ...] tags
+                        let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+
+                        if !memories_to_save.is_empty() {
+                            if let Some(ref mem_store) = semantic_memory {
+                                let store = mem_store.lock().await;
+                                for memory in &memories_to_save {
+                                    match store.save(memory, 0.9, "explicit") {
+                                        Ok(id) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                                    }
+                                }
+                            }
+                        }
+
+                        Response::Message { content: cleaned_response }
                     }
                     Err(e) => {
                         Response::Error { message: e.to_string() }
@@ -459,22 +614,67 @@ async fn handle_connection(
             }
 
             Request::IncomingMessage { ref from, ref content } => {
-                println!("[socket] Incoming message from {}: {}", from, content);
+                logger.log(&format!("[socket] Incoming message from {}: {}", from, content));
 
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
 
+                // Inject relevant memories if enabled
+                let memory_injection = if let Some(ref mem_store) = semantic_memory {
+                    let store = mem_store.lock().await;
+                    match store.recall(content, 5) {
+                        Ok(memories) => {
+                            if !memories.is_empty() {
+                                logger.memory(&format!("Recall: {} memories for incoming", memories.len()));
+                                for m in &memories {
+                                    logger.memory(&format!("  #{}: \"{}\"", m.id, m.content));
+                                }
+                            }
+                            build_memory_injection(&memories)
+                        }
+                        Err(e) => {
+                            logger.log(&format!("[socket] Memory recall error: {}", e));
+                            String::new()
+                        }
+                    }
+                } else {
+                    String::new()
+                };
+
+                // Combine memory injection with always prompt
+                let effective_always = match (&always, memory_injection.is_empty()) {
+                    (Some(a), false) => Some(format!("{}\n{}", memory_injection, a)),
+                    (Some(a), true) => Some(a.clone()),
+                    (None, false) => Some(memory_injection),
+                    (None, true) => None,
+                };
+
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
-                    always_prompt: always.clone(),
+                    always_prompt: effective_always,
                     ..Default::default()
                 };
 
                 let mut agent_guard = agent.lock().await;
                 match agent_guard.think_with_options(&formatted_message, options).await {
                     Ok(result) => {
-                        println!("[socket] Response to {}: {}", from, result.response);
-                        Response::Message { content: result.response }
+                        // Extract and store [REMEMBER: ...] tags
+                        let (cleaned_response, memories_to_save) = extract_remember_tags(&result.response);
+
+                        if !memories_to_save.is_empty() {
+                            if let Some(ref mem_store) = semantic_memory {
+                                let store = mem_store.lock().await;
+                                for memory in &memories_to_save {
+                                    match store.save(memory, 0.9, "explicit") {
+                                        Ok(id) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
+                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
+                                    }
+                                }
+                            }
+                        }
+
+                        logger.log(&format!("[socket] Response to {}: {}", from, cleaned_response));
+                        Response::Message { content: cleaned_response }
                     }
                     Err(e) => {
                         Response::Error { message: e.to_string() }

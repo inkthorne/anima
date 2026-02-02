@@ -28,6 +28,14 @@ fn default_exponential_base() -> f64 {
     2.0
 }
 
+fn default_recall_limit() -> usize {
+    5
+}
+
+fn default_min_importance() -> f64 {
+    0.1
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentConfig {
     pub agent: AgentSection,
@@ -37,11 +45,15 @@ pub struct AgentConfig {
     #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
+    pub semantic_memory: SemanticMemorySection,
+    #[serde(default)]
     pub think: ThinkSection,
     #[serde(default)]
     pub retry: RetrySection,
     #[serde(default)]
     pub observe: ObserveSection,
+    #[serde(default)]
+    pub timer: Option<TimerSection>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,6 +101,52 @@ impl Default for MemorySection {
             path: None,
         }
     }
+}
+
+/// Configuration for the semantic memory system.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SemanticMemorySection {
+    /// Enable semantic memory (default: false)
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the memory database (relative to agent directory)
+    #[serde(default = "default_semantic_memory_path")]
+    pub path: String,
+    /// Maximum number of memories to inject per turn
+    #[serde(default = "default_recall_limit")]
+    pub recall_limit: usize,
+    /// Minimum importance score to include (0.0-1.0)
+    #[serde(default = "default_min_importance")]
+    pub min_importance: f64,
+}
+
+fn default_semantic_memory_path() -> String {
+    "memory.db".to_string()
+}
+
+impl Default for SemanticMemorySection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_semantic_memory_path(),
+            recall_limit: default_recall_limit(),
+            min_importance: default_min_importance(),
+        }
+    }
+}
+
+/// Configuration for timer-based triggers.
+#[derive(Debug, Deserialize)]
+pub struct TimerSection {
+    /// Enable timer triggers
+    #[serde(default)]
+    pub enabled: bool,
+    /// Timer interval (e.g., "5m", "1h")
+    #[serde(default)]
+    pub interval: String,
+    /// Message to send on timer trigger
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +260,11 @@ model = "gpt-4o"
         assert!(!config.observe.verbose);
         // LLM tools default to enabled
         assert!(config.llm.tools);
+        // Semantic memory defaults
+        assert!(!config.semantic_memory.enabled);
+        assert_eq!(config.semantic_memory.path, "memory.db");
+        assert_eq!(config.semantic_memory.recall_limit, 5);
+        assert!((config.semantic_memory.min_importance - 0.1).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -275,5 +338,51 @@ tools = false
         assert_eq!(config.llm.provider, "ollama");
         assert_eq!(config.llm.model, "gemma3:27b");
         assert!(!config.llm.tools);
+    }
+
+    #[test]
+    fn test_parse_semantic_memory_config() {
+        let toml = r#"
+[agent]
+name = "memory-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4o"
+
+[semantic_memory]
+enabled = true
+path = "semantic.db"
+recall_limit = 10
+min_importance = 0.2
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(config.semantic_memory.enabled);
+        assert_eq!(config.semantic_memory.path, "semantic.db");
+        assert_eq!(config.semantic_memory.recall_limit, 10);
+        assert!((config.semantic_memory.min_importance - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_parse_timer_config() {
+        let toml = r#"
+[agent]
+name = "timer-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4o"
+
+[timer]
+enabled = true
+interval = "5m"
+message = "heartbeat"
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(config.timer.is_some());
+        let timer = config.timer.unwrap();
+        assert!(timer.enabled);
+        assert_eq!(timer.interval, "5m");
+        assert_eq!(timer.message, Some("heartbeat".to_string()));
     }
 }
