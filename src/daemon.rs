@@ -1136,11 +1136,68 @@ async fn handle_connection(
                             agent_guard.think_streaming_with_options(&current_message_clone, options, token_tx).await
                         });
 
-                        // Forward tokens to socket as they arrive
+                        // Forward tokens to socket as they arrive, but suppress tool call blocks
+                        // Tool blocks look like: ```json\n{"tool": "...", "params": {...}}\n```
+                        let mut in_code_block = false;
+                        let mut code_block_buffer = String::new();
+
                         while let Some(token) = token_rx.recv().await {
-                            if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
-                                logger.log(&format!("[socket] Error writing chunk: {}", e));
-                                break;
+                            if !in_code_block {
+                                // Check if this token starts or contains a code block
+                                if token.contains("```") {
+                                    in_code_block = true;
+                                    code_block_buffer = token;
+                                    // Check if the code block is already complete in this token
+                                    if code_block_buffer.matches("```").count() >= 2 {
+                                        // Complete block in single token - check if it's a tool call
+                                        if code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"") {
+                                            // Tool call - suppress
+                                        } else {
+                                            // Not a tool call - send it
+                                            if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer.clone() }).await {
+                                                logger.log(&format!("[socket] Error writing chunk: {}", e));
+                                                break;
+                                            }
+                                        }
+                                        in_code_block = false;
+                                        code_block_buffer.clear();
+                                    }
+                                    continue;
+                                }
+                                // Normal token - send it
+                                if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
+                                    logger.log(&format!("[socket] Error writing chunk: {}", e));
+                                    break;
+                                }
+                            } else {
+                                // Inside code block - buffer
+                                code_block_buffer.push_str(&token);
+
+                                // Check if code block ended
+                                if code_block_buffer.matches("```").count() >= 2 {
+                                    // Code block complete - check if it's a tool call
+                                    if code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"") {
+                                        // Tool call - suppress (don't send)
+                                    } else {
+                                        // Not a tool call - send the buffered content
+                                        if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer.clone() }).await {
+                                            logger.log(&format!("[socket] Error writing chunk: {}", e));
+                                            break;
+                                        }
+                                    }
+                                    in_code_block = false;
+                                    code_block_buffer.clear();
+                                }
+                            }
+                        }
+
+                        // Handle any remaining buffer at end (incomplete code block)
+                        if !code_block_buffer.is_empty() {
+                            // If it doesn't look like a tool call, send it
+                            if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                                if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer }).await {
+                                    logger.log(&format!("[socket] Error writing final buffer: {}", e));
+                                }
                             }
                         }
 
