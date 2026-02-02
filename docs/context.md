@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v2.7.2 |
+| **Version** | v2.7.3 |
 | **Tests** | 320 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
