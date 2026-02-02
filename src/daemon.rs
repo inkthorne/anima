@@ -635,6 +635,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let timer_embedding_client = embedding_client.clone();
         let timer_registry = tool_registry.clone();
         let timer_logger = logger.clone();
+        let timer_recall_limit = config.semantic_memory.recall_limit;
 
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(timer_config.interval);
@@ -662,7 +663,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             };
 
                             let store = mem_store.lock().await;
-                            match store.recall_with_embedding(&timer_config.message, 5, query_embedding.as_deref()) {
+                            match store.recall_with_embedding(&timer_config.message, timer_recall_limit, query_embedding.as_deref()) {
                                 Ok(memories) => {
                                     if !memories.is_empty() {
                                         timer_logger.memory(&format!("Recall: {} memories for timer", memories.len()));
@@ -683,7 +684,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                         // Inject relevant tools if registry is available
                         let tools_injection = if let Some(ref registry) = timer_registry {
-                            let relevant = registry.find_relevant(&timer_config.message, 5);
+                            let relevant = registry.find_relevant(&timer_config.message, timer_recall_limit);
                             let relevant = filter_by_allowlist(relevant, &allowed_tools);
                             if !relevant.is_empty() {
                                 timer_logger.tool(&format!("Recall: {} tools for timer", relevant.len()));
@@ -773,6 +774,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_registry = tool_registry.clone();
                         let conn_logger = logger.clone();
 
+                        let recall_limit = config.semantic_memory.recall_limit;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
                             if let Err(e) = handle_connection(
@@ -788,6 +790,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 use_native_tools,
                                 shutdown_clone,
                                 conn_logger,
+                                recall_limit,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -927,6 +930,7 @@ async fn handle_connection(
     use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
+    recall_limit: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -952,7 +956,7 @@ async fn handle_connection(
 
                 // Get relevant tools from registry (used for both modes)
                 let relevant_tools = if let Some(ref registry) = tool_registry {
-                    let relevant = registry.find_relevant(content, 5);
+                    let relevant = registry.find_relevant(content, recall_limit);
                     let relevant = filter_by_allowlist(relevant, &allowed_tools);
                     if !relevant.is_empty() {
                         logger.tool(&format!("Recall: {} tools for query", relevant.len()));
@@ -993,7 +997,7 @@ async fn handle_connection(
                     };
 
                     let store = mem_store.lock().await;
-                    match store.recall_with_embedding(content, 5, query_embedding.as_deref()) {
+                    match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for query", memories.len()));
@@ -1173,7 +1177,7 @@ async fn handle_connection(
 
                 // Inject relevant tools if registry is available
                 let tools_injection = if let Some(ref registry) = tool_registry {
-                    let relevant = registry.find_relevant(content, 5);
+                    let relevant = registry.find_relevant(content, recall_limit);
                     let relevant = filter_by_allowlist(relevant, &allowed_tools);
                     if !relevant.is_empty() {
                         logger.tool(&format!("Recall: {} tools for incoming", relevant.len()));
@@ -1202,7 +1206,7 @@ async fn handle_connection(
                     };
 
                     let store = mem_store.lock().await;
-                    match store.recall_with_embedding(content, 5, query_embedding.as_deref()) {
+                    match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
                         Ok(memories) => {
                             if !memories.is_empty() {
                                 logger.memory(&format!("Recall: {} memories for incoming", memories.len()));
