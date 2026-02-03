@@ -143,6 +143,11 @@ enum ChatCommands {
         /// Name for the conversation (optional, generates fun name if not provided)
         name: Option<String>,
     },
+    /// Create a conversation without entering interactive mode
+    Create {
+        /// Name for the conversation (optional, generates fun name if not provided)
+        name: Option<String>,
+    },
     /// Join an existing conversation by name
     #[clap(alias = "open")]
     Join {
@@ -845,6 +850,13 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
             // Enter the new chat
             chat_with_conversation(&conv_name).await?;
+        }
+
+        // `anima chat create` or `anima chat create <name>` - create conversation without entering interactive mode
+        Some(ChatCommands::Create { name }) => {
+            // Create conversation with "user" as participant (agents join via @mention)
+            let conv_name = store.create_conversation(name.as_deref(), &["user"])?;
+            println!("Created conversation: {}", conv_name);
         }
 
         // `anima chat join <name>` (or `anima chat open <name>`) - join existing chat by name
