@@ -1,4 +1,5 @@
 pub mod add;
+pub mod claude_code;
 pub mod echo;
 pub mod http;
 pub mod list_agents;
@@ -10,6 +11,7 @@ pub mod wait_for_child;
 pub mod write_file;
 
 pub use add::AddTool;
+pub use claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, ClaudeCodeTask, TaskError, is_process_running};
 pub use echo::EchoTool;
 pub use http::HttpTool;
 pub use list_agents::DaemonListAgentsTool;

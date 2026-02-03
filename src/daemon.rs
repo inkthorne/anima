@@ -121,6 +121,7 @@ use crate::tool_registry::{ToolRegistry, ToolDefinition};
 use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
+use crate::tools::claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, is_process_running};
 
 /// Build the effective always prompt by combining tools, memory, base always, and model always.
 fn build_effective_always(
@@ -152,9 +153,19 @@ fn build_effective_always(
     }
 }
 
+/// Context for executing tools that need daemon state.
+pub struct ToolExecutionContext {
+    pub agent_name: String,
+    pub task_store: Option<Arc<Mutex<TaskStore>>>,
+}
+
 /// Execute a tool call and return the result as a string.
 /// If a tool_def is provided, command validation is performed for shell tools.
-async fn execute_tool_call(tool_call: &ToolCall, tool_def: Option<&ToolDefinition>) -> Result<String, String> {
+async fn execute_tool_call(
+    tool_call: &ToolCall,
+    tool_def: Option<&ToolDefinition>,
+    context: Option<&ToolExecutionContext>,
+) -> Result<String, String> {
     match tool_call.tool.as_str() {
         "read_file" => {
             let tool = ReadFileTool::default();
@@ -233,6 +244,24 @@ async fn execute_tool_call(tool_call: &ToolCall, tool_def: Option<&ToolDefinitio
                     let status = result.get("status").and_then(|s| s.as_u64()).unwrap_or(0);
                     let body = result.get("body").and_then(|b| b.as_str()).unwrap_or("");
                     Ok(format!("[HTTP {}]\n{}", status, body))
+                }
+                Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
+        "claude_code" => {
+            // Claude Code tool requires agent context and task store
+            let ctx = context.ok_or("claude_code tool requires execution context")?;
+            let task_store = ctx.task_store.as_ref()
+                .ok_or("claude_code tool requires task store to be initialized")?;
+
+            let tool = ClaudeCodeTool::new(ctx.agent_name.clone(), task_store.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
+                        Ok(msg.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
                 }
                 Err(e) => Err(format!("Tool error: {}", e))
             }
@@ -641,6 +670,18 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Initialize task store for Claude Code tasks
+    let task_store: Option<Arc<Mutex<TaskStore>>> = match TaskStore::init() {
+        Ok(store) => {
+            logger.log("  Task store: initialized");
+            Some(Arc::new(Mutex::new(store)))
+        }
+        Err(e) => {
+            logger.log(&format!("  Task store: not initialized ({})", e));
+            None
+        }
+    };
+
     // Process pending notifications (queued while agent was offline)
     if let Ok(conv_store) = ConversationStore::init() {
         match conv_store.get_pending_notifications(&config.name) {
@@ -909,6 +950,26 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Set up task watcher for Claude Code tasks (if task store is available)
+    let task_watcher_handle = if let Some(ref ts) = task_store {
+        let ts_clone = ts.clone();
+        let agent_name = config.name.clone();
+        let tw_logger = logger.clone();
+        let shutdown_clone = shutdown.clone();
+
+        logger.log("  Task watcher: started");
+        Some(tokio::spawn(async move {
+            task_watcher_loop(
+                ts_clone,
+                agent_name,
+                tw_logger,
+                shutdown_clone,
+            ).await
+        }))
+    } else {
+        None
+    };
+
     // Main loop: accept connections
     loop {
         tokio::select! {
@@ -928,6 +989,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_logger = logger.clone();
                         let conn_heartbeat_config = heartbeat_config.clone();
                         let conn_heartbeat_pending = heartbeat_pending.clone();
+                        let conn_task_store = task_store.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
                         tokio::spawn(async move {
@@ -949,6 +1011,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 recall_limit,
                                 conn_heartbeat_config,
                                 conn_heartbeat_pending,
+                                conn_task_store,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -973,6 +1036,11 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for heartbeat task to finish
     if let Some(handle) = heartbeat_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for task watcher to finish
+    if let Some(handle) = task_watcher_handle {
         let _ = handle.await;
     }
 
@@ -1636,6 +1704,172 @@ async fn run_heartbeat(
     logger.log(&format!("[heartbeat] Complete. Response: {} chars", cleaned_response.len()));
 }
 
+/// Task watcher loop for Claude Code tasks.
+/// Checks running tasks every 10 seconds and notifies the agent when they complete.
+async fn task_watcher_loop(
+    task_store: Arc<Mutex<TaskStore>>,
+    agent_name: String,
+    logger: Arc<AgentLogger>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(10));
+    // Skip the first immediate tick
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                // Get running tasks for this agent
+                let running_tasks = {
+                    let store = task_store.lock().await;
+                    match store.get_running_tasks() {
+                        Ok(tasks) => tasks.into_iter().filter(|t| t.agent == agent_name).collect::<Vec<_>>(),
+                        Err(e) => {
+                            logger.log(&format!("[task-watcher] Error getting running tasks: {}", e));
+                            continue;
+                        }
+                    }
+                };
+
+                for task in running_tasks {
+                    if let Some(pid) = task.pid {
+                        if !is_process_running(pid) {
+                            // Task has completed - read log and update status
+                            logger.log(&format!("[task-watcher] Task {} (pid {}) completed", task.id, pid));
+
+                            let log_path = format!("/tmp/claude-{}.log", task.id);
+                            let (exit_code, output_summary) = read_task_output(&log_path, &logger);
+
+                            let status = if exit_code == 0 {
+                                TaskStatus::Completed
+                            } else {
+                                TaskStatus::Failed
+                            };
+
+                            // Update task in store
+                            {
+                                let store = task_store.lock().await;
+                                if let Err(e) = store.complete_task(&task.id, status.clone(), exit_code, &output_summary) {
+                                    logger.log(&format!("[task-watcher] Error updating task {}: {}", task.id, e));
+                                    continue;
+                                }
+                            }
+
+                            // Notify the agent via a conversation message
+                            notify_task_complete(&task.agent, &task.id, status, exit_code, &output_summary, &logger).await;
+                        }
+                    }
+                }
+            }
+            _ = shutdown.notified() => {
+                logger.log("[task-watcher] Shutting down task watcher");
+                break;
+            }
+        }
+    }
+}
+
+/// Read the output from a Claude Code task log file.
+/// Returns (exit_code, summary).
+fn read_task_output(log_path: &str, logger: &AgentLogger) -> (i32, String) {
+    // Read the log file
+    let log_content = match std::fs::read_to_string(log_path) {
+        Ok(content) => content,
+        Err(e) => {
+            logger.log(&format!("[task-watcher] Error reading log {}: {}", log_path, e));
+            return (-1, format!("Error reading log: {}", e));
+        }
+    };
+
+    // Get last 100 lines for the summary
+    let lines: Vec<&str> = log_content.lines().collect();
+    let last_lines: String = if lines.len() > 100 {
+        lines[lines.len() - 100..].join("\n")
+    } else {
+        lines.join("\n")
+    };
+
+    // Try to extract exit code from the log
+    // Look for patterns like "exit code: N" or "exited with N"
+    let exit_code = if log_content.contains("exit code: 0") || log_content.contains("exited with 0") {
+        0
+    } else if log_content.contains("exit code: 1") || log_content.contains("exited with 1") {
+        1
+    } else if log_content.contains("error") || log_content.contains("Error") || log_content.contains("ERROR") {
+        // Assume failure if errors present
+        1
+    } else {
+        // Default to success if no clear indicators
+        0
+    };
+
+    (exit_code, last_lines)
+}
+
+/// Notify an agent that a Claude Code task has completed.
+/// Creates or uses a "claude-tasks" conversation and sends a message.
+async fn notify_task_complete(
+    agent_name: &str,
+    task_id: &str,
+    status: TaskStatus,
+    exit_code: i32,
+    output_summary: &str,
+    logger: &Arc<AgentLogger>,
+) {
+    let conv_name = format!("claude-code-{}", agent_name);
+
+    // Open conversation store
+    let store = match ConversationStore::init() {
+        Ok(s) => s,
+        Err(e) => {
+            logger.log(&format!("[task-watcher] Failed to open conversation store: {}", e));
+            return;
+        }
+    };
+
+    // Create conversation if it doesn't exist
+    if store.find_by_name(&conv_name).ok().flatten().is_none() {
+        if let Err(e) = store.create_conversation(Some(&conv_name), &[agent_name, "system"]) {
+            logger.log(&format!("[task-watcher] Failed to create conversation: {}", e));
+            return;
+        }
+        logger.log(&format!("[task-watcher] Created conversation '{}'", conv_name));
+    }
+
+    // Format notification message
+    let status_str = match status {
+        TaskStatus::Completed => "completed",
+        TaskStatus::Failed => "failed",
+        TaskStatus::Running => "running", // shouldn't happen
+    };
+
+    let message = format!(
+        "Claude Code task {} {} (exit code {}).\n\nOutput summary:\n```\n{}\n```",
+        task_id, status_str, exit_code, output_summary
+    );
+
+    // Add message to conversation
+    match store.add_message(&conv_name, "system", &message, &[agent_name]) {
+        Ok(msg_id) => {
+            logger.log(&format!("[task-watcher] Stored notification as msg_id={}", msg_id));
+
+            // Forward the notification to the agent daemon if it's running
+            forward_notify_to_agent(
+                agent_name,
+                &conv_name,
+                msg_id,
+                0,
+                logger,
+            ).await;
+
+            logger.log(&format!("[task-watcher] Notified @{} about task {}", agent_name, task_id));
+        }
+        Err(e) => {
+            logger.log(&format!("[task-watcher] Failed to store notification: {}", e));
+        }
+    }
+}
+
 /// Handle a single connection from a client.
 async fn handle_connection(
     mut api: SocketApi,
@@ -1654,7 +1888,13 @@ async fn handle_connection(
     recall_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     _heartbeat_pending: Arc<AtomicBool>,
+    task_store: Option<Arc<Mutex<TaskStore>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Create tool execution context for tools that need daemon state
+    let tool_context = ToolExecutionContext {
+        agent_name: agent_name.clone(),
+        task_store: task_store.clone(),
+    };
     loop {
         // Read request with a timeout
         let request = tokio::select! {
@@ -2002,7 +2242,7 @@ async fn handle_connection(
                             let tool_def = tool_registry.as_ref()
                                 .and_then(|r| r.find_by_name(&tc.tool));
 
-                            match execute_tool_call(&tc, tool_def).await {
+                            match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
                                 Ok(tool_result) => {
                                     logger.tool(&format!("Result: {} bytes", tool_result.len()));
                                     current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
@@ -2558,7 +2798,7 @@ api_key = "sk-test"
         };
 
         // Should succeed - "ls" is in allowed list
-        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        let result = execute_tool_call(&tool_call, Some(&tool_def), None).await;
         assert!(result.is_ok());
     }
 
@@ -2581,7 +2821,7 @@ api_key = "sk-test"
         };
 
         // Should fail - "rm" is not in allowed list
-        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        let result = execute_tool_call(&tool_call, Some(&tool_def), None).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("not in allowed list"));
@@ -2607,7 +2847,7 @@ api_key = "sk-test"
         };
 
         // Should succeed - no allowed_commands restriction
-        let result = execute_tool_call(&tool_call, Some(&tool_def)).await;
+        let result = execute_tool_call(&tool_call, Some(&tool_def), None).await;
         assert!(result.is_ok());
     }
 
@@ -2619,7 +2859,7 @@ api_key = "sk-test"
         };
 
         // Should succeed - no tool_def means no restrictions
-        let result = execute_tool_call(&tool_call, None).await;
+        let result = execute_tool_call(&tool_call, None, None).await;
         assert!(result.is_ok());
     }
 }

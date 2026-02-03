@@ -48,10 +48,19 @@ From `AUTONOMOUS_CONV_SPEC.md`, the daemon should:
 
 ## Checklist
 
-- [ ] Review current Notify handler in daemon.rs
-- [ ] Implement agent auto-invoke on Notify (if missing)
-- [ ] Implement conversation context fetching
-- [ ] Implement response storage
-- [ ] Implement @mention forwarding from responses
-- [ ] Test with real agents
-- [ ] Update CURRENT_WORK.md when complete
+- [x] Review current Notify handler in daemon.rs
+- [x] Implement agent auto-invoke on Notify (if missing) — already implemented!
+- [x] Implement conversation context fetching
+- [x] Implement response storage
+- [x] Implement @mention forwarding from responses
+- [x] Test with real agents (gendry, arya)
+- [x] Update CURRENT_WORK.md when complete
+
+## Phase 3 Complete ✅
+
+Verified 2026-02-02: Auto-invoke was already fully implemented in `handle_notify()` at `src/daemon.rs:1087`.
+
+**Test results:**
+- Created `test-notify-1770088617` conversation
+- Sent "@gendry what's your status?" — gendry auto-responded
+- Sent "@gendry can you ask @arya for her status too?" — both responded, arya was forwarded via @mention chain
