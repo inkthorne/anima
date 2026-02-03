@@ -1444,11 +1444,19 @@ async fn handle_notify(
                         Ok(tool_result) => {
                             logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
                             current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                            // Store tool result in conversation
+                            if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
+                                logger.log(&format!("[notify] Failed to store tool result: {}", e));
+                            }
                             // Continue to next iteration
                         }
                         Err(e) => {
                             logger.tool(&format!("[notify] Error: {}", e));
                             current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                            // Store tool error in conversation
+                            if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
+                                logger.log(&format!("[notify] Failed to store tool error: {}", e));
+                            }
                             // Continue to next iteration to let LLM handle the error
                         }
                     }
