@@ -69,7 +69,7 @@ interval = "15m"
 ```
 
 **Prompt:** `~/.anima/agents/<name>/heartbeat.md`
-**Output:** `heartbeat-<agent>` conversation
+**Output:** `<agent>-heartbeat` conversation
 
 ## Claude Code Tool (v3.4.0+)
 

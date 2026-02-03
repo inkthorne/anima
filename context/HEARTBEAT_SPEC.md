@@ -62,7 +62,7 @@ Check on things. Be proactive but not annoying.
 
 ## Conversation
 
-- **Name:** `heartbeat-<agent>` (e.g., `heartbeat-arya`)
+- **Name:** `<agent>-heartbeat` (e.g., `heartbeat-arya`)
 - **Created automatically** on first heartbeat if doesn't exist
 - **Participants:** just the agent (solo conversation)
 - **Message flow:** Agent's heartbeat output stored as messages from the agent
@@ -87,10 +87,10 @@ This gives the agent memory of previous heartbeats — it can see what it checke
    - If busy: queue heartbeat (set pending flag)
    - If free: proceed
 2. Load heartbeat.md content
-3. Get/create heartbeat-<agent> conversation
+3. Get/create <agent>-heartbeat conversation
 4. Fetch last N messages for context
 5. Think with heartbeat.md as user message
-6. Store response in heartbeat-<agent> conversation
+6. Store response in <agent>-heartbeat conversation
 7. Parse @mentions from response → notify if any
 ```
 

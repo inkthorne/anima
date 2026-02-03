@@ -1569,7 +1569,7 @@ async fn heartbeat_loop(
     }
 }
 
-/// Execute a heartbeat: load heartbeat.md, think, store response in heartbeat-<agent> conversation.
+/// Execute a heartbeat: load heartbeat.md, think, store response in <agent>-heartbeat conversation.
 async fn run_heartbeat(
     config: &HeartbeatDaemonConfig,
     agent: &Arc<Mutex<Agent>>,
@@ -1600,8 +1600,8 @@ async fn run_heartbeat(
 
     logger.log(&format!("[heartbeat] Running with prompt: {} chars", heartbeat_prompt.len()));
 
-    // 2. Get or create heartbeat-<agent> conversation
-    let conv_name = format!("heartbeat-{}", agent_name);
+    // 2. Get or create <agent>-heartbeat conversation
+    let conv_name = format!("{}-heartbeat", agent_name);
     let store = match ConversationStore::init() {
         Ok(s) => s,
         Err(e) => {
@@ -1719,7 +1719,7 @@ async fn run_heartbeat(
         }
     }
 
-    // 7. Store response in heartbeat-<agent> conversation (just the response, not the prompt)
+    // 7. Store response in <agent>-heartbeat conversation (just the response, not the prompt)
     match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
         Ok(msg_id) => {
             logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
