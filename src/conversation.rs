@@ -1157,6 +1157,43 @@ pub async fn notify_mentioned_agents_parallel_owned(
         return results;
     }
 
+    // Check if conversation is paused - if so, queue all notifications instead of sending
+    let is_paused = match ConversationStore::init() {
+        Ok(store) => store.is_paused(&conv_id).unwrap_or(false),
+        Err(_) => false, // If we can't check, proceed normally
+    };
+
+    if is_paused {
+        // Conversation is paused - queue all notifications instead of sending
+        match ConversationStore::init() {
+            Ok(store) => {
+                for agent_name in &mentions {
+                    // Only queue if agent exists
+                    if !crate::discovery::agent_exists(agent_name) {
+                        results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
+                        continue;
+                    }
+                    let queued_result = match store.add_pending_notification(agent_name, &conv_id, message_id) {
+                        Ok(notification_id) => NotifyResult::Queued { notification_id },
+                        Err(e) => NotifyResult::Failed {
+                            reason: format!("Failed to queue notification: {}", e),
+                        },
+                    };
+                    results.insert(agent_name.clone(), queued_result);
+                }
+            }
+            Err(e) => {
+                // Can't queue - mark all as failed
+                for agent_name in &mentions {
+                    results.insert(agent_name.clone(), NotifyResult::Failed {
+                        reason: format!("Conversation paused but failed to queue: {}", e),
+                    });
+                }
+            }
+        }
+        return results;
+    }
+
     // Spawn parallel notification tasks
     let futures: Vec<_> = mentions.iter().map(|agent_name| {
         let agent = agent_name.clone();
@@ -1234,7 +1271,7 @@ pub async fn notify_mentioned_agents_parallel_owned(
 ///
 /// Unlike `notify_mentioned_agents_parallel`, this function:
 /// - Does NOT wait for responses
-/// - Does NOT queue notifications for offline agents
+/// - Queues notifications if conversation is paused
 /// - Returns immediately after spawning tasks
 ///
 /// The daemon will handle the conversation chain autonomously.
@@ -1243,6 +1280,25 @@ pub fn notify_mentioned_agents_fire_and_forget(
     message_id: i64,
     mentions: &[String],
 ) {
+    // Check if conversation is paused - if so, queue all notifications instead of sending
+    let is_paused = match ConversationStore::init() {
+        Ok(store) => store.is_paused(conv_id).unwrap_or(false),
+        Err(_) => false, // If we can't check, proceed normally
+    };
+
+    if is_paused {
+        // Conversation is paused - queue all notifications instead of sending
+        if let Ok(store) = ConversationStore::init() {
+            for agent_name in mentions {
+                // Only queue if agent exists
+                if crate::discovery::agent_exists(agent_name) {
+                    let _ = store.add_pending_notification(agent_name, conv_id, message_id);
+                }
+            }
+        }
+        return;
+    }
+
     for agent_name in mentions {
         let agent = agent_name.clone();
         let cid = conv_id.to_string();
