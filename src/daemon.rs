@@ -708,6 +708,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             use_native_tools,
                             &logger,
                             config.semantic_memory.recall_limit,
+                            &task_store,
                         ).await;
 
                         match response {
@@ -1168,6 +1169,7 @@ async fn handle_notify(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
+    task_store: &Option<Arc<Mutex<TaskStore>>>,
 ) -> Response {
     // Open conversation store
     let store = match ConversationStore::init() {
@@ -1244,93 +1246,146 @@ async fn handle_notify(
 
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
-    let options = ThinkOptions {
-        system_prompt: persona.clone(),
-        always_prompt: effective_always,
-        ..Default::default()
+    // Create tool execution context for tools that need daemon state
+    let tool_context = ToolExecutionContext {
+        agent_name: agent_name.to_string(),
+        task_store: task_store.clone(),
     };
 
-    // Generate response
-    let mut agent_guard = agent.lock().await;
-    match agent_guard.think_with_options(&context, options).await {
-        Ok(result) => {
-            // Strip thinking tags and extract [REMEMBER: ...] tags
-            let without_thinking = strip_thinking_tags(&result.response);
-            let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
+    // Tool execution loop - similar to Request::Message handler
+    let max_tool_calls = 10;
+    let mut tool_call_count = 0;
+    let mut current_message = context.clone();
+    let mut final_response: Option<String> = None;
 
-            // Save memories
-            if !memories_to_save.is_empty() {
-                if let Some(mem_store) = semantic_memory {
-                    let store_guard = mem_store.lock().await;
-                    for memory in &memories_to_save {
-                        let embedding = if let Some(emb_client) = embedding_client {
-                            emb_client.embed(memory).await.ok()
-                        } else {
-                            None
-                        };
-                        let _ = store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
+    loop {
+        let options = ThinkOptions {
+            system_prompt: persona.clone(),
+            always_prompt: effective_always.clone(),
+            ..Default::default()
+        };
+
+        // Generate response
+        let mut agent_guard = agent.lock().await;
+        let result = agent_guard.think_with_options(&current_message, options).await;
+        drop(agent_guard); // Release lock before potential tool execution
+
+        match result {
+            Ok(think_result) => {
+                // Strip thinking tags and extract [REMEMBER: ...] tags
+                let without_thinking = strip_thinking_tags(&think_result.response);
+                let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+
+                // Save memories
+                if !memories_to_save.is_empty() {
+                    if let Some(mem_store) = semantic_memory {
+                        let store_guard = mem_store.lock().await;
+                        for memory in &memories_to_save {
+                            let embedding = if let Some(emb_client) = embedding_client {
+                                emb_client.embed(memory).await.ok()
+                            } else {
+                                None
+                            };
+                            let _ = store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
+                        }
                     }
+                }
+
+                // Check for tool calls (JSON-block parsing)
+                let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+
+                if let Some(tc) = tool_call {
+                    tool_call_count += 1;
+                    if tool_call_count > max_tool_calls {
+                        logger.tool("[notify] Max tool calls reached, stopping");
+                        final_response = Some(cleaned_response);
+                        break;
+                    }
+
+                    logger.tool(&format!("[notify] Executing: {} with params {}", tc.tool, tc.params));
+
+                    // Look up the tool definition to get allowed_commands
+                    let tool_def = tool_registry.as_ref()
+                        .and_then(|r| r.find_by_name(&tc.tool));
+
+                    match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
+                        Ok(tool_result) => {
+                            logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
+                            current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                            // Continue to next iteration
+                        }
+                        Err(e) => {
+                            logger.tool(&format!("[notify] Error: {}", e));
+                            current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                            // Continue to next iteration to let LLM handle the error
+                        }
+                    }
+                } else {
+                    // No more tool calls - done
+                    final_response = Some(cleaned_response);
+                    break;
                 }
             }
-
-            // Store response in conversation
-            match store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
-                Ok(response_msg_id) => {
-                    logger.log(&format!("[notify] Stored response as msg_id={}", response_msg_id));
-
-                    // Parse @mentions from our response and forward to other agents
-                    // Only forward if not paused and not at depth limit
-                    let should_forward = depth < MAX_MENTION_DEPTH
-                        && !store.is_paused(conv_id).unwrap_or(false);
-
-                    if should_forward {
-                        // Parse @mentions from our response
-                        let mentions = crate::conversation::parse_mentions(&cleaned_response);
-
-                        // Filter out self, "user", and non-existent agents
-                        let valid_mentions: Vec<String> = mentions
-                            .into_iter()
-                            .filter(|m| m != agent_name && m != "user" && m != "all")
-                            .filter(|m| discovery::agent_exists(m))
-                            .collect();
-
-                        if !valid_mentions.is_empty() {
-                            logger.log(&format!("[notify] Forwarding to {} agents at depth {}: {:?}",
-                                valid_mentions.len(), depth + 1, valid_mentions));
-
-                            // Add mentioned agents as participants if not already
-                            for mention in &valid_mentions {
-                                if let Err(e) = store.add_participant(conv_id, mention) {
-                                    logger.log(&format!("[notify] Warning: Could not add {} as participant: {}", mention, e));
-                                }
-                            }
-
-                            // Forward to each mentioned agent
-                            for mention in valid_mentions {
-                                forward_notify_to_agent(
-                                    &mention,
-                                    conv_id,
-                                    response_msg_id,
-                                    depth + 1,
-                                    logger,
-                                ).await;
-                            }
-                        }
-                    } else if depth >= MAX_MENTION_DEPTH {
-                        logger.log(&format!("[notify] Skipping forwarding: depth limit reached ({})", depth));
-                    }
-
-                    Response::Notified { response_message_id: response_msg_id }
-                }
-                Err(e) => {
-                    logger.log(&format!("[notify] Failed to store response: {}", e));
-                    Response::Error { message: format!("Failed to store response: {}", e) }
-                }
+            Err(e) => {
+                logger.log(&format!("[notify] Agent error: {}", e));
+                return Response::Error { message: e.to_string() };
             }
         }
+    }
+
+    // Store final response in conversation
+    let cleaned_response = final_response.unwrap_or_default();
+    match store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
+        Ok(response_msg_id) => {
+            logger.log(&format!("[notify] Stored response as msg_id={}", response_msg_id));
+
+            // Parse @mentions from our response and forward to other agents
+            // Only forward if not paused and not at depth limit
+            let should_forward = depth < MAX_MENTION_DEPTH
+                && !store.is_paused(conv_id).unwrap_or(false);
+
+            if should_forward {
+                // Parse @mentions from our response
+                let mentions = crate::conversation::parse_mentions(&cleaned_response);
+
+                // Filter out self, "user", and non-existent agents
+                let valid_mentions: Vec<String> = mentions
+                    .into_iter()
+                    .filter(|m| m != agent_name && m != "user" && m != "all")
+                    .filter(|m| discovery::agent_exists(m))
+                    .collect();
+
+                if !valid_mentions.is_empty() {
+                    logger.log(&format!("[notify] Forwarding to {} agents at depth {}: {:?}",
+                        valid_mentions.len(), depth + 1, valid_mentions));
+
+                    // Add mentioned agents as participants if not already
+                    for mention in &valid_mentions {
+                        if let Err(e) = store.add_participant(conv_id, mention) {
+                            logger.log(&format!("[notify] Warning: Could not add {} as participant: {}", mention, e));
+                        }
+                    }
+
+                    // Forward to each mentioned agent
+                    for mention in valid_mentions {
+                        forward_notify_to_agent(
+                            &mention,
+                            conv_id,
+                            response_msg_id,
+                            depth + 1,
+                            logger,
+                        ).await;
+                    }
+                }
+            } else if depth >= MAX_MENTION_DEPTH {
+                logger.log(&format!("[notify] Skipping forwarding: depth limit reached ({})", depth));
+            }
+
+            Response::Notified { response_message_id: response_msg_id }
+        }
         Err(e) => {
-            logger.log(&format!("[notify] Agent error: {}", e));
-            Response::Error { message: e.to_string() }
+            logger.log(&format!("[notify] Failed to store response: {}", e));
+            Response::Error { message: format!("Failed to store response: {}", e) }
         }
     }
 }
@@ -2398,6 +2453,7 @@ async fn handle_connection(
                 let embedding_client = embedding_client.clone();
                 let tool_registry = tool_registry.clone();
                 let logger = logger.clone();
+                let task_store = task_store.clone();
 
                 tokio::spawn(async move {
                     let _response = handle_notify(
@@ -2416,6 +2472,7 @@ async fn handle_connection(
                         use_native_tools,
                         &logger,
                         recall_limit,
+                        &task_store,
                     ).await;
                     // Response is logged inside handle_notify, no need to do anything with it
                 });
