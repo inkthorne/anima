@@ -14,7 +14,9 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::io::{self, Write};
+use std::time::Duration;
 use tokio::net::UnixStream;
 
 /// Format tool params for display in a brief, readable way.
@@ -402,6 +404,8 @@ const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 /// Note: The daemon now handles @mention forwarding autonomously. The CLI only
 /// sends initial notifications and displays results - follow-up chains continue
 /// in the background via daemon-to-daemon communication.
+///
+/// A background polling task displays incoming agent messages in real-time.
 async fn chat_with_conversation(
     conv_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -415,6 +419,16 @@ async fn chat_with_conversation(
         .map(|p| p.agent.clone())
         .collect();
 
+    // Track the last message ID we've displayed
+    let last_seen_id = Arc::new(AtomicI64::new(0));
+
+    // Get current last message ID so we don't display old messages
+    if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
+        if let Some(last) = msgs.last() {
+            last_seen_id.store(last.id, Ordering::SeqCst);
+        }
+    }
+
     // Print connection info
     println!("\x1b[32m✓ Joined conversation '{}'\x1b[0m", conv_name);
     if participants.is_empty() {
@@ -423,6 +437,44 @@ async fn chat_with_conversation(
         println!("\x1b[90mParticipants: {}\x1b[0m", participants.join(", "));
     }
     println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
+
+    // Spawn background message polling task
+    let poll_conv_name = conv_name.to_string();
+    let poll_last_seen = last_seen_id.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let poll_shutdown = shutdown.clone();
+
+    let poll_handle = tokio::spawn(async move {
+        // Create a separate store connection for the polling task
+        let poll_store = match ConversationStore::init() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        loop {
+            if poll_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let last_id = poll_last_seen.load(Ordering::SeqCst);
+            if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id)) {
+                for msg in msgs {
+                    // Only display messages from agents (not from "user")
+                    if msg.from_agent != "user" {
+                        // Print the agent message on a new line
+                        print!("\r\x1b[K"); // Clear current line (in case user was typing)
+                        println!("\x1b[36m[{}]:\x1b[0m {}", msg.from_agent, msg.content);
+                        print!("\x1b[36myou>\x1b[0m "); // Re-print prompt
+                        let _ = io::stdout().flush();
+                    }
+                    // Update last seen ID regardless of sender
+                    poll_last_seen.store(msg.id, Ordering::SeqCst);
+                }
+            }
+        }
+    });
 
     // Use rustyline for interactive input
     let mut rl = rustyline::DefaultEditor::new()?;
@@ -471,6 +523,9 @@ async fn chat_with_conversation(
                 // Store user message in conversation with mentions
                 let user_msg_id = store.add_message(conv_name, "user", line, &mention_refs)?;
 
+                // Update last_seen_id to the user's message to avoid re-displaying it
+                last_seen_id.store(user_msg_id, Ordering::SeqCst);
+
                 // Notify mentioned agents (initial notifications only)
                 // The daemon now handles all follow-up @mention chains autonomously
                 if !expanded_mentions.is_empty() {
@@ -481,10 +536,13 @@ async fn chat_with_conversation(
                         match result {
                             NotifyResult::Acknowledged => {
                                 // Fire-and-forget: agent received notification, processing async
+                                // The background poller will display the response when it arrives
                                 println!("\x1b[90m[@{} notified, processing...]\x1b[0m", agent);
                             }
                             NotifyResult::Notified { response_message_id } => {
                                 // Synchronous response (backwards compat)
+                                // Update last_seen_id so poller doesn't re-display
+                                last_seen_id.store(*response_message_id, Ordering::SeqCst);
                                 if let Ok(msgs) = store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
                                     if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                         println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
@@ -505,7 +563,7 @@ async fn chat_with_conversation(
 
                     // Note: Any @mentions in agent responses are now forwarded autonomously
                     // by the daemon. The CLI no longer tracks or displays follow-up chains.
-                    // Use 'anima chat view <conv>' to see all messages including follow-ups.
+                    // The background poller will display new messages as they arrive.
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -522,6 +580,10 @@ async fn chat_with_conversation(
             }
         }
     }
+
+    // Signal shutdown and wait for the polling task to finish
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = poll_handle.await;
 
     Ok(())
 }
