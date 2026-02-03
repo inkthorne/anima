@@ -247,6 +247,8 @@ pub struct ToolExecutionContext {
     pub agent_name: String,
     pub task_store: Option<Arc<Mutex<TaskStore>>>,
     pub conv_id: Option<String>,
+    pub semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    pub embedding_client: Option<Arc<EmbeddingClient>>,
 }
 
 /// Execute a tool call and return the result as a string.
@@ -354,6 +356,38 @@ async fn execute_tool_call(
                     }
                 }
                 Err(e) => Err(format!("Tool error: {}", e))
+            }
+        }
+        "remember" => {
+            // Remember tool requires semantic memory store
+            let ctx = context.ok_or("remember tool requires execution context")?;
+            let mem_store = ctx.semantic_memory_store.as_ref()
+                .ok_or("remember tool requires semantic memory to be enabled")?;
+
+            let content = tool_call.params.get("content")
+                .and_then(|c| c.as_str())
+                .ok_or("remember tool requires 'content' parameter")?;
+
+            // Generate embedding if client is available
+            let embedding = if let Some(emb_client) = &ctx.embedding_client {
+                emb_client.embed(content).await.ok()
+            } else {
+                None
+            };
+
+            // Save with high importance (0.9) as "explicit" source, same as [REMEMBER:] tags
+            let store_guard = mem_store.lock().await;
+            match store_guard.save_with_embedding(content, 0.9, "explicit", embedding.as_deref()) {
+                Ok(result) => {
+                    let msg = match result {
+                        SaveResult::New(id) => format!("Remembered: {} (id={})", content, id),
+                        SaveResult::Reinforced(id, old_imp, new_imp) => {
+                            format!("Reinforced memory: {} (id={}, importance {:.2} → {:.2})", content, id, old_imp, new_imp)
+                        }
+                    };
+                    Ok(msg)
+                }
+                Err(e) => Err(format!("Failed to save memory: {}", e))
             }
         }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
@@ -1334,6 +1368,8 @@ async fn handle_notify(
         agent_name: agent_name.to_string(),
         task_store: task_store.clone(),
         conv_id: Some(conv_id.to_string()),
+        semantic_memory_store: semantic_memory.clone(),
+        embedding_client: embedding_client.clone(),
     };
 
     // Tool execution loop - similar to Request::Message handler
@@ -2024,6 +2060,8 @@ async fn handle_connection(
         agent_name: agent_name.clone(),
         task_store: task_store.clone(),
         conv_id: None,
+        semantic_memory_store: semantic_memory.clone(),
+        embedding_client: embedding_client.clone(),
     };
     loop {
         // Read request with a timeout
