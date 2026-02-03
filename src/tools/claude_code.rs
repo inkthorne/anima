@@ -69,6 +69,7 @@ impl std::str::FromStr for TaskStatus {
 pub struct ClaudeCodeTask {
     pub id: String,
     pub agent: String,
+    pub conv_id: Option<String>,
     pub task_prompt: String,
     pub workdir: String,
     pub status: TaskStatus,
@@ -127,6 +128,7 @@ impl TaskStore {
             CREATE TABLE IF NOT EXISTS claude_code_tasks (
                 id TEXT PRIMARY KEY,
                 agent TEXT NOT NULL,
+                conv_id TEXT,
                 task_prompt TEXT NOT NULL,
                 workdir TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'running',
@@ -141,6 +143,13 @@ impl TaskStore {
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON claude_code_tasks(status);
             "#,
         )?;
+
+        // Migration: add conv_id column if it doesn't exist (for existing databases)
+        let _ = self.conn.execute(
+            "ALTER TABLE claude_code_tasks ADD COLUMN conv_id TEXT",
+            [],
+        );
+
         Ok(())
     }
 
@@ -149,6 +158,7 @@ impl TaskStore {
         &self,
         id: &str,
         agent: &str,
+        conv_id: Option<&str>,
         task_prompt: &str,
         workdir: &str,
         pid: i32,
@@ -156,9 +166,9 @@ impl TaskStore {
         let now = current_timestamp();
 
         self.conn.execute(
-            "INSERT INTO claude_code_tasks (id, agent, task_prompt, workdir, status, pid, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6)",
-            params![id, agent, task_prompt, workdir, pid, now],
+            "INSERT INTO claude_code_tasks (id, agent, conv_id, task_prompt, workdir, status, pid, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7)",
+            params![id, agent, conv_id, task_prompt, workdir, pid, now],
         )?;
 
         Ok(())
@@ -167,7 +177,7 @@ impl TaskStore {
     /// Get a task by ID.
     pub fn get_task(&self, id: &str) -> Result<Option<ClaudeCodeTask>, TaskError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
+            "SELECT id, agent, conv_id, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
              FROM claude_code_tasks WHERE id = ?1",
         )?;
 
@@ -182,7 +192,7 @@ impl TaskStore {
     /// Get all running tasks.
     pub fn get_running_tasks(&self) -> Result<Vec<ClaudeCodeTask>, TaskError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
+            "SELECT id, agent, conv_id, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
              FROM claude_code_tasks WHERE status = 'running' ORDER BY started_at",
         )?;
 
@@ -196,7 +206,7 @@ impl TaskStore {
     /// Get all tasks for an agent.
     pub fn get_tasks_for_agent(&self, agent: &str) -> Result<Vec<ClaudeCodeTask>, TaskError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
+            "SELECT id, agent, conv_id, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
              FROM claude_code_tasks WHERE agent = ?1 ORDER BY started_at DESC",
         )?;
 
@@ -236,7 +246,7 @@ impl TaskStore {
     /// List all tasks.
     pub fn list_tasks(&self) -> Result<Vec<ClaudeCodeTask>, TaskError> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, agent, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
+            "SELECT id, agent, conv_id, task_prompt, workdir, status, pid, started_at, completed_at, exit_code, output_summary
              FROM claude_code_tasks ORDER BY started_at DESC",
         )?;
 
@@ -250,20 +260,21 @@ impl TaskStore {
 
 /// Helper to construct a task from a database row.
 fn task_from_row(row: &rusqlite::Row) -> rusqlite::Result<ClaudeCodeTask> {
-    let status_str: String = row.get(4)?;
+    let status_str: String = row.get(5)?;
     let status = status_str.parse().unwrap_or(TaskStatus::Running);
 
     Ok(ClaudeCodeTask {
         id: row.get(0)?,
         agent: row.get(1)?,
-        task_prompt: row.get(2)?,
-        workdir: row.get(3)?,
+        conv_id: row.get(2)?,
+        task_prompt: row.get(3)?,
+        workdir: row.get(4)?,
         status,
-        pid: row.get(5)?,
-        started_at: row.get(6)?,
-        completed_at: row.get(7)?,
-        exit_code: row.get(8)?,
-        output_summary: row.get(9)?,
+        pid: row.get(6)?,
+        started_at: row.get(7)?,
+        completed_at: row.get(8)?,
+        exit_code: row.get(9)?,
+        output_summary: row.get(10)?,
     })
 }
 
@@ -308,6 +319,7 @@ pub fn is_process_running(pid: i32) -> bool {
 pub struct ClaudeCodeTool {
     agent_name: String,
     task_store: Arc<Mutex<TaskStore>>,
+    conv_id: Option<String>,
 }
 
 impl ClaudeCodeTool {
@@ -316,6 +328,16 @@ impl ClaudeCodeTool {
         Self {
             agent_name,
             task_store,
+            conv_id: None,
+        }
+    }
+
+    /// Create a new Claude Code tool with a conversation ID for notifications.
+    pub fn with_conv_id(agent_name: String, task_store: Arc<Mutex<TaskStore>>, conv_id: Option<String>) -> Self {
+        Self {
+            agent_name,
+            task_store,
+            conv_id,
         }
     }
 }
@@ -413,7 +435,7 @@ impl Tool for ClaudeCodeTool {
         // Store task record
         {
             let store = self.task_store.lock().await;
-            store.create_task(&task_id, &self.agent_name, task, &workdir, pid).map_err(|e| {
+            store.create_task(&task_id, &self.agent_name, self.conv_id.as_deref(), task, &workdir, pid).map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to store task: {}", e))
             })?;
         }
@@ -461,13 +483,14 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let store = TaskStore::open(temp_file.path()).unwrap();
 
-        // Create a task
-        store.create_task("test123", "gendry", "Fix the bug", "/home/test", 12345).unwrap();
+        // Create a task with conv_id
+        store.create_task("test123", "gendry", Some("test-conv"), "Fix the bug", "/home/test", 12345).unwrap();
 
         // Get the task
         let task = store.get_task("test123").unwrap().unwrap();
         assert_eq!(task.id, "test123");
         assert_eq!(task.agent, "gendry");
+        assert_eq!(task.conv_id, Some("test-conv".to_string()));
         assert_eq!(task.task_prompt, "Fix the bug");
         assert_eq!(task.workdir, "/home/test");
         assert_eq!(task.status, TaskStatus::Running);
@@ -502,14 +525,15 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let store = TaskStore::open(temp_file.path()).unwrap();
 
-        store.create_task("task1", "gendry", "Task 1", "/home", 1001).unwrap();
-        store.create_task("task2", "arya", "Task 2", "/home", 1002).unwrap();
-        store.create_task("task3", "gendry", "Task 3", "/home", 1003).unwrap();
+        store.create_task("task1", "gendry", None, "Task 1", "/home", 1001).unwrap();
+        store.create_task("task2", "arya", Some("conv-a"), "Task 2", "/home", 1002).unwrap();
+        store.create_task("task3", "gendry", Some("conv-b"), "Task 3", "/home", 1003).unwrap();
 
         let gendry_tasks = store.get_tasks_for_agent("gendry").unwrap();
         assert_eq!(gendry_tasks.len(), 2);
 
         let arya_tasks = store.get_tasks_for_agent("arya").unwrap();
         assert_eq!(arya_tasks.len(), 1);
+        assert_eq!(arya_tasks[0].conv_id, Some("conv-a".to_string()));
     }
 }

@@ -157,6 +157,7 @@ fn build_effective_always(
 pub struct ToolExecutionContext {
     pub agent_name: String,
     pub task_store: Option<Arc<Mutex<TaskStore>>>,
+    pub conv_id: Option<String>,
 }
 
 /// Execute a tool call and return the result as a string.
@@ -254,7 +255,7 @@ async fn execute_tool_call(
             let task_store = ctx.task_store.as_ref()
                 .ok_or("claude_code tool requires task store to be initialized")?;
 
-            let tool = ClaudeCodeTool::new(ctx.agent_name.clone(), task_store.clone());
+            let tool = ClaudeCodeTool::with_conv_id(ctx.agent_name.clone(), task_store.clone(), ctx.conv_id.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
@@ -1250,6 +1251,7 @@ async fn handle_notify(
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
         task_store: task_store.clone(),
+        conv_id: Some(conv_id.to_string()),
     };
 
     // Tool execution loop - similar to Request::Message handler
@@ -1812,7 +1814,7 @@ async fn task_watcher_loop(
                             }
 
                             // Notify the agent via a conversation message
-                            notify_task_complete(&task.agent, &task.id, status, exit_code, &output_summary, &logger).await;
+                            notify_task_complete(&task.agent, &task.id, task.conv_id.as_deref(), status, exit_code, &output_summary, &logger).await;
                         }
                     }
                 }
@@ -1863,16 +1865,24 @@ fn read_task_output(log_path: &str, logger: &AgentLogger) -> (i32, String) {
 }
 
 /// Notify an agent that a Claude Code task has completed.
-/// Creates or uses a "claude-tasks" conversation and sends a message.
+/// Posts completion notification to the source conversation with @mention.
 async fn notify_task_complete(
     agent_name: &str,
     task_id: &str,
+    conv_id: Option<&str>,
     status: TaskStatus,
     exit_code: i32,
     output_summary: &str,
     logger: &Arc<AgentLogger>,
 ) {
-    let conv_name = format!("claude-code-{}", agent_name);
+    // conv_id is required - task must have been invoked from a conversation
+    let conv_name = match conv_id {
+        Some(id) => id.to_string(),
+        None => {
+            logger.log(&format!("[task-watcher] Task {} has no conv_id, cannot notify", task_id));
+            return;
+        }
+    };
 
     // Open conversation store
     let store = match ConversationStore::init() {
@@ -1883,15 +1893,6 @@ async fn notify_task_complete(
         }
     };
 
-    // Create conversation if it doesn't exist
-    if store.find_by_name(&conv_name).ok().flatten().is_none() {
-        if let Err(e) = store.create_conversation(Some(&conv_name), &[agent_name, "system"]) {
-            logger.log(&format!("[task-watcher] Failed to create conversation: {}", e));
-            return;
-        }
-        logger.log(&format!("[task-watcher] Created conversation '{}'", conv_name));
-    }
-
     // Format notification message
     let status_str = match status {
         TaskStatus::Completed => "completed",
@@ -1899,9 +1900,10 @@ async fn notify_task_complete(
         TaskStatus::Running => "running", // shouldn't happen
     };
 
+    // Include @mention when posting to source conversation so the agent gets notified
     let message = format!(
-        "Claude Code task {} {} (exit code {}).\n\nOutput summary:\n```\n{}\n```",
-        task_id, status_str, exit_code, output_summary
+        "@{} Claude Code task {} {} (exit code {}).\n\nOutput summary:\n```\n{}\n```",
+        agent_name, task_id, status_str, exit_code, output_summary
     );
 
     // Add message to conversation
@@ -1947,9 +1949,11 @@ async fn handle_connection(
     task_store: Option<Arc<Mutex<TaskStore>>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create tool execution context for tools that need daemon state
+    // Note: conv_id is None in handle_connection context (direct socket messages)
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.clone(),
         task_store: task_store.clone(),
+        conv_id: None,
     };
     loop {
         // Read request with a timeout
