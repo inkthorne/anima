@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -150,6 +151,8 @@ pub struct Agent {
     router: Option<Arc<Mutex<MessageRouter>>>,
     /// Conversation history for multi-turn interactions
     history: Vec<ChatMessage>,
+    /// Agent directory path for context dumping
+    agent_dir: Option<PathBuf>,
 }
 
 impl Agent {
@@ -165,7 +168,14 @@ impl Agent {
             message_rx: None,
             router: None,
             history: Vec::new(),
+            agent_dir: None,
         }
+    }
+
+    /// Set the agent directory for context dumping
+    pub fn with_agent_dir(mut self, dir: PathBuf) -> Self {
+        self.agent_dir = Some(dir);
+        self
     }
 
     /// Attach an observer for monitoring agent activity.
@@ -481,6 +491,91 @@ pub async fn forget(&mut self, key: &str) -> bool {
         Some(context)
     }
 
+    /// Dump the raw LLM request payload to last_turn.json in the agent directory.
+    /// This is called before each LLM request to provide the exact JSON for debugging/reproduction.
+    fn dump_context(
+        &self,
+        _system_prompt: &Option<String>,
+        _memory_context: &Option<String>,
+        tools: &Option<Vec<ToolSpec>>,
+        messages: &[ChatMessage],
+    ) {
+        let agent_dir = match &self.agent_dir {
+            Some(dir) => dir,
+            None => return, // No agent dir configured, skip dump
+        };
+
+        let file_path = agent_dir.join("last_turn.json");
+
+        // Get model name from LLM if available
+        let model = self.llm.as_ref()
+            .map(|l| l.model_name().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Format messages for Ollama API (tool_calls arguments as objects, not strings)
+        let formatted_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
+            let mut formatted = serde_json::json!({
+                "role": msg.role,
+            });
+            if let Some(ref content) = msg.content {
+                formatted["content"] = serde_json::Value::String(content.clone());
+            }
+            if let Some(ref tool_call_id) = msg.tool_call_id {
+                formatted["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+            }
+            if let Some(ref tool_calls) = msg.tool_calls {
+                if !tool_calls.is_empty() {
+                    let formatted_tool_calls: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": tc.arguments  // Object, not string (Ollama native format)
+                            }
+                        })
+                    }).collect();
+                    formatted["tool_calls"] = serde_json::Value::Array(formatted_tool_calls);
+                }
+            }
+            formatted
+        }).collect();
+
+        // Build request body matching Ollama /api/chat format
+        let mut request_body = serde_json::json!({
+            "model": model,
+            "messages": formatted_messages,
+            "stream": false
+        });
+
+        // Add tools if present (Ollama format)
+        if let Some(tool_list) = tools {
+            if !tool_list.is_empty() {
+                let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                }).collect();
+                request_body["tools"] = serde_json::Value::Array(formatted_tools);
+                request_body["tool_choice"] = serde_json::json!("auto");
+            }
+        }
+
+        // Write pretty-printed JSON for readability while maintaining valid JSON
+        let content = serde_json::to_string_pretty(&request_body)
+            .unwrap_or_else(|_| "{}".to_string());
+
+        // Write to file (best-effort, don't fail the agent on IO errors)
+        if let Err(e) = std::fs::write(&file_path, content) {
+            eprintln!("[agent:{}] Failed to write context dump: {}", self.id, e);
+        }
+    }
+
     pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<ThinkResult, crate::error::AgentError> {
         let agent_start = Instant::now();
 
@@ -594,6 +689,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         // Agentic loop
         for _iteration in 0..options.max_iterations {
+            // Dump context before each LLM call
+            self.dump_context(&effective_system_prompt, &memory_context, &tools, &messages);
+
             // Call LLM with retry if policy is configured
             let llm_start = Instant::now();
             let response = if let Some(ref policy) = options.retry_policy {
@@ -853,6 +951,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         // Agentic loop with streaming
         for _iteration in 0..options.max_iterations {
+            // Dump context before each LLM call
+            self.dump_context(&effective_system_prompt, &memory_context, &tools, &messages);
+
             // Call LLM with retry if policy is configured
             // Note: streaming with retry will restart the entire stream on failure
             let llm_start = Instant::now();
@@ -1175,6 +1276,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             message_rx,
             router,
             history: Vec::new(),  // Child starts with fresh history
+            agent_dir: parent.agent_dir.clone(),  // Inherit agent_dir for context dumps
         }
     }
 

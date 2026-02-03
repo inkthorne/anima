@@ -1101,9 +1101,10 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<(Agent, bool), Bo
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
     }
 
-    // Apply LLM and memory
+    // Apply LLM, memory, and agent_dir
     agent = agent.with_llm(llm);
     agent = agent.with_memory(memory);
+    agent = agent.with_agent_dir(agent_dir.path.clone());
 
     // Add observer (verbose for daemon since there's no REPL)
     let observer = Arc::new(ConsoleObserver::new(true));
