@@ -384,6 +384,25 @@ impl ConversationStore {
         Ok(participants)
     }
 
+    /// Add a participant to an existing conversation.
+    /// Does nothing if the participant is already in the conversation.
+    pub fn add_participant(&self, conv_name: &str, agent: &str) -> Result<(), ConversationError> {
+        // Verify conversation exists
+        if self.get_conversation(conv_name)?.is_none() {
+            return Err(ConversationError::NotFound(conv_name.to_string()));
+        }
+
+        let now = current_timestamp();
+
+        // Use INSERT OR IGNORE to handle duplicate participants gracefully
+        self.conn.execute(
+            "INSERT OR IGNORE INTO participants (conv_name, agent, joined_at) VALUES (?1, ?2, ?3)",
+            params![conv_name, agent, now],
+        )?;
+
+        Ok(())
+    }
+
     /// Add a message to a conversation.
     /// Returns the message ID.
     pub fn add_message(
@@ -1151,6 +1170,42 @@ mod tests {
         assert!(store.get_conversation(&conv_name).unwrap().is_none());
         assert!(store.get_messages(&conv_name, None).unwrap().is_empty());
         assert!(store.get_participants(&conv_name).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_add_participant() {
+        let store = test_store();
+
+        // Create a conversation with initial participants
+        let conv_name = store.create_conversation(Some("chat"), &["user"]).unwrap();
+
+        // Verify initial participant
+        let participants = store.get_participants(&conv_name).unwrap();
+        assert_eq!(participants.len(), 1);
+        assert!(participants.iter().any(|p| p.agent == "user"));
+
+        // Add a new participant
+        store.add_participant(&conv_name, "arya").unwrap();
+
+        // Verify new participant was added
+        let participants = store.get_participants(&conv_name).unwrap();
+        assert_eq!(participants.len(), 2);
+        assert!(participants.iter().any(|p| p.agent == "arya"));
+
+        // Adding the same participant again should be idempotent (no error)
+        store.add_participant(&conv_name, "arya").unwrap();
+
+        // Still only 2 participants
+        let participants = store.get_participants(&conv_name).unwrap();
+        assert_eq!(participants.len(), 2);
+    }
+
+    #[test]
+    fn test_add_participant_nonexistent_conversation() {
+        let store = test_store();
+
+        let result = store.add_participant("nonexistent", "arya");
+        assert!(matches!(result, Err(ConversationError::NotFound(_))));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v3.0.0 |
+| **Version** | v3.1.0 |
 | **Tests** | 378 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
