@@ -197,6 +197,11 @@ enum ChatCommands {
         /// Name of the conversation to delete
         name: String,
     },
+    /// Clear all messages from a conversation (keeps the conversation and participants)
+    Clear {
+        /// Name of the conversation to clear
+        conv: String,
+    },
     /// Run cleanup to delete expired messages and empty conversations
     Cleanup,
 }
@@ -1228,6 +1233,12 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
             store.delete_conversation(&name)?;
             println!("Deleted conversation '\x1b[36m{}\x1b[0m'", name);
+        }
+
+        // `anima chat clear <conv>` - clear all messages from a conversation
+        Some(ChatCommands::Clear { conv }) => {
+            let deleted = store.clear_messages(&conv)?;
+            println!("Cleared {} messages from '\x1b[36m{}\x1b[0m'", deleted, conv);
         }
 
         // `anima chat cleanup` - run cleanup_expired

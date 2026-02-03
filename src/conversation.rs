@@ -724,6 +724,27 @@ impl ConversationStore {
     }
 
     /// Delete a conversation and all its messages.
+    /// Clear all messages from a conversation (keeps the conversation and participants).
+    pub fn clear_messages(&self, conv_name: &str) -> Result<usize, ConversationError> {
+        // Check conversation exists
+        self.find_by_name(conv_name)?
+            .ok_or_else(|| ConversationError::NotFound(conv_name.to_string()))?;
+
+        // Delete pending notifications for this conversation
+        self.conn.execute(
+            "DELETE FROM pending_notifications WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+
+        // Delete all messages
+        let deleted = self.conn.execute(
+            "DELETE FROM messages WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+
+        Ok(deleted)
+    }
+
     pub fn delete_conversation(&self, conv_name: &str) -> Result<(), ConversationError> {
         // Delete in order: pending_notifications, messages, participants, conversation
         self.conn.execute(
