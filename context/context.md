@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | v3.3.0 |
-| **Tests** | 423+ passing |
+| **Version** | v3.4.5 |
+| **Tests** | 428+ passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -29,38 +29,17 @@ Configured on Mojave (Ollama at 100.67.222.97:11434):
 | `gemma3:27b` | 128k | JSON-block | General conversation |
 | `qwen3-coder:30b` | 256k | Native | Coding, large context |
 
-### Model Config Example
-
-```toml
-# ~/.anima/models/gemma3-27b.toml
-provider = "ollama"
-base_url = "http://100.67.222.97:11434"  # Note: base_url not url
-model = "gemma3:27b"
-num_ctx = 131072
-tools = false
-```
-
-## Multi-Agent Conversations (v3.0+)
-
-**@mention routing:** `@arya` notifies arya, `@all` notifies all participants.
-
-**Conversation store:** SQLite with conversations, participants, messages, pending_notifications.
-
-**Autonomous chains:** Daemons forward @mentions automatically (depth limit 100).
-
-**Pause/Resume:** Queue notifications while paused, process on resume.
-
 ## Chat Commands
 
 ```bash
 anima chat                           # List all chats
 anima chat create [name]             # Create (non-interactive)
 anima chat new [name]                # Create + enter interactive
-anima chat join <name>               # Join existing
+anima chat join <name>               # Join existing (shows last 25 msgs)
 anima chat send <conv> "msg"         # Fire-and-forget (~50ms)
 anima chat view <conv>               # Dump messages to stdout
 anima chat view <conv> --limit 10    # Last N messages
-anima chat view <conv> --since <id>  # Messages after ID
+anima chat clear <conv>              # Clear all messages (keep conv)
 anima chat pause <conv>              # Queue notifications
 anima chat resume <conv>             # Process queued
 anima chat delete <conv>             # Delete conversation
@@ -80,40 +59,54 @@ anima heartbeat <name>               # Manually trigger heartbeat
 
 ## Heartbeat (v3.3.0+)
 
-Agents can wake up periodically and think proactively.
+Agents wake up periodically and think proactively.
 
-**Config:**
 ```toml
 # ~/.anima/agents/<name>/config.toml
 [heartbeat]
 enabled = true
-interval = "15m"  # Supports: "30s", "5m", "1h", "2h30m"
+interval = "15m"
 ```
 
-**Heartbeat prompt:** `~/.anima/agents/<name>/heartbeat.md`
+**Prompt:** `~/.anima/agents/<name>/heartbeat.md`
+**Output:** `heartbeat-<agent>` conversation
 
-**Output:** Stored in `heartbeat-<agent>` conversation (auto-created).
+## Claude Code Tool (v3.4.0+)
 
-**Behavior:**
-- First heartbeat fires after first interval (not on startup)
-- Queues if agent is busy, runs when free
-- Agent sees previous heartbeat outputs for continuity
+Agents can delegate coding tasks to Claude Code.
 
-## Key Files
+**Tool call format:**
+```json
+{"tool": "claude_code", "params": {"task": "Create a hello world", "workdir": "/path"}}
+```
 
-| File | Purpose |
-|------|---------|
-| `src/daemon.rs` | Daemon, Notify handling, @mention forwarding |
-| `src/conversation.rs` | ConversationStore, pause/resume, notifications |
-| `src/socket_api.rs` | Request/Response types for daemon communication |
-| `src/main.rs` | CLI commands |
-| `src/llm.rs` | LLM providers (Ollama, OpenAI) |
+**Flow:**
+1. Agent uses `claude_code` tool in a conversation
+2. Tool launches Claude Code in background, returns task ID
+3. Task watcher monitors for completion (every 10s)
+4. On completion, posts `@agent` notification to source conversation
+5. Agent wakes via @mention, sees result, responds
+
+**Agent config:**
+```toml
+[tools]
+allowed = ["read_file", "write_file", "safe_shell", "claude_code"]
+```
+
+## Tool Format (JSON-block)
+
+Agents use tools via JSON blocks:
+```json
+{"tool": "tool_name", "params": {"param1": "value"}}
+```
+
+**Available tools:** `read_file`, `write_file`, `safe_shell`, `http`, `claude_code`
 
 ## Config Structure
 
 ```
 ~/.anima/
-├── conversations.db     # Multi-agent conversations
+├── conversations.db     # Conversations + claude_code_tasks
 ├── models/*.toml        # Model definitions
 ├── tools.toml           # Tool registry
 └── agents/
@@ -135,4 +128,4 @@ anima restart all  # After changes
 
 ## Last Updated
 
-2026-02-02 — v3.3.0: **Agent heartbeats!** Periodic wakeups via `[heartbeat]` config, auto-creates `heartbeat-<agent>` conversation, busy queuing, `anima heartbeat <agent>` manual trigger.
+2026-02-02 — v3.4.5: Claude Code tool with source conversation notifications, chat join shows history, chat clear command, real-time message display in interactive chat.
