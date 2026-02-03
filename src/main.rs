@@ -514,6 +514,29 @@ async fn chat_with_conversation(
                 // Add to history
                 let _ = rl.add_history_entry(line);
 
+                // Handle slash commands
+                if line.starts_with('/') {
+                    match line {
+                        "/clear" => {
+                            store.clear_messages(conv_name)?;
+                            println!("\x1b[90mConversation cleared.\x1b[0m");
+                            continue;
+                        }
+                        "/quit" | "/exit" => {
+                            println!("\x1b[33mGoodbye!\x1b[0m");
+                            break;
+                        }
+                        "/help" => {
+                            println!("\x1b[90mCommands: /clear, /quit, /exit, /help\x1b[0m");
+                            continue;
+                        }
+                        _ => {
+                            eprintln!("\x1b[33mUnknown command. Type /help for available commands.\x1b[0m");
+                            continue;
+                        }
+                    }
+                }
+
                 // Parse @mentions from user message
                 let mentions = parse_mentions(line);
 
