@@ -664,7 +664,8 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
 }
 
 /// Start an agent daemon in the background.
-fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// If `quiet` is true, suppresses output (used by restart_all_agents).
+fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     let agent_path = resolve_agent_path(agent);
     let pid_path = agent_path.join("daemon.pid");
 
@@ -696,19 +697,29 @@ fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
 
     let pid = child.id();
-    println!("Started {} (pid {})", agent, pid);
+    if !quiet {
+        println!("Started {} (pid {})", agent, pid);
+    }
 
     Ok(())
 }
 
+/// Start an agent daemon in the background.
+fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    start_agent_impl(agent, false)
+}
+
 /// Stop a running agent daemon.
-async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// If `quiet` is true, suppresses output (used by restart_all_agents).
+async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
     let agent_path = resolve_agent_path(agent);
     let pid_path = agent_path.join("daemon.pid");
 
     // Check if running
     if !PidFile::is_running(&pid_path) {
-        println!("Agent '{}' is not running", agent);
+        if !quiet {
+            println!("Agent '{}' is not running", agent);
+        }
         return Ok(());
     }
 
@@ -719,20 +730,26 @@ async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(mut api) => {
             // Send shutdown request
             if let Err(e) = api.write_request(&Request::Shutdown).await {
-                eprintln!("Warning: Failed to send shutdown request: {}", e);
+                if !quiet {
+                    eprintln!("Warning: Failed to send shutdown request: {}", e);
+                }
             } else {
                 // Wait briefly for graceful shutdown
                 for _ in 0..10 {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     if !PidFile::is_running(&pid_path) {
-                        println!("Stopped {}", agent);
+                        if !quiet {
+                            println!("Stopped {}", agent);
+                        }
                         return Ok(());
                     }
                 }
             }
         }
         Err(e) => {
-            eprintln!("Warning: Could not connect to agent socket: {}", e);
+            if !quiet {
+                eprintln!("Warning: Could not connect to agent socket: {}", e);
+            }
         }
     }
 
@@ -743,22 +760,41 @@ async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..20 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if !PidFile::is_running(&pid_path) {
-                    println!("Stopped {}", agent);
+                    if !quiet {
+                        println!("Stopped {}", agent);
+                    }
                     return Ok(());
                 }
             }
-            eprintln!("Warning: Agent did not stop within timeout");
+            if !quiet {
+                eprintln!("Warning: Agent did not stop within timeout");
+            }
         } else {
-            eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
+            if !quiet {
+                eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
+            }
         }
     }
 
-    println!("Stopped {}", agent);
+    if !quiet {
+        println!("Stopped {}", agent);
+    }
     Ok(())
 }
 
+/// Stop a running agent daemon.
+async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    stop_agent_impl(agent, false).await
+}
+
 /// Restart a running agent daemon (stop then start).
+/// If agent is "all", restarts all currently running agents.
 async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle "all" case - restart all running agents
+    if agent == "all" {
+        return restart_all_agents().await;
+    }
+
     let agent_path = resolve_agent_path(agent);
     let pid_path = agent_path.join("daemon.pid");
 
@@ -779,6 +815,62 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Starting {}...", agent);
     start_agent(agent)?;
+
+    Ok(())
+}
+
+/// Restart all currently running agent daemons.
+async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::discover_running_agents;
+
+    // Get all running agents
+    let running_agents = discover_running_agents();
+
+    if running_agents.is_empty() {
+        println!("No running agents to restart");
+        return Ok(());
+    }
+
+    let mut restarted_count = 0;
+
+    for agent in &running_agents {
+        print!("Restarting {}... ", agent.name);
+        io::stdout().flush()?;
+
+        // Stop the agent (quiet mode - no output)
+        if let Err(e) = stop_agent_impl(&agent.name, true).await {
+            println!("failed to stop: {}", e);
+            continue;
+        }
+
+        // Brief wait to ensure clean shutdown
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Start the agent (quiet mode - no output)
+        match start_agent_impl(&agent.name, true) {
+            Ok(()) => {
+                // Wait for daemon.pid to be written by the daemon process
+                let pid_path = resolve_agent_path(&agent.name).join("daemon.pid");
+                let mut pid = 0u32;
+                for _ in 0..20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if let Ok(p) = PidFile::read(&pid_path) {
+                        if p > 0 {
+                            pid = p;
+                            break;
+                        }
+                    }
+                }
+                println!("done (pid {})", pid);
+                restarted_count += 1;
+            }
+            Err(e) => {
+                println!("failed to start: {}", e);
+            }
+        }
+    }
+
+    println!("Restarted {} agent{}", restarted_count, if restarted_count == 1 { "" } else { "s" });
 
     Ok(())
 }
