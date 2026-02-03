@@ -1424,6 +1424,16 @@ async fn handle_notify(
                         break;
                     }
 
+                    // Store this assistant response before executing the tool
+                    // (if there's content beyond just the tool call)
+                    if !cleaned_response.trim().is_empty() {
+                        if let Err(e) = store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
+                            logger.log(&format!("[notify] Failed to store intermediate response: {}", e));
+                        } else {
+                            logger.log(&format!("[notify] Stored intermediate response: {} bytes", cleaned_response.len()));
+                        }
+                    }
+
                     logger.tool(&format!("[notify] Executing: {} with params {}", tc.tool, tc.params));
 
                     // Look up the tool definition to get allowed_commands
