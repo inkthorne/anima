@@ -895,12 +895,24 @@ fn current_timestamp() -> i64 {
 ///
 /// Matches patterns like @agentname where agentname contains alphanumeric chars,
 /// hyphens, and underscores.
+///
+/// Ignores mentions inside:
+/// - Single backticks: `@name`
+/// - Triple-backtick code blocks: ```...@name...```
 pub fn parse_mentions(content: &str) -> Vec<String> {
     use regex::Regex;
 
-    let re = Regex::new(r"@([a-zA-Z0-9_-]+)").unwrap();
-    let mut mentions: Vec<String> = re
-        .captures_iter(content)
+    // Remove code blocks and inline code before parsing mentions.
+    // Order matters: remove triple-backtick blocks first (they may contain single backticks).
+    let code_block_re = Regex::new(r"```[\s\S]*?```").unwrap();
+    let inline_code_re = Regex::new(r"`[^`]+`").unwrap();
+
+    let without_code_blocks = code_block_re.replace_all(content, "");
+    let without_inline_code = inline_code_re.replace_all(&without_code_blocks, "");
+
+    let mention_re = Regex::new(r"@([a-zA-Z0-9_-]+)").unwrap();
+    let mut mentions: Vec<String> = mention_re
+        .captures_iter(&without_inline_code)
         .map(|cap| cap[1].to_string())
         .filter(|name| name != "user") // Don't notify "user"
         .collect();
@@ -1665,6 +1677,40 @@ mod tests {
     fn test_parse_mentions_in_sentence() {
         let mentions = parse_mentions("I think @arya is right, but @gendry has a point too.");
         assert_eq!(mentions, vec!["arya", "gendry"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_ignores_inline_code() {
+        // Single backticks should be ignored
+        let mentions = parse_mentions("Use `@arya` in your code");
+        assert!(mentions.is_empty());
+
+        // Real mention alongside inline code mention
+        let mentions = parse_mentions("Hey @gendry, use `@arya` in your code");
+        assert_eq!(mentions, vec!["gendry"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_ignores_code_blocks() {
+        // Triple-backtick code blocks should be ignored
+        let mentions = parse_mentions("Example:\n```\n@arya\n```");
+        assert!(mentions.is_empty());
+
+        // Code block with language specifier
+        let mentions = parse_mentions("```rust\nlet agent = \"@arya\";\n```");
+        assert!(mentions.is_empty());
+
+        // Real mention before code block
+        let mentions = parse_mentions("@gendry check this:\n```\n@arya\n```");
+        assert_eq!(mentions, vec!["gendry"]);
+    }
+
+    #[test]
+    fn test_parse_mentions_mixed_code_and_real() {
+        // Mix of real mentions and code-wrapped mentions
+        let content = "@arya look at `@fake` and also @gendry said:\n```\n@codeonly\n```\ncc @sansa";
+        let mentions = parse_mentions(content);
+        assert_eq!(mentions, vec!["arya", "gendry", "sansa"]);
     }
 
     #[test]
