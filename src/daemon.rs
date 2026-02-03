@@ -1449,6 +1449,9 @@ async fn forward_notify_to_agent(
                     Ok(Ok(Some(Response::Error { message }))) => {
                         logger.log(&format!("[notify] @{} error: {}", agent_name, message));
                     }
+                    Ok(Ok(Some(Response::NotifyReceived))) => {
+                        logger.log(&format!("[notify] @{} acknowledged (async)", agent_name));
+                    }
                     Ok(Ok(Some(_))) => {
                         logger.log(&format!("[notify] @{} unexpected response", agent_name));
                     }
