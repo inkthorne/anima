@@ -1121,22 +1121,26 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                 return Ok(());
             }
 
-            // Improved formatting: wider NAME column, show UPDATED time
-            println!("\x1b[1m{:<30} {:<30} {}\x1b[0m", "NAME", "PARTICIPANTS", "UPDATED");
+            // Column order: NAME, MSGS, UPDATED, PARTICIPANTS (last so it can overflow)
+            println!("\x1b[1m{:<30} {:>6}   {:<10} {}\x1b[0m", "NAME", "MSGS", "UPDATED", "PARTICIPANTS");
             println!("{}", "-".repeat(80));
 
             for conv in conversations {
                 let participants = store.get_participants(&conv.name)?;
                 let agents: Vec<_> = participants.iter().map(|p| p.agent.as_str()).collect();
 
+                // Get message count
+                let msg_count = store.get_message_count(&conv.name)?;
+
                 // Format updated_at as relative time
                 let updated = format_relative_time(conv.updated_at);
 
                 println!(
-                    "{:<30} {:<30} {}",
+                    "{:<30} {:>6}   {:<10} {}",
                     conv.name,
-                    agents.join(", "),
-                    updated
+                    msg_count,
+                    updated,
+                    agents.join(", ")
                 );
             }
         }

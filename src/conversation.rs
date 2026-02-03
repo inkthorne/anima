@@ -746,6 +746,16 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Get the count of non-expired messages in a conversation.
+    pub fn get_message_count(&self, conv_name: &str) -> Result<i64, ConversationError> {
+        let now = current_timestamp();
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*) FROM messages WHERE conv_name = ?1 AND expires_at > ?2",
+        )?;
+        let count: i64 = stmt.query_row(params![conv_name, now], |row| row.get(0))?;
+        Ok(count)
+    }
+
     /// Find a conversation by its name.
     pub fn find_by_name(&self, name: &str) -> Result<Option<Conversation>, ConversationError> {
         self.get_conversation(name)
