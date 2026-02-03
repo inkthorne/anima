@@ -54,6 +54,8 @@ pub struct AgentConfig {
     pub observe: ObserveSection,
     #[serde(default)]
     pub timer: Option<TimerSection>,
+    #[serde(default)]
+    pub heartbeat: HeartbeatConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +149,17 @@ pub struct TimerSection {
     /// Message to send on timer trigger
     #[serde(default)]
     pub message: Option<String>,
+}
+
+/// Configuration for heartbeat functionality.
+/// Agents can wake up periodically, read their heartbeat.md, think, and log output.
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct HeartbeatConfig {
+    /// Enable heartbeat triggers
+    #[serde(default)]
+    pub enabled: bool,
+    /// Heartbeat interval (e.g., "30s", "5m", "1h", "2h30m")
+    pub interval: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,5 +397,39 @@ message = "heartbeat"
         assert!(timer.enabled);
         assert_eq!(timer.interval, "5m");
         assert_eq!(timer.message, Some("heartbeat".to_string()));
+    }
+
+    #[test]
+    fn test_parse_heartbeat_config() {
+        let toml = r#"
+[agent]
+name = "heartbeat-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4o"
+
+[heartbeat]
+enabled = true
+interval = "30m"
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(config.heartbeat.enabled);
+        assert_eq!(config.heartbeat.interval, Some("30m".to_string()));
+    }
+
+    #[test]
+    fn test_heartbeat_config_defaults() {
+        let toml = r#"
+[agent]
+name = "no-heartbeat-agent"
+
+[llm]
+provider = "openai"
+model = "gpt-4o"
+"#;
+        let config: AgentConfig = toml::from_str(toml).unwrap();
+        assert!(!config.heartbeat.enabled);
+        assert!(config.heartbeat.interval.is_none());
     }
 }

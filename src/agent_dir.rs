@@ -170,6 +170,8 @@ pub struct AgentDirConfig {
     pub timer: Option<TimerSection>,
     #[serde(default)]
     pub semantic_memory: SemanticMemorySection,
+    #[serde(default)]
+    pub heartbeat: crate::config::HeartbeatConfig,
 }
 
 #[derive(Debug)]

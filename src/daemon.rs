@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Local;
@@ -312,6 +313,8 @@ pub struct DaemonConfig {
     pub pid_path: PathBuf,
     /// Timer configuration (if enabled)
     pub timer: Option<TimerConfig>,
+    /// Heartbeat configuration (if enabled)
+    pub heartbeat: Option<HeartbeatDaemonConfig>,
     /// Persona (system prompt)
     pub persona: Option<String>,
     /// Always content (injected before user messages for recency bias)
@@ -331,6 +334,15 @@ pub struct TimerConfig {
     pub interval: Duration,
     /// Message to send when timer fires
     pub message: String,
+}
+
+/// Heartbeat configuration for the daemon.
+#[derive(Debug, Clone)]
+pub struct HeartbeatDaemonConfig {
+    /// How often the heartbeat fires
+    pub interval: Duration,
+    /// Path to the heartbeat.md file
+    pub heartbeat_path: PathBuf,
 }
 
 impl DaemonConfig {
@@ -354,6 +366,19 @@ impl DaemonConfig {
                 None
             }
         });
+
+        // Parse heartbeat config if enabled and interval set
+        let heartbeat_path = dir_path.join("heartbeat.md");
+        let heartbeat = if agent_dir.config.heartbeat.enabled {
+            agent_dir.config.heartbeat.interval.as_ref().and_then(|interval_str| {
+                parse_duration(interval_str).map(|interval| HeartbeatDaemonConfig {
+                    interval,
+                    heartbeat_path: heartbeat_path.clone(),
+                })
+            })
+        } else {
+            None
+        };
 
         // Load persona
         let persona = agent_dir.load_persona()?;
@@ -383,6 +408,7 @@ impl DaemonConfig {
             socket_path,
             pid_path,
             timer,
+            heartbeat,
             persona,
             always,
             model_always,
@@ -402,27 +428,46 @@ fn build_runtime_context(agent: &str, model: &str, host: &str, tools_native: boo
     )
 }
 
-/// Parse a duration string like "30s", "5m", "1h" into a Duration.
+/// Parse a duration string like "30s", "5m", "1h", or compound "2h30m" into a Duration.
 fn parse_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
 
-    let num_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
-    if num_end == 0 {
-        return None;
+    let mut total_secs: u64 = 0;
+    let mut remaining = s;
+
+    while !remaining.is_empty() {
+        // Find the end of the numeric part
+        let num_end = remaining.find(|c: char| !c.is_ascii_digit()).unwrap_or(remaining.len());
+        if num_end == 0 {
+            return None;
+        }
+
+        let num: u64 = remaining[..num_end].parse().ok()?;
+        remaining = &remaining[num_end..];
+
+        // Find the end of the unit part
+        let unit_end = remaining.find(|c: char| c.is_ascii_digit()).unwrap_or(remaining.len());
+        let unit = &remaining[..unit_end];
+        remaining = &remaining[unit_end..];
+
+        let secs = match unit {
+            "s" | "sec" | "secs" | "second" | "seconds" => num,
+            "m" | "min" | "mins" | "minute" | "minutes" => num * 60,
+            "h" | "hr" | "hrs" | "hour" | "hours" => num * 3600,
+            "" if remaining.is_empty() => num, // Bare number at end means seconds
+            _ => return None,
+        };
+
+        total_secs += secs;
     }
 
-    let num: u64 = s[..num_end].parse().ok()?;
-    let unit = &s[num_end..];
-
-    match unit {
-        "s" | "sec" | "secs" | "second" | "seconds" => Some(Duration::from_secs(num)),
-        "m" | "min" | "mins" | "minute" | "minutes" => Some(Duration::from_secs(num * 60)),
-        "h" | "hr" | "hrs" | "hour" | "hours" => Some(Duration::from_secs(num * 3600)),
-        "" => Some(Duration::from_secs(num)),
-        _ => None,
+    if total_secs > 0 {
+        Some(Duration::from_secs(total_secs))
+    } else {
+        None
     }
 }
 
@@ -522,6 +567,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     logger.log(&format!("  Socket: {}", config.socket_path.display()));
     if let Some(ref timer) = config.timer {
         logger.log(&format!("  Timer: every {:?}, message: \"{}\"", timer.interval, timer.message));
+    }
+    if let Some(ref hb) = config.heartbeat {
+        logger.log(&format!("  Heartbeat: every {:?}, file: {}", hb.interval, hb.heartbeat_path.display()));
     }
 
     // Create the agent
@@ -811,6 +859,56 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Set up heartbeat if configured
+    // heartbeat_pending tracks if a heartbeat should fire after current think completes
+    let heartbeat_pending = Arc::new(AtomicBool::new(false));
+    let heartbeat_config = config.heartbeat.clone();
+
+    let heartbeat_handle = if let Some(ref hb_config) = heartbeat_config {
+        // Only start heartbeat loop if heartbeat.md exists
+        if hb_config.heartbeat_path.exists() {
+            let agent_clone = agent.clone();
+            let agent_name = config.name.clone();
+            let persona = config.persona.clone();
+            let always = config.always.clone();
+            let model_always = config.model_always.clone();
+            let allowed_tools = config.allowed_tools.clone();
+            let hb_config = hb_config.clone();
+            let shutdown_clone = shutdown.clone();
+            let semantic_memory = semantic_memory_store.clone();
+            let hb_embedding_client = embedding_client.clone();
+            let hb_registry = tool_registry.clone();
+            let hb_logger = logger.clone();
+            let hb_recall_limit = config.semantic_memory.recall_limit;
+            let hb_pending = heartbeat_pending.clone();
+
+            Some(tokio::spawn(async move {
+                heartbeat_loop(
+                    hb_config,
+                    agent_clone,
+                    agent_name,
+                    persona,
+                    always,
+                    model_always,
+                    allowed_tools,
+                    semantic_memory,
+                    hb_embedding_client,
+                    hb_registry,
+                    use_native_tools,
+                    hb_logger,
+                    hb_recall_limit,
+                    hb_pending,
+                    shutdown_clone,
+                ).await
+            }))
+        } else {
+            logger.log("  Heartbeat: heartbeat.md not found, skipping");
+            None
+        }
+    } else {
+        None
+    };
+
     // Main loop: accept connections
     loop {
         tokio::select! {
@@ -828,6 +926,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_embedding_client = embedding_client.clone();
                         let conn_registry = tool_registry.clone();
                         let conn_logger = logger.clone();
+                        let conn_heartbeat_config = heartbeat_config.clone();
+                        let conn_heartbeat_pending = heartbeat_pending.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
                         tokio::spawn(async move {
@@ -847,6 +947,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 shutdown_clone,
                                 conn_logger,
                                 recall_limit,
+                                conn_heartbeat_config,
+                                conn_heartbeat_pending,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -866,6 +968,11 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for timer task to finish
     if let Some(handle) = timer_handle {
+        let _ = handle.await;
+    }
+
+    // Wait for heartbeat task to finish
+    if let Some(handle) = heartbeat_handle {
         let _ = handle.await;
     }
 
@@ -1242,6 +1349,293 @@ async fn forward_notify_to_agent(
     }
 }
 
+/// Heartbeat loop that fires periodically.
+/// Queues heartbeat if agent is busy (thinking lock held).
+async fn heartbeat_loop(
+    config: HeartbeatDaemonConfig,
+    agent: Arc<Mutex<Agent>>,
+    agent_name: String,
+    persona: Option<String>,
+    always: Option<String>,
+    model_always: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
+    tool_registry: Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    logger: Arc<AgentLogger>,
+    recall_limit: usize,
+    heartbeat_pending: Arc<AtomicBool>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let mut interval = tokio::time::interval(config.interval);
+    // Skip the first immediate tick - first heartbeat fires AFTER first interval
+    interval.tick().await;
+
+    // Polling interval for checking pending heartbeats (1 second)
+    let mut pending_check = tokio::time::interval(Duration::from_secs(1));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                logger.log("[heartbeat] Timer fired");
+
+                // Try to acquire the agent lock (non-blocking check)
+                // We use try_lock to see if agent is busy
+                match agent.try_lock() {
+                    Ok(guard) => {
+                        // Agent is free, drop the guard and run heartbeat
+                        drop(guard);
+                        run_heartbeat(
+                            &config,
+                            &agent,
+                            &agent_name,
+                            &persona,
+                            &always,
+                            &model_always,
+                            &allowed_tools,
+                            &semantic_memory,
+                            &embedding_client,
+                            &tool_registry,
+                            use_native_tools,
+                            &logger,
+                            recall_limit,
+                        ).await;
+                    }
+                    Err(_) => {
+                        // Agent is busy, queue the heartbeat
+                        logger.log("[heartbeat] Agent busy, queuing heartbeat");
+                        heartbeat_pending.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+            _ = pending_check.tick() => {
+                // Check if there's a pending heartbeat and agent is now free
+                if heartbeat_pending.load(Ordering::SeqCst) {
+                    if let Ok(guard) = agent.try_lock() {
+                        // Agent is free now, clear pending and run heartbeat
+                        heartbeat_pending.store(false, Ordering::SeqCst);
+                        drop(guard);
+                        logger.log("[heartbeat] Running pending heartbeat");
+                        run_heartbeat(
+                            &config,
+                            &agent,
+                            &agent_name,
+                            &persona,
+                            &always,
+                            &model_always,
+                            &allowed_tools,
+                            &semantic_memory,
+                            &embedding_client,
+                            &tool_registry,
+                            use_native_tools,
+                            &logger,
+                            recall_limit,
+                        ).await;
+                    }
+                }
+            }
+            _ = shutdown.notified() => {
+                logger.log("[heartbeat] Shutting down heartbeat loop");
+                break;
+            }
+        }
+    }
+}
+
+/// Execute a heartbeat: load heartbeat.md, think, store response in heartbeat-<agent> conversation.
+async fn run_heartbeat(
+    config: &HeartbeatDaemonConfig,
+    agent: &Arc<Mutex<Agent>>,
+    agent_name: &str,
+    persona: &Option<String>,
+    always: &Option<String>,
+    model_always: &Option<String>,
+    allowed_tools: &Option<Vec<String>>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    logger: &Arc<AgentLogger>,
+    recall_limit: usize,
+) {
+    // 1. Load heartbeat.md content
+    let heartbeat_prompt = match std::fs::read_to_string(&config.heartbeat_path) {
+        Ok(content) if !content.trim().is_empty() => content,
+        Ok(_) => {
+            logger.log("[heartbeat] heartbeat.md is empty, skipping");
+            return;
+        }
+        Err(e) => {
+            logger.log(&format!("[heartbeat] Failed to read heartbeat.md: {}", e));
+            return;
+        }
+    };
+
+    logger.log(&format!("[heartbeat] Running with prompt: {} chars", heartbeat_prompt.len()));
+
+    // 2. Get or create heartbeat-<agent> conversation
+    let conv_name = format!("heartbeat-{}", agent_name);
+    let store = match ConversationStore::init() {
+        Ok(s) => s,
+        Err(e) => {
+            logger.log(&format!("[heartbeat] Failed to open conversation store: {}", e));
+            return;
+        }
+    };
+
+    // Create conversation if it doesn't exist (agent is only participant)
+    if store.find_by_name(&conv_name).ok().flatten().is_none() {
+        if let Err(e) = store.create_conversation(Some(&conv_name), &[agent_name]) {
+            logger.log(&format!("[heartbeat] Failed to create conversation: {}", e));
+            return;
+        }
+        logger.log(&format!("[heartbeat] Created conversation '{}'", conv_name));
+    }
+
+    // 3. Get conversation context (recent heartbeat outputs for continuity)
+    let context_messages = store.get_messages(&conv_name, Some(recall_limit)).unwrap_or_default();
+    let context = if context_messages.is_empty() {
+        String::new()
+    } else {
+        context_messages
+            .iter()
+            .map(|msg| {
+                let escaped = msg.content
+                    .replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('\n', "\\n");
+                format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", msg.from_agent, escaped)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // 4. Build effective always with tools and memory injection
+    let tools_injection = if use_native_tools {
+        String::new()
+    } else if let Some(registry) = tool_registry {
+        let relevant = registry.find_relevant(&heartbeat_prompt, recall_limit);
+        let relevant = filter_by_allowlist(relevant, allowed_tools);
+        ToolRegistry::format_for_prompt(&relevant)
+    } else {
+        String::new()
+    };
+
+    let memory_injection = if let Some(mem_store) = semantic_memory {
+        let query_embedding = if let Some(emb_client) = embedding_client {
+            emb_client.embed(&heartbeat_prompt).await.ok()
+        } else {
+            None
+        };
+
+        let store_guard = mem_store.lock().await;
+        match store_guard.recall_with_embedding(&heartbeat_prompt, recall_limit, query_embedding.as_deref()) {
+            Ok(memories) => {
+                if !memories.is_empty() {
+                    logger.memory(&format!("[heartbeat] Recall: {} memories", memories.len()));
+                }
+                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                build_memory_injection(&entries)
+            }
+            Err(_) => String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+
+    // Build prompt with context if available
+    let full_prompt = if context.is_empty() {
+        heartbeat_prompt
+    } else {
+        format!("{}\n\n[Previous heartbeat outputs]\n{}", heartbeat_prompt, context)
+    };
+
+    // 5. Think
+    let options = ThinkOptions {
+        system_prompt: persona.clone(),
+        always_prompt: effective_always,
+        ..Default::default()
+    };
+
+    let mut agent_guard = agent.lock().await;
+    let result = match agent_guard.think_with_options(&full_prompt, options).await {
+        Ok(r) => r,
+        Err(e) => {
+            logger.log(&format!("[heartbeat] Think error: {}", e));
+            return;
+        }
+    };
+    drop(agent_guard);
+
+    // 6. Process response: strip thinking tags, extract memories
+    let without_thinking = strip_thinking_tags(&result.response);
+    let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
+
+    // Save memories
+    if !memories_to_save.is_empty() {
+        if let Some(mem_store) = semantic_memory {
+            let store_guard = mem_store.lock().await;
+            for memory in &memories_to_save {
+                let embedding = if let Some(emb_client) = embedding_client {
+                    emb_client.embed(memory).await.ok()
+                } else {
+                    None
+                };
+                match store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                    Ok(SaveResult::New(id)) => logger.memory(&format!("[heartbeat] Save #{}: \"{}\"", id, memory)),
+                    Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("[heartbeat] Reinforce #{}: ({:.2} → {:.2})", id, old, new)),
+                    Err(e) => logger.log(&format!("[heartbeat] Failed to save memory: {}", e)),
+                }
+            }
+        }
+    }
+
+    // 7. Store response in heartbeat-<agent> conversation (just the response, not the prompt)
+    match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
+        Ok(msg_id) => {
+            logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
+        }
+        Err(e) => {
+            logger.log(&format!("[heartbeat] Failed to store response: {}", e));
+        }
+    }
+
+    // 8. Parse @mentions from response and notify (reuse existing logic)
+    let mentions = crate::conversation::parse_mentions(&cleaned_response);
+    let valid_mentions: Vec<String> = mentions
+        .into_iter()
+        .filter(|m| m != agent_name && m != "user" && m != "all")
+        .filter(|m| discovery::agent_exists(m))
+        .collect();
+
+    if !valid_mentions.is_empty() {
+        logger.log(&format!("[heartbeat] Notifying {} agents: {:?}", valid_mentions.len(), valid_mentions));
+
+        // Get the message ID we just stored
+        if let Ok(msgs) = store.get_messages(&conv_name, Some(1)) {
+            if let Some(last_msg) = msgs.last() {
+                for mention in valid_mentions {
+                    // Add mentioned agent as participant
+                    let _ = store.add_participant(&conv_name, &mention);
+
+                    forward_notify_to_agent(
+                        &mention,
+                        &conv_name,
+                        last_msg.id,
+                        0, // Start at depth 0
+                        logger,
+                    ).await;
+                }
+            }
+        }
+    }
+
+    logger.log(&format!("[heartbeat] Complete. Response: {} chars", cleaned_response.len()));
+}
+
 /// Handle a single connection from a client.
 async fn handle_connection(
     mut api: SocketApi,
@@ -1258,6 +1652,8 @@ async fn handle_connection(
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
+    heartbeat_config: Option<HeartbeatDaemonConfig>,
+    _heartbeat_pending: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -1823,6 +2219,40 @@ async fn handle_connection(
                 let persona_content = persona.clone().unwrap_or_else(|| "(no persona configured)".to_string());
                 Response::System { persona: persona_content }
             }
+
+            Request::Heartbeat => {
+                logger.log("[socket] Manual heartbeat requested");
+
+                // Check if heartbeat is configured
+                if let Some(ref hb_config) = heartbeat_config {
+                    // Check if heartbeat.md exists
+                    if !hb_config.heartbeat_path.exists() {
+                        logger.log("[socket] heartbeat.md not found");
+                        Response::Error { message: "heartbeat.md not found".to_string() }
+                    } else {
+                        // Run heartbeat immediately (skip busy check for manual trigger)
+                        run_heartbeat(
+                            hb_config,
+                            &agent,
+                            &agent_name,
+                            &persona,
+                            &always,
+                            &model_always,
+                            &allowed_tools,
+                            &semantic_memory,
+                            &embedding_client,
+                            &tool_registry,
+                            use_native_tools,
+                            &logger,
+                            recall_limit,
+                        ).await;
+                        Response::HeartbeatTriggered
+                    }
+                } else {
+                    logger.log("[socket] Heartbeat not configured");
+                    Response::HeartbeatNotConfigured
+                }
+            }
         };
 
         if let Err(e) = api.write_response(&response).await {
@@ -1868,6 +2298,14 @@ mod tests {
         assert_eq!(parse_duration(""), None);
         assert_eq!(parse_duration("abc"), None);
         assert_eq!(parse_duration("5x"), None);
+    }
+
+    #[test]
+    fn test_parse_duration_compound() {
+        // Compound durations like "2h30m", "1h30m15s"
+        assert_eq!(parse_duration("2h30m"), Some(Duration::from_secs(2 * 3600 + 30 * 60)));
+        assert_eq!(parse_duration("1h30m15s"), Some(Duration::from_secs(3600 + 30 * 60 + 15)));
+        assert_eq!(parse_duration("1m30s"), Some(Duration::from_secs(60 + 30)));
     }
 
     #[test]

@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | v3.2.7 |
-| **Tests** | 418+ passing |
+| **Version** | v3.3.0 |
+| **Tests** | 423+ passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -75,7 +75,29 @@ anima restart all                    # Restart all running
 anima status                         # Show running agents
 anima ask <name> "msg"               # One-shot
 anima send <name> "msg"              # Send to agent
+anima heartbeat <name>               # Manually trigger heartbeat
 ```
+
+## Heartbeat (v3.3.0+)
+
+Agents can wake up periodically and think proactively.
+
+**Config:**
+```toml
+# ~/.anima/agents/<name>/config.toml
+[heartbeat]
+enabled = true
+interval = "15m"  # Supports: "30s", "5m", "1h", "2h30m"
+```
+
+**Heartbeat prompt:** `~/.anima/agents/<name>/heartbeat.md`
+
+**Output:** Stored in `heartbeat-<agent>` conversation (auto-created).
+
+**Behavior:**
+- First heartbeat fires after first interval (not on startup)
+- Queues if agent is busy, runs when free
+- Agent sees previous heartbeat outputs for continuity
 
 ## Key Files
 
@@ -99,6 +121,7 @@ anima send <name> "msg"              # Send to agent
     └── <name>/
         ├── config.toml  # Agent config
         ├── persona.md   # System prompt
+        ├── heartbeat.md # Heartbeat prompt (optional)
         └── memory.db    # Semantic memory
 ```
 
@@ -112,4 +135,4 @@ anima restart all  # After changes
 
 ## Last Updated
 
-2026-02-02 — v3.2.7: Autonomous conversations complete. Fire-and-forget send (~50ms), pause/resume queues notifications, daemon-driven @mention chains, fun conversation names.
+2026-02-02 — v3.3.0: **Agent heartbeats!** Periodic wakeups via `[heartbeat]` config, auto-creates `heartbeat-<agent>` conversation, busy queuing, `anima heartbeat <agent>` manual trigger.

@@ -134,6 +134,11 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
+    /// Trigger a heartbeat for a running agent daemon
+    Heartbeat {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -282,6 +287,12 @@ async fn main() {
         }
         Commands::System { agent } => {
             if let Err(e) = show_system_prompt(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Heartbeat { agent } => {
+            if let Err(e) = trigger_heartbeat(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -915,6 +926,36 @@ async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error
     match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
         Some(Response::System { persona }) => {
             println!("{}", persona);
+        }
+        Some(Response::Error { message }) => {
+            return Err(format!("Error from agent: {}", message).into());
+        }
+        Some(other) => {
+            return Err(format!("Unexpected response: {:?}", other).into());
+        }
+        None => {
+            return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Trigger a heartbeat for a running agent daemon.
+async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    // Send heartbeat request
+    api.write_request(&Request::Heartbeat).await
+        .map_err(|e| format!("Failed to send heartbeat request: {}", e))?;
+
+    // Read the response
+    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+        Some(Response::HeartbeatTriggered) => {
+            println!("Heartbeat triggered for {}", agent);
+        }
+        Some(Response::HeartbeatNotConfigured) => {
+            println!("Heartbeat not configured for {} (add [heartbeat] section to config.toml)", agent);
         }
         Some(Response::Error { message }) => {
             return Err(format!("Error from agent: {}", message).into());

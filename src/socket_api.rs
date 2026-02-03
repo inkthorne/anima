@@ -44,6 +44,8 @@ pub enum Request {
     ListAgents,
     /// Get the system prompt (persona) for this agent.
     System,
+    /// Manually trigger a heartbeat.
+    Heartbeat,
 }
 
 /// Response types for the socket API.
@@ -92,6 +94,10 @@ pub enum Response {
     /// Immediate acknowledgment for Notify request (fire-and-forget).
     /// The daemon will process the notification asynchronously.
     NotifyReceived,
+    /// Response to a heartbeat request.
+    HeartbeatTriggered,
+    /// Response when heartbeat is not configured for the agent.
+    HeartbeatNotConfigured,
 }
 
 /// Socket API handler for reading and writing protocol messages.
@@ -527,5 +533,35 @@ mod tests {
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::NotifyReceived));
+    }
+
+    #[test]
+    fn test_request_heartbeat_serialization() {
+        let request = Request::Heartbeat;
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, r#"{"type":"heartbeat"}"#);
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Request::Heartbeat));
+    }
+
+    #[test]
+    fn test_response_heartbeat_triggered_serialization() {
+        let response = Response::HeartbeatTriggered;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"type":"heartbeat_triggered"}"#);
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::HeartbeatTriggered));
+    }
+
+    #[test]
+    fn test_response_heartbeat_not_configured_serialization() {
+        let response = Response::HeartbeatNotConfigured;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"type":"heartbeat_not_configured"}"#);
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::HeartbeatNotConfigured));
     }
 }
