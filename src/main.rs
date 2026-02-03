@@ -956,7 +956,7 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
         Some(ChatCommands::Join { name }) => {
             // Check if conversation exists
             if store.find_by_name(&name)?.is_none() {
-                return Err(format!("Conversation '{}' not found. Use 'anima chat new {}' to create it.", name, name).into());
+                return Err(format!("Conversation '{}' not found. Use 'anima chat create {}' to create it.", name, name).into());
             }
 
             chat_with_conversation(&name).await?;
@@ -1141,7 +1141,7 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
             if conversations.is_empty() {
                 println!("\x1b[33mNo conversations found.\x1b[0m");
-                println!("Create one with: \x1b[36manima chat new\x1b[0m");
+                println!("Create one with: \x1b[36manima chat create\x1b[0m");
                 return Ok(());
             }
 
