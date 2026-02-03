@@ -526,8 +526,45 @@ async fn chat_with_conversation(
                             println!("\x1b[33mGoodbye!\x1b[0m");
                             break;
                         }
+                        "/pause" => {
+                            match store.set_paused(conv_name, true) {
+                                Ok(_) => println!("\x1b[90mConversation paused. Notifications will be queued.\x1b[0m"),
+                                Err(e) => eprintln!("\x1b[31mFailed to pause: {}\x1b[0m", e),
+                            }
+                            continue;
+                        }
+                        "/resume" => {
+                            match store.set_paused(conv_name, false) {
+                                Ok(_) => {
+                                    // Check for pending notifications and process them
+                                    match store.get_pending_notifications_for_conversation(conv_name) {
+                                        Ok(pending) => {
+                                            let pending_count = pending.len();
+                                            if pending_count > 0 {
+                                                for notification in &pending {
+                                                    let mentions = vec![notification.agent.clone()];
+                                                    let _ = notify_mentioned_agents_parallel(
+                                                        &store,
+                                                        conv_name,
+                                                        notification.message_id,
+                                                        &mentions
+                                                    ).await;
+                                                    let _ = store.delete_pending_notification(notification.id);
+                                                }
+                                                println!("\x1b[90mConversation resumed. {} pending notification(s) processed.\x1b[0m", pending_count);
+                                            } else {
+                                                println!("\x1b[90mConversation resumed.\x1b[0m");
+                                            }
+                                        }
+                                        Err(_) => println!("\x1b[90mConversation resumed.\x1b[0m"),
+                                    }
+                                }
+                                Err(e) => eprintln!("\x1b[31mFailed to resume: {}\x1b[0m", e),
+                            }
+                            continue;
+                        }
                         "/help" => {
-                            println!("\x1b[90mCommands: /clear, /quit, /exit, /help\x1b[0m");
+                            println!("\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m");
                             continue;
                         }
                         _ => {
