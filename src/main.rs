@@ -803,7 +803,49 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
 
 /// Start an agent daemon in the background.
 fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle "all" case - start all stopped agents
+    if agent == "all" {
+        return start_all_agents();
+    }
     start_agent_impl(agent, false)
+}
+
+/// Start all configured agents that are not currently running.
+fn start_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::{list_saved_agents, is_agent_running};
+
+    let all_agents = list_saved_agents();
+
+    if all_agents.is_empty() {
+        println!("No configured agents found");
+        return Ok(());
+    }
+
+    // Filter to only stopped agents
+    let stopped_agents: Vec<_> = all_agents
+        .into_iter()
+        .filter(|name| !is_agent_running(name))
+        .collect();
+
+    if stopped_agents.is_empty() {
+        println!("All agents already running");
+        return Ok(());
+    }
+
+    let mut started = Vec::new();
+
+    for agent in &stopped_agents {
+        match start_agent_impl(agent, true) {
+            Ok(()) => started.push(agent.clone()),
+            Err(e) => eprintln!("Failed to start {}: {}", agent, e),
+        }
+    }
+
+    if !started.is_empty() {
+        println!("Started {} agent(s): {}", started.len(), started.join(", "));
+    }
+
+    Ok(())
 }
 
 /// Stop a running agent daemon.
