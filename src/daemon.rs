@@ -1256,6 +1256,7 @@ async fn handle_notify(
     let max_tool_calls = 10;
     let mut tool_call_count = 0;
     let mut current_message = context.clone();
+    #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
 
     loop {

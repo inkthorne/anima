@@ -441,6 +441,24 @@ async fn chat_with_conversation(
     } else {
         println!("\x1b[90mParticipants: {}\x1b[0m", participants.join(", "));
     }
+
+    // Display recent message history for context
+    if let Ok(recent_msgs) = store.get_messages(conv_name, Some(25)) {
+        if !recent_msgs.is_empty() {
+            println!("\x1b[90m--- Recent messages ---\x1b[0m");
+            for msg in &recent_msgs {
+                let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
+                println!("\x1b[{}m[{}]:\x1b[0m {}", color, msg.from_agent, msg.content);
+            }
+            println!("\x1b[90m--- End of history ---\x1b[0m\n");
+            
+            // Update last_seen_id to the most recent message
+            if let Some(last) = recent_msgs.last() {
+                last_seen_id.store(last.id, Ordering::SeqCst);
+            }
+        }
+    }
+
     println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
 
     // Spawn background message polling task
