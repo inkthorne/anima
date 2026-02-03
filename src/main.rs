@@ -881,7 +881,43 @@ async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::er
 
 /// Stop a running agent daemon.
 async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle "all" case - stop all running agents
+    if agent == "all" {
+        return stop_all_agents().await;
+    }
     stop_agent_impl(agent, false).await
+}
+
+/// Stop all running agent daemons.
+async fn stop_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::discover_running_agents;
+
+    let running_agents = discover_running_agents();
+
+    if running_agents.is_empty() {
+        println!("No running agents to stop");
+        return Ok(());
+    }
+
+    let mut stopped_count = 0;
+
+    for agent in &running_agents {
+        print!("Stopping {}... ", agent.name);
+        io::stdout().flush()?;
+
+        match stop_agent_impl(&agent.name, true).await {
+            Ok(()) => {
+                println!("stopped");
+                stopped_count += 1;
+            }
+            Err(e) => {
+                println!("failed: {}", e);
+            }
+        }
+    }
+
+    println!("\nStopped {} agent(s)", stopped_count);
+    Ok(())
 }
 
 /// Restart a running agent daemon (stop then start).
