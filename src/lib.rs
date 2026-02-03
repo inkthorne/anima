@@ -36,4 +36,4 @@ pub use tools::{SendMessageTool, ListAgentsTool};
 pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient, OllamaClient, UsageInfo, strip_thinking_tags};
 pub use supervision::{ChildHandle, ChildConfig, ChildStatus};
 pub use tool_registry::{ToolRegistry, ToolDefinition, ToolRegistryError};
-pub use conversation::{ConversationStore, Conversation, ConversationMessage, Participant, PendingNotification, ConversationError, generate_fun_name, parse_mentions, expand_all_mention, notify_mentioned_agents, notify_mentioned_agents_parallel, NotifyResult};
+pub use conversation::{ConversationStore, Conversation, ConversationMessage, Participant, PendingNotification, ConversationError, generate_fun_name, parse_mentions, expand_all_mention, notify_mentioned_agents, notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned, notify_mentioned_agents_fire_and_forget, NotifyResult};

@@ -1744,24 +1744,48 @@ async fn handle_connection(
             Request::Notify { ref conv_id, message_id, depth } => {
                 logger.log(&format!("[socket] Notify: conv={} msg_id={} depth={}", conv_id, message_id, depth));
 
-                // Handle notification - use a helper function to keep the match arm cleaner
-                handle_notify(
-                    conv_id,
-                    message_id,
-                    depth,
-                    &agent,
-                    &agent_name,
-                    &persona,
-                    &always,
-                    &model_always,
-                    &allowed_tools,
-                    &semantic_memory,
-                    &embedding_client,
-                    &tool_registry,
-                    use_native_tools,
-                    &logger,
-                    recall_limit,
-                ).await
+                // Send immediate ack - fire-and-forget semantics
+                if let Err(e) = api.write_response(&Response::NotifyReceived).await {
+                    logger.log(&format!("[socket] Error writing NotifyReceived: {}", e));
+                    continue;
+                }
+
+                // Spawn async processing - don't block the caller
+                let conv_id = conv_id.clone();
+                let agent = agent.clone();
+                let agent_name = agent_name.clone();
+                let persona = persona.clone();
+                let always = always.clone();
+                let model_always = model_always.clone();
+                let allowed_tools = allowed_tools.clone();
+                let semantic_memory = semantic_memory.clone();
+                let embedding_client = embedding_client.clone();
+                let tool_registry = tool_registry.clone();
+                let logger = logger.clone();
+
+                tokio::spawn(async move {
+                    let _response = handle_notify(
+                        &conv_id,
+                        message_id,
+                        depth,
+                        &agent,
+                        &agent_name,
+                        &persona,
+                        &always,
+                        &model_always,
+                        &allowed_tools,
+                        &semantic_memory,
+                        &embedding_client,
+                        &tool_registry,
+                        use_native_tools,
+                        &logger,
+                        recall_limit,
+                    ).await;
+                    // Response is logged inside handle_notify, no need to do anything with it
+                });
+
+                // Continue to next request - we already sent the ack
+                continue;
             }
 
             Request::Status => {

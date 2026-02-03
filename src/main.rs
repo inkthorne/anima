@@ -468,14 +468,15 @@ async fn chat_with_conversation(
                     // Display results for each initially notified agent
                     for (agent, result) in &notify_results {
                         match result {
+                            NotifyResult::Acknowledged => {
+                                // Fire-and-forget: agent received notification, processing async
+                                println!("\x1b[90m[@{} notified, processing...]\x1b[0m", agent);
+                            }
                             NotifyResult::Notified { response_message_id } => {
-                                // Fetch and display the agent's response
+                                // Synchronous response (backwards compat)
                                 if let Ok(msgs) = store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
                                     if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                         println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
-
-                                        // Note: @mentions in the response are now handled by the daemon
-                                        // autonomously - no need for CLI to track and forward them
                                     }
                                 }
                             }
@@ -1002,11 +1003,34 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             // Store user message in conversation
             let user_msg_id = store.add_message(&conv, "user", &message, &mention_refs)?;
 
-            // Notify mentioned agents (fire and forget - we trigger but don't wait for full responses)
+            // Notify mentioned agents - wait for acknowledgments but not responses
+            // The daemon processes notifications asynchronously after acknowledging
             if !expanded_mentions.is_empty() {
-                // Notify agents - this sends the requests but we don't display results
-                let _ = notify_mentioned_agents_parallel(&store, &conv, user_msg_id, &expanded_mentions).await;
-                println!("Sent message to '{}', notified: {}", conv, expanded_mentions.join(", "));
+                let results = notify_mentioned_agents_parallel(&store, &conv, user_msg_id, &expanded_mentions).await;
+
+                // Report results
+                let mut notified = Vec::new();
+                let mut queued = Vec::new();
+                let mut failed = Vec::new();
+
+                for (agent, result) in results {
+                    match result {
+                        NotifyResult::Acknowledged | NotifyResult::Notified { .. } => notified.push(agent),
+                        NotifyResult::Queued { .. } => queued.push(agent),
+                        NotifyResult::UnknownAgent => failed.push(format!("{} (unknown)", agent)),
+                        NotifyResult::Failed { reason } => failed.push(format!("{} ({})", agent, reason)),
+                    }
+                }
+
+                if !notified.is_empty() {
+                    println!("Sent message to '{}', notified: {}", conv, notified.join(", "));
+                }
+                if !queued.is_empty() {
+                    println!("Queued for offline agents: {}", queued.join(", "));
+                }
+                if !failed.is_empty() {
+                    eprintln!("Failed to notify: {}", failed.join(", "));
+                }
             } else {
                 println!("Sent message to '{}' (no @mentions)", conv);
             }

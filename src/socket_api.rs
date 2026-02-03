@@ -89,6 +89,9 @@ pub enum Response {
         /// The message ID of the agent's response (stored in conversation)
         response_message_id: i64,
     },
+    /// Immediate acknowledgment for Notify request (fire-and-forget).
+    /// The daemon will process the notification asynchronously.
+    NotifyReceived,
 }
 
 /// Socket API handler for reading and writing protocol messages.
@@ -514,5 +517,15 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_response_notify_received_serialization() {
+        let response = Response::NotifyReceived;
+        let json = serde_json::to_string(&response).unwrap();
+        assert_eq!(json, r#"{"type":"notify_received"}"#);
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, Response::NotifyReceived));
     }
 }

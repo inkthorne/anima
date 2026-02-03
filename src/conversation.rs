@@ -920,8 +920,10 @@ pub fn expand_all_mention(mentions: &[String], participants: &[String]) -> Vec<S
 /// Result of attempting to notify an agent.
 #[derive(Debug)]
 pub enum NotifyResult {
-    /// Agent was notified via socket (running daemon)
+    /// Agent was notified via socket (running daemon) - synchronous response
     Notified { response_message_id: i64 },
+    /// Agent acknowledged notification (fire-and-forget) - will process asynchronously
+    Acknowledged,
     /// Agent was not running; notification queued
     Queued { notification_id: i64 },
     /// Agent does not exist (no config.toml found)
@@ -1076,7 +1078,12 @@ async fn notify_single_agent(
 
                 // Read response
                 match api.read_response().await {
+                    Ok(Some(Response::NotifyReceived)) => {
+                        // Fire-and-forget: daemon acknowledged, will process async
+                        (agent_name, NotifyResult::Acknowledged)
+                    }
                     Ok(Some(Response::Notified { response_message_id })) => {
+                        // Synchronous response (backwards compat)
                         (agent_name, NotifyResult::Notified { response_message_id })
                     }
                     Ok(Some(Response::Error { message })) => {
@@ -1125,10 +1132,22 @@ async fn notify_single_agent(
 ///
 /// Returns a map of agent name to NotifyResult.
 pub async fn notify_mentioned_agents_parallel(
-    store: &ConversationStore,
+    _store: &ConversationStore,
     conv_id: &str,
     message_id: i64,
     mentions: &[String],
+) -> std::collections::HashMap<String, NotifyResult> {
+    // Delegate to implementation that creates its own store for queuing
+    // This avoids holding store reference across await points (Send issue)
+    notify_mentioned_agents_parallel_owned(conv_id.to_string(), message_id, mentions.to_vec()).await
+}
+
+/// Parallel notification that owns all its data (no references held across await).
+/// This version is safe to use from tokio::spawn.
+pub async fn notify_mentioned_agents_parallel_owned(
+    conv_id: String,
+    message_id: i64,
+    mentions: Vec<String>,
 ) -> std::collections::HashMap<String, NotifyResult> {
     use futures_util::future::join_all;
 
@@ -1141,7 +1160,7 @@ pub async fn notify_mentioned_agents_parallel(
     // Spawn parallel notification tasks
     let futures: Vec<_> = mentions.iter().map(|agent_name| {
         let agent = agent_name.clone();
-        let cid = conv_id.to_string();
+        let cid = conv_id.clone();
         let mid = message_id;
         tokio::spawn(async move {
             notify_single_agent(agent, cid, mid).await
@@ -1151,24 +1170,23 @@ pub async fn notify_mentioned_agents_parallel(
     // Wait for all notifications to complete
     let outcomes = join_all(futures).await;
 
-    // Process results and queue failed notifications for offline agents
+    // Collect agents that need queuing
+    let mut agents_to_queue: Vec<String> = Vec::new();
+
+    // Process results
     for outcome in outcomes {
         match outcome {
             Ok((agent_name, result)) => {
-                // If agent wasn't reachable or not running, queue the notification
+                // If agent wasn't reachable or not running, mark for queuing
                 let final_result = match &result {
                     NotifyResult::Failed { reason } if reason.contains("not running") || reason.contains("not reachable") => {
                         // Only queue if agent actually exists
                         if !crate::discovery::agent_exists(&agent_name) {
                             NotifyResult::UnknownAgent
                         } else {
-                            // Queue the notification for when agent comes online
-                            match store.add_pending_notification(&agent_name, conv_id, message_id) {
-                                Ok(notification_id) => NotifyResult::Queued { notification_id },
-                                Err(e) => NotifyResult::Failed {
-                                    reason: format!("Failed to queue notification: {}", e),
-                                },
-                            }
+                            agents_to_queue.push(agent_name.clone());
+                            // Placeholder - will be updated below
+                            NotifyResult::Failed { reason: "pending_queue".to_string() }
                         }
                     }
                     _ => result,
@@ -1182,7 +1200,59 @@ pub async fn notify_mentioned_agents_parallel(
         }
     }
 
+    // Queue notifications for offline agents (creates its own store)
+    if !agents_to_queue.is_empty() {
+        match ConversationStore::init() {
+            Ok(store) => {
+                for agent in agents_to_queue {
+                    let queued_result = match store.add_pending_notification(&agent, &conv_id, message_id) {
+                        Ok(notification_id) => NotifyResult::Queued { notification_id },
+                        Err(e) => NotifyResult::Failed {
+                            reason: format!("Failed to queue notification: {}", e),
+                        },
+                    };
+                    results.insert(agent, queued_result);
+                }
+            }
+            Err(e) => {
+                // Update all queued agents to failed
+                for agent in agents_to_queue {
+                    results.insert(agent, NotifyResult::Failed {
+                        reason: format!("Failed to open store for queuing: {}", e),
+                    });
+                }
+            }
+        }
+    }
+
     results
+}
+
+/// Fire-and-forget notification - spawns notification tasks without waiting for responses.
+/// This is used for CLI commands like `anima chat send` where we want to trigger
+/// notifications but return immediately without blocking.
+///
+/// Unlike `notify_mentioned_agents_parallel`, this function:
+/// - Does NOT wait for responses
+/// - Does NOT queue notifications for offline agents
+/// - Returns immediately after spawning tasks
+///
+/// The daemon will handle the conversation chain autonomously.
+pub fn notify_mentioned_agents_fire_and_forget(
+    conv_id: &str,
+    message_id: i64,
+    mentions: &[String],
+) {
+    for agent_name in mentions {
+        let agent = agent_name.clone();
+        let cid = conv_id.to_string();
+        let mid = message_id;
+
+        // Spawn notification task - don't await, let it run in background
+        tokio::spawn(async move {
+            let _ = notify_single_agent(agent, cid, mid).await;
+        });
+    }
 }
 
 #[cfg(test)]
