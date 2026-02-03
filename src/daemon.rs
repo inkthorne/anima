@@ -111,7 +111,8 @@ use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedL
 use crate::conversation::ConversationStore;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, strip_thinking_tags};
+use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, ChatMessage, strip_thinking_tags};
+use crate::conversation::ConversationMessage;
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
 use crate::observe::ConsoleObserver;
 use crate::runtime::Runtime;
@@ -150,6 +151,94 @@ fn build_effective_always(
         None
     } else {
         Some(parts.join("\n\n"))
+    }
+}
+
+/// Format conversation history into proper ChatMessage roles for LLM consumption.
+///
+/// # Design Reasoning
+///
+/// 1. **Role mapping by speaker:**
+///    - Messages from current agent → `assistant` role, RAW text (no JSON wrapper)
+///    - Messages from others (user, other agents) → `user` role, JSON wrapped
+///
+/// 2. **Why this asymmetry?**
+///    - Models are trained on user/assistant alternation - this matches their training
+///    - Current agent's past responses as 'assistant' helps model understand conversation flow
+///    - JSON wrapper on others' messages tells model WHO said what (multi-party awareness)
+///    - Model outputs raw text, so seeing its own past output as raw maintains consistency
+///
+/// 3. **Batching for alternation:**
+///    - Consecutive messages from non-self speakers get batched into a single user message
+///    - This maintains strict user/assistant alternation that models expect
+///    - Prevents back-to-back user messages which can confuse models
+///
+/// Returns `(history: Vec<ChatMessage>, final_user_content: String)` where:
+/// - `history` contains all but the last user turn, properly formatted
+/// - `final_user_content` is the last user turn's content (for always_prompt prepending)
+fn format_conversation_history(
+    messages: &[ConversationMessage],
+    current_agent: &str,
+) -> (Vec<ChatMessage>, String) {
+    if messages.is_empty() {
+        return (Vec::new(), String::new());
+    }
+
+    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut pending_user_batch: Vec<String> = Vec::new();
+
+    // Helper to flush pending user messages into a single ChatMessage
+    let flush_user_batch = |batch: &mut Vec<String>, hist: &mut Vec<ChatMessage>| {
+        if !batch.is_empty() {
+            hist.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(batch.join("\n")),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+            batch.clear();
+        }
+    };
+
+    // Process all messages
+    for msg in messages {
+        if msg.from_agent == current_agent {
+            // Current agent's message → assistant role, raw text
+            // First, flush any pending user messages
+            flush_user_batch(&mut pending_user_batch, &mut history);
+
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(msg.content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        } else {
+            // Other speaker → accumulate for user batch with JSON wrapper
+            let escaped = msg.content
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n");
+            pending_user_batch.push(format!(
+                "{{\"from\": \"{}\", \"text\": \"{}\"}}",
+                msg.from_agent, escaped
+            ));
+        }
+    }
+
+    // After processing all messages, we need to extract the final user content
+    // The final user turn is what gets the always_prompt prepended
+    if !pending_user_batch.is_empty() {
+        // Last turn is from non-self (user/other agent) - this is the current query
+        let final_content = pending_user_batch.join("\n");
+        (history, final_content)
+    } else if !history.is_empty() {
+        // Last message was from self - unusual but handle it
+        // Pop the last assistant message and treat it as context
+        // The "task" will be empty, which think_with_options will handle
+        (history, String::new())
+    } else {
+        (Vec::new(), String::new())
     }
 }
 
@@ -1196,24 +1285,16 @@ async fn handle_notify(
         return Response::Error { message: "No messages in conversation".to_string() };
     }
 
-    // Format context for the agent (JSON format)
-    let context = context_messages
-        .iter()
-        .map(|msg| {
-            let escaped = msg.content
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('\n', "\\n");
-            format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", msg.from_agent, escaped)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Format conversation into proper user/assistant ChatMessages
+    // This maps self→assistant (raw), others→user (JSON wrapped), with batching for alternation
+    let (conversation_history, final_user_content) = format_conversation_history(&context_messages, agent_name);
 
-    logger.log(&format!("[notify] Context: {} messages", context_messages.len()));
+    logger.log(&format!("[notify] Context: {} messages → {} history + final user turn",
+        context_messages.len(), conversation_history.len()));
 
-    // Get relevant tools from registry
+    // Get relevant tools from registry (based on final user content)
     let relevant_tools = if let Some(registry) = tool_registry {
-        let relevant = registry.find_relevant(&context, recall_limit);
+        let relevant = registry.find_relevant(&final_user_content, recall_limit);
         filter_by_allowlist(relevant, allowed_tools)
     } else {
         Vec::new()
@@ -1226,16 +1307,16 @@ async fn handle_notify(
         ToolRegistry::format_for_prompt(&relevant_tools)
     };
 
-    // Get memory injection
+    // Get memory injection (based on final user content)
     let memory_injection = if let Some(mem_store) = semantic_memory {
         let query_embedding = if let Some(emb_client) = embedding_client {
-            emb_client.embed(&context).await.ok()
+            emb_client.embed(&final_user_content).await.ok()
         } else {
             None
         };
 
         let store_guard = mem_store.lock().await;
-        match store_guard.recall_with_embedding(&context, recall_limit, query_embedding.as_deref()) {
+        match store_guard.recall_with_embedding(&final_user_content, recall_limit, query_embedding.as_deref()) {
             Ok(memories) => {
                 let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
                 build_memory_injection(&entries)
@@ -1258,7 +1339,7 @@ async fn handle_notify(
     // Tool execution loop - similar to Request::Message handler
     let max_tool_calls = 10;
     let mut tool_call_count = 0;
-    let mut current_message = context.clone();
+    let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
 
@@ -1266,6 +1347,7 @@ async fn handle_notify(
         let options = ThinkOptions {
             system_prompt: persona.clone(),
             always_prompt: effective_always.clone(),
+            conversation_history: Some(conversation_history.clone()),
             ..Default::default()
         };
 
@@ -1624,22 +1706,12 @@ async fn run_heartbeat(
     }
 
     // 3. Get conversation context (recent heartbeat outputs for continuity)
+    // Heartbeat is a self-conversation - all messages are from this agent
+    // Format them as assistant messages to show the model its previous outputs
     let context_messages = store.get_messages(&conv_name, Some(recall_limit)).unwrap_or_default();
-    let context = if context_messages.is_empty() {
-        String::new()
-    } else {
-        context_messages
-            .iter()
-            .map(|msg| {
-                let escaped = msg.content
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n");
-                format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", msg.from_agent, escaped)
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
+    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+
+    logger.log(&format!("[heartbeat] Context: {} previous outputs", conversation_history.len()));
 
     // 4. Build effective always with tools and memory injection
     let tools_injection = if use_native_tools {
@@ -1676,22 +1748,16 @@ async fn run_heartbeat(
 
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
-    // Build prompt with context if available
-    let full_prompt = if context.is_empty() {
-        heartbeat_prompt
-    } else {
-        format!("{}\n\n[Previous heartbeat outputs]\n{}", heartbeat_prompt, context)
-    };
-
-    // 5. Think
+    // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
     let options = ThinkOptions {
         system_prompt: persona.clone(),
         always_prompt: effective_always,
+        conversation_history: if conversation_history.is_empty() { None } else { Some(conversation_history) },
         ..Default::default()
     };
 
     let mut agent_guard = agent.lock().await;
-    let result = match agent_guard.think_with_options(&full_prompt, options).await {
+    let result = match agent_guard.think_with_options(&heartbeat_prompt, options).await {
         Ok(r) => r,
         Err(e) => {
             logger.log(&format!("[heartbeat] Think error: {}", e));
@@ -2927,5 +2993,149 @@ api_key = "sk-test"
         // Should succeed - no tool_def means no restrictions
         let result = execute_tool_call(&tool_call, None, None).await;
         assert!(result.is_ok());
+    }
+
+    // =========================================================================
+    // format_conversation_history tests
+    // =========================================================================
+
+    fn make_conv_msg(from: &str, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: 1,
+            conv_name: "test".to_string(),
+            from_agent: from.to_string(),
+            content: content.to_string(),
+            mentions: vec![],
+            created_at: 0,
+            expires_at: i64::MAX,
+        }
+    }
+
+    #[test]
+    fn test_format_conversation_history_empty() {
+        let (history, final_content) = format_conversation_history(&[], "arya");
+        assert!(history.is_empty());
+        assert!(final_content.is_empty());
+    }
+
+    #[test]
+    fn test_format_conversation_history_single_user_message() {
+        // Single message from user → should become final_content
+        let msgs = vec![make_conv_msg("user", "hello")];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        assert!(history.is_empty());
+        assert!(final_content.contains("\"from\": \"user\""));
+        assert!(final_content.contains("\"text\": \"hello\""));
+    }
+
+    #[test]
+    fn test_format_conversation_history_user_then_self() {
+        // user → arya → user
+        // Should map: [user→user JSON], [arya→assistant raw], final = [user→user JSON]
+        let msgs = vec![
+            make_conv_msg("user", "hi arya"),
+            make_conv_msg("arya", "hey there!"),
+            make_conv_msg("user", "what's up?"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // History should have 2 messages: user JSON, assistant raw
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert!(history[0].content.as_ref().unwrap().contains("\"from\": \"user\""));
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content.as_ref().unwrap(), "hey there!");
+
+        // Final content should be the last user message in JSON format
+        assert!(final_content.contains("\"from\": \"user\""));
+        assert!(final_content.contains("what's up?"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_batches_consecutive_users() {
+        // user → claude → user (should batch claude and user before arya responds)
+        // For arya, both "user" and "claude" are non-self, so they batch together
+        let msgs = vec![
+            make_conv_msg("user", "hi @arya"),
+            make_conv_msg("arya", "hey!"),
+            make_conv_msg("claude", "I can help"),
+            make_conv_msg("user", "thanks"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // History: [user JSON], [assistant raw]
+        // Final: [claude JSON + user JSON batched]
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content.as_ref().unwrap(), "hey!");
+
+        // Final content should batch claude and user messages
+        assert!(final_content.contains("\"from\": \"claude\""));
+        assert!(final_content.contains("\"from\": \"user\""));
+        assert!(final_content.contains("I can help"));
+        assert!(final_content.contains("thanks"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_self_raw_others_json() {
+        // Verify self messages are raw, others are JSON wrapped
+        let msgs = vec![
+            make_conv_msg("gendry", "need help"),
+            make_conv_msg("arya", "what do you need?"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // Both messages go into history since last message is from self
+        // gendry → user JSON, arya → assistant raw
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        assert!(history[0].content.as_ref().unwrap().contains("\"from\": \"gendry\""));
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content.as_ref().unwrap(), "what do you need?");
+
+        // Last message from arya is from self, so final_content is empty (unusual case)
+        // This typically shouldn't happen in NotifyReceived - the notification only
+        // fires when there's a new message addressed to this agent
+        assert!(final_content.is_empty());
+    }
+
+    #[test]
+    fn test_format_conversation_history_escapes_special_chars() {
+        // Verify special characters are escaped in JSON wrapper
+        let msgs = vec![make_conv_msg("user", "line1\nline2\"quote\\backslash")];
+        let (_, final_content) = format_conversation_history(&msgs, "arya");
+
+        // Newlines should be escaped as \n (literal)
+        assert!(final_content.contains("\\n"));
+        // Quotes should be escaped
+        assert!(final_content.contains("\\\""));
+        // Backslashes should be escaped
+        assert!(final_content.contains("\\\\"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_maintains_alternation() {
+        // Complex conversation: user → arya → user → arya → user
+        // Should maintain strict user/assistant alternation
+        let msgs = vec![
+            make_conv_msg("user", "msg1"),
+            make_conv_msg("arya", "resp1"),
+            make_conv_msg("user", "msg2"),
+            make_conv_msg("arya", "resp2"),
+            make_conv_msg("user", "msg3"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // Should be: user, assistant, user, assistant (4 messages)
+        // Final: user (msg3)
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[2].role, "user");
+        assert_eq!(history[3].role, "assistant");
+
+        assert!(final_content.contains("msg3"));
     }
 }
