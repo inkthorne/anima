@@ -4,82 +4,102 @@
 
 | | |
 |---|---|
-| **Version** | v3.1.0 |
-| **Tests** | 378 passing |
+| **Version** | v3.2.7 |
+| **Tests** | 418+ passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
 ## Architecture
 
-**REPL-as-Frontend:** Agents always run as daemons. REPL is a thin client.
+**Daemon-driven agents** with autonomous conversations:
 
 ```
 Daemon: arya (process, ~/.anima/agents/arya/agent.sock)
 Daemon: gendry (process, ~/.anima/agents/gendry/agent.sock)
-REPL (thin client, connects via sockets)
+CLI: thin client for commands, daemons handle @mention chains
+Conversations: stored in ~/.anima/conversations.db (SQLite)
 ```
 
 ## Models
 
-Two models configured on Mojave (Ollama):
+Configured on Mojave (Ollama at 100.67.222.97:11434):
 
 | Model | Context | Tools | Use Case |
 |-------|---------|-------|----------|
-| `gemma-27b` | 128k | JSON-block | General, needs tool teaching |
-| `qwen3-coder-30b` | 256k | Native | Coding, large context |
+| `gemma3:27b` | 128k | JSON-block | General conversation |
+| `qwen3-coder:30b` | 256k | Native | Coding, large context |
 
 ### Model Config Example
 
 ```toml
-# ~/.anima/models/qwen3-coder-30b.toml
+# ~/.anima/models/gemma3-27b.toml
 provider = "ollama"
-model = "qwen3-coder:30b"
-num_ctx = 262144     # 256k context
-tools = true         # Native tool calling
-always = "Optional model-specific prompt text"
+base_url = "http://100.67.222.97:11434"  # Note: base_url not url
+model = "gemma3:27b"
+num_ctx = 131072
+tools = false
 ```
 
-## Tool Calling (Hybrid System)
+## Multi-Agent Conversations (v3.0+)
 
-**Keyword Recall:** Tools defined in `~/.anima/tools.toml`. Only relevant tools (3-5) injected per query.
+**@mention routing:** `@arya` notifies arya, `@all` notifies all participants.
 
-**Two Modes:**
-- `tools = true`: Native tool calling — LLM gets ToolSpecs, Agent handles execution
-- `tools = false`: JSON-block — Model outputs `{"tool": "x", "params": {...}}`, daemon executes
+**Conversation store:** SQLite with conversations, participants, messages, pending_notifications.
 
-**Available Tools:** `read_file`, `write_file`, `shell`, `http`
+**Autonomous chains:** Daemons forward @mentions automatically (depth limit 100).
+
+**Pause/Resume:** Queue notifications while paused, process on resume.
+
+## Chat Commands
+
+```bash
+anima chat                           # List all chats
+anima chat create [name]             # Create (non-interactive)
+anima chat new [name]                # Create + enter interactive
+anima chat join <name>               # Join existing
+anima chat send <conv> "msg"         # Fire-and-forget (~50ms)
+anima chat view <conv>               # Dump messages to stdout
+anima chat view <conv> --limit 10    # Last N messages
+anima chat view <conv> --since <id>  # Messages after ID
+anima chat pause <conv>              # Queue notifications
+anima chat resume <conv>             # Process queued
+anima chat delete <conv>             # Delete conversation
+anima chat cleanup                   # Remove expired
+```
+
+## Agent Commands
+
+```bash
+anima start/stop/restart <name>      # Daemon control
+anima restart all                    # Restart all running
+anima status                         # Show running agents
+anima ask <name> "msg"               # One-shot
+anima send <name> "msg"              # Send to agent
+```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `src/daemon.rs` | Daemon, tool execution, always prompt building |
-| `src/agent.rs` | Core agent, ThinkOptions.external_tools |
-| `src/agent_dir.rs` | Config loading, ResolvedLlmConfig |
-| `src/llm.rs` | LLM providers, ToolSpec |
-| `src/tool_registry.rs` | Keyword-based tool recall |
+| `src/daemon.rs` | Daemon, Notify handling, @mention forwarding |
+| `src/conversation.rs` | ConversationStore, pause/resume, notifications |
+| `src/socket_api.rs` | Request/Response types for daemon communication |
+| `src/main.rs` | CLI commands |
+| `src/llm.rs` | LLM providers (Ollama, OpenAI) |
 
 ## Config Structure
 
 ```
 ~/.anima/
-├── models/*.toml        # Model definitions (provider, context, tools, always)
-├── tools.toml           # Tool registry for keyword recall
+├── conversations.db     # Multi-agent conversations
+├── models/*.toml        # Model definitions
+├── tools.toml           # Tool registry
 └── agents/
-    ├── always.md        # Global always (Memory, Agents sections)
+    ├── always.md        # Global always prompt
     └── <name>/
-        ├── config.toml  # Agent config (references model_file)
+        ├── config.toml  # Agent config
         ├── persona.md   # System prompt
         └── memory.db    # Semantic memory
-```
-
-## CLI Quick Reference
-
-```bash
-anima start/stop/restart <name>   # Daemon control
-anima status                      # Show running
-anima ask <name> "msg"            # One-shot
-anima                             # REPL mode
 ```
 
 ## Build & Test
@@ -87,9 +107,9 @@ anima                             # REPL mode
 ```bash
 cargo build --release
 cargo test
-anima restart <name>  # After changes
+anima restart all  # After changes
 ```
 
 ## Last Updated
 
-2026-02-02 — v3.0.0: Multi-agent communication system. Daemon-to-daemon messaging, conversation store (SQLite), @mention routing, parallel notifications, group conversations.
+2026-02-02 — v3.2.7: Autonomous conversations complete. Fire-and-forget send (~50ms), pause/resume queues notifications, daemon-driven @mention chains, fun conversation names.
