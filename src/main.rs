@@ -156,7 +156,7 @@ enum ChatCommands {
         /// Message to send (use @mentions to notify agents)
         message: String,
     },
-    /// View messages in a conversation (parseable output for scripts)
+    /// View messages in a conversation
     View {
         /// Name of the conversation
         conv: String,
@@ -166,6 +166,9 @@ enum ChatCommands {
         /// Show only messages with ID greater than this value
         #[arg(long)]
         since: Option<i64>,
+        /// Output raw pipe-delimited format for scripts (ID|TIMESTAMP|FROM|CONTENT)
+        #[arg(long)]
+        raw: bool,
     },
     /// Pause a conversation (notifications will be queued)
     Pause {
@@ -905,8 +908,8 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
         }
 
-        // `anima chat view <conv>` - dump messages to stdout (parseable)
-        Some(ChatCommands::View { conv, limit, since }) => {
+        // `anima chat view <conv>` - view messages (pretty by default, --raw for scripts)
+        Some(ChatCommands::View { conv, limit, since, raw }) => {
             // Check if conversation exists
             if store.find_by_name(&conv)?.is_none() {
                 return Err(format!("Conversation '{}' not found", conv).into());
@@ -915,14 +918,31 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             // Get messages with filtering
             let messages = store.get_messages_filtered(&conv, limit, since)?;
 
-            // Output in parseable format: ID|TIMESTAMP|FROM|CONTENT
-            // Content has newlines escaped as \n for single-line output
-            for msg in messages {
-                let escaped_content = msg.content
-                    .replace('\\', "\\\\")
-                    .replace('\n', "\\n")
-                    .replace('|', "\\|");
-                println!("{}|{}|{}|{}", msg.id, msg.created_at, msg.from_agent, escaped_content);
+            if raw {
+                // Raw format: ID|TIMESTAMP|FROM|CONTENT (one line per message, escaped)
+                for msg in messages {
+                    let escaped_content = msg.content
+                        .replace('\\', "\\\\")
+                        .replace('\n', "\\n")
+                        .replace('|', "\\|");
+                    println!("{}|{}|{}|{}", msg.id, msg.created_at, msg.from_agent, escaped_content);
+                }
+            } else {
+                // Pretty format (human-readable)
+                for msg in &messages {
+                    // Format timestamp: YYYY-MM-DD HH:MM
+                    let datetime = format_timestamp_pretty(msg.created_at);
+
+                    // [ID] YYYY-MM-DD HH:MM • agent_name
+                    // ID and timestamp in dim gray, agent name in cyan
+                    println!(
+                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m",
+                        msg.id, datetime, msg.from_agent
+                    );
+                    // Content in normal color
+                    println!("{}", msg.content);
+                    println!(); // Blank line between messages
+                }
             }
         }
 
@@ -1019,6 +1039,14 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
     }
 
     Ok(())
+}
+
+/// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.
+fn format_timestamp_pretty(timestamp: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
+    let datetime: chrono::DateTime<chrono::Local> = datetime.into();
+    datetime.format("%Y-%m-%d %H:%M").to_string()
 }
 
 /// Format a Unix timestamp as relative time (e.g., "2h ago", "3d ago").
