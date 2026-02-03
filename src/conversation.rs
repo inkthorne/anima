@@ -27,6 +27,7 @@ pub struct Conversation {
     pub name: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub paused: bool,
 }
 
 /// A participant in a conversation.
@@ -115,7 +116,8 @@ impl ConversationStore {
                 CREATE TABLE IF NOT EXISTS conversations (
                     name TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL
+                    updated_at INTEGER NOT NULL,
+                    paused INTEGER DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS participants (
@@ -152,6 +154,29 @@ impl ConversationStore {
                 "#,
             )?;
         }
+
+        // Migrate: add paused column if it doesn't exist (for existing DBs)
+        self.migrate_add_paused_column()?;
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add the paused column if it doesn't exist.
+    fn migrate_add_paused_column(&self) -> Result<(), ConversationError> {
+        // Check if conversations table has paused column
+        let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
+        let has_paused = stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            Ok(col_name)
+        })?.any(|r| r.map(|n| n == "paused").unwrap_or(false));
+
+        if !has_paused {
+            self.conn.execute(
+                "ALTER TABLE conversations ADD COLUMN paused INTEGER DEFAULT 0",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -188,7 +213,8 @@ impl ConversationStore {
             CREATE TABLE conversations_new (
                 name TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                paused INTEGER DEFAULT 0
             );
 
             CREATE TABLE participants_new (
@@ -331,7 +357,7 @@ impl ConversationStore {
     /// List all conversations.
     pub fn list_conversations(&self) -> Result<Vec<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at FROM conversations ORDER BY updated_at DESC",
+            "SELECT name, created_at, updated_at, paused FROM conversations ORDER BY updated_at DESC",
         )?;
 
         let conversations = stmt
@@ -340,6 +366,7 @@ impl ConversationStore {
                     name: row.get(0)?,
                     created_at: row.get(1)?,
                     updated_at: row.get(2)?,
+                    paused: row.get::<_, i64>(3)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -350,7 +377,7 @@ impl ConversationStore {
     /// Get a conversation by name.
     pub fn get_conversation(&self, name: &str) -> Result<Option<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at FROM conversations WHERE name = ?1",
+            "SELECT name, created_at, updated_at, paused FROM conversations WHERE name = ?1",
         )?;
 
         let mut rows = stmt.query(params![name])?;
@@ -359,10 +386,34 @@ impl ConversationStore {
                 name: row.get(0)?,
                 created_at: row.get(1)?,
                 updated_at: row.get(2)?,
+                paused: row.get::<_, i64>(3)? != 0,
             }))
         } else {
             Ok(None)
         }
+    }
+
+    /// Check if a conversation is paused.
+    pub fn is_paused(&self, conv_name: &str) -> Result<bool, ConversationError> {
+        match self.get_conversation(conv_name)? {
+            Some(conv) => Ok(conv.paused),
+            None => Err(ConversationError::NotFound(conv_name.to_string())),
+        }
+    }
+
+    /// Set the paused state of a conversation.
+    pub fn set_paused(&self, conv_name: &str, paused: bool) -> Result<(), ConversationError> {
+        // Verify conversation exists
+        if self.get_conversation(conv_name)?.is_none() {
+            return Err(ConversationError::NotFound(conv_name.to_string()));
+        }
+
+        self.conn.execute(
+            "UPDATE conversations SET paused = ?1 WHERE name = ?2",
+            params![paused as i64, conv_name],
+        )?;
+
+        Ok(())
     }
 
     /// Get participants for a conversation.
@@ -487,6 +538,71 @@ impl ConversationStore {
         Ok(messages)
     }
 
+    /// Get messages for a conversation with filtering options.
+    /// - `limit`: Return at most N messages (applied after filtering)
+    /// - `since_id`: Only return messages with ID > since_id
+    /// Messages are returned in chronological order (oldest first).
+    pub fn get_messages_filtered(
+        &self,
+        conv_name: &str,
+        limit: Option<usize>,
+        since_id: Option<i64>,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        let now = current_timestamp();
+        let since = since_id.unwrap_or(0);
+
+        // Build query based on options
+        // When using --since, we want messages after that ID in chronological order
+        // When using --limit without --since, we want the last N messages
+        let query = match (limit, since_id) {
+            (Some(n), Some(_)) => format!(
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at
+                 FROM messages
+                 WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
+                 ORDER BY id ASC
+                 LIMIT {}",
+                n
+            ),
+            (Some(n), None) => format!(
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at
+                 FROM messages
+                 WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
+                 ORDER BY id DESC
+                 LIMIT {}",
+                n
+            ),
+            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at
+                     FROM messages
+                     WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
+                     ORDER BY id ASC".to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut messages: Vec<ConversationMessage> = stmt
+            .query_map(params![conv_name, now, since], |row| {
+                let mentions_json: String = row.get(4)?;
+                let mentions: Vec<String> =
+                    serde_json::from_str(&mentions_json).unwrap_or_default();
+                Ok(ConversationMessage {
+                    id: row.get(0)?,
+                    conv_name: row.get(1)?,
+                    from_agent: row.get(2)?,
+                    content: row.get(3)?,
+                    mentions,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // If we used LIMIT with DESC (no since_id), reverse to get chronological order
+        if limit.is_some() && since_id.is_none() {
+            messages.reverse();
+        }
+
+        Ok(messages)
+    }
+
     /// Add a pending notification for an offline agent.
     pub fn add_pending_notification(
         &self,
@@ -538,6 +654,42 @@ impl ConversationStore {
             params![agent],
         )?;
         Ok(count)
+    }
+
+    /// Get pending notifications for a specific conversation.
+    pub fn get_pending_notifications_for_conversation(
+        &self,
+        conv_name: &str,
+    ) -> Result<Vec<PendingNotification>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, agent, conv_name, message_id, created_at
+             FROM pending_notifications
+             WHERE conv_name = ?1
+             ORDER BY created_at",
+        )?;
+
+        let notifications = stmt
+            .query_map(params![conv_name], |row| {
+                Ok(PendingNotification {
+                    id: row.get(0)?,
+                    agent: row.get(1)?,
+                    conv_name: row.get(2)?,
+                    message_id: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(notifications)
+    }
+
+    /// Delete a single pending notification by ID.
+    pub fn delete_pending_notification(&self, notification_id: i64) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "DELETE FROM pending_notifications WHERE id = ?1",
+            params![notification_id],
+        )?;
+        Ok(())
     }
 
     /// Delete expired messages and clean up empty conversations.
@@ -638,7 +790,7 @@ impl ConversationStore {
         let conv_name = self.generate_unique_fun_name()?;
 
         self.conn.execute(
-            "INSERT INTO conversations (name, created_at, updated_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO conversations (name, created_at, updated_at, paused) VALUES (?1, ?2, ?3, 0)",
             params![conv_name, now, now],
         )?;
 
@@ -654,6 +806,7 @@ impl ConversationStore {
             name: conv_name,
             created_at: now,
             updated_at: now,
+            paused: false,
         })
     }
 }
@@ -792,10 +945,11 @@ pub async fn notify_mentioned_agents(
                 Ok(stream) => {
                     let mut api = SocketApi::new(stream);
 
-                    // Send Notify request
+                    // Send Notify request (depth 0 for initial notifications from CLI)
                     let request = Request::Notify {
                         conv_id: conv_id.to_string(),
                         message_id,
+                        depth: 0,
                     };
 
                     if let Err(e) = api.write_request(&request).await {
@@ -897,10 +1051,11 @@ async fn notify_single_agent(
             Ok(stream) => {
                 let mut api = SocketApi::new(stream);
 
-                // Send Notify request
+                // Send Notify request (depth 0 for initial notifications from CLI)
                 let request = Request::Notify {
                     conv_id: conv_id.clone(),
                     message_id,
+                    depth: 0,
                 };
 
                 if let Err(e) = api.write_request(&request).await {
@@ -1406,5 +1561,199 @@ mod tests {
         let expanded = expand_all_mention(&mentions, &participants);
         // Only user in participants, so nothing to expand to
         assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn test_conversation_paused_default() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("test-paused"), &["arya", "user"]).unwrap();
+        let conv = store.get_conversation(&conv_name).unwrap().unwrap();
+
+        // Conversations are not paused by default
+        assert!(!conv.paused);
+        assert!(!store.is_paused(&conv_name).unwrap());
+    }
+
+    #[test]
+    fn test_set_paused() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("pause-test"), &["arya", "user"]).unwrap();
+
+        // Initially not paused
+        assert!(!store.is_paused(&conv_name).unwrap());
+
+        // Pause the conversation
+        store.set_paused(&conv_name, true).unwrap();
+        assert!(store.is_paused(&conv_name).unwrap());
+
+        // Resume the conversation
+        store.set_paused(&conv_name, false).unwrap();
+        assert!(!store.is_paused(&conv_name).unwrap());
+    }
+
+    #[test]
+    fn test_set_paused_nonexistent_conversation() {
+        let store = test_store();
+
+        let result = store.set_paused("nonexistent", true);
+        assert!(matches!(result, Err(ConversationError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_is_paused_nonexistent_conversation() {
+        let store = test_store();
+
+        let result = store.is_paused("nonexistent");
+        assert!(matches!(result, Err(ConversationError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_get_pending_notifications_for_conversation() {
+        let store = test_store();
+
+        // Create two conversations
+        let conv1 = store.create_conversation(Some("conv-1"), &["alice", "bob"]).unwrap();
+        let conv2 = store.create_conversation(Some("conv-2"), &["charlie", "dave"]).unwrap();
+
+        // Add messages
+        let msg1 = store.add_message(&conv1, "alice", "Hey @bob", &["bob"]).unwrap();
+        let msg2 = store.add_message(&conv2, "charlie", "Hey @dave", &["dave"]).unwrap();
+
+        // Add pending notifications
+        store.add_pending_notification("bob", &conv1, msg1).unwrap();
+        store.add_pending_notification("dave", &conv2, msg2).unwrap();
+
+        // Get pending notifications for conv1 only
+        let pending = store.get_pending_notifications_for_conversation(&conv1).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].agent, "bob");
+        assert_eq!(pending[0].conv_name, conv1);
+
+        // Get pending notifications for conv2 only
+        let pending = store.get_pending_notifications_for_conversation(&conv2).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].agent, "dave");
+        assert_eq!(pending[0].conv_name, conv2);
+    }
+
+    #[test]
+    fn test_delete_pending_notification() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("chat"), &["alice", "bob"]).unwrap();
+        let msg_id = store.add_message(&conv_name, "alice", "Hey @bob", &["bob"]).unwrap();
+
+        // Add pending notification
+        let notif_id = store.add_pending_notification("bob", &conv_name, msg_id).unwrap();
+
+        // Verify it exists
+        let pending = store.get_pending_notifications("bob").unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Delete the notification
+        store.delete_pending_notification(notif_id).unwrap();
+
+        // Verify it's gone
+        let pending = store.get_pending_notifications("bob").unwrap();
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn test_delete_pending_notification_nonexistent() {
+        let store = test_store();
+
+        // Deleting a nonexistent notification should not error (just does nothing)
+        let result = store.delete_pending_notification(999999);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_messages_filtered_all() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("filter-test"), &["alice", "bob"]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
+
+        // Get all messages (no limit, no since)
+        let messages = store.get_messages_filtered(&conv_name, None, None).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "Message 1");
+        assert_eq!(messages[2].content, "Message 3");
+    }
+
+    #[test]
+    fn test_get_messages_filtered_limit() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("limit-test"), &["alice", "bob"]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
+
+        // Get last 2 messages
+        let messages = store.get_messages_filtered(&conv_name, Some(2), None).unwrap();
+        assert_eq!(messages.len(), 2);
+        // Should be in chronological order (oldest first among the last 2)
+        assert_eq!(messages[0].content, "Message 3");
+        assert_eq!(messages[1].content, "Message 4");
+    }
+
+    #[test]
+    fn test_get_messages_filtered_since() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("since-test"), &["alice", "bob"]).unwrap();
+        let msg1 = store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
+        let msg2 = store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
+
+        // Get messages after msg2
+        let messages = store.get_messages_filtered(&conv_name, None, Some(msg2)).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "Message 3");
+        assert_eq!(messages[1].content, "Message 4");
+
+        // Get messages after msg1
+        let messages = store.get_messages_filtered(&conv_name, None, Some(msg1)).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "Message 2");
+    }
+
+    #[test]
+    fn test_get_messages_filtered_since_and_limit() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("since-limit-test"), &["alice", "bob"]).unwrap();
+        let msg1 = store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
+        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 5", &[]).unwrap();
+
+        // Get 2 messages after msg1
+        let messages = store.get_messages_filtered(&conv_name, Some(2), Some(msg1)).unwrap();
+        assert_eq!(messages.len(), 2);
+        // When using --since with --limit, we get the first N messages after since_id
+        assert_eq!(messages[0].content, "Message 2");
+        assert_eq!(messages[1].content, "Message 3");
+    }
+
+    #[test]
+    fn test_get_messages_filtered_since_none_after() {
+        let store = test_store();
+
+        let conv_name = store.create_conversation(Some("since-none-test"), &["alice", "bob"]).unwrap();
+        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
+        let msg2 = store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+
+        // Get messages after the last message - should be empty
+        let messages = store.get_messages_filtered(&conv_name, None, Some(msg2)).unwrap();
+        assert!(messages.is_empty());
     }
 }

@@ -29,6 +29,10 @@ pub enum Request {
         conv_id: String,
         /// The message ID that triggered this notification
         message_id: i64,
+        /// Depth of the @mention chain (for preventing infinite loops)
+        /// Defaults to 0 for backwards compatibility
+        #[serde(default)]
+        depth: u32,
     },
     /// Get the current status of the daemon.
     Status,
@@ -460,17 +464,35 @@ mod tests {
         let request = Request::Notify {
             conv_id: "1:1:arya:user".to_string(),
             message_id: 42,
+            depth: 5,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"notify\""));
         assert!(json.contains("\"conv_id\":\"1:1:arya:user\""));
         assert!(json.contains("\"message_id\":42"));
+        assert!(json.contains("\"depth\":5"));
 
         let parsed: Request = serde_json::from_str(&json).unwrap();
         match parsed {
-            Request::Notify { conv_id, message_id } => {
+            Request::Notify { conv_id, message_id, depth } => {
                 assert_eq!(conv_id, "1:1:arya:user");
                 assert_eq!(message_id, 42);
+                assert_eq!(depth, 5);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_notify_default_depth() {
+        // Test backwards compatibility: depth should default to 0 if not provided
+        let json = r#"{"type":"notify","conv_id":"test-conv","message_id":10}"#;
+        let parsed: Request = serde_json::from_str(json).unwrap();
+        match parsed {
+            Request::Notify { conv_id, message_id, depth } => {
+                assert_eq!(conv_id, "test-conv");
+                assert_eq!(message_id, 10);
+                assert_eq!(depth, 0);
             }
             _ => panic!("Wrong variant"),
         }

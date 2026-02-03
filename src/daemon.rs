@@ -606,6 +606,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let response = handle_notify(
                             &notification.conv_name,
                             notification.message_id,
+                            0, // Start at depth 0 for pending notifications
                             &agent,
                             &config.name,
                             &config.persona,
@@ -971,10 +972,15 @@ fn create_llm_from_config(
     Ok(llm)
 }
 
-/// Handle a Notify request: fetch conversation context, generate response, store it.
+/// Maximum depth for @mention chains to prevent infinite loops
+const MAX_MENTION_DEPTH: u32 = 100;
+
+/// Handle a Notify request: fetch conversation context, generate response, store it,
+/// and forward @mentions to other agents (daemon-to-daemon).
 async fn handle_notify(
     conv_id: &str,
     _message_id: i64,
+    depth: u32,
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
     persona: &Option<String>,
@@ -1096,6 +1102,49 @@ async fn handle_notify(
             match store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
                 Ok(response_msg_id) => {
                     logger.log(&format!("[notify] Stored response as msg_id={}", response_msg_id));
+
+                    // Parse @mentions from our response and forward to other agents
+                    // Only forward if not paused and not at depth limit
+                    let should_forward = depth < MAX_MENTION_DEPTH
+                        && !store.is_paused(conv_id).unwrap_or(false);
+
+                    if should_forward {
+                        // Parse @mentions from our response
+                        let mentions = crate::conversation::parse_mentions(&cleaned_response);
+
+                        // Filter out self, "user", and non-existent agents
+                        let valid_mentions: Vec<String> = mentions
+                            .into_iter()
+                            .filter(|m| m != agent_name && m != "user" && m != "all")
+                            .filter(|m| discovery::agent_exists(m))
+                            .collect();
+
+                        if !valid_mentions.is_empty() {
+                            logger.log(&format!("[notify] Forwarding to {} agents at depth {}: {:?}",
+                                valid_mentions.len(), depth + 1, valid_mentions));
+
+                            // Add mentioned agents as participants if not already
+                            for mention in &valid_mentions {
+                                if let Err(e) = store.add_participant(conv_id, mention) {
+                                    logger.log(&format!("[notify] Warning: Could not add {} as participant: {}", mention, e));
+                                }
+                            }
+
+                            // Forward to each mentioned agent
+                            for mention in valid_mentions {
+                                forward_notify_to_agent(
+                                    &mention,
+                                    conv_id,
+                                    response_msg_id,
+                                    depth + 1,
+                                    logger,
+                                ).await;
+                            }
+                        }
+                    } else if depth >= MAX_MENTION_DEPTH {
+                        logger.log(&format!("[notify] Skipping forwarding: depth limit reached ({})", depth));
+                    }
+
                     Response::Notified { response_message_id: response_msg_id }
                 }
                 Err(e) => {
@@ -1108,6 +1157,88 @@ async fn handle_notify(
             logger.log(&format!("[notify] Agent error: {}", e));
             Response::Error { message: e.to_string() }
         }
+    }
+}
+
+/// Forward a Notify request to another agent daemon.
+/// If the agent is not running, queues the notification for later.
+///
+/// Note: This function creates its own ConversationStore internally when needed
+/// to avoid threading issues with SQLite.
+async fn forward_notify_to_agent(
+    agent_name: &str,
+    conv_id: &str,
+    message_id: i64,
+    depth: u32,
+    logger: &Arc<AgentLogger>,
+) {
+    use tokio::net::UnixStream;
+
+    // Helper function to queue notification using a fresh store
+    let queue_notification = |agent: &str, cid: &str, mid: i64, log: &AgentLogger| {
+        if let Ok(store) = ConversationStore::init() {
+            if let Err(e) = store.add_pending_notification(agent, cid, mid) {
+                log.log(&format!("[notify] Failed to queue notification for @{}: {}", agent, e));
+            }
+        } else {
+            log.log(&format!("[notify] Failed to open store to queue notification for @{}", agent));
+        }
+    };
+
+    // Check if agent is running
+    if let Some(running_agent) = discovery::get_running_agent(agent_name) {
+        // Try to connect and send Notify request
+        match UnixStream::connect(&running_agent.socket_path).await {
+            Ok(stream) => {
+                let mut api = SocketApi::new(stream);
+
+                let request = Request::Notify {
+                    conv_id: conv_id.to_string(),
+                    message_id,
+                    depth,
+                };
+
+                if let Err(e) = api.write_request(&request).await {
+                    logger.log(&format!("[notify] Failed to send to @{}: {}", agent_name, e));
+                    // Queue notification for later
+                    queue_notification(agent_name, conv_id, message_id, logger);
+                    return;
+                }
+
+                // Read response (but don't wait too long)
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(300), // 5 min timeout for agent response
+                    api.read_response()
+                ).await {
+                    Ok(Ok(Some(Response::Notified { response_message_id }))) => {
+                        logger.log(&format!("[notify] @{} responded with msg_id={}", agent_name, response_message_id));
+                    }
+                    Ok(Ok(Some(Response::Error { message }))) => {
+                        logger.log(&format!("[notify] @{} error: {}", agent_name, message));
+                    }
+                    Ok(Ok(Some(_))) => {
+                        logger.log(&format!("[notify] @{} unexpected response", agent_name));
+                    }
+                    Ok(Ok(None)) => {
+                        logger.log(&format!("[notify] @{} connection closed", agent_name));
+                    }
+                    Ok(Err(e)) => {
+                        logger.log(&format!("[notify] @{} read error: {}", agent_name, e));
+                    }
+                    Err(_) => {
+                        logger.log(&format!("[notify] @{} timeout waiting for response", agent_name));
+                    }
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("[notify] @{} not reachable ({}), queuing", agent_name, e));
+                queue_notification(agent_name, conv_id, message_id, logger);
+            }
+        }
+    } else {
+        // Agent not running - queue notification
+        logger.log(&format!("[notify] @{} not running, queuing notification", agent_name));
+        queue_notification(agent_name, conv_id, message_id, logger);
     }
 }
 
@@ -1610,13 +1741,14 @@ async fn handle_connection(
                 }
             }
 
-            Request::Notify { ref conv_id, message_id } => {
-                logger.log(&format!("[socket] Notify: conv={} msg_id={}", conv_id, message_id));
+            Request::Notify { ref conv_id, message_id, depth } => {
+                logger.log(&format!("[socket] Notify: conv={} msg_id={} depth={}", conv_id, message_id, depth));
 
                 // Handle notification - use a helper function to keep the match arm cleaner
                 handle_notify(
                     conv_id,
                     message_id,
+                    depth,
                     &agent,
                     &agent_name,
                     &persona,

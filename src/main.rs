@@ -144,10 +144,38 @@ enum ChatCommands {
         name: Option<String>,
     },
     /// Join an existing conversation by name
-    #[clap(alias = "join")]
-    Open {
+    #[clap(alias = "open")]
+    Join {
         /// Name of the conversation to join
         name: String,
+    },
+    /// Send a message to a conversation (fire-and-forget, notifies @mentioned agents)
+    Send {
+        /// Name of the conversation
+        conv: String,
+        /// Message to send (use @mentions to notify agents)
+        message: String,
+    },
+    /// View messages in a conversation (parseable output for scripts)
+    View {
+        /// Name of the conversation
+        conv: String,
+        /// Show only the last N messages
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Show only messages with ID greater than this value
+        #[arg(long)]
+        since: Option<i64>,
+    },
+    /// Pause a conversation (notifications will be queued)
+    Pause {
+        /// Name of the conversation to pause
+        conv: String,
+    },
+    /// Resume a paused conversation (processes queued notifications)
+    Resume {
+        /// Name of the conversation to resume
+        conv: String,
     },
     /// Delete a conversation completely
     Delete {
@@ -351,6 +379,10 @@ const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 ///
 /// Messages are sent to @mentioned agents. When a user @mentions an agent
 /// for the first time, they are automatically added as a participant.
+///
+/// Note: The daemon now handles @mention forwarding autonomously. The CLI only
+/// sends initial notifications and displays results - follow-up chains continue
+/// in the background via daemon-to-daemon communication.
 async fn chat_with_conversation(
     conv_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -420,13 +452,12 @@ async fn chat_with_conversation(
                 // Store user message in conversation with mentions
                 let user_msg_id = store.add_message(conv_name, "user", line, &mention_refs)?;
 
-                // Notify mentioned agents
+                // Notify mentioned agents (initial notifications only)
+                // The daemon now handles all follow-up @mention chains autonomously
                 if !expanded_mentions.is_empty() {
                     let notify_results = notify_mentioned_agents_parallel(&store, conv_name, user_msg_id, &expanded_mentions).await;
 
-                    // Display results for each agent and check for @mentions in their responses
-                    let mut agent_mentions_to_notify: Vec<(i64, Vec<String>)> = Vec::new();
-
+                    // Display results for each initially notified agent
                     for (agent, result) in &notify_results {
                         match result {
                             NotifyResult::Notified { response_message_id } => {
@@ -435,37 +466,8 @@ async fn chat_with_conversation(
                                     if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
                                         println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
 
-                                        // Parse @mentions from the agent's response
-                                        let response_mentions = parse_mentions(&response_msg.content);
-                                        // Filter out self and "user"
-                                        let filtered_mentions: Vec<String> = response_mentions
-                                            .into_iter()
-                                            .filter(|m| m != agent && m != "user")
-                                            .collect();
-
-                                        // Add any new agents mentioned by agents as participants
-                                        for new_agent in &filtered_mentions {
-                                            if new_agent != "all" && !participants.contains(new_agent) {
-                                                // Only add if agent actually exists
-                                                if anima::discovery::agent_exists(new_agent) {
-                                                    if let Err(e) = store.add_participant(conv_name, new_agent) {
-                                                        eprintln!("\x1b[33mWarning: Could not add {} as participant: {}\x1b[0m", new_agent, e);
-                                                    } else {
-                                                        participants.push(new_agent.clone());
-                                                        println!("\x1b[90m[@{} joined the conversation]\x1b[0m", new_agent);
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        // Only notify agents that actually exist
-                                        let valid_mentions: Vec<String> = filtered_mentions
-                                            .into_iter()
-                                            .filter(|m| anima::discovery::agent_exists(m))
-                                            .collect();
-                                        if !valid_mentions.is_empty() {
-                                            agent_mentions_to_notify.push((*response_message_id, valid_mentions));
-                                        }
+                                        // Note: @mentions in the response are now handled by the daemon
+                                        // autonomously - no need for CLI to track and forward them
                                     }
                                 }
                             }
@@ -481,65 +483,9 @@ async fn chat_with_conversation(
                         }
                     }
 
-                    // Notify agents mentioned in agent responses (agent-to-agent communication)
-                    // Loop with depth limit to handle chains of @mentions
-                    const MAX_MENTION_DEPTH: usize = 100;
-                    let mut current_mentions = agent_mentions_to_notify;
-                    let mut depth = 0;
-
-                    while !current_mentions.is_empty() && depth < MAX_MENTION_DEPTH {
-                        depth += 1;
-                        let mut next_mentions: Vec<(i64, Vec<String>)> = Vec::new();
-
-                        for (msg_id, mentions) in current_mentions {
-                            let followup_results = notify_mentioned_agents_parallel(&store, conv_name, msg_id, &mentions).await;
-
-                            for (agent, result) in &followup_results {
-                                match result {
-                                    NotifyResult::Notified { response_message_id } => {
-                                        if let Ok(msgs) = store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
-                                            if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
-                                                println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
-
-                                                // Parse @mentions from this response too
-                                                let response_mentions = parse_mentions(&response_msg.content);
-                                                let filtered: Vec<String> = response_mentions
-                                                    .into_iter()
-                                                    .filter(|m| m != agent && m != "user" && m != "all")
-                                                    .filter(|m| anima::discovery::agent_exists(m))
-                                                    .collect();
-
-                                                // Add new agents as participants
-                                                for new_agent in &filtered {
-                                                    if !participants.contains(new_agent) {
-                                                        if let Ok(()) = store.add_participant(conv_name, new_agent) {
-                                                            participants.push(new_agent.clone());
-                                                            println!("\x1b[90m[@{} joined the conversation]\x1b[0m", new_agent);
-                                                        }
-                                                    }
-                                                }
-
-                                                if !filtered.is_empty() {
-                                                    next_mentions.push((*response_message_id, filtered));
-                                                }
-                                            }
-                                        }
-                                    }
-                                    NotifyResult::Queued { notification_id: _ } => {
-                                        eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
-                                    }
-                                    NotifyResult::UnknownAgent => {
-                                        eprintln!("\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m", agent);
-                                    }
-                                    NotifyResult::Failed { reason } => {
-                                        eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
-                                    }
-                                }
-                            }
-                        }
-
-                        current_mentions = next_mentions;
-                    }
+                    // Note: Any @mentions in agent responses are now forwarded autonomously
+                    // by the daemon. The CLI no longer tracks or displays follow-up chains.
+                    // Use 'anima chat view <conv>' to see all messages including follow-ups.
                 }
             }
             Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -898,14 +844,128 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             chat_with_conversation(&conv_name).await?;
         }
 
-        // `anima chat open <name>` (or `anima chat join <name>`) - join existing chat by name
-        Some(ChatCommands::Open { name }) => {
+        // `anima chat join <name>` (or `anima chat open <name>`) - join existing chat by name
+        Some(ChatCommands::Join { name }) => {
             // Check if conversation exists
             if store.find_by_name(&name)?.is_none() {
                 return Err(format!("Conversation '{}' not found. Use 'anima chat new {}' to create it.", name, name).into());
             }
 
             chat_with_conversation(&name).await?;
+        }
+
+        // `anima chat send <conv> "message"` - fire-and-forget message injection
+        Some(ChatCommands::Send { conv, message }) => {
+            // Check if conversation exists
+            if store.find_by_name(&conv)?.is_none() {
+                return Err(format!("Conversation '{}' not found", conv).into());
+            }
+
+            // Parse @mentions from message
+            let mentions = parse_mentions(&message);
+
+            // Get current participants
+            let parts = store.get_participants(&conv)?;
+            let participants: Vec<String> = parts.iter()
+                .filter(|p| p.agent != "user")
+                .map(|p| p.agent.clone())
+                .collect();
+
+            // Add mentioned agents as participants if they exist and not already in
+            for agent_name in &mentions {
+                if agent_name != "all" && !participants.contains(agent_name) {
+                    if anima::discovery::agent_exists(agent_name) {
+                        if let Err(e) = store.add_participant(&conv, agent_name) {
+                            eprintln!("Warning: Could not add {} as participant: {}", agent_name, e);
+                        }
+                    }
+                }
+            }
+
+            // Expand @all to all participants
+            let updated_parts = store.get_participants(&conv)?;
+            let updated_participants: Vec<String> = updated_parts.iter()
+                .filter(|p| p.agent != "user")
+                .map(|p| p.agent.clone())
+                .collect();
+            let expanded_mentions = expand_all_mention(&mentions, &updated_participants);
+
+            let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
+
+            // Store user message in conversation
+            let user_msg_id = store.add_message(&conv, "user", &message, &mention_refs)?;
+
+            // Notify mentioned agents (fire and forget - we trigger but don't wait for full responses)
+            if !expanded_mentions.is_empty() {
+                // Notify agents - this sends the requests but we don't display results
+                let _ = notify_mentioned_agents_parallel(&store, &conv, user_msg_id, &expanded_mentions).await;
+                println!("Sent message to '{}', notified: {}", conv, expanded_mentions.join(", "));
+            } else {
+                println!("Sent message to '{}' (no @mentions)", conv);
+            }
+        }
+
+        // `anima chat view <conv>` - dump messages to stdout (parseable)
+        Some(ChatCommands::View { conv, limit, since }) => {
+            // Check if conversation exists
+            if store.find_by_name(&conv)?.is_none() {
+                return Err(format!("Conversation '{}' not found", conv).into());
+            }
+
+            // Get messages with filtering
+            let messages = store.get_messages_filtered(&conv, limit, since)?;
+
+            // Output in parseable format: ID|TIMESTAMP|FROM|CONTENT
+            // Content has newlines escaped as \n for single-line output
+            for msg in messages {
+                let escaped_content = msg.content
+                    .replace('\\', "\\\\")
+                    .replace('\n', "\\n")
+                    .replace('|', "\\|");
+                println!("{}|{}|{}|{}", msg.id, msg.created_at, msg.from_agent, escaped_content);
+            }
+        }
+
+        // `anima chat pause <conv>` - pause notifications for a conversation
+        Some(ChatCommands::Pause { conv }) => {
+            // Check if conversation exists (set_paused will return error if not found)
+            store.set_paused(&conv, true)?;
+            println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv);
+        }
+
+        // `anima chat resume <conv>` - resume a paused conversation
+        Some(ChatCommands::Resume { conv }) => {
+            // Check if conversation exists
+            if store.find_by_name(&conv)?.is_none() {
+                return Err(format!("Conversation '{}' not found", conv).into());
+            }
+
+            // Resume the conversation
+            store.set_paused(&conv, false)?;
+
+            // Check for pending notifications for this conversation and process them
+            let pending = store.get_pending_notifications_for_conversation(&conv)?;
+            let pending_count = pending.len();
+
+            if pending_count > 0 {
+                // Process pending notifications
+                for notification in &pending {
+                    let mentions = vec![notification.agent.clone()];
+                    let _ = notify_mentioned_agents_parallel(
+                        &store,
+                        &conv,
+                        notification.message_id,
+                        &mentions
+                    ).await;
+
+                    // Clear this notification after processing
+                    let _ = store.delete_pending_notification(notification.id);
+                }
+
+                println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending notifications processed)", conv, pending_count);
+            } else {
+                println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv);
+            }
         }
 
         // `anima chat delete <name>` - delete a conversation
