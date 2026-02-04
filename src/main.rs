@@ -545,9 +545,15 @@ async fn chat_with_conversation(
                 }
                 let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
                 let datetime = format_timestamp_pretty(msg.created_at);
+                // Show duration for agent messages if available
+                let duration_str = if msg.from_agent != "user" {
+                    msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
+                } else {
+                    String::new()
+                };
                 println!(
-                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m",
-                    msg.id, datetime, color, msg.from_agent
+                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}",
+                    msg.id, datetime, color, msg.from_agent, duration_str
                 );
                 println!("{}", msg.content);
                 println!(); // Blank line between messages
@@ -590,9 +596,11 @@ async fn chat_with_conversation(
                         // Print the agent message on a new line
                         print!("\r\x1b[K"); // Clear current line (in case user was typing)
                         let datetime = format_timestamp_pretty(msg.created_at);
+                        // Show duration if available
+                        let duration_str = msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default();
                         println!(
-                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m",
-                            msg.id, datetime, msg.from_agent
+                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}",
+                            msg.id, datetime, msg.from_agent, duration_str
                         );
                         println!("{}", msg.content);
                         println!(); // Blank line between messages
@@ -1574,11 +1582,18 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                     // Format timestamp: YYYY-MM-DD HH:MM
                     let datetime = format_timestamp_pretty(msg.created_at);
 
-                    // [ID] YYYY-MM-DD HH:MM • agent_name
-                    // ID and timestamp in dim gray, agent name in cyan
+                    // Show duration for agent messages if available
+                    let duration_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
+                        msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+
+                    // [ID] YYYY-MM-DD HH:MM • agent_name • duration
+                    // ID and timestamp in dim gray, agent name in cyan, duration in yellow
                     println!(
-                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m",
-                        msg.id, datetime, msg.from_agent
+                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}",
+                        msg.id, datetime, msg.from_agent, duration_str
                     );
                     // Content in normal color
                     println!("{}", msg.content);
@@ -2021,6 +2036,29 @@ fn format_timestamp_pretty(timestamp: i64) -> String {
     let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
     let datetime: chrono::DateTime<chrono::Local> = datetime.into();
     datetime.format("%Y-%m-%d %H:%M").to_string()
+}
+
+/// Format a duration in milliseconds as human-readable (e.g., "1m 32s", "450ms").
+fn format_duration_ms(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{}ms", ms)
+    } else if ms < 60_000 {
+        let secs = ms / 1000;
+        let millis = ms % 1000;
+        if millis > 0 {
+            format!("{}.{}s", secs, millis / 100)
+        } else {
+            format!("{}s", secs)
+        }
+    } else {
+        let mins = ms / 60_000;
+        let secs = (ms % 60_000) / 1000;
+        if secs > 0 {
+            format!("{}m {}s", mins, secs)
+        } else {
+            format!("{}m", mins)
+        }
+    }
 }
 
 /// Format a Unix timestamp as relative time (e.g., "2h ago", "3d ago").

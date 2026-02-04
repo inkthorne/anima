@@ -1316,6 +1316,9 @@ async fn handle_notify(
     recall_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
 ) -> Response {
+    // Track start time for response duration
+    let start_time = std::time::Instant::now();
+
     // Open conversation store
     let store = match ConversationStore::init() {
         Ok(s) => s,
@@ -1541,11 +1544,12 @@ async fn handle_notify(
         }
     }
 
-    // Store final response in conversation
+    // Store final response in conversation with duration
     let cleaned_response = final_response.unwrap_or_default();
-    match store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
+    let duration_ms = start_time.elapsed().as_millis() as i64;
+    match store.add_message_with_duration(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms)) {
         Ok(response_msg_id) => {
-            logger.log(&format!("[notify] Stored response as msg_id={}", response_msg_id));
+            logger.log(&format!("[notify] Stored response as msg_id={} ({}ms)", response_msg_id, duration_ms));
 
             // Parse @mentions from our response and forward to other agents
             // Only forward if not paused and not at depth limit
@@ -3132,6 +3136,7 @@ api_key = "sk-test"
             mentions: vec![],
             created_at: 0,
             expires_at: i64::MAX,
+            duration_ms: None,
         }
     }
 
