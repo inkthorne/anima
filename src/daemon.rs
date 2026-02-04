@@ -7,12 +7,11 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Local;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Agent-specific logger that writes to {agent_dir}/agent.log
 pub struct AgentLogger {
@@ -110,6 +109,33 @@ use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, She
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, is_process_running};
+
+/// Work items that are serialized through the agent worker.
+/// These operations require exclusive access to the Agent to prevent race conditions.
+pub enum AgentWork {
+    /// Process a message from the socket API (Request::Message)
+    Message {
+        content: String,
+        conv_name: Option<String>,
+        response_tx: oneshot::Sender<MessageWorkResult>,
+        /// Token stream sender for streaming responses
+        token_tx: Option<mpsc::Sender<String>>,
+    },
+    /// Process a notify request (conversation @mention)
+    Notify {
+        conv_id: String,
+        message_id: i64,
+        depth: u32,
+    },
+    /// Process a heartbeat
+    Heartbeat,
+}
+
+/// Result from processing a Message work item
+pub struct MessageWorkResult {
+    pub response: String,
+    pub error: Option<String>,
+}
 
 /// Build the effective always prompt by combining tools, memory, base always, and model always.
 fn build_effective_always(
@@ -955,20 +981,55 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         shutdown_clone.notify_waiters();
     });
 
-    // Set up timer if configured
+    // Create mpsc channel for serializing agent work
+    // All Message, Notify, and Heartbeat work goes through this channel to prevent race conditions
+    let (work_tx, work_rx) = mpsc::unbounded_channel::<AgentWork>();
+
+    // Spawn the worker task that owns the agent and processes work sequentially
+    let worker_handle = {
+        let worker_agent = agent.clone();
+        let worker_name = config.name.clone();
+        let worker_persona = config.persona.clone();
+        let worker_always = config.always.clone();
+        let worker_model_always = config.model_always.clone();
+        let worker_allowed_tools = config.allowed_tools.clone();
+        let worker_semantic_memory = semantic_memory_store.clone();
+        let worker_embedding_client = embedding_client.clone();
+        let worker_tool_registry = tool_registry.clone();
+        let worker_logger = logger.clone();
+        let worker_recall_limit = config.semantic_memory.recall_limit;
+        let worker_task_store = task_store.clone();
+        let worker_heartbeat_config = config.heartbeat.clone();
+
+        tokio::spawn(async move {
+            agent_worker(
+                work_rx,
+                worker_agent,
+                worker_name,
+                worker_persona,
+                worker_always,
+                worker_model_always,
+                worker_allowed_tools,
+                worker_semantic_memory,
+                worker_embedding_client,
+                worker_tool_registry,
+                use_native_tools,
+                worker_logger,
+                worker_recall_limit,
+                worker_task_store,
+                worker_heartbeat_config,
+            ).await
+        })
+    };
+
+    logger.log("  Worker task: started");
+
+    // Set up timer if configured (timer still uses its own agent access since it's a simple single-turn)
     let timer_handle = if let Some(ref timer_config) = config.timer {
-        let agent_clone = agent.clone();
-        let persona = config.persona.clone();
-        let always = config.always.clone();
-        let model_always = config.model_always.clone();
-        let allowed_tools = config.allowed_tools.clone();
+        let timer_work_tx = work_tx.clone();
         let timer_config = timer_config.clone();
         let shutdown_clone = shutdown.clone();
-        let semantic_memory = semantic_memory_store.clone();
-        let timer_embedding_client = embedding_client.clone();
-        let timer_registry = tool_registry.clone();
         let timer_logger = logger.clone();
-        let timer_recall_limit = config.semantic_memory.recall_limit;
 
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(timer_config.interval);
@@ -979,105 +1040,25 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 tokio::select! {
                     _ = interval.tick() => {
                         timer_logger.log("[timer] Firing timer trigger...");
-
-                        // Inject relevant memories if enabled
-                        let memory_injection = if let Some(ref mem_store) = semantic_memory {
-                            // Generate query embedding if we have an embedding client
-                            let query_embedding = if let Some(ref emb_client) = timer_embedding_client {
-                                match emb_client.embed(&timer_config.message).await {
-                                    Ok(emb) => Some(emb),
-                                    Err(e) => {
-                                        timer_logger.log(&format!("[timer] Failed to generate query embedding: {}", e));
-                                        None
+                        // Timer uses a simple Message work item (no streaming needed)
+                        let (response_tx, response_rx) = oneshot::channel();
+                        if timer_work_tx.send(AgentWork::Message {
+                            content: timer_config.message.clone(),
+                            conv_name: None,
+                            response_tx,
+                            token_tx: None,
+                        }).is_ok() {
+                            match response_rx.await {
+                                Ok(result) => {
+                                    if let Some(err) = result.error {
+                                        timer_logger.log(&format!("[timer] Error: {}", err));
+                                    } else {
+                                        timer_logger.log(&format!("[timer] Response: {}", result.response));
                                     }
                                 }
-                            } else {
-                                None
-                            };
-
-                            let store = mem_store.lock().await;
-                            match store.recall_with_embedding(&timer_config.message, timer_recall_limit, query_embedding.as_deref()) {
-                                Ok(memories) => {
-                                    if !memories.is_empty() {
-                                        timer_logger.memory(&format!("Recall: {} memories for timer", memories.len()));
-                                        for (m, score) in &memories {
-                                            timer_logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
-                                        }
-                                    }
-                                    let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                                    build_memory_injection(&entries)
+                                Err(_) => {
+                                    timer_logger.log("[timer] Worker dropped response channel");
                                 }
-                                Err(e) => {
-                                    timer_logger.log(&format!("[timer] Memory recall error: {}", e));
-                                    String::new()
-                                }
-                            }
-                        } else {
-                            String::new()
-                        };
-
-                        // Inject relevant tools if registry is available
-                        let tools_injection = if let Some(ref registry) = timer_registry {
-                            let relevant = registry.find_relevant(&timer_config.message, timer_recall_limit);
-                            let relevant = filter_by_allowlist(relevant, &allowed_tools);
-                            if !relevant.is_empty() {
-                                timer_logger.tool(&format!("Recall: {} tools for timer", relevant.len()));
-                                for t in &relevant {
-                                    timer_logger.tool(&format!("  - {}", t.name));
-                                }
-                            }
-                            ToolRegistry::format_for_prompt(&relevant)
-                        } else {
-                            String::new()
-                        };
-
-                        // Combine tools, memory injection, and always prompt
-                        let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
-
-                        let mut agent_guard = agent_clone.lock().await;
-
-                        let options = ThinkOptions {
-                            system_prompt: persona.clone(),
-                            always_prompt: effective_always,
-                            ..Default::default()
-                        };
-
-                        match agent_guard.think_with_options(&timer_config.message, options).await {
-                            Ok(result) => {
-                                // Strip thinking tags and extract [REMEMBER: ...] tags
-                                let without_thinking = strip_thinking_tags(&result.response);
-                                let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
-
-                                if !memories_to_save.is_empty() {
-                                    if let Some(ref mem_store) = semantic_memory {
-                                        let store = mem_store.lock().await;
-                                        for memory in &memories_to_save {
-                                            // Generate embedding if we have a client
-                                            let embedding = if let Some(ref emb_client) = timer_embedding_client {
-                                                match emb_client.embed(memory).await {
-                                                    Ok(emb) => Some(emb),
-                                                    Err(e) => {
-                                                        timer_logger.log(&format!("[timer] Failed to generate embedding: {}", e));
-                                                        None
-                                                    }
-                                                }
-                                            } else {
-                                                None
-                                            };
-
-                                            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                                                Ok(SaveResult::New(id)) => timer_logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                                Ok(SaveResult::Reinforced(id, old, new)) => timer_logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                                Err(e) => timer_logger.log(&format!("[timer] Failed to save memory: {}", e)),
-                                            }
-                                        }
-                                    }
-                                }
-
-                                timer_logger.log(&format!("[timer] Response: {}", cleaned_response));
-                            }
-                            Err(e) => {
-                                timer_logger.log(&format!("[timer] Error: {}", e));
                             }
                         }
                     }
@@ -1092,46 +1073,38 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Set up heartbeat if configured
-    // heartbeat_pending tracks if a heartbeat should fire after current think completes
-    let heartbeat_pending = Arc::new(AtomicBool::new(false));
     let heartbeat_config = config.heartbeat.clone();
 
     let heartbeat_handle = if let Some(ref hb_config) = heartbeat_config {
         // Only start heartbeat loop if heartbeat.md exists
         if hb_config.heartbeat_path.exists() {
-            let agent_clone = agent.clone();
-            let agent_name = config.name.clone();
-            let persona = config.persona.clone();
-            let always = config.always.clone();
-            let model_always = config.model_always.clone();
-            let allowed_tools = config.allowed_tools.clone();
+            let hb_work_tx = work_tx.clone();
             let hb_config = hb_config.clone();
             let shutdown_clone = shutdown.clone();
-            let semantic_memory = semantic_memory_store.clone();
-            let hb_embedding_client = embedding_client.clone();
-            let hb_registry = tool_registry.clone();
             let hb_logger = logger.clone();
-            let hb_recall_limit = config.semantic_memory.recall_limit;
-            let hb_pending = heartbeat_pending.clone();
 
             Some(tokio::spawn(async move {
-                heartbeat_loop(
-                    hb_config,
-                    agent_clone,
-                    agent_name,
-                    persona,
-                    always,
-                    model_always,
-                    allowed_tools,
-                    semantic_memory,
-                    hb_embedding_client,
-                    hb_registry,
-                    use_native_tools,
-                    hb_logger,
-                    hb_recall_limit,
-                    hb_pending,
-                    shutdown_clone,
-                ).await
+                let mut interval = tokio::time::interval(hb_config.interval);
+                // Skip the first immediate tick
+                interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            hb_logger.log("[heartbeat] Timer fired, sending work");
+                            // Simply send heartbeat work - no need for try_lock or pending flag
+                            // The worker will process it in order
+                            if hb_work_tx.send(AgentWork::Heartbeat).is_err() {
+                                hb_logger.log("[heartbeat] Worker channel closed");
+                                break;
+                            }
+                        }
+                        _ = shutdown_clone.notified() => {
+                            hb_logger.log("[heartbeat] Shutting down heartbeat loop");
+                            break;
+                        }
+                    }
+                }
             }))
         } else {
             logger.log("  Heartbeat: heartbeat.md not found, skipping");
@@ -1179,8 +1152,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_registry = tool_registry.clone();
                         let conn_logger = logger.clone();
                         let conn_heartbeat_config = heartbeat_config.clone();
-                        let conn_heartbeat_pending = heartbeat_pending.clone();
                         let conn_task_store = task_store.clone();
+                        let conn_work_tx = work_tx.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
                         tokio::spawn(async move {
@@ -1201,8 +1174,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 conn_logger,
                                 recall_limit,
                                 conn_heartbeat_config,
-                                conn_heartbeat_pending,
                                 conn_task_store,
+                                conn_work_tx,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -1220,6 +1193,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Drop the work_tx so the worker knows to stop
+    drop(work_tx);
+
     // Wait for timer task to finish
     if let Some(handle) = timer_handle {
         let _ = handle.await;
@@ -1234,6 +1210,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(handle) = task_watcher_handle {
         let _ = handle.await;
     }
+
+    // Wait for worker task to finish
+    let _ = worker_handle.await;
 
     // Clean up socket file
     if config.socket_path.exists() {
@@ -1337,6 +1316,462 @@ fn create_llm_from_config(
         other => return Err(format!("Unsupported LLM provider: {}", other).into()),
     };
     Ok(llm)
+}
+
+/// Worker task that owns the agent and processes work items sequentially.
+/// This ensures no race conditions between Message, Notify, and Heartbeat handlers.
+async fn agent_worker(
+    mut work_rx: mpsc::UnboundedReceiver<AgentWork>,
+    agent: Arc<Mutex<Agent>>,
+    agent_name: String,
+    persona: Option<String>,
+    always: Option<String>,
+    model_always: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+    semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
+    tool_registry: Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    logger: Arc<AgentLogger>,
+    recall_limit: usize,
+    task_store: Option<Arc<Mutex<TaskStore>>>,
+    heartbeat_config: Option<HeartbeatDaemonConfig>,
+) {
+    logger.log("[worker] Agent worker started");
+
+    while let Some(work) = work_rx.recv().await {
+        // Clear agent history before processing ANY work item
+        // This prevents context bleed between different requests
+        {
+            let mut agent_guard = agent.lock().await;
+            agent_guard.clear_history();
+        }
+
+        match work {
+            AgentWork::Message { content, conv_name, response_tx, token_tx } => {
+                logger.log(&format!("[worker] Processing message: {}", content));
+                let result = process_message_work(
+                    &content,
+                    conv_name.as_deref(),
+                    token_tx,
+                    &agent,
+                    &agent_name,
+                    &persona,
+                    &always,
+                    &model_always,
+                    &allowed_tools,
+                    &semantic_memory,
+                    &embedding_client,
+                    &tool_registry,
+                    use_native_tools,
+                    &logger,
+                    recall_limit,
+                    &task_store,
+                ).await;
+                let _ = response_tx.send(result);
+            }
+            AgentWork::Notify { conv_id, message_id, depth } => {
+                logger.log(&format!("[worker] Processing notify: conv={} msg_id={} depth={}", conv_id, message_id, depth));
+                let _response = handle_notify(
+                    &conv_id,
+                    message_id,
+                    depth,
+                    &agent,
+                    &agent_name,
+                    &persona,
+                    &always,
+                    &model_always,
+                    &allowed_tools,
+                    &semantic_memory,
+                    &embedding_client,
+                    &tool_registry,
+                    use_native_tools,
+                    &logger,
+                    recall_limit,
+                    &task_store,
+                ).await;
+            }
+            AgentWork::Heartbeat => {
+                logger.log("[worker] Processing heartbeat");
+                if let Some(ref hb_config) = heartbeat_config {
+                    run_heartbeat(
+                        hb_config,
+                        &agent,
+                        &agent_name,
+                        &persona,
+                        &always,
+                        &model_always,
+                        &allowed_tools,
+                        &semantic_memory,
+                        &embedding_client,
+                        &tool_registry,
+                        use_native_tools,
+                        &logger,
+                        recall_limit,
+                    ).await;
+                } else {
+                    logger.log("[worker] Heartbeat work received but no heartbeat config");
+                }
+            }
+        }
+    }
+
+    logger.log("[worker] Agent worker stopped");
+}
+
+/// Process a Message work item: handle memory/tools injection, streaming, and tool execution.
+/// Returns the final response (or error) for the oneshot channel.
+async fn process_message_work(
+    content: &str,
+    conv_name: Option<&str>,
+    token_tx: Option<mpsc::Sender<String>>,
+    agent: &Arc<Mutex<Agent>>,
+    agent_name: &str,
+    persona: &Option<String>,
+    always: &Option<String>,
+    model_always: &Option<String>,
+    allowed_tools: &Option<Vec<String>>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    logger: &Arc<AgentLogger>,
+    recall_limit: usize,
+    task_store: &Option<Arc<Mutex<TaskStore>>>,
+) -> MessageWorkResult {
+    let start_time = std::time::Instant::now();
+
+    // Create tool execution context
+    let tool_context = ToolExecutionContext {
+        agent_name: agent_name.to_string(),
+        task_store: task_store.clone(),
+        conv_id: conv_name.map(|s| s.to_string()),
+        semantic_memory_store: semantic_memory.clone(),
+        embedding_client: embedding_client.clone(),
+        allowed_tools: allowed_tools.clone(),
+    };
+
+    // Get relevant tools from registry
+    let relevant_tools = if let Some(registry) = tool_registry {
+        let relevant = registry.find_relevant(content, recall_limit);
+        let relevant = filter_by_allowlist(relevant, allowed_tools);
+        if !relevant.is_empty() {
+            logger.tool(&format!("[worker] Recall: {} tools for query", relevant.len()));
+            for t in &relevant {
+                logger.tool(&format!("  - {}", t.name));
+            }
+        }
+        relevant
+    } else {
+        Vec::new()
+    };
+
+    // Build tools injection or tool specs
+    let (tools_injection, external_tools) = if use_native_tools {
+        let specs = if !relevant_tools.is_empty() {
+            Some(tool_definitions_to_specs(&relevant_tools))
+        } else {
+            None
+        };
+        (String::new(), specs)
+    } else {
+        (ToolRegistry::format_for_prompt(&relevant_tools), None)
+    };
+
+    // Inject relevant memories
+    let memory_injection = if let Some(mem_store) = semantic_memory {
+        let query_embedding = if let Some(emb_client) = embedding_client {
+            match emb_client.embed(content).await {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    logger.log(&format!("[worker] Failed to generate query embedding: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let store = mem_store.lock().await;
+        match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
+            Ok(memories) => {
+                if !memories.is_empty() {
+                    logger.memory(&format!("[worker] Recall: {} memories for query", memories.len()));
+                    for (m, score) in &memories {
+                        logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
+                    }
+                }
+                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                build_memory_injection(&entries)
+            }
+            Err(e) => {
+                logger.log(&format!("[worker] Memory recall error: {}", e));
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+
+    // Process with or without streaming
+    let final_response = if use_native_tools {
+        // Native tool mode with optional streaming
+        process_native_tool_mode(
+            content,
+            &effective_always,
+            external_tools,
+            token_tx,
+            agent,
+            persona,
+            semantic_memory,
+            embedding_client,
+            logger,
+        ).await
+    } else {
+        // JSON-block mode with optional streaming
+        process_json_block_mode(
+            content,
+            &effective_always,
+            &relevant_tools,
+            token_tx,
+            agent,
+            persona,
+            semantic_memory,
+            embedding_client,
+            tool_registry,
+            logger,
+            &tool_context,
+        ).await
+    };
+
+    // Store response in conversation if conv_name was provided
+    if let Some(cname) = conv_name {
+        let duration_ms = start_time.elapsed().as_millis() as i64;
+        match ConversationStore::init() {
+            Ok(store) => {
+                if let Err(e) = store.add_message_with_duration(cname, agent_name, &final_response, &[], Some(duration_ms)) {
+                    logger.log(&format!("[worker] Failed to store response in conversation: {}", e));
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("[worker] Failed to init conversation store: {}", e));
+            }
+        }
+    }
+
+    MessageWorkResult {
+        response: final_response,
+        error: None,
+    }
+}
+
+/// Process message in native tool mode (tools = true in model config)
+async fn process_native_tool_mode(
+    content: &str,
+    effective_always: &Option<String>,
+    external_tools: Option<Vec<ToolSpec>>,
+    token_tx: Option<mpsc::Sender<String>>,
+    agent: &Arc<Mutex<Agent>>,
+    persona: &Option<String>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    logger: &Arc<AgentLogger>,
+) -> String {
+    let options = ThinkOptions {
+        system_prompt: persona.clone(),
+        always_prompt: effective_always.clone(),
+        external_tools,
+        ..Default::default()
+    };
+
+    let result = if let Some(tx) = token_tx {
+        // Streaming mode
+        let agent_clone = agent.clone();
+        let content_clone = content.to_string();
+
+        let handle = tokio::spawn(async move {
+            let mut agent_guard = agent_clone.lock().await;
+            agent_guard.think_streaming_with_options(&content_clone, options, tx).await
+        });
+
+        match handle.await {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => format!("Error: {}", e),
+            Err(e) => format!("Error: task panicked: {}", e),
+        }
+    } else {
+        // Non-streaming mode
+        let mut agent_guard = agent.lock().await;
+        match agent_guard.think_with_options(content, options).await {
+            Ok(result) => result.response,
+            Err(e) => format!("Error: {}", e),
+        }
+    };
+
+    // Strip thinking tags and extract [REMEMBER: ...] tags
+    let without_thinking = strip_thinking_tags(&result);
+    let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+
+    // Save memories
+    if !memories_to_save.is_empty() {
+        if let Some(mem_store) = semantic_memory {
+            let store = mem_store.lock().await;
+            for memory in &memories_to_save {
+                let embedding = if let Some(emb_client) = embedding_client {
+                    emb_client.embed(memory).await.ok()
+                } else {
+                    None
+                };
+                match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                    Ok(SaveResult::New(id)) => logger.memory(&format!("[worker] Save #{}: \"{}\"", id, memory)),
+                    Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("[worker] Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
+                    Err(e) => logger.log(&format!("[worker] Failed to save memory: {}", e)),
+                }
+            }
+        }
+    }
+
+    after_remember
+}
+
+/// Process message in JSON-block tool mode (tools = false in model config)
+async fn process_json_block_mode(
+    content: &str,
+    effective_always: &Option<String>,
+    _relevant_tools: &[&ToolDefinition],
+    token_tx: Option<mpsc::Sender<String>>,
+    agent: &Arc<Mutex<Agent>>,
+    persona: &Option<String>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    logger: &Arc<AgentLogger>,
+    tool_context: &ToolExecutionContext,
+) -> String {
+    let mut current_message = content.to_string();
+    let max_tool_calls = 10;
+    let mut tool_call_count = 0;
+
+    loop {
+        let options = ThinkOptions {
+            system_prompt: persona.clone(),
+            always_prompt: effective_always.clone(),
+            external_tools: None,
+            ..Default::default()
+        };
+
+        let llm_response = if let Some(ref tx) = token_tx {
+            // Streaming mode - but suppress tool call blocks
+            let (internal_tx, mut internal_rx) = mpsc::channel::<String>(100);
+            let agent_clone = agent.clone();
+            let current_message_clone = current_message.clone();
+
+            let handle = tokio::spawn(async move {
+                let mut agent_guard = agent_clone.lock().await;
+                agent_guard.think_streaming_with_options(&current_message_clone, options, internal_tx).await
+            });
+
+            // Forward tokens, suppressing tool call blocks
+            let tx_clone = tx.clone();
+            let mut in_code_block = false;
+            let mut code_block_buffer = String::new();
+
+            while let Some(token) = internal_rx.recv().await {
+                if !in_code_block {
+                    if token.contains("```") {
+                        in_code_block = true;
+                        code_block_buffer = token;
+                        if code_block_buffer.matches("```").count() >= 2 {
+                            if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                                let _ = tx_clone.send(code_block_buffer.clone()).await;
+                            }
+                            in_code_block = false;
+                            code_block_buffer.clear();
+                        }
+                        continue;
+                    }
+                    let _ = tx_clone.send(token).await;
+                } else {
+                    code_block_buffer.push_str(&token);
+                    if code_block_buffer.matches("```").count() >= 2 {
+                        if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                            let _ = tx_clone.send(code_block_buffer.clone()).await;
+                        }
+                        in_code_block = false;
+                        code_block_buffer.clear();
+                    }
+                }
+            }
+
+            if !code_block_buffer.is_empty() {
+                if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                    let _ = tx_clone.send(code_block_buffer).await;
+                }
+            }
+
+            match handle.await {
+                Ok(Ok(response)) => response,
+                Ok(Err(e)) => return format!("Error: {}", e),
+                Err(e) => return format!("Error: task panicked: {}", e),
+            }
+        } else {
+            // Non-streaming mode
+            let mut agent_guard = agent.lock().await;
+            match agent_guard.think_with_options(&current_message, options).await {
+                Ok(result) => result.response,
+                Err(e) => return format!("Error: {}", e),
+            }
+        };
+
+        // Strip thinking tags and extract [REMEMBER: ...] tags
+        let without_thinking = strip_thinking_tags(&llm_response);
+        let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+
+        // Save memories
+        if !memories_to_save.is_empty() {
+            if let Some(mem_store) = semantic_memory {
+                let store = mem_store.lock().await;
+                for memory in &memories_to_save {
+                    let embedding = if let Some(emb_client) = embedding_client {
+                        emb_client.embed(memory).await.ok()
+                    } else {
+                        None
+                    };
+                    let _ = store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
+                }
+            }
+        }
+
+        // Check for tool calls
+        let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+
+        if let Some(tc) = tool_call {
+            tool_call_count += 1;
+            if tool_call_count > max_tool_calls {
+                logger.tool("[worker] Max tool calls reached, stopping");
+                return cleaned_response;
+            }
+
+            logger.tool(&format!("[worker] Executing: {} with params {}", tc.tool, tc.params));
+
+            let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
+
+            match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
+                Ok(tool_result) => {
+                    logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
+                    current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                }
+                Err(e) => {
+                    logger.tool(&format!("[worker] Error: {}", e));
+                    current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                }
+            }
+        } else {
+            return cleaned_response;
+        }
+    }
 }
 
 /// Maximum depth for @mention chains to prevent infinite loops
@@ -1734,100 +2169,6 @@ async fn forward_notify_to_agent(
     }
 }
 
-/// Heartbeat loop that fires periodically.
-/// Queues heartbeat if agent is busy (thinking lock held).
-async fn heartbeat_loop(
-    config: HeartbeatDaemonConfig,
-    agent: Arc<Mutex<Agent>>,
-    agent_name: String,
-    persona: Option<String>,
-    always: Option<String>,
-    model_always: Option<String>,
-    allowed_tools: Option<Vec<String>>,
-    semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
-    embedding_client: Option<Arc<EmbeddingClient>>,
-    tool_registry: Option<Arc<ToolRegistry>>,
-    use_native_tools: bool,
-    logger: Arc<AgentLogger>,
-    recall_limit: usize,
-    heartbeat_pending: Arc<AtomicBool>,
-    shutdown: Arc<tokio::sync::Notify>,
-) {
-    let mut interval = tokio::time::interval(config.interval);
-    // Skip the first immediate tick - first heartbeat fires AFTER first interval
-    interval.tick().await;
-
-    // Polling interval for checking pending heartbeats (1 second)
-    let mut pending_check = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                logger.log("[heartbeat] Timer fired");
-
-                // Try to acquire the agent lock (non-blocking check)
-                // We use try_lock to see if agent is busy
-                match agent.try_lock() {
-                    Ok(guard) => {
-                        // Agent is free, drop the guard and run heartbeat
-                        drop(guard);
-                        run_heartbeat(
-                            &config,
-                            &agent,
-                            &agent_name,
-                            &persona,
-                            &always,
-                            &model_always,
-                            &allowed_tools,
-                            &semantic_memory,
-                            &embedding_client,
-                            &tool_registry,
-                            use_native_tools,
-                            &logger,
-                            recall_limit,
-                        ).await;
-                    }
-                    Err(_) => {
-                        // Agent is busy, queue the heartbeat
-                        logger.log("[heartbeat] Agent busy, queuing heartbeat");
-                        heartbeat_pending.store(true, Ordering::SeqCst);
-                    }
-                }
-            }
-            _ = pending_check.tick() => {
-                // Check if there's a pending heartbeat and agent is now free
-                if heartbeat_pending.load(Ordering::SeqCst) {
-                    if let Ok(guard) = agent.try_lock() {
-                        // Agent is free now, clear pending and run heartbeat
-                        heartbeat_pending.store(false, Ordering::SeqCst);
-                        drop(guard);
-                        logger.log("[heartbeat] Running pending heartbeat");
-                        run_heartbeat(
-                            &config,
-                            &agent,
-                            &agent_name,
-                            &persona,
-                            &always,
-                            &model_always,
-                            &allowed_tools,
-                            &semantic_memory,
-                            &embedding_client,
-                            &tool_registry,
-                            use_native_tools,
-                            &logger,
-                            recall_limit,
-                        ).await;
-                    }
-                }
-            }
-            _ = shutdown.notified() => {
-                logger.log("[heartbeat] Shutting down heartbeat loop");
-                break;
-            }
-        }
-    }
-}
-
 /// Execute a heartbeat: load heartbeat.md, think, store response in <agent>-heartbeat conversation.
 async fn run_heartbeat(
     config: &HeartbeatDaemonConfig,
@@ -2183,17 +2524,17 @@ async fn handle_connection(
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: Option<Arc<EmbeddingClient>>,
     tool_registry: Option<Arc<ToolRegistry>>,
-    use_native_tools: bool,
+    _use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
-    _heartbeat_pending: Arc<AtomicBool>,
     task_store: Option<Arc<Mutex<TaskStore>>>,
+    work_tx: mpsc::UnboundedSender<AgentWork>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Create tool execution context for tools that need daemon state
     // Note: conv_id is None in handle_connection context (direct socket messages)
-    let tool_context = ToolExecutionContext {
+    let _tool_context = ToolExecutionContext {
         agent_name: agent_name.clone(),
         task_store: task_store.clone(),
         conv_id: None,
@@ -2222,398 +2563,51 @@ async fn handle_connection(
         let response = match request {
             Request::Message { ref content, ref conv_name } => {
                 logger.log(&format!("[socket] Received message: {}", content));
-                let start_time = std::time::Instant::now();
 
-                // Get relevant tools from registry (used for both modes)
-                let relevant_tools = if let Some(ref registry) = tool_registry {
-                    let relevant = registry.find_relevant(content, recall_limit);
-                    let relevant = filter_by_allowlist(relevant, &allowed_tools);
-                    if !relevant.is_empty() {
-                        logger.tool(&format!("Recall: {} tools for query", relevant.len()));
-                        for t in &relevant {
-                            logger.tool(&format!("  - {}", t.name));
-                        }
-                    }
-                    relevant
-                } else {
-                    Vec::new()
-                };
+                // Create streaming channel for tokens
+                let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
 
-                // Build tools injection for JSON-block mode, or tool specs for native mode
-                let (tools_injection, external_tools) = if use_native_tools {
-                    let specs = if !relevant_tools.is_empty() {
-                        Some(tool_definitions_to_specs(&relevant_tools))
-                    } else {
-                        None
-                    };
-                    (String::new(), specs)
-                } else {
-                    (ToolRegistry::format_for_prompt(&relevant_tools), None)
-                };
+                // Create oneshot channel for final result
+                let (response_tx, response_rx) = oneshot::channel();
 
-                // Inject relevant memories if enabled
-                let memory_injection = if let Some(ref mem_store) = semantic_memory {
-                    // Generate query embedding if we have an embedding client
-                    let query_embedding = if let Some(ref emb_client) = embedding_client {
-                        match emb_client.embed(content).await {
-                            Ok(emb) => Some(emb),
-                            Err(e) => {
-                                logger.log(&format!("[socket] Failed to generate query embedding: {}", e));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let store = mem_store.lock().await;
-                    match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
-                        Ok(memories) => {
-                            if !memories.is_empty() {
-                                logger.memory(&format!("Recall: {} memories for query", memories.len()));
-                                for (m, score) in &memories {
-                                    logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
-                                }
-                            }
-                            let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                            build_memory_injection(&entries)
-                        }
-                        Err(e) => {
-                            logger.log(&format!("[socket] Memory recall error: {}", e));
-                            String::new()
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-
-                // Combine tools, memory injection, and always prompt
-                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
-
-                // Clear agent's internal history to prevent context bleed from other requests
-                // (e.g., heartbeat context leaking into ask requests)
-                {
-                    let mut agent_guard = agent.lock().await;
-                    agent_guard.clear_history();
+                // Send work to the worker
+                if work_tx.send(AgentWork::Message {
+                    content: content.clone(),
+                    conv_name: conv_name.clone(),
+                    response_tx,
+                    token_tx: Some(token_tx),
+                }).is_err() {
+                    logger.log("[socket] Worker channel closed");
+                    break;
                 }
 
-                let agent_guard = agent.lock().await;
-
-                if use_native_tools {
-                    // Native tool mode with streaming: Agent handles tool calling internally
-                    let options = ThinkOptions {
-                        system_prompt: persona.clone(),
-                        always_prompt: effective_always.clone(),
-                        external_tools: external_tools.clone(),
-                        ..Default::default()
-                    };
-
-                    // Create channel for streaming tokens
-                    let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
-
-                    // We need to drop the agent_guard so we can spawn the thinking task
-                    drop(agent_guard);
-
-                    // Clone things needed in the spawned task
-                    let agent_clone = agent.clone();
-                    let content_clone = content.clone();
-
-                    // Spawn thinking in background
-                    let think_handle = tokio::spawn(async move {
-                        let mut agent_guard = agent_clone.lock().await;
-                        agent_guard.think_streaming_with_options(&content_clone, options, token_tx).await
-                    });
-
-                    // Forward tokens to socket as they arrive
-                    while let Some(token) = token_rx.recv().await {
-                        if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
-                            logger.log(&format!("[socket] Error writing chunk: {}", e));
-                            break;
-                        }
+                // Forward tokens to socket as they arrive
+                while let Some(token) = token_rx.recv().await {
+                    if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
+                        logger.log(&format!("[socket] Error writing chunk: {}", e));
+                        break;
                     }
-
-                    // Wait for completion
-                    let result = think_handle.await;
-
-                    // Handle the result
-                    let final_response = match result {
-                        Ok(Ok(response)) => {
-                            // Strip thinking tags and extract [REMEMBER: ...] tags
-                            let without_thinking = strip_thinking_tags(&response);
-                            let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-                            if !memories_to_save.is_empty() {
-                                if let Some(ref mem_store) = semantic_memory {
-                                    let store = mem_store.lock().await;
-                                    for memory in &memories_to_save {
-                                        // Generate embedding if we have a client
-                                        let embedding = if let Some(ref emb_client) = embedding_client {
-                                            match emb_client.embed(memory).await {
-                                                Ok(emb) => Some(emb),
-                                                Err(e) => {
-                                                    logger.log(&format!("[socket] Failed to generate embedding: {}", e));
-                                                    None
-                                                }
-                                            }
-                                        } else {
-                                            None
-                                        };
-
-                                        match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                                            Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                            Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                            Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
-                                        }
-                                    }
-                                }
-                            }
-                            after_remember
-                        }
-                        Ok(Err(e)) => format!("Error: {}", e),
-                        Err(e) => format!("Error: task panicked: {}", e),
-                    };
-
-                    // Send Done to signal stream complete
-                    if let Err(e) = api.write_response(&Response::Done).await {
-                        logger.log(&format!("[socket] Error writing Done: {}", e));
-                    }
-
-                    // Log the final response (but don't send it - already streamed)
-                    logger.log(&format!("[socket] Final response: {} bytes", final_response.len()));
-
-                    // Store response in conversation if conv_name was provided
-                    if let Some(cname) = conv_name {
-                        let duration_ms = start_time.elapsed().as_millis() as i64;
-                        match ConversationStore::init() {
-                            Ok(store) => {
-                                if let Err(e) = store.add_message_with_duration(cname, &agent_name, &final_response, &[], Some(duration_ms)) {
-                                    logger.log(&format!("[socket] Failed to store response in conversation: {}", e));
-                                }
-                            }
-                            Err(e) => {
-                                logger.log(&format!("[socket] Failed to init conversation store: {}", e));
-                            }
-                        }
-                    }
-
-                    // Continue to next request (don't send Response::Message)
-                    continue;
-                } else {
-                    // JSON-block mode with streaming: Daemon parses and executes tool calls
-                    // We need to drop the agent_guard so we can re-acquire it in the loop
-                    drop(agent_guard);
-
-                    let mut current_message = content.clone();
-                    let max_tool_calls = 10;
-                    let mut tool_call_count = 0;
-                    let final_json_response: String;
-
-                    loop {
-                        let options = ThinkOptions {
-                            system_prompt: persona.clone(),
-                            always_prompt: effective_always.clone(),
-                            external_tools: None,
-                            ..Default::default()
-                        };
-
-                        // Create channel for streaming tokens
-                        let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
-
-                        // Clone things needed in the spawned task
-                        let agent_clone = agent.clone();
-                        let current_message_clone = current_message.clone();
-
-                        // Spawn thinking in background
-                        let think_handle = tokio::spawn(async move {
-                            let mut agent_guard = agent_clone.lock().await;
-                            agent_guard.think_streaming_with_options(&current_message_clone, options, token_tx).await
-                        });
-
-                        // Forward tokens to socket as they arrive, but suppress tool call blocks
-                        // Tool blocks look like: ```json\n{"tool": "...", "params": {...}}\n```
-                        let mut in_code_block = false;
-                        let mut code_block_buffer = String::new();
-
-                        while let Some(token) = token_rx.recv().await {
-                            if !in_code_block {
-                                // Check if this token starts or contains a code block
-                                if token.contains("```") {
-                                    in_code_block = true;
-                                    code_block_buffer = token;
-                                    // Check if the code block is already complete in this token
-                                    if code_block_buffer.matches("```").count() >= 2 {
-                                        // Complete block in single token - check if it's a tool call
-                                        if code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"") {
-                                            // Tool call - suppress
-                                        } else {
-                                            // Not a tool call - send it
-                                            if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer.clone() }).await {
-                                                logger.log(&format!("[socket] Error writing chunk: {}", e));
-                                                break;
-                                            }
-                                        }
-                                        in_code_block = false;
-                                        code_block_buffer.clear();
-                                    }
-                                    continue;
-                                }
-                                // Normal token - send it
-                                if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
-                                    logger.log(&format!("[socket] Error writing chunk: {}", e));
-                                    break;
-                                }
-                            } else {
-                                // Inside code block - buffer
-                                code_block_buffer.push_str(&token);
-
-                                // Check if code block ended
-                                if code_block_buffer.matches("```").count() >= 2 {
-                                    // Code block complete - check if it's a tool call
-                                    if code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"") {
-                                        // Tool call - suppress (don't send)
-                                    } else {
-                                        // Not a tool call - send the buffered content
-                                        if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer.clone() }).await {
-                                            logger.log(&format!("[socket] Error writing chunk: {}", e));
-                                            break;
-                                        }
-                                    }
-                                    in_code_block = false;
-                                    code_block_buffer.clear();
-                                }
-                            }
-                        }
-
-                        // Handle any remaining buffer at end (incomplete code block)
-                        if !code_block_buffer.is_empty() {
-                            // If it doesn't look like a tool call, send it
-                            if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
-                                if let Err(e) = api.write_response(&Response::Chunk { text: code_block_buffer }).await {
-                                    logger.log(&format!("[socket] Error writing final buffer: {}", e));
-                                }
-                            }
-                        }
-
-                        // Wait for completion and get the full response
-                        let result = think_handle.await;
-
-                        let llm_response = match result {
-                            Ok(Ok(response)) => response,
-                            Ok(Err(e)) => {
-                                logger.log(&format!("[socket] LLM error: {}", e));
-                                if let Err(e) = api.write_response(&Response::Done).await {
-                                    logger.log(&format!("[socket] Error writing Done: {}", e));
-                                }
-                                continue; // Move to next request
-                            }
-                            Err(e) => {
-                                logger.log(&format!("[socket] Task panic: {}", e));
-                                if let Err(e) = api.write_response(&Response::Done).await {
-                                    logger.log(&format!("[socket] Error writing Done: {}", e));
-                                }
-                                continue; // Move to next request
-                            }
-                        };
-
-                        // Strip thinking tags and extract [REMEMBER: ...] tags
-                        let without_thinking = strip_thinking_tags(&llm_response);
-                        let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-
-                        if !memories_to_save.is_empty() {
-                            if let Some(ref mem_store) = semantic_memory {
-                                let store = mem_store.lock().await;
-                                for memory in &memories_to_save {
-                                    // Generate embedding if we have a client
-                                    let embedding = if let Some(ref emb_client) = embedding_client {
-                                        match emb_client.embed(memory).await {
-                                            Ok(emb) => Some(emb),
-                                            Err(e) => {
-                                                logger.log(&format!("[socket] Failed to generate embedding: {}", e));
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        None
-                                    };
-
-                                    match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
-                                    }
-                                }
-                            }
-                        }
-
-                        // Check for tool calls (JSON-block parsing)
-                        let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
-
-                        if let Some(tc) = tool_call {
-                            tool_call_count += 1;
-                            if tool_call_count > max_tool_calls {
-                                logger.tool("Max tool calls reached, stopping");
-                                // Send Done to signal stream complete
-                                if let Err(e) = api.write_response(&Response::Done).await {
-                                    logger.log(&format!("[socket] Error writing Done: {}", e));
-                                }
-                                final_json_response = cleaned_response;
-                                break;
-                            }
-
-                            // Send ToolCall event to client before executing
-                            if let Err(e) = api.write_response(&Response::ToolCall {
-                                tool: tc.tool.clone(),
-                                params: tc.params.clone(),
-                            }).await {
-                                logger.log(&format!("[socket] Error writing ToolCall: {}", e));
-                            }
-
-                            logger.tool(&format!("Executing: {} with params {}", tc.tool, tc.params));
-
-                            // Look up the tool definition to get allowed_commands
-                            let tool_def = tool_registry.as_ref()
-                                .and_then(|r| r.find_by_name(&tc.tool));
-
-                            match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
-                                Ok(tool_result) => {
-                                    logger.tool(&format!("Result: {} bytes", tool_result.len()));
-                                    current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
-                                    // Continue to next iteration - don't send Done yet
-                                }
-                                Err(e) => {
-                                    logger.tool(&format!("Error: {}", e));
-                                    current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
-                                    // Continue to next iteration to let LLM handle the error
-                                }
-                            }
-                        } else {
-                            // No more tool calls - done
-                            if let Err(e) = api.write_response(&Response::Done).await {
-                                logger.log(&format!("[socket] Error writing Done: {}", e));
-                            }
-                            logger.log(&format!("[socket] Final response: {} bytes", cleaned_response.len()));
-                            final_json_response = cleaned_response;
-                            break;
-                        }
-                    }
-
-                    // Store response in conversation if conv_name was provided
-                    if let Some(cname) = conv_name {
-                        let duration_ms = start_time.elapsed().as_millis() as i64;
-                        match ConversationStore::init() {
-                            Ok(store) => {
-                                if let Err(e) = store.add_message_with_duration(cname, &agent_name, &final_json_response, &[], Some(duration_ms)) {
-                                    logger.log(&format!("[socket] Failed to store response in conversation: {}", e));
-                                }
-                            }
-                            Err(e) => {
-                                logger.log(&format!("[socket] Failed to init conversation store: {}", e));
-                            }
-                        }
-                    }
-
-                    // Continue to next request (don't send Response::Message - already streamed)
-                    continue;
                 }
+
+                // Wait for final result
+                match response_rx.await {
+                    Ok(result) => {
+                        // Send Done to signal stream complete
+                        if let Err(e) = api.write_response(&Response::Done).await {
+                            logger.log(&format!("[socket] Error writing Done: {}", e));
+                        }
+                        logger.log(&format!("[socket] Final response: {} bytes", result.response.len()));
+                    }
+                    Err(_) => {
+                        logger.log("[socket] Worker dropped response channel");
+                        if let Err(e) = api.write_response(&Response::Done).await {
+                            logger.log(&format!("[socket] Error writing Done: {}", e));
+                        }
+                    }
+                }
+
+                // Continue to next request (don't send Response::Message - already streamed)
+                continue;
             }
 
             Request::IncomingMessage { ref from, ref content } => {
@@ -2733,41 +2727,14 @@ async fn handle_connection(
                     continue;
                 }
 
-                // Spawn async processing - don't block the caller
-                let conv_id = conv_id.clone();
-                let agent = agent.clone();
-                let agent_name = agent_name.clone();
-                let persona = persona.clone();
-                let always = always.clone();
-                let model_always = model_always.clone();
-                let allowed_tools = allowed_tools.clone();
-                let semantic_memory = semantic_memory.clone();
-                let embedding_client = embedding_client.clone();
-                let tool_registry = tool_registry.clone();
-                let logger = logger.clone();
-                let task_store = task_store.clone();
-
-                tokio::spawn(async move {
-                    let _response = handle_notify(
-                        &conv_id,
-                        message_id,
-                        depth,
-                        &agent,
-                        &agent_name,
-                        &persona,
-                        &always,
-                        &model_always,
-                        &allowed_tools,
-                        &semantic_memory,
-                        &embedding_client,
-                        &tool_registry,
-                        use_native_tools,
-                        &logger,
-                        recall_limit,
-                        &task_store,
-                    ).await;
-                    // Response is logged inside handle_notify, no need to do anything with it
-                });
+                // Send Notify work to the worker - serialized with other agent work
+                if work_tx.send(AgentWork::Notify {
+                    conv_id: conv_id.clone(),
+                    message_id,
+                    depth,
+                }).is_err() {
+                    logger.log("[socket] Worker channel closed");
+                }
 
                 // Continue to next request - we already sent the ack
                 continue;
@@ -2819,23 +2786,13 @@ async fn handle_connection(
                         logger.log("[socket] heartbeat.md not found");
                         Response::Error { message: "heartbeat.md not found".to_string() }
                     } else {
-                        // Run heartbeat immediately (skip busy check for manual trigger)
-                        run_heartbeat(
-                            hb_config,
-                            &agent,
-                            &agent_name,
-                            &persona,
-                            &always,
-                            &model_always,
-                            &allowed_tools,
-                            &semantic_memory,
-                            &embedding_client,
-                            &tool_registry,
-                            use_native_tools,
-                            &logger,
-                            recall_limit,
-                        ).await;
-                        Response::HeartbeatTriggered
+                        // Send heartbeat work to the worker - serialized with other agent work
+                        if work_tx.send(AgentWork::Heartbeat).is_err() {
+                            logger.log("[socket] Worker channel closed");
+                            Response::Error { message: "Worker channel closed".to_string() }
+                        } else {
+                            Response::HeartbeatTriggered
+                        }
                     }
                 } else {
                     logger.log("[socket] Heartbeat not configured");
