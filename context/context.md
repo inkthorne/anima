@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| **Version** | v3.4.32 |
+| **Version** | v3.4.34 |
 | **Tests** | 469 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
@@ -93,6 +93,7 @@ Agents use tools via JSON blocks:
 - `write_file` — Write/create files
 - `safe_shell` — Run read-only shell commands (ls, grep, find, cat, etc.)
 - `http` — Make HTTP requests
+- `list_tools` — List all available tools (always injected for discoverability)
 - `list_agents` — Discover other agents in the system
 - `remember` — Save to persistent semantic memory
 - `send_message` — Send message to another agent
@@ -164,8 +165,10 @@ cargo install --path . --force  # Install to ~/.cargo/bin
 anima restart all               # After changes
 ```
 
-## Recent Changes (v3.4.6 → v3.4.32)
+## Recent Changes (v3.4.6 → v3.4.34)
 
+- **v3.4.34** — `list_tools` meta-tool always injected for tool discoverability
+- **v3.4.33** — Response duration shown in chat TUI (e.g., `• 1m 32s`)
 - **v3.4.32** — Fix duplicate tool results in conversation history
 - **v3.4.29** — `list_agents` tool for agent discovery
 - **v3.4.28** — Split always_prompt: memories only on first turn (reduces noise in tool loops)
@@ -182,4 +185,4 @@ anima restart all               # After changes
 
 ## Last Updated
 
-2026-02-03 — v3.4.32: Comprehensive tool loop fixes, multi-agent communication, enhanced debugging.
+2026-02-04 — v3.4.34: Tool discoverability with list_tools, response duration display.
