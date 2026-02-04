@@ -22,7 +22,7 @@ dependencies = [
 
 [[package]]
 name = "anima"
-version = "3.4.29"
+version = "3.4.30"
 dependencies = [
  "async-trait",
  "chrono",

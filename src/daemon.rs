@@ -1469,12 +1469,13 @@ async fn handle_notify(
                     }
 
                     // Store this assistant response before executing the tool
-                    // (if there's content beyond just the tool call)
-                    if !cleaned_response.trim().is_empty() {
-                        if let Err(e) = store.add_message(conv_id, agent_name, &cleaned_response, &[]) {
+                    // Use after_remember (not cleaned_response) to preserve the tool call JSON block
+                    // so the model can see what it called in conversation history
+                    if !after_remember.trim().is_empty() {
+                        if let Err(e) = store.add_message(conv_id, agent_name, &after_remember, &[]) {
                             logger.log(&format!("[notify] Failed to store intermediate response: {}", e));
                         } else {
-                            logger.log(&format!("[notify] Stored intermediate response: {} bytes", cleaned_response.len()));
+                            logger.log(&format!("[notify] Stored intermediate response: {} bytes", after_remember.len()));
                         }
                     }
 
