@@ -929,6 +929,16 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
     let exe = std::env::current_exe()
         .map_err(|e| format!("Failed to get current executable: {}", e))?;
 
+    // Open log file for stdout/stderr redirection
+    let log_path = agent_path.join("agent.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open log file: {}", e))?;
+    let log_file_err = log_file.try_clone()
+        .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
+
     // Spawn daemon process in background
     // Use `run --daemon` for the actual daemon logic
     let child = Command::new(&exe)
@@ -936,8 +946,8 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
         .arg(agent)
         .arg("--daemon")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file_err))
         .spawn()
         .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
 
