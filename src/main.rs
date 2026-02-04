@@ -484,8 +484,8 @@ async fn chat_with_conversation(
             let last_id = poll_last_seen.load(Ordering::SeqCst);
             if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id)) {
                 for msg in msgs {
-                    // Only display messages from agents (not from "user")
-                    if msg.from_agent != "user" {
+                    // Only display messages from agents (not from "user" or "tool")
+                    if msg.from_agent != "user" && msg.from_agent != "tool" {
                         // Print the agent message on a new line
                         print!("\r\x1b[K"); // Clear current line (in case user was typing)
                         println!("\x1b[36m[{}]:\x1b[0m {}", msg.from_agent, msg.content);
@@ -1309,6 +1309,9 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
             // Get messages with filtering
             let messages = store.get_messages_filtered(&conv, limit, since)?;
+
+            // Filter out tool messages from display (they clutter the chat)
+            let messages: Vec<_> = messages.into_iter().filter(|m| m.from_agent != "tool").collect();
 
             if raw {
                 // Raw format: ID|TIMESTAMP|FROM|CONTENT (one line per message, escaped)
