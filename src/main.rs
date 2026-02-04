@@ -90,13 +90,6 @@ enum Commands {
     },
     /// Interactive REPL for exploring anima (default if no command given)
     Repl,
-    /// Send a message to a running agent daemon
-    Send {
-        /// Agent name (from ~/.anima/agents/)
-        agent: String,
-        /// Message to send
-        message: String,
-    },
     /// Manage conversations - list, create, join, or delete chats
     Chat {
         #[command(subcommand)]
@@ -333,12 +326,6 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Send { agent, message } => {
-            if let Err(e) = send_message(&agent, &message).await {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
         Commands::Chat { command } => {
             if let Err(e) = handle_chat_command(command).await {
                 eprintln!("Error: {}", e);
@@ -441,54 +428,6 @@ async fn connect_to_agent(agent: &str) -> Result<SocketApi, Box<dyn std::error::
     Ok(SocketApi::new(stream))
 }
 
-/// Send a single message to a running agent daemon.
-async fn send_message(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut api = connect_to_agent(agent).await?;
-
-    // Send the message
-    api.write_request(&Request::Message {
-        content: message.to_string(),
-    }).await.map_err(|e| format!("Failed to send message: {}", e))?;
-
-    // Read responses (may be streaming or non-streaming)
-    loop {
-        match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
-            Some(Response::Chunk { text }) => {
-                // Streaming: print tokens as they arrive
-                print!("{}", text);
-                io::stdout().flush()?;
-            }
-            Some(Response::ToolCall { tool, params }) => {
-                // Show tool call: " - [tool] safe_shell: ls -la ~/dev"
-                let param_summary = format_tool_params(&params);
-                eprintln!(" - [tool] {}: {}", tool, param_summary);
-            }
-            Some(Response::Done) => {
-                // Streaming complete
-                println!();  // Final newline
-                break;
-            }
-            Some(Response::Message { content }) => {
-                // Fallback for non-streaming responses (JSON-block mode)
-                println!("{}", content);
-                break;
-            }
-            Some(Response::Error { message }) => {
-                eprintln!("Error from agent: {}", message);
-                std::process::exit(1);
-            }
-            None => {
-                eprintln!("Connection closed unexpectedly");
-                std::process::exit(1);
-            }
-            _ => {
-                // Ignore other response types
-            }
-        }
-    }
-
-    Ok(())
-}
 
 /// Default number of context messages to load from conversation history.
 const DEFAULT_CONTEXT_MESSAGES: usize = 20;
@@ -864,102 +803,106 @@ fn show_status() {
     }
 }
 
-/// One-shot query to an agent without daemon.
-/// Loads the agent config, creates LLM, sends message, prints response.
+/// Query an agent with conversation persistence.
+/// Starts daemon if not running, creates/uses conversation named after agent,
+/// stores user message, streams response, and daemon stores agent response.
 async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use anima::{ChatMessage, LLM};
+    use anima::discovery;
+    use std::process::Command;
 
     let agent_path = resolve_agent_path(agent);
 
-    // Load the agent directory
+    // Verify agent exists
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    // Load agent directory to get canonical name
     let agent_dir = AgentDir::load(&agent_path)
         .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
+    let agent_name = agent_dir.config.agent.name.clone();
 
-    // Load persona if configured
-    let persona = agent_dir.load_persona()
-        .map_err(|e| format!("Failed to load persona: {}", e))?;
+    // Start daemon if not running
+    if !discovery::is_agent_running(&agent_name) {
+        eprintln!("\x1b[33mStarting daemon for '{}'...\x1b[0m", agent_name);
 
-    // Load always content if configured
-    let always = agent_dir.load_always()
-        .map_err(|e| format!("Failed to load always: {}", e))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("Failed to get executable path: {}", e))?;
 
-    // Resolve LLM config (loads model file if specified, applies overrides)
-    let llm_config = agent_dir.resolve_llm_config()
-        .map_err(|e| format!("Failed to resolve LLM config: {}", e))?;
+        Command::new(&exe)
+            .args(["start", &agent_name])
+            .spawn()
+            .map_err(|e| format!("Failed to start daemon: {}", e))?;
 
-    // Get API key using resolved config
-    let api_key = AgentDir::api_key_for_config(&llm_config)
-        .map_err(|e| format!("Failed to get API key: {}", e))?;
-
-    // Create LLM from resolved config
-    let llm: Arc<dyn LLM> = match llm_config.provider.as_str() {
-        "openai" => {
-            let key = api_key.ok_or("OpenAI API key not configured")?;
-            let mut client = OpenAIClient::new(key).with_model(&llm_config.model);
-            if let Some(ref base_url) = llm_config.base_url {
-                client = client.with_base_url(base_url);
+        // Wait for daemon to start (up to 2 seconds)
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if discovery::is_agent_running(&agent_name) {
+                break;
             }
-            Arc::new(client)
         }
-        "anthropic" => {
-            let key = api_key.ok_or("Anthropic API key not configured")?;
-            let mut client = AnthropicClient::new(key).with_model(&llm_config.model);
-            if let Some(ref base_url) = llm_config.base_url {
-                client = client.with_base_url(base_url);
-            }
-            Arc::new(client)
-        }
-        "ollama" => {
-            let mut client = OllamaClient::new()
-                .with_model(&llm_config.model)
-                .with_thinking(llm_config.thinking)
-                .with_num_ctx(llm_config.num_ctx);
-            if let Some(ref base_url) = llm_config.base_url {
-                client = client.with_base_url(base_url);
-            }
-            Arc::new(client)
-        }
-        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
-    };
 
-    // Build messages
-    let mut messages = Vec::new();
-
-    // Add system prompt from persona if available
-    if let Some(persona_content) = persona {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(persona_content),
-            tool_call_id: None,
-            tool_calls: None,
-        });
+        if !discovery::is_agent_running(&agent_name) {
+            return Err(format!("Daemon for '{}' failed to start", agent_name).into());
+        }
     }
 
-    // Inject always content as system message just before user message (recency bias)
-    if let Some(always_content) = always {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: Some(always_content),
-            tool_call_id: None,
-            tool_calls: None,
-        });
+    // Initialize conversation store and create/get conversation named after agent
+    let store = ConversationStore::init()?;
+    let conv_name = agent_name.clone();
+
+    // Create conversation if it doesn't exist
+    if store.find_by_name(&conv_name)?.is_none() {
+        store.create_conversation(Some(&conv_name), &["user", &agent_name])?;
     }
 
-    // Add user message
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: Some(message.to_string()),
-        tool_call_id: None,
-        tool_calls: None,
-    });
+    // Store user message in conversation
+    store.add_message(&conv_name, "user", message, &[])?;
 
-    // Call LLM directly (no tools for simple ask)
-    let response = llm.chat_complete(messages, None).await
-        .map_err(|e| format!("LLM error: {}", e))?;
+    // Connect to daemon
+    let mut api = connect_to_agent(&agent_name).await?;
 
-    // Print the response
-    if let Some(content) = response.content {
-        println!("{}", content);
+    // Send message with conversation name for persistence
+    api.write_request(&Request::Message {
+        content: message.to_string(),
+        conv_name: Some(conv_name),
+    }).await.map_err(|e| format!("Failed to send message: {}", e))?;
+
+    // Read responses (streaming)
+    loop {
+        match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+            Some(Response::Chunk { text }) => {
+                // Streaming: print tokens as they arrive
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            Some(Response::ToolCall { tool, params }) => {
+                // Show tool call
+                let param_summary = format_tool_params(&params);
+                eprintln!(" - [tool] {}: {}", tool, param_summary);
+            }
+            Some(Response::Done) => {
+                // Streaming complete
+                println!();  // Final newline
+                break;
+            }
+            Some(Response::Message { content }) => {
+                // Fallback for non-streaming responses
+                println!("{}", content);
+                break;
+            }
+            Some(Response::Error { message }) => {
+                eprintln!("Error from agent: {}", message);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Connection closed unexpectedly");
+                std::process::exit(1);
+            }
+            _ => {
+                // Ignore other response types
+            }
+        }
     }
 
     Ok(())

@@ -2220,8 +2220,9 @@ async fn handle_connection(
         };
 
         let response = match request {
-            Request::Message { ref content } => {
+            Request::Message { ref content, ref conv_name } => {
                 logger.log(&format!("[socket] Received message: {}", content));
+                let start_time = std::time::Instant::now();
 
                 // Get relevant tools from registry (used for both modes)
                 let relevant_tools = if let Some(ref registry) = tool_registry {
@@ -2372,6 +2373,21 @@ async fn handle_connection(
                     // Log the final response (but don't send it - already streamed)
                     logger.log(&format!("[socket] Final response: {} bytes", final_response.len()));
 
+                    // Store response in conversation if conv_name was provided
+                    if let Some(cname) = conv_name {
+                        let duration_ms = start_time.elapsed().as_millis() as i64;
+                        match ConversationStore::init() {
+                            Ok(store) => {
+                                if let Err(e) = store.add_message_with_duration(cname, &agent_name, &final_response, &[], Some(duration_ms)) {
+                                    logger.log(&format!("[socket] Failed to store response in conversation: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                logger.log(&format!("[socket] Failed to init conversation store: {}", e));
+                            }
+                        }
+                    }
+
                     // Continue to next request (don't send Response::Message)
                     continue;
                 } else {
@@ -2382,6 +2398,7 @@ async fn handle_connection(
                     let mut current_message = content.clone();
                     let max_tool_calls = 10;
                     let mut tool_call_count = 0;
+                    let mut final_json_response = String::new();
 
                     loop {
                         let options = ThinkOptions {
@@ -2531,6 +2548,7 @@ async fn handle_connection(
                                 if let Err(e) = api.write_response(&Response::Done).await {
                                     logger.log(&format!("[socket] Error writing Done: {}", e));
                                 }
+                                final_json_response = cleaned_response;
                                 break;
                             }
 
@@ -2566,7 +2584,23 @@ async fn handle_connection(
                                 logger.log(&format!("[socket] Error writing Done: {}", e));
                             }
                             logger.log(&format!("[socket] Final response: {} bytes", cleaned_response.len()));
+                            final_json_response = cleaned_response;
                             break;
+                        }
+                    }
+
+                    // Store response in conversation if conv_name was provided
+                    if let Some(cname) = conv_name {
+                        let duration_ms = start_time.elapsed().as_millis() as i64;
+                        match ConversationStore::init() {
+                            Ok(store) => {
+                                if let Err(e) = store.add_message_with_duration(cname, &agent_name, &final_json_response, &[], Some(duration_ms)) {
+                                    logger.log(&format!("[socket] Failed to store response in conversation: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                logger.log(&format!("[socket] Failed to init conversation store: {}", e));
+                            }
                         }
                     }
 

@@ -638,7 +638,7 @@ impl Repl {
         };
 
         // Send message request with conversation context
-        let request = Request::Message { content: context.to_string() };
+        let request = Request::Message { content: context.to_string(), conv_name: None };
         if let Err(e) = api.write_request(&request).await {
             println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
@@ -726,7 +726,7 @@ impl Repl {
         };
 
         // Send message request with conversation context
-        let request = Request::Message { content: context };
+        let request = Request::Message { content: context, conv_name: None };
         if let Err(e) = api.write_request(&request).await {
             println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);

@@ -14,6 +14,10 @@ pub enum Request {
     /// Send a message to the agent and get a response (from user/REPL).
     Message {
         content: String,
+        /// Optional conversation name for persistence.
+        /// If provided, the daemon will store the response in this conversation.
+        #[serde(default)]
+        conv_name: Option<String>,
     },
     /// Incoming message from another agent (inter-daemon communication).
     IncomingMessage {
@@ -218,6 +222,7 @@ mod tests {
     fn test_request_message_serialization() {
         let request = Request::Message {
             content: "Hello, agent!".to_string(),
+            conv_name: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"message\""));
@@ -226,7 +231,43 @@ mod tests {
         // Deserialize back
         let parsed: Request = serde_json::from_str(&json).unwrap();
         match parsed {
-            Request::Message { content } => assert_eq!(content, "Hello, agent!"),
+            Request::Message { content, conv_name } => {
+                assert_eq!(content, "Hello, agent!");
+                assert!(conv_name.is_none());
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_message_with_conv_name() {
+        let request = Request::Message {
+            content: "Hello!".to_string(),
+            conv_name: Some("test-conv".to_string()),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"conv_name\":\"test-conv\""));
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::Message { content, conv_name } => {
+                assert_eq!(content, "Hello!");
+                assert_eq!(conv_name, Some("test-conv".to_string()));
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_message_without_conv_name_backward_compat() {
+        // Test backwards compatibility - conv_name should default to None if not provided
+        let json = r#"{"type":"message","content":"Hello!"}"#;
+        let parsed: Request = serde_json::from_str(json).unwrap();
+        match parsed {
+            Request::Message { content, conv_name } => {
+                assert_eq!(content, "Hello!");
+                assert!(conv_name.is_none());
+            }
             _ => panic!("Wrong variant"),
         }
     }
