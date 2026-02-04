@@ -1350,6 +1350,12 @@ async fn handle_notify(
 
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
+    // Clear agent's internal history to avoid duplication with DB-backed conversation_history
+    // The agent accumulates history in self.history during think_with_options calls,
+    // but we're already injecting conversation_history from the DB. Without clearing,
+    // both histories get injected (agent.rs lines 656, 659-660) causing duplication.
+    agent.lock().await.clear_history();
+
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
@@ -1365,6 +1371,9 @@ async fn handle_notify(
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
+
+    // Mutable conversation history - refreshed from DB after each tool result
+    let mut conversation_history = conversation_history;
 
     loop {
         let options = ThinkOptions {
@@ -1444,6 +1453,13 @@ async fn handle_notify(
                             if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
                                 logger.log(&format!("[notify] Failed to store tool result: {}", e));
                             }
+                            // Refresh conversation_history from DB to include the tool result we just stored.
+                            // This ensures we use ONLY DB-backed history and avoids duplication with agent's
+                            // internal history (which we cleared at the start of handle_notify).
+                            if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
+                                let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
+                                conversation_history = refreshed_history;
+                            }
                             // Continue to next iteration
                         }
                         Err(e) => {
@@ -1452,6 +1468,11 @@ async fn handle_notify(
                             // Store tool error in conversation
                             if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
                                 logger.log(&format!("[notify] Failed to store tool error: {}", e));
+                            }
+                            // Refresh conversation_history from DB (same as success case)
+                            if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
+                                let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
+                                conversation_history = refreshed_history;
                             }
                             // Continue to next iteration to let LLM handle the error
                         }
