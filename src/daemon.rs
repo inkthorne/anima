@@ -2290,6 +2290,13 @@ async fn handle_connection(
                 // Combine tools, memory injection, and always prompt
                 let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
+                // Clear agent's internal history to prevent context bleed from other requests
+                // (e.g., heartbeat context leaking into ask requests)
+                {
+                    let mut agent_guard = agent.lock().await;
+                    agent_guard.clear_history();
+                }
+
                 let agent_guard = agent.lock().await;
 
                 if use_native_tools {
