@@ -1350,12 +1350,6 @@ async fn handle_notify(
 
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
-    // Clear agent's internal history to avoid duplication with DB-backed conversation_history
-    // The agent accumulates history in self.history during think_with_options calls,
-    // but we're already injecting conversation_history from the DB. Without clearing,
-    // both histories get injected (agent.rs lines 656, 659-660) causing duplication.
-    agent.lock().await.clear_history();
-
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
@@ -1376,6 +1370,12 @@ async fn handle_notify(
     let mut conversation_history = conversation_history;
 
     loop {
+        // Clear agent's internal history EACH iteration to avoid duplication.
+        // think_with_options adds to self.history, and agent.rs injects self.history
+        // BEFORE options.conversation_history (lines 655-660). Without clearing each
+        // iteration, the growing internal history appears before DB-backed history.
+        agent.lock().await.clear_history();
+
         let options = ThinkOptions {
             system_prompt: persona.clone(),
             always_prompt: effective_always.clone(),
