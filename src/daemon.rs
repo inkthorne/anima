@@ -1497,9 +1497,12 @@ async fn handle_notify(
                             // Refresh conversation_history from DB to include the tool result we just stored.
                             // This ensures we use ONLY DB-backed history and avoids duplication with agent's
                             // internal history (which we cleared at the start of handle_notify).
+                            // IMPORTANT: Also update current_message from refreshed_final to avoid passing
+                            // the tool result twice (once in history, once as the task).
                             if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
-                                let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
+                                let (refreshed_history, refreshed_final) = format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
+                                current_message = refreshed_final;
                             }
                             // Subsequent iterations are tool continuations - no need to re-inject always
                             is_first_iteration = false;
@@ -1513,9 +1516,12 @@ async fn handle_notify(
                                 logger.log(&format!("[notify] Failed to store tool error: {}", e));
                             }
                             // Refresh conversation_history from DB (same as success case)
+                            // IMPORTANT: Also update current_message from refreshed_final to avoid passing
+                            // the tool result twice (once in history, once as the task).
                             if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
-                                let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
+                                let (refreshed_history, refreshed_final) = format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
+                                current_message = refreshed_final;
                             }
                             // Subsequent iterations are tool continuations - no need to re-inject always
                             is_first_iteration = false;
