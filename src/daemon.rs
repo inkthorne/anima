@@ -1464,7 +1464,8 @@ async fn handle_notify(
                     tool_call_count += 1;
                     if tool_call_count > max_tool_calls {
                         logger.tool("[notify] Max tool calls reached, stopping");
-                        final_response = Some(cleaned_response);
+                        // Use after_remember to preserve the tool call that couldn't be executed
+                        final_response = Some(after_remember.clone());
                         break;
                     }
 
