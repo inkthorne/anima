@@ -2,6 +2,7 @@ use anima::{
     Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
     InMemoryStore, SqliteMemory, LLM, ConversationStore,
     parse_mentions, expand_all_mention, notify_mentioned_agents_parallel, NotifyResult,
+    SemanticMemoryStore, format_age,
 };
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
@@ -140,6 +141,79 @@ enum Commands {
     Heartbeat {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
+    },
+    /// Manage agent memories
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemoryCommands {
+    /// List all memories for an agent
+    List {
+        /// Agent name
+        agent: String,
+        /// Maximum memories to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Search memories using semantic similarity
+    Search {
+        /// Agent name
+        agent: String,
+        /// Search query
+        query: String,
+        /// Maximum results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+    /// Delete a specific memory by ID
+    Delete {
+        /// Agent name
+        agent: String,
+        /// Memory ID to delete
+        id: i64,
+    },
+    /// Clear all memories for an agent
+    Clear {
+        /// Agent name
+        agent: String,
+        /// Skip confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Count memories for an agent
+    Count {
+        /// Agent name
+        agent: String,
+    },
+    /// Show full details of a specific memory
+    Show {
+        /// Agent name
+        agent: String,
+        /// Memory ID to show
+        id: i64,
+    },
+    /// Add a new memory for an agent
+    Add {
+        /// Agent name
+        agent: String,
+        /// Memory content
+        content: String,
+        /// Importance (0.0-1.0, default 0.9)
+        #[arg(short, long, default_value = "0.9")]
+        importance: f64,
+    },
+    /// Replace the content of an existing memory (keeps importance)
+    Replace {
+        /// Agent name
+        agent: String,
+        /// Memory ID to replace
+        id: i64,
+        /// New content
+        content: String,
     },
 }
 
@@ -312,6 +386,12 @@ async fn main() {
         }
         Commands::Heartbeat { agent } => {
             if let Err(e) = trigger_heartbeat(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Memory { command } => {
+            if let Err(e) = handle_memory_command(command).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -1685,6 +1765,244 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
     }
 
     Ok(())
+}
+
+/// Handle memory subcommands.
+async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        MemoryCommands::List { agent, limit } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            let memories = store.list_all(Some(limit))?;
+
+            if memories.is_empty() {
+                println!("No memories found for agent '{}'", agent);
+                return Ok(());
+            }
+
+            // Print header
+            println!("\x1b[1m{:<6} {:<12} {:<10} {}\x1b[0m", "ID", "CREATED", "SOURCE", "CONTENT");
+            println!("{}", "─".repeat(110));
+
+            for m in memories {
+                let age = format_age(m.created_at);
+                // Truncate content to ~80 chars for display
+                let content_display: String = m.content.chars().take(80).collect();
+                let content_display = if m.content.chars().count() > 80 {
+                    format!("{}...", content_display)
+                } else {
+                    content_display
+                };
+                // Replace newlines with spaces for single-line display
+                let content_display = content_display.replace('\n', " ");
+
+                println!("{:<6} {:<12} {:<10} {}", m.id, age, m.source, content_display);
+            }
+        }
+
+        MemoryCommands::Search { agent, query, limit } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+
+            // For semantic search, we need embeddings. Check if agent has embedding config.
+            // Try to get embedding from Ollama if available
+            let embedding_result = get_query_embedding(&query).await;
+
+            let results = match embedding_result {
+                Ok(embedding) => {
+                    #[allow(deprecated)]
+                    store.recall_with_embedding(&query, limit, Some(&embedding))?
+                }
+                Err(_) => {
+                    // Fall back to listing all and doing simple text search
+                    eprintln!("\x1b[33mWarning: Could not generate embedding, falling back to text search\x1b[0m");
+                    let all = store.list_all(None)?;
+                    let query_lower = query.to_lowercase();
+                    all.into_iter()
+                        .filter(|m| m.content.to_lowercase().contains(&query_lower))
+                        .take(limit)
+                        .map(|m| (m, 1.0)) // Dummy score for text matches
+                        .collect()
+                }
+            };
+
+            if results.is_empty() {
+                println!("No memories matching '{}' found for agent '{}'", query, agent);
+                return Ok(());
+            }
+
+            // Print header
+            println!("\x1b[1m{:<6} {:<8} {:<12} {:<10} {}\x1b[0m", "ID", "SCORE", "CREATED", "SOURCE", "CONTENT");
+            println!("{}", "─".repeat(80));
+
+            for (m, score) in results {
+                let age = format_age(m.created_at);
+                // Truncate content to ~35 chars for display
+                let content_display: String = m.content.chars().take(35).collect();
+                let content_display = if m.content.chars().count() > 35 {
+                    format!("{}...", content_display)
+                } else {
+                    content_display
+                };
+                let content_display = content_display.replace('\n', " ");
+
+                println!("{:<6} {:<8.3} {:<12} {:<10} {}", m.id, score, age, m.source, content_display);
+            }
+        }
+
+        MemoryCommands::Delete { agent, id } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            let deleted = store.delete(id)?;
+
+            if deleted {
+                println!("Deleted memory #{} for agent '{}'", id, agent);
+            } else {
+                println!("Memory #{} not found for agent '{}'", id, agent);
+            }
+        }
+
+        MemoryCommands::Clear { agent, force } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            let count = store.count()?;
+
+            if count == 0 {
+                println!("No memories to clear for agent '{}'", agent);
+                return Ok(());
+            }
+
+            // Confirm unless --force
+            if !force {
+                print!("This will delete {} memories for '{}'. Continue? [y/N] ", count, agent);
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            let deleted = store.clear_all()?;
+            println!("Cleared {} memories for agent '{}'", deleted, agent);
+        }
+
+        MemoryCommands::Count { agent } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            let count = store.count()?;
+
+            println!("Agent '{}' has {} memories", agent, count);
+        }
+
+        MemoryCommands::Show { agent, id } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            
+            match store.get(id)? {
+                Some(entry) => {
+                    let age = format_age(entry.created_at);
+                    println!("\x1b[1mMemory #{}\x1b[0m", entry.id);
+                    println!("─────────────────────────────────────────");
+                    println!("\x1b[90mCreated:\x1b[0m    {}", age);
+                    println!("\x1b[90mSource:\x1b[0m     {}", entry.source);
+                    println!("\x1b[90mImportance:\x1b[0m {:.2}", entry.importance);
+                    println!("\x1b[90mContent:\x1b[0m");
+                    println!("{}", entry.content);
+                }
+                None => {
+                    return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
+                }
+            }
+        }
+
+        MemoryCommands::Add { agent, content, importance } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            // Create memory.db if it doesn't exist
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            
+            // Clamp importance to valid range
+            let importance = importance.clamp(0.0, 1.0);
+            
+            match store.save(&content, importance, "cli")? {
+                anima::memory::SaveResult::New(id) => {
+                    println!("Created memory #{} for agent '{}'", id, agent);
+                }
+                anima::memory::SaveResult::Reinforced(id, old_imp, new_imp) => {
+                    println!("Reinforced existing memory #{} (importance: {:.2} → {:.2})", id, old_imp, new_imp);
+                }
+            }
+        }
+
+        MemoryCommands::Replace { agent, id, content } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            if !memory_path.exists() {
+                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+            }
+
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+            
+            if store.update_content(id, &content)? {
+                println!("Updated memory #{} for agent '{}'", id, agent);
+            } else {
+                return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Try to get an embedding for a query string using Ollama.
+async fn get_query_embedding(query: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    use anima::EmbeddingClient;
+
+    // Try to use the default embedding model (nomic-embed-text is common)
+    let client = EmbeddingClient::new("nomic-embed-text", None);
+    let embedding = client.embed(query).await?;
+    Ok(embedding)
 }
 
 /// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.

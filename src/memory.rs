@@ -661,6 +661,98 @@ impl SemanticMemoryStore {
         Ok(count)
     }
 
+    /// List all memories, ordered by created_at descending.
+    pub fn list_all(&self, limit: Option<usize>) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding
+             FROM semantic_memories WHERE agent_id = ?1 ORDER BY created_at DESC{}",
+            limit_clause
+        )).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
+        let entries = stmt.query_map(params![self.agent_id], |row| {
+            let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+            Ok(SemanticMemoryEntry {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                importance: row.get(2)?,
+                source: row.get(3)?,
+                created_at: row.get(4)?,
+                keywords: row.get(5)?,
+                access_count: row.get(6)?,
+                last_accessed: row.get(7)?,
+                embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+            })
+        }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
+        entries.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))
+    }
+
+    /// Delete a memory by ID. Returns true if deleted, false if not found.
+    pub fn delete(&self, id: i64) -> Result<bool, MemoryError> {
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = conn.execute(
+            "DELETE FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
+            params![id, self.agent_id]
+        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Delete all memories for this agent. Returns count of deleted memories.
+    pub fn clear_all(&self) -> Result<usize, MemoryError> {
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = conn.execute(
+            "DELETE FROM semantic_memories WHERE agent_id = ?1",
+            params![self.agent_id]
+        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        Ok(rows)
+    }
+
+    /// Update the content of an existing memory. Keeps importance, updates timestamp.
+    /// Returns true if updated, false if not found.
+    pub fn update_content(&self, id: i64, new_content: &str) -> Result<bool, MemoryError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = conn.execute(
+            "UPDATE semantic_memories SET content = ?1, last_accessed = ?2 WHERE id = ?3 AND agent_id = ?4",
+            params![new_content, timestamp, id, self.agent_id]
+        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        Ok(rows > 0)
+    }
+
+    /// Get a specific memory by ID. Returns None if not found or belongs to different agent.
+    pub fn get(&self, id: i64) -> Result<Option<SemanticMemoryEntry>, MemoryError> {
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
+            params![id, self.agent_id],
+            |row| {
+                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+                Ok(SemanticMemoryEntry {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    importance: row.get(2)?,
+                    source: row.get(3)?,
+                    created_at: row.get(4)?,
+                    keywords: row.get(5)?,
+                    access_count: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+                })
+            }
+        );
+        match result {
+            Ok(entry) => Ok(Some(entry)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(MemoryError::StorageError(e.to_string())),
+        }
+    }
+
     /// Get the currently configured embedding model from metadata.
     pub fn get_embedding_model(&self) -> Result<Option<String>, MemoryError> {
         let conn = self.conn.lock().unwrap();
@@ -1568,5 +1660,146 @@ mod tests {
             }
             _ => panic!("Expected reinforced memory"),
         }
+    }
+
+    #[test]
+    fn test_list_all_empty() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+        let memories = store.list_all(None).unwrap();
+        assert!(memories.is_empty());
+    }
+
+    #[test]
+    fn test_list_all_with_memories() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        store.save("First memory", 0.5, "auto").unwrap();
+        store.save("Second memory", 0.7, "explicit").unwrap();
+        store.save("Third memory", 0.3, "auto").unwrap();
+
+        let memories = store.list_all(None).unwrap();
+        assert_eq!(memories.len(), 3);
+
+        // Should be ordered by created_at descending (most recent first)
+        assert!(memories[0].content.contains("Third"));
+        assert!(memories[1].content.contains("Second"));
+        assert!(memories[2].content.contains("First"));
+    }
+
+    #[test]
+    fn test_list_all_with_limit() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        store.save("Memory 1", 0.5, "auto").unwrap();
+        store.save("Memory 2", 0.5, "auto").unwrap();
+        store.save("Memory 3", 0.5, "auto").unwrap();
+        store.save("Memory 4", 0.5, "auto").unwrap();
+
+        let memories = store.list_all(Some(2)).unwrap();
+        assert_eq!(memories.len(), 2);
+    }
+
+    #[test]
+    fn test_delete_existing() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        let result = store.save("Test memory", 0.5, "auto").unwrap();
+        let id = match result {
+            SaveResult::New(id) => id,
+            _ => panic!("Expected new memory"),
+        };
+
+        assert_eq!(store.count().unwrap(), 1);
+
+        let deleted = store.delete(id).unwrap();
+        assert!(deleted);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_delete_nonexistent() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        let deleted = store.delete(999).unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn test_delete_respects_agent_id() {
+        // Use a temp file so both stores share the same database
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let store_a = SemanticMemoryStore::open(&db_path, "agent_a").unwrap();
+        let store_b = SemanticMemoryStore::open(&db_path, "agent_b").unwrap();
+
+        // Save memory for agent_a
+        let result = store_a.save("Agent A memory", 0.5, "auto").unwrap();
+        let id_a = match result {
+            SaveResult::New(id) => id,
+            _ => panic!("Expected new memory"),
+        };
+
+        // Save memory for agent_b
+        store_b.save("Agent B memory", 0.5, "auto").unwrap();
+
+        // Agent B should not be able to delete Agent A's memory
+        let deleted = store_b.delete(id_a).unwrap();
+        assert!(!deleted);
+
+        // Agent A can delete their own memory
+        let deleted = store_a.delete(id_a).unwrap();
+        assert!(deleted);
+    }
+
+    #[test]
+    fn test_clear_all_empty() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        let cleared = store.clear_all().unwrap();
+        assert_eq!(cleared, 0);
+    }
+
+    #[test]
+    fn test_clear_all_with_memories() {
+        let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
+
+        store.save("Memory 1", 0.5, "auto").unwrap();
+        store.save("Memory 2", 0.5, "auto").unwrap();
+        store.save("Memory 3", 0.5, "auto").unwrap();
+
+        assert_eq!(store.count().unwrap(), 3);
+
+        let cleared = store.clear_all().unwrap();
+        assert_eq!(cleared, 3);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_clear_all_respects_agent_id() {
+        // Use a temp file so both stores share the same database
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let store_a = SemanticMemoryStore::open(&db_path, "agent_a").unwrap();
+        let store_b = SemanticMemoryStore::open(&db_path, "agent_b").unwrap();
+
+        // Save memories for both agents
+        store_a.save("Agent A memory 1", 0.5, "auto").unwrap();
+        store_a.save("Agent A memory 2", 0.5, "auto").unwrap();
+        store_b.save("Agent B memory", 0.5, "auto").unwrap();
+
+        assert_eq!(store_a.count().unwrap(), 2);
+        assert_eq!(store_b.count().unwrap(), 1);
+
+        // Clear agent_a's memories
+        let cleared = store_a.clear_all().unwrap();
+        assert_eq!(cleared, 2);
+
+        // Agent A should have 0 memories
+        assert_eq!(store_a.count().unwrap(), 0);
+
+        // Agent B should still have their memory
+        assert_eq!(store_b.count().unwrap(), 1);
     }
 }
