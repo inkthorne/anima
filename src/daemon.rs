@@ -137,7 +137,69 @@ pub struct MessageWorkResult {
     pub error: Option<String>,
 }
 
+/// Expand injection directives in always.md content.
+///
+/// Supported directives:
+/// - `<!-- @inject:tools -->` — replaced with formatted tools list
+/// - `<!-- @inject:memories -->` — replaced with formatted memories
+///
+/// If directives are found, they are replaced in-place.
+/// If no directives are found, returns None to signal fallback to append behavior.
+/// If a directive is found but its content is empty, the directive line is removed.
+fn expand_inject_directives(
+    content: &str,
+    tools_injection: &str,
+    memory_injection: &str,
+) -> Option<String> {
+    const TOOLS_DIRECTIVE: &str = "<!-- @inject:tools -->";
+    const MEMORIES_DIRECTIVE: &str = "<!-- @inject:memories -->";
+
+    let has_tools_directive = content.contains(TOOLS_DIRECTIVE);
+    let has_memories_directive = content.contains(MEMORIES_DIRECTIVE);
+
+    // No directives found — signal to use fallback append behavior
+    if !has_tools_directive && !has_memories_directive {
+        return None;
+    }
+
+    let mut result = content.to_string();
+
+    // Replace tools directive
+    if has_tools_directive {
+        if tools_injection.is_empty() {
+            // Remove the directive line cleanly (including trailing newline if present)
+            result = result
+                .lines()
+                .filter(|line| line.trim() != TOOLS_DIRECTIVE)
+                .collect::<Vec<_>>()
+                .join("\n");
+        } else {
+            result = result.replace(TOOLS_DIRECTIVE, tools_injection);
+        }
+    }
+
+    // Replace memories directive
+    if has_memories_directive {
+        if memory_injection.is_empty() {
+            // Remove the directive line cleanly (including trailing newline if present)
+            result = result
+                .lines()
+                .filter(|line| line.trim() != MEMORIES_DIRECTIVE)
+                .collect::<Vec<_>>()
+                .join("\n");
+        } else {
+            result = result.replace(MEMORIES_DIRECTIVE, memory_injection);
+        }
+    }
+
+    Some(result)
+}
+
 /// Build the effective always prompt by combining tools, memory, base always, and model always.
+///
+/// If base_always contains injection directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
+/// tools and memories are expanded in-place at those positions.
+/// Otherwise, tools and memories are prepended (backward compatible behavior).
 fn build_effective_always(
     tools_injection: &str,
     memory_injection: &str,
@@ -146,16 +208,28 @@ fn build_effective_always(
 ) -> Option<String> {
     let mut parts = Vec::new();
 
-    if !tools_injection.is_empty() {
-        parts.push(tools_injection.to_string());
+    // Try directive expansion first
+    let expanded_base = base_always
+        .as_ref()
+        .and_then(|base| expand_inject_directives(base, tools_injection, memory_injection));
+
+    if let Some(expanded) = expanded_base {
+        // Directives were found and expanded — use the expanded content
+        parts.push(expanded);
+    } else {
+        // No directives found — fall back to prepend behavior
+        if !tools_injection.is_empty() {
+            parts.push(tools_injection.to_string());
+        }
+        if !memory_injection.is_empty() {
+            parts.push(memory_injection.to_string());
+        }
+        if let Some(base) = base_always {
+            parts.push(base.clone());
+        }
     }
-    if !memory_injection.is_empty() {
-        parts.push(memory_injection.to_string());
-    }
-    if let Some(base) = base_always {
-        parts.push(base.clone());
-    }
-    // Model-specific always is appended after agent always
+
+    // Model-specific always is always appended after agent always
     if let Some(model) = model_always {
         parts.push(model.clone());
     }
@@ -3339,5 +3413,135 @@ api_key = "sk-test"
         assert_eq!(history[3].role, "assistant");
 
         assert!(final_content.contains("msg3"));
+    }
+
+    // Tests for expand_inject_directives
+
+    #[test]
+    fn test_expand_inject_directives_no_directives() {
+        let content = "Some always content\nwith no directives";
+        let result = expand_inject_directives(content, "tools here", "memories here");
+        // Should return None to signal fallback behavior
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_expand_inject_directives_tools_only() {
+        let content = "Before\n<!-- @inject:tools -->\nAfter";
+        let result = expand_inject_directives(content, "**Tools:**\n- tool1", "");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.contains("Before"));
+        assert!(expanded.contains("**Tools:**\n- tool1"));
+        assert!(expanded.contains("After"));
+        assert!(!expanded.contains("<!-- @inject:tools -->"));
+    }
+
+    #[test]
+    fn test_expand_inject_directives_memories_only() {
+        let content = "Before\n<!-- @inject:memories -->\nAfter";
+        let result = expand_inject_directives(content, "", "[Memories]\n- mem1");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.contains("Before"));
+        assert!(expanded.contains("[Memories]\n- mem1"));
+        assert!(expanded.contains("After"));
+        assert!(!expanded.contains("<!-- @inject:memories -->"));
+    }
+
+    #[test]
+    fn test_expand_inject_directives_both() {
+        let content = "Header\n<!-- @inject:tools -->\nMiddle\n<!-- @inject:memories -->\nFooter";
+        let result = expand_inject_directives(content, "TOOLS", "MEMORIES");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.contains("Header"));
+        assert!(expanded.contains("TOOLS"));
+        assert!(expanded.contains("Middle"));
+        assert!(expanded.contains("MEMORIES"));
+        assert!(expanded.contains("Footer"));
+        // Verify order is preserved
+        let tools_pos = expanded.find("TOOLS").unwrap();
+        let memories_pos = expanded.find("MEMORIES").unwrap();
+        assert!(tools_pos < memories_pos);
+    }
+
+    #[test]
+    fn test_expand_inject_directives_empty_tools_removes_line() {
+        let content = "Line1\n<!-- @inject:tools -->\nLine2";
+        let result = expand_inject_directives(content, "", "");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert_eq!(expanded, "Line1\nLine2");
+    }
+
+    #[test]
+    fn test_expand_inject_directives_empty_memories_removes_line() {
+        let content = "Line1\n<!-- @inject:memories -->\nLine2";
+        let result = expand_inject_directives(content, "", "");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert_eq!(expanded, "Line1\nLine2");
+    }
+
+    #[test]
+    fn test_expand_inject_directives_both_empty() {
+        let content = "Line1\n<!-- @inject:tools -->\nLine2\n<!-- @inject:memories -->\nLine3";
+        let result = expand_inject_directives(content, "", "");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert_eq!(expanded, "Line1\nLine2\nLine3");
+    }
+
+    #[test]
+    fn test_expand_inject_directives_whitespace_tolerance() {
+        // Directive with surrounding whitespace on the line
+        let content = "Before\n  <!-- @inject:tools -->  \nAfter";
+        let result = expand_inject_directives(content, "TOOLS", "");
+        assert!(result.is_some());
+        // The line with only the directive should be filtered out when empty
+        // But with content, it replaces the directive text
+        let expanded = result.unwrap();
+        assert!(expanded.contains("TOOLS"));
+    }
+
+    #[test]
+    fn test_build_effective_always_with_directives() {
+        let base = Some("Header\n<!-- @inject:tools -->\n<!-- @inject:memories -->\nFooter".to_string());
+        let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
+        assert!(result.is_some());
+        let effective = result.unwrap();
+        // Tools and memories should be in their directive positions
+        let tools_pos = effective.find("TOOLS").unwrap();
+        let memories_pos = effective.find("MEMORIES").unwrap();
+        let footer_pos = effective.find("Footer").unwrap();
+        assert!(tools_pos < memories_pos);
+        assert!(memories_pos < footer_pos);
+    }
+
+    #[test]
+    fn test_build_effective_always_without_directives_fallback() {
+        let base = Some("Just content, no directives".to_string());
+        let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
+        assert!(result.is_some());
+        let effective = result.unwrap();
+        // Fallback: tools and memories prepended
+        let tools_pos = effective.find("TOOLS").unwrap();
+        let content_pos = effective.find("Just content").unwrap();
+        assert!(tools_pos < content_pos);
+    }
+
+    #[test]
+    fn test_build_effective_always_model_always_appended() {
+        let base = Some("Base\n<!-- @inject:tools -->".to_string());
+        let model = Some("Model always".to_string());
+        let result = build_effective_always("TOOLS", "", &base, &model);
+        assert!(result.is_some());
+        let effective = result.unwrap();
+        // Model always should be at the end
+        assert!(effective.ends_with("Model always") || effective.contains("Model always"));
+        let base_pos = effective.find("Base").unwrap();
+        let model_pos = effective.find("Model always").unwrap();
+        assert!(base_pos < model_pos);
     }
 }
