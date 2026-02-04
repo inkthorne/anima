@@ -233,11 +233,11 @@ impl AgentDir {
     /// Returns Ok(None) if no always file exists.
     /// Expands {{include:filename}} directives recursively.
     ///
-    /// Resolution order:
-    /// 1. Agent-specific: `<agent_dir>/always.md` (or configured always_file)
-    /// 2. Global fallback: `~/.anima/agents/always.md`
+    /// Load agent's always.md file if it exists.
+    /// Returns Ok(None) if no always.md exists in the agent directory.
     ///
-    /// Agent-specific always.md completely overrides global (no merge).
+    /// Global always.md files are available via `<!-- @include:path -->` directives
+    /// if agents want to share common content.
     pub fn load_always(&self) -> Result<Option<String>, AgentDirError> {
         // Try agent-specific always file first
         let agent_always_path = match &self.config.agent.always_file {
@@ -253,21 +253,8 @@ impl AgentDir {
             return Ok(Some(expanded));
         }
 
-        // Fall back to global always.md at ~/.anima/agents/always.md
-        if let Some(global_agents_dir) = dirs::home_dir()
-            .map(|h| h.join(".anima").join("agents"))
-        {
-            let global_always_path = global_agents_dir.join("always.md");
-            if global_always_path.exists() {
-                let content = std::fs::read_to_string(&global_always_path)?;
-                let mut seen = HashSet::new();
-                seen.insert(global_always_path.canonicalize().unwrap_or(global_always_path));
-                // Use global agents directory as base path for includes
-                let expanded = Self::expand_includes_with_base(&content, &global_agents_dir, &mut seen)?;
-                return Ok(Some(expanded));
-            }
-        }
-
+        // No agent-specific always.md — return None
+        // (Global always.md is available via includes if agents want it)
         Ok(None)
     }
 
@@ -1158,10 +1145,10 @@ model = "gpt-4"
         assert_eq!(always, Some("Agent-specific always".to_string()));
     }
 
-    /// Test: Falls back to global when agent-specific doesn't exist
+    /// Test: Returns None when agent-specific doesn't exist (no global fallback)
     #[test]
     #[serial]
-    fn test_load_always_global_fallback() {
+    fn test_load_always_no_global_fallback() {
         // Create fake home directory with global always.md
         let fake_home = tempdir().unwrap();
         let global_always_dir = fake_home.path().join(".anima").join("agents");
@@ -1194,8 +1181,8 @@ model = "gpt-4"
             None => unsafe { std::env::remove_var("HOME") },
         }
 
-        // Global should be used as fallback
-        assert_eq!(always, Some("Global always content".to_string()));
+        // Should return None — no global fallback
+        assert_eq!(always, None);
     }
 
     /// Test: Returns None when neither agent-specific nor global exists
@@ -1238,22 +1225,18 @@ model = "gpt-4"
         assert_eq!(always, None);
     }
 
-    /// Test: Global always.md supports include directives
+    /// Test: Agent always.md can include shared files from global agents directory
     #[test]
     #[serial]
-    fn test_load_always_global_with_include() {
-        // Create fake home directory with global always.md that uses includes
+    fn test_load_always_agent_includes_global_shared() {
+        // Create fake home directory with shared files
         let fake_home = tempdir().unwrap();
         let global_always_dir = fake_home.path().join(".anima").join("agents");
         fs::create_dir_all(&global_always_dir).unwrap();
-        fs::write(
-            global_always_dir.join("always.md"),
-            "Global: {{include:rules.md}}",
-        )
-        .unwrap();
-        fs::write(global_always_dir.join("rules.md"), "Be kind.").unwrap();
+        // Shared file that agents can include
+        fs::write(global_always_dir.join("shared-tools.md"), "Tool instructions here").unwrap();
 
-        // Create agent directory WITHOUT always.md
+        // Create agent directory with always.md that includes the shared file
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1264,22 +1247,19 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        // Agent always.md includes the global shared file
+        let global_path = global_always_dir.join("shared-tools.md");
+        fs::write(
+            agent_dir_path.path().join("always.md"),
+            format!("Agent header\n{{{{include:{}}}}}\nAgent footer", global_path.display()),
+        )
+        .unwrap();
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
         let always = agent_dir.load_always().unwrap();
 
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Includes should be expanded in global always.md
-        assert_eq!(always, Some("Global: Be kind.".to_string()));
+        // Includes should be expanded
+        assert_eq!(always, Some("Agent header\nTool instructions here\nAgent footer".to_string()));
     }
 
     // =========================================================================

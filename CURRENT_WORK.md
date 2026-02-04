@@ -1,29 +1,33 @@
-# Current Work: Opt-in Injection Behavior
+# Current Work: Remove Global Always.md Fallback
 
 **Date:** 2026-02-04
 **Status:** Complete ✅
 
 ## Summary
 
-Change injection behavior so that creating an always.md means opting into manual control.
+Remove automatic fallback to global `~/.anima/agents/always.md`. Agents now explicitly include shared files via `{{include:path}}` directives.
+
+## Rationale
+
+- Global always.md is a place for **shared templates**, not a mandatory fallback
+- Different agents may want different shared files (e.g., `always-tooluser.md` vs `always-nontooluser.md`)
+- Explicit includes are clearer than implicit fallback behavior
 
 ## New Behavior
 
 | Scenario | Behavior |
 |----------|----------|
-| No always.md | Inject tools + memories (sensible defaults) |
-| always.md **with** directives | Expand in-place at directive positions |
-| always.md **without** directives | Use as-is, no injection (user opted out) |
-
-## Rationale
-
-Creating an always.md signals that the user wants explicit control over what gets injected. If they want tools/memories, they add the directives. If they don't add them, they're intentionally leaving them out.
+| Agent has always.md | Use it (expand includes) |
+| Agent has no always.md | Return None (no global fallback) |
+| Agent includes shared file | `{{include:../always.md}}` or absolute path |
 
 ## Changes
 
-- Modified `build_effective_always()` in daemon.rs
-- Updated tests to reflect new behavior
-- Added test for "no base always" case
+- `agent_dir.rs`: Removed global fallback logic in `load_always()`
+- Updated tests to expect None when no agent always.md exists
+- Added test for agent including shared global file
+- Updated arya + gendry always.md to include global via `{{include:../always.md}}`
+- Claude's always.md unchanged (no tools needed for delegate worker)
 
 ---
 
