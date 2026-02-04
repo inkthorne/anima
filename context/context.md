@@ -4,8 +4,8 @@
 
 | | |
 |---|---|
-| **Version** | v3.4.34 |
-| **Tests** | 469 passing |
+| **Version** | v3.5.0 |
+| **Tests** | 460 passing |
 | **Repo** | github.com/inkthorne/anima |
 | **Location** | `~/dev/anima` |
 
@@ -165,8 +165,9 @@ cargo install --path . --force  # Install to ~/.cargo/bin
 anima restart all               # After changes
 ```
 
-## Recent Changes (v3.4.6 → v3.4.34)
+## Recent Changes (v3.4.6 → v3.5.0)
 
+- **v3.5.0** — **Channel-based request serialization** — All agent work (Message, Notify, Heartbeat) now flows through an mpsc channel with a single worker. Fixes race conditions that caused context bleed between concurrent requests (e.g., heartbeat contaminating ask requests, cross-conversation leakage).
 - **v3.4.34** — `list_tools` meta-tool always injected for tool discoverability
 - **v3.4.33** — Response duration shown in chat TUI (e.g., `• 1m 32s`)
 - **v3.4.32** — Fix duplicate tool results in conversation history
@@ -185,4 +186,4 @@ anima restart all               # After changes
 
 ## Last Updated
 
-2026-02-04 — v3.4.34: Tool discoverability with list_tools, response duration display.
+2026-02-04 — v3.5.0: Channel-based request serialization fixes race conditions.
