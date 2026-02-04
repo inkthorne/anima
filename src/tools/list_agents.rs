@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::agent_dir::AgentDir;
 use crate::discovery;
 use crate::error::ToolError;
 use crate::tool::Tool;
@@ -50,16 +51,42 @@ impl Tool for DaemonListAgentsTool {
         // Discover running agents
         let running = discovery::discover_running_agents();
 
-        // Filter out ourselves
-        let agents: Vec<String> = running
+        // Filter out ourselves and collect agent info with descriptions
+        let agents_dir = crate::agent_dir::agents_dir();
+        let agents: Vec<serde_json::Value> = running
             .into_iter()
             .filter(|a| a.name != self.agent_id)
-            .map(|a| a.name)
+            .map(|a| {
+                // Try to load the agent's config to get description
+                let description = AgentDir::load(agents_dir.join(&a.name))
+                    .ok()
+                    .and_then(|dir| dir.config.agent.description);
+
+                serde_json::json!({
+                    "name": a.name,
+                    "description": description
+                })
+            })
             .collect();
+
+        // Also format a human-readable summary
+        let summary = if agents.is_empty() {
+            "No other agents available.".to_string()
+        } else {
+            let lines: Vec<String> = agents.iter().map(|a| {
+                let name = a["name"].as_str().unwrap_or("");
+                match a["description"].as_str() {
+                    Some(desc) => format!("- {}: {}", name, desc),
+                    None => format!("- {}", name),
+                }
+            }).collect();
+            format!("Available agents:\n{}", lines.join("\n"))
+        };
 
         Ok(serde_json::json!({
             "agents": agents,
-            "count": agents.len()
+            "count": agents.len(),
+            "summary": summary
         }))
     }
 }

@@ -158,6 +158,7 @@ impl Default for SemanticMemorySection {
 #[derive(Debug, Deserialize)]
 pub struct AgentSection {
     pub name: String,
+    pub description: Option<String>,
     pub persona_file: Option<PathBuf>,
     pub always_file: Option<PathBuf>,
 }
