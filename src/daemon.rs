@@ -200,6 +200,16 @@ fn format_conversation_history(
                 tool_call_id: None,
                 tool_calls: None,
             });
+        } else if msg.from_agent == "tool" {
+            // Tool results/errors should NOT be batched with user messages.
+            // Flush any pending user messages first, then add tool message as its own user message.
+            flush_user_batch(&mut pending_user_batch, &mut history);
+            history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(msg.content.clone()), // Raw content, not JSON-wrapped
+                tool_call_id: None,
+                tool_calls: None,
+            });
         } else {
             // Other speaker → accumulate for user batch with JSON wrapper
             let escaped = msg.content
