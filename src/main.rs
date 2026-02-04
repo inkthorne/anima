@@ -447,11 +447,20 @@ async fn chat_with_conversation(
         if !recent_msgs.is_empty() {
             println!("\x1b[90m--- Recent messages ---\x1b[0m");
             for msg in &recent_msgs {
+                // Skip tool messages
+                if msg.from_agent == "tool" {
+                    continue;
+                }
                 let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
-                println!("\x1b[{}m[{}]:\x1b[0m {}", color, msg.from_agent, msg.content);
+                let datetime = format_timestamp_pretty(msg.created_at);
+                println!(
+                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m",
+                    msg.id, datetime, color, msg.from_agent
+                );
+                println!("{}", msg.content);
+                println!(); // Blank line between messages
             }
-            println!("\x1b[90m--- End of history ---\x1b[0m\n");
-            
+
             // Update last_seen_id to the most recent message
             if let Some(last) = recent_msgs.last() {
                 last_seen_id.store(last.id, Ordering::SeqCst);
@@ -488,7 +497,13 @@ async fn chat_with_conversation(
                     if msg.from_agent != "user" && msg.from_agent != "tool" {
                         // Print the agent message on a new line
                         print!("\r\x1b[K"); // Clear current line (in case user was typing)
-                        println!("\x1b[36m[{}]:\x1b[0m {}", msg.from_agent, msg.content);
+                        let datetime = format_timestamp_pretty(msg.created_at);
+                        println!(
+                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m",
+                            msg.id, datetime, msg.from_agent
+                        );
+                        println!("{}", msg.content);
+                        println!(); // Blank line between messages
                         print!("\x1b[36myou>\x1b[0m "); // Re-print prompt
                         let _ = io::stdout().flush();
                     }
