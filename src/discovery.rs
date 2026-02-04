@@ -156,6 +156,37 @@ pub fn agent_exists(name: &str) -> bool {
     config_path.exists()
 }
 
+/// Match agent names against a glob pattern.
+/// Returns list of matching agent names (from ~/.anima/agents/ directories).
+/// Supports * (any characters) and ? (single character) wildcards.
+pub fn match_agents(pattern: &str) -> Vec<String> {
+    let agents = list_saved_agents();
+
+    // If no wildcards, check for exact match
+    if !pattern.contains('*') && !pattern.contains('?') {
+        if agents.contains(&pattern.to_string()) {
+            return vec![pattern.to_string()];
+        }
+        return vec![];
+    }
+
+    // Convert glob to regex
+    let regex_pattern = pattern
+        .replace('.', "\\.")
+        .replace('*', ".*")
+        .replace('?', ".");
+
+    let regex = match regex::Regex::new(&format!("^{}$", regex_pattern)) {
+        Ok(r) => r,
+        Err(_) => return vec![],
+    };
+
+    agents
+        .into_iter()
+        .filter(|a| regex.is_match(a))
+        .collect()
+}
+
 #[cfg(unix)]
 fn is_process_alive(pid: u32) -> bool {
     // Use kill(pid, 0) to check if process exists
@@ -207,5 +238,54 @@ mod tests {
         assert_eq!(daemon.name, "test");
         assert_eq!(daemon.pid, 12345);
         assert_eq!(daemon.is_alive, true);
+    }
+
+    #[test]
+    fn test_match_agents_glob_conversion() {
+        // Test that glob patterns are correctly converted to regex patterns
+        // Note: This test doesn't rely on actual agents existing
+
+        // Test star wildcard: convert * to .*
+        let regex_pattern = "test-*"
+            .replace('.', "\\.")
+            .replace('*', ".*")
+            .replace('?', ".");
+        let regex = regex::Regex::new(&format!("^{}$", regex_pattern)).unwrap();
+        assert!(regex.is_match("test-agent1"));
+        assert!(regex.is_match("test-"));
+        assert!(!regex.is_match("other-test"));
+
+        // Test question wildcard: convert ? to .
+        let regex_pattern = "dev-?"
+            .replace('.', "\\.")
+            .replace('*', ".*")
+            .replace('?', ".");
+        let regex = regex::Regex::new(&format!("^{}$", regex_pattern)).unwrap();
+        assert!(regex.is_match("dev-1"));
+        assert!(regex.is_match("dev-a"));
+        assert!(!regex.is_match("dev-12"));
+
+        // Test dot escaping: . should not match any character
+        let regex_pattern = "test.agent"
+            .replace('.', "\\.")
+            .replace('*', ".*")
+            .replace('?', ".");
+        let regex = regex::Regex::new(&format!("^{}$", regex_pattern)).unwrap();
+        assert!(regex.is_match("test.agent"));
+        assert!(!regex.is_match("testXagent"));
+    }
+
+    #[test]
+    fn test_match_agents_no_wildcards_returns_empty_for_nonexistent() {
+        // When no wildcards and agent doesn't exist, should return empty
+        let matches = match_agents("nonexistent-agent-12345");
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_match_agents_wildcards_returns_empty_for_no_matches() {
+        // When using wildcards but no agents match, should return empty
+        let matches = match_agents("zzz-nonexistent-*");
+        assert!(matches.is_empty());
     }
 }

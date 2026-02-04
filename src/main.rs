@@ -111,14 +111,14 @@ enum Commands {
         /// Message to send to the agent
         message: String,
     },
-    /// Start an agent daemon in the background
+    /// Start an agent daemon in the background. Supports glob patterns (*, ?).
     Start {
-        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        /// Agent name or glob pattern (from ~/.anima/agents/)
         agent: String,
     },
-    /// Stop a running agent daemon
+    /// Stop a running agent daemon. Supports glob patterns (*, ?).
     Stop {
-        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        /// Agent name or glob pattern (from ~/.anima/agents/)
         agent: String,
     },
     /// Clear conversation history for a running agent daemon
@@ -126,9 +126,9 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
-    /// Restart a running agent daemon (stop then start)
+    /// Restart a running agent daemon (stop then start). Supports glob patterns (*, ?).
     Restart {
-        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        /// Agent name or glob pattern (from ~/.anima/agents/)
         agent: String,
     },
     /// Show the system prompt for a running agent daemon
@@ -916,11 +916,38 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
 }
 
 /// Start an agent daemon in the background.
+/// Supports glob patterns (*, ?) for matching multiple agents.
 fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
     // Handle "all" case - start all stopped agents
     if agent == "all" {
         return start_all_agents();
     }
+
+    // Check for glob pattern
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        let mut started = Vec::new();
+        for name in &matches {
+            match start_agent_impl(name, true) {
+                Ok(()) => started.push(name.clone()),
+                Err(e) => eprintln!("Failed to start {}: {}", name, e),
+            }
+        }
+
+        if !started.is_empty() {
+            println!("Started {} agent(s): {}", started.len(), started.join(", "));
+        }
+
+        return Ok(());
+    }
+
     start_agent_impl(agent, false)
 }
 
@@ -1036,11 +1063,38 @@ async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::er
 }
 
 /// Stop a running agent daemon.
+/// Supports glob patterns (*, ?) for matching multiple agents.
 async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
     // Handle "all" case - stop all running agents
     if agent == "all" {
         return stop_all_agents().await;
     }
+
+    // Check for glob pattern
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        let mut stopped = Vec::new();
+        for name in &matches {
+            match stop_agent_impl(name, true).await {
+                Ok(()) => stopped.push(name.clone()),
+                Err(e) => eprintln!("Failed to stop {}: {}", name, e),
+            }
+        }
+
+        if !stopped.is_empty() {
+            println!("Stopped {} agent(s): {}", stopped.len(), stopped.join(", "));
+        }
+
+        return Ok(());
+    }
+
     stop_agent_impl(agent, false).await
 }
 
@@ -1077,13 +1131,68 @@ async fn stop_all_agents() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Restart a running agent daemon (stop then start).
+/// Supports glob patterns (*, ?) for matching multiple agents.
 /// If agent is "all", restarts all currently running agents.
 async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
     // Handle "all" case - restart all running agents
     if agent == "all" {
         return restart_all_agents().await;
     }
 
+    // Check for glob pattern
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        let mut restarted = Vec::new();
+        for name in &matches {
+            print!("Restarting {}... ", name);
+            io::stdout().flush()?;
+
+            // Stop the agent (quiet mode)
+            if let Err(e) = stop_agent_impl(name, true).await {
+                println!("failed to stop: {}", e);
+                continue;
+            }
+
+            // Brief wait to ensure clean shutdown
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+            // Start the agent (quiet mode)
+            match start_agent_impl(name, true) {
+                Ok(()) => {
+                    // Wait for daemon.pid to be written by the daemon process
+                    let pid_path = resolve_agent_path(name).join("daemon.pid");
+                    let mut pid = 0u32;
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if let Ok(p) = PidFile::read(&pid_path) {
+                            if p > 0 {
+                                pid = p;
+                                break;
+                            }
+                        }
+                    }
+                    println!("done (pid {})", pid);
+                    restarted.push(name.clone());
+                }
+                Err(e) => {
+                    println!("failed to start: {}", e);
+                }
+            }
+        }
+
+        println!("Restarted {} agent{}", restarted.len(), if restarted.len() == 1 { "" } else { "s" });
+
+        return Ok(());
+    }
+
+    // Single agent (no wildcards)
     let agent_path = resolve_agent_path(agent);
     let pid_path = agent_path.join("daemon.pid");
 
