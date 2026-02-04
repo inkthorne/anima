@@ -129,12 +129,13 @@ impl ToolRegistry {
     }
 
     /// Format tool definitions for injection into the agent's prompt.
+    /// Always includes `list_tools` meta-tool for discoverability.
     pub fn format_for_prompt(tools: &[&ToolDefinition]) -> String {
-        if tools.is_empty() {
-            return String::new();
-        }
-
         let mut output = String::from("**Available tools:**\n");
+        
+        // Always include list_tools for discoverability
+        output.push_str("- `list_tools` — List all available tools. Use to discover what tools you can call. Params: \n");
+        
         for tool in tools {
             output.push_str(&format!(
                 "- `{}` — {}. Params: {}\n",
@@ -397,8 +398,10 @@ category = "system"
 
     #[test]
     fn test_format_for_prompt_empty() {
+        // Even with no tools, list_tools meta-tool is always included
         let formatted = ToolRegistry::format_for_prompt(&[]);
-        assert!(formatted.is_empty());
+        assert!(formatted.contains("list_tools"));
+        assert!(formatted.contains("**Available tools:**"));
     }
 
     #[test]

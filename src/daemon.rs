@@ -410,6 +410,29 @@ async fn execute_tool_call(
                 Err(e) => Err(format!("Tool error: {}", e))
             }
         }
+        "list_tools" => {
+            // Load tool registry and return all available tool names
+            let tools_path = dirs::home_dir()
+                .map(|h| h.join(".anima").join("tools.toml"))
+                .ok_or("Could not determine home directory")?;
+            
+            match ToolRegistry::load_from_file(&tools_path) {
+                Ok(registry) => {
+                    let tool_names: Vec<&str> = registry.all_tools().iter()
+                        .map(|t| t.name.as_str())
+                        .collect();
+                    if tool_names.is_empty() {
+                        Ok("No tools registered in tools.toml".to_string())
+                    } else {
+                        Ok(format!("Available tools: {}", tool_names.join(", ")))
+                    }
+                }
+                Err(e) => {
+                    // Fallback: return built-in tools if registry fails to load
+                    Ok(format!("Built-in tools: read_file, write_file, safe_shell, http, remember, list_agents, send_message, list_tools\n(Note: tools.toml failed to load: {})", e))
+                }
+            }
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.tool))
     }
 }
