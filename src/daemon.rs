@@ -1543,31 +1543,43 @@ async fn process_message_work(
         allowed_tools: allowed_tools.clone(),
     };
 
-    // Get relevant tools from registry
-    let relevant_tools = if let Some(registry) = tool_registry {
-        let relevant = registry.find_relevant(content, recall_limit);
-        let relevant = filter_by_allowlist(relevant, allowed_tools);
-        if !relevant.is_empty() {
-            logger.tool(&format!("[worker] Recall: {} tools for query", relevant.len()));
-            for t in &relevant {
-                logger.tool(&format!("  - {}", t.name));
-            }
-        }
-        relevant
-    } else {
-        Vec::new()
-    };
-
     // Build tools injection or tool specs
-    let (tools_injection, external_tools) = if use_native_tools {
-        let specs = if !relevant_tools.is_empty() {
-            Some(tool_definitions_to_specs(&relevant_tools))
+    // Native mode: pass ALL allowed tools (model can only call tools in the array)
+    // JSON-block mode: keyword-match relevant tools (injected into prompt)
+    let (tools_injection, external_tools, relevant_tools) = if use_native_tools {
+        // Native tool calling: pass ALL allowed tools from registry
+        let all_tools = if let Some(registry) = tool_registry {
+            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+            filter_by_allowlist(all, allowed_tools)
+        } else {
+            Vec::new()
+        };
+        if !all_tools.is_empty() {
+            logger.tool(&format!("[worker] Native tools: {} allowed", all_tools.len()));
+        }
+        let specs = if !all_tools.is_empty() {
+            Some(tool_definitions_to_specs(&all_tools))
         } else {
             None
         };
-        (String::new(), specs)
+        (String::new(), specs, Vec::new())
     } else {
-        (ToolRegistry::format_for_prompt(&relevant_tools), None)
+        // JSON-block mode: keyword-match relevant tools
+        let relevant_tools = if let Some(registry) = tool_registry {
+            let relevant = registry.find_relevant(content, recall_limit);
+            let relevant = filter_by_allowlist(relevant, allowed_tools);
+            if !relevant.is_empty() {
+                logger.tool(&format!("[worker] Recall: {} tools for query", relevant.len()));
+                for t in &relevant {
+                    logger.tool(&format!("  - {}", t.name));
+                }
+            }
+            relevant
+        } else {
+            Vec::new()
+        };
+        let injection = ToolRegistry::format_for_prompt(&relevant_tools);
+        (injection, None, relevant_tools)
     };
 
     // Inject relevant memories
@@ -1928,19 +1940,39 @@ async fn handle_notify(
     logger.log(&format!("[notify] Context: {} messages → {} history + final user turn",
         context_messages.len(), conversation_history.len()));
 
-    // Get relevant tools from registry (based on final user content)
-    let relevant_tools = if let Some(registry) = tool_registry {
-        let relevant = registry.find_relevant(&final_user_content, recall_limit);
-        filter_by_allowlist(relevant, allowed_tools)
+    // Build tools injection or tool specs
+    // Native mode: pass ALL allowed tools (model can only call tools in the array)
+    // JSON-block mode: keyword-match relevant tools (injected into prompt)
+    let (tools_injection, external_tools) = if use_native_tools {
+        // Native tool calling: pass ALL allowed tools from registry
+        let all_tools = if let Some(registry) = tool_registry {
+            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+            filter_by_allowlist(all, allowed_tools)
+        } else {
+            Vec::new()
+        };
+        if !all_tools.is_empty() {
+            logger.tool(&format!("[notify] Native tools: {} allowed", all_tools.len()));
+        }
+        let specs = if !all_tools.is_empty() {
+            Some(tool_definitions_to_specs(&all_tools))
+        } else {
+            None
+        };
+        (String::new(), specs)
     } else {
-        Vec::new()
-    };
-
-    // Build tools injection
-    let tools_injection = if use_native_tools {
-        String::new()
-    } else {
-        ToolRegistry::format_for_prompt(&relevant_tools)
+        // JSON-block mode: keyword-match relevant tools
+        let relevant_tools = if let Some(registry) = tool_registry {
+            let relevant = registry.find_relevant(&final_user_content, recall_limit);
+            let relevant = filter_by_allowlist(relevant, allowed_tools);
+            if !relevant.is_empty() {
+                logger.tool(&format!("[notify] Recall: {} tools for query", relevant.len()));
+            }
+            relevant
+        } else {
+            Vec::new()
+        };
+        (ToolRegistry::format_for_prompt(&relevant_tools), None)
     };
 
     // Get memory injection (based on final user content)
@@ -2002,6 +2034,7 @@ async fn handle_notify(
             system_prompt: persona.clone(),
             always_prompt: if is_first_iteration { effective_always.clone() } else { effective_always_no_memory.clone() },
             conversation_history: Some(conversation_history.clone()),
+            external_tools: external_tools.clone(),
             ..Default::default()
         };
 
@@ -2332,14 +2365,32 @@ async fn run_heartbeat(
     logger.log(&format!("[heartbeat] Context: {} previous outputs", conversation_history.len()));
 
     // 4. Build effective always with tools and memory injection
-    let tools_injection = if use_native_tools {
-        String::new()
+    // Native mode: pass ALL allowed tools (model can only call tools in the array)
+    // JSON-block mode: keyword-match relevant tools (injected into prompt)
+    let (tools_injection, external_tools) = if use_native_tools {
+        // Native tool calling: pass ALL allowed tools from registry
+        let all_tools = if let Some(registry) = tool_registry {
+            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+            filter_by_allowlist(all, allowed_tools)
+        } else {
+            Vec::new()
+        };
+        if !all_tools.is_empty() {
+            logger.tool(&format!("[heartbeat] Native tools: {} allowed", all_tools.len()));
+        }
+        let specs = if !all_tools.is_empty() {
+            Some(tool_definitions_to_specs(&all_tools))
+        } else {
+            None
+        };
+        (String::new(), specs)
     } else if let Some(registry) = tool_registry {
+        // JSON-block mode: keyword-match relevant tools
         let relevant = registry.find_relevant(&heartbeat_prompt, recall_limit);
         let relevant = filter_by_allowlist(relevant, allowed_tools);
-        ToolRegistry::format_for_prompt(&relevant)
+        (ToolRegistry::format_for_prompt(&relevant), None)
     } else {
-        String::new()
+        (String::new(), None)
     };
 
     let memory_injection = if let Some(mem_store) = semantic_memory {
@@ -2371,6 +2422,7 @@ async fn run_heartbeat(
         system_prompt: persona.clone(),
         always_prompt: effective_always,
         conversation_history: if conversation_history.is_empty() { None } else { Some(conversation_history) },
+        external_tools,
         ..Default::default()
     };
 
@@ -2628,7 +2680,7 @@ async fn handle_connection(
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: Option<Arc<EmbeddingClient>>,
     tool_registry: Option<Arc<ToolRegistry>>,
-    _use_native_tools: bool,
+    use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
@@ -2720,8 +2772,28 @@ async fn handle_connection(
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
 
-                // Inject relevant tools if registry is available
-                let tools_injection = if let Some(ref registry) = tool_registry {
+                // Build tools injection or tool specs
+                // Native mode: pass ALL allowed tools (model can only call tools in the array)
+                // JSON-block mode: keyword-match relevant tools (injected into prompt)
+                let (tools_injection, external_tools) = if use_native_tools {
+                    // Native tool calling: pass ALL allowed tools from registry
+                    let all_tools = if let Some(ref registry) = tool_registry {
+                        let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+                        filter_by_allowlist(all, &allowed_tools)
+                    } else {
+                        Vec::new()
+                    };
+                    if !all_tools.is_empty() {
+                        logger.tool(&format!("[socket] Native tools: {} allowed", all_tools.len()));
+                    }
+                    let specs = if !all_tools.is_empty() {
+                        Some(tool_definitions_to_specs(&all_tools))
+                    } else {
+                        None
+                    };
+                    (String::new(), specs)
+                } else if let Some(ref registry) = tool_registry {
+                    // JSON-block mode: keyword-match relevant tools
                     let relevant = registry.find_relevant(content, recall_limit);
                     let relevant = filter_by_allowlist(relevant, &allowed_tools);
                     if !relevant.is_empty() {
@@ -2730,9 +2802,9 @@ async fn handle_connection(
                             logger.tool(&format!("  - {}", t.name));
                         }
                     }
-                    ToolRegistry::format_for_prompt(&relevant)
+                    (ToolRegistry::format_for_prompt(&relevant), None)
                 } else {
-                    String::new()
+                    (String::new(), None)
                 };
 
                 // Inject relevant memories if enabled
@@ -2777,6 +2849,7 @@ async fn handle_connection(
                 let options = ThinkOptions {
                     system_prompt: persona.clone(),
                     always_prompt: effective_always,
+                    external_tools,
                     ..Default::default()
                 };
 
