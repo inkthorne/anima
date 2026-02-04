@@ -419,19 +419,28 @@ async fn execute_tool_call(
             let tool = DaemonListAgentsTool::new(ctx.agent_name.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
-                    // Format nicely for the agent
-                    let agents = result.get("agents")
-                        .and_then(|a| a.as_array())
-                        .map(|arr| arr.iter()
-                            .filter_map(|v| v.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_default();
-                    let count = result.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
-                    if count == 0 {
-                        Ok("No other agents are currently running.".to_string())
+                    // Use the pre-formatted summary if available, otherwise format from agents array
+                    if let Some(summary) = result.get("summary").and_then(|s| s.as_str()) {
+                        Ok(summary.to_string())
                     } else {
-                        Ok(format!("Available agents: {}", agents))
+                        // Fallback: format from agents array (handles both string and object formats)
+                        let agents = result.get("agents")
+                            .and_then(|a| a.as_array())
+                            .map(|arr| arr.iter()
+                                .filter_map(|v| {
+                                    // Handle both string format and object format
+                                    v.as_str().map(|s| s.to_string())
+                                        .or_else(|| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "))
+                            .unwrap_or_default();
+                        let count = result.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
+                        if count == 0 {
+                            Ok("No other agents are currently running.".to_string())
+                        } else {
+                            Ok(format!("Available agents: {}", agents))
+                        }
                     }
                 }
                 Err(e) => Err(format!("Tool error: {}", e))
