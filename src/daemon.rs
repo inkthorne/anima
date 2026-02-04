@@ -246,6 +246,7 @@ pub struct ToolExecutionContext {
     pub conv_id: Option<String>,
     pub semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>>,
     pub embedding_client: Option<Arc<EmbeddingClient>>,
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 /// Execute a tool call and return the result as a string.
@@ -411,25 +412,47 @@ async fn execute_tool_call(
             }
         }
         "list_tools" => {
-            // Load tool registry and return all available tool names
+            // Load tool registry and return tool names filtered by agent's allowlist
             let tools_path = dirs::home_dir()
                 .map(|h| h.join(".anima").join("tools.toml"))
                 .ok_or("Could not determine home directory")?;
             
+            // Get allowed tools from context (if available)
+            let allowed = context.and_then(|ctx| ctx.allowed_tools.as_ref());
+            
             match ToolRegistry::load_from_file(&tools_path) {
                 Ok(registry) => {
-                    let tool_names: Vec<&str> = registry.all_tools().iter()
+                    let all_tools: Vec<&str> = registry.all_tools().iter()
                         .map(|t| t.name.as_str())
                         .collect();
-                    if tool_names.is_empty() {
-                        Ok("No tools registered in tools.toml".to_string())
+                    
+                    // Filter by allowlist if present
+                    let tool_names: Vec<&str> = match allowed {
+                        Some(allowlist) => all_tools.into_iter()
+                            .filter(|t| allowlist.iter().any(|a| a == *t))
+                            .collect(),
+                        None => all_tools, // No allowlist = show all (for testing)
+                    };
+                    
+                    // Always include built-in tools that are typically allowed
+                    let mut result: Vec<&str> = tool_names;
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message"] {
+                        if !result.contains(builtin) {
+                            if allowed.map(|a| a.iter().any(|x| x == *builtin)).unwrap_or(true) {
+                                result.push(builtin);
+                            }
+                        }
+                    }
+                    
+                    if result.is_empty() {
+                        Ok("No tools available for this agent.".to_string())
                     } else {
-                        Ok(format!("Available tools: {}", tool_names.join(", ")))
+                        Ok(format!("Available tools: {}", result.join(", ")))
                     }
                 }
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
-                    Ok(format!("Built-in tools: read_file, write_file, safe_shell, http, remember, list_agents, send_message, list_tools\n(Note: tools.toml failed to load: {})", e))
+                    Ok(format!("Built-in tools: list_tools, list_agents, remember, send_message\n(Note: tools.toml failed to load: {})", e))
                 }
             }
         }
@@ -1418,6 +1441,7 @@ async fn handle_notify(
         conv_id: Some(conv_id.to_string()),
         semantic_memory_store: semantic_memory.clone(),
         embedding_client: embedding_client.clone(),
+        allowed_tools: allowed_tools.clone(),
     };
 
     // Tool execution loop - similar to Request::Message handler
@@ -2175,6 +2199,7 @@ async fn handle_connection(
         conv_id: None,
         semantic_memory_store: semantic_memory.clone(),
         embedding_client: embedding_client.clone(),
+        allowed_tools: allowed_tools.clone(),
     };
     loop {
         // Read request with a timeout
