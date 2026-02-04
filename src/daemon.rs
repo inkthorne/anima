@@ -73,7 +73,8 @@ pub struct ToolCall {
 /// Extract a JSON tool block from agent output.
 /// Returns (cleaned_output, Option<ToolCall>)
 pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
-    // Try ```json ... ``` blocks first
+    // Only accept fenced ```json ... ``` blocks for tool calls
+    // This is unambiguous and handles nested braces correctly
     let fenced_re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
     
     if let Some(cap) = fenced_re.captures(output) {
@@ -86,20 +87,6 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
                     params,
                 }));
             }
-        }
-    }
-    
-    // Fall back to raw JSON: {"tool": "...", "params": {...}}
-    let raw_re = regex::Regex::new(r#"\{"tool"\s*:\s*"([^"]+)"\s*,\s*"params"\s*:\s*(\{[^}]*\})\}"#).unwrap();
-    
-    if let Some(cap) = raw_re.captures(output) {
-        let tool_name = &cap[1];
-        if let Ok(params) = serde_json::from_str::<serde_json::Value>(&cap[2]) {
-            let cleaned = raw_re.replace(output, "").trim().to_string();
-            return (cleaned, Some(ToolCall {
-                tool: tool_name.to_string(),
-                params,
-            }));
         }
     }
     
