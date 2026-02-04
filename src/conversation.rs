@@ -18,6 +18,9 @@ pub enum ConversationError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Pattern error: {0}")]
+    Pattern(#[from] regex::Error),
 }
 
 /// A conversation between agents.
@@ -415,6 +418,38 @@ impl ConversationStore {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(conversations)
+    }
+
+    /// Match conversation names against a glob pattern.
+    /// Supports * (any chars) and ? (single char).
+    /// Returns matching conversation names sorted alphabetically.
+    pub fn match_conversations(&self, pattern: &str) -> Result<Vec<String>, ConversationError> {
+        let all_convs = self.list_conversations()?;
+
+        // If no wildcards, return exact match only
+        if !pattern.contains('*') && !pattern.contains('?') {
+            if all_convs.iter().any(|c| c.name == pattern) {
+                return Ok(vec![pattern.to_string()]);
+            } else {
+                return Ok(vec![]);
+            }
+        }
+
+        // Convert glob pattern to regex
+        let regex_pattern = pattern
+            .replace('.', "\\.")
+            .replace('*', ".*")
+            .replace('?', ".");
+        let regex = regex::Regex::new(&format!("^{}$", regex_pattern))?;
+
+        let mut matches: Vec<String> = all_convs
+            .iter()
+            .filter(|c| regex.is_match(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+
+        matches.sort();
+        Ok(matches)
     }
 
     /// Get a conversation by name.
@@ -1926,6 +1961,78 @@ mod tests {
 
         let result = store.is_paused("nonexistent");
         assert!(matches!(result, Err(ConversationError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_match_conversations_exact() {
+        let store = test_store();
+
+        store.create_conversation(Some("test-conv"), &["arya", "user"]).unwrap();
+        store.create_conversation(Some("other-conv"), &["gendry", "user"]).unwrap();
+
+        // Exact match (no wildcards)
+        let matches = store.match_conversations("test-conv").unwrap();
+        assert_eq!(matches, vec!["test-conv"]);
+
+        // Exact match not found
+        let matches = store.match_conversations("nonexistent").unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_match_conversations_star_wildcard() {
+        let store = test_store();
+
+        store.create_conversation(Some("test-1"), &["arya", "user"]).unwrap();
+        store.create_conversation(Some("test-2"), &["gendry", "user"]).unwrap();
+        store.create_conversation(Some("other-conv"), &["sansa", "user"]).unwrap();
+
+        // Match all starting with "test-"
+        let matches = store.match_conversations("test-*").unwrap();
+        assert_eq!(matches, vec!["test-1", "test-2"]);
+
+        // Match all conversations
+        let matches = store.match_conversations("*").unwrap();
+        assert_eq!(matches.len(), 3);
+
+        // Match ending pattern
+        let matches = store.match_conversations("*-conv").unwrap();
+        assert_eq!(matches, vec!["other-conv"]);
+    }
+
+    #[test]
+    fn test_match_conversations_question_wildcard() {
+        let store = test_store();
+
+        store.create_conversation(Some("test-1"), &["arya", "user"]).unwrap();
+        store.create_conversation(Some("test-2"), &["gendry", "user"]).unwrap();
+        store.create_conversation(Some("test-10"), &["sansa", "user"]).unwrap();
+
+        // ? matches single character
+        let matches = store.match_conversations("test-?").unwrap();
+        assert_eq!(matches, vec!["test-1", "test-2"]);
+    }
+
+    #[test]
+    fn test_match_conversations_no_matches() {
+        let store = test_store();
+
+        store.create_conversation(Some("test-conv"), &["arya", "user"]).unwrap();
+
+        let matches = store.match_conversations("other-*").unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_match_conversations_special_chars() {
+        let store = test_store();
+
+        store.create_conversation(Some("test.conv"), &["arya", "user"]).unwrap();
+        store.create_conversation(Some("testXconv"), &["gendry", "user"]).unwrap();
+
+        // Dots should be escaped (not treated as regex "any char")
+        let matches = store.match_conversations("test.conv").unwrap();
+        assert_eq!(matches, vec!["test.conv"]);
     }
 
     #[test]

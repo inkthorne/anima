@@ -182,25 +182,37 @@ enum ChatCommands {
         #[arg(long)]
         raw: bool,
     },
-    /// Pause a conversation (notifications will be queued)
+    /// Pause a conversation (notifications will be queued). Supports glob patterns (*, ?).
     Pause {
-        /// Name of the conversation to pause
+        /// Name or pattern of the conversation(s) to pause
         conv: String,
+        /// Skip confirmation prompt for multiple matches
+        #[arg(short, long)]
+        force: bool,
     },
-    /// Resume a paused conversation (processes queued notifications)
+    /// Resume a paused conversation (processes queued notifications). Supports glob patterns (*, ?).
     Resume {
-        /// Name of the conversation to resume
+        /// Name or pattern of the conversation(s) to resume
         conv: String,
+        /// Skip confirmation prompt for multiple matches
+        #[arg(short, long)]
+        force: bool,
     },
-    /// Delete a conversation completely
+    /// Delete a conversation completely. Supports glob patterns (*, ?).
     Delete {
-        /// Name of the conversation to delete
+        /// Name or pattern of the conversation(s) to delete
         name: String,
+        /// Skip confirmation prompt for multiple matches
+        #[arg(short, long)]
+        force: bool,
     },
-    /// Clear all messages from a conversation (keeps the conversation and participants)
+    /// Clear all messages from a conversation (keeps the conversation and participants). Supports glob patterns (*, ?).
     Clear {
-        /// Name of the conversation to clear
+        /// Name or pattern of the conversation(s) to clear
         conv: String,
+        /// Skip confirmation prompt for multiple matches
+        #[arg(short, long)]
+        force: bool,
     },
     /// Run cleanup to delete expired messages and empty conversations
     Cleanup,
@@ -1383,88 +1395,141 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
         }
 
-        // `anima chat pause <conv>` - pause notifications for a conversation
-        Some(ChatCommands::Pause { conv }) => {
-            // Check if conversation exists (set_paused will return error if not found)
-            let _ = store.set_paused(&conv, true)?;
-            println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv);
-        }
+        // `anima chat pause <conv>` - pause notifications for a conversation (supports glob patterns)
+        Some(ChatCommands::Pause { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
 
-        // `anima chat resume <conv>` - resume a paused conversation
-        Some(ChatCommands::Resume { conv }) => {
-            // Check if conversation exists
-            if store.find_by_name(&conv)?.is_none() {
-                return Err(format!("Conversation '{}' not found", conv).into());
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
             }
 
-            // Resume the conversation and get the paused_at_msg_id
-            let paused_at_msg_id = store.set_paused(&conv, false)?;
-            let mut catchup_count = 0;
+            // Ask for confirmation if multiple matches or using wildcards
+            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
+                if !confirm_action("pause", &matches)? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
 
-            // Process catchup items (tool calls and mentions skipped during pause)
-            if let Some(paused_at) = paused_at_msg_id {
-                if let Ok(catchup_msgs) = store.get_catchup_messages(&conv, paused_at) {
-                    let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
-                    for item in &catchup_items {
-                        // Process @mentions
-                        if !item.mentions.is_empty() {
-                            let _ = notify_mentioned_agents_parallel(
-                                &store,
-                                &conv,
-                                item.message.id,
-                                &item.mentions
-                            ).await;
-                            catchup_count += item.mentions.len();
+            for conv_name in &matches {
+                let _ = store.set_paused(conv_name, true)?;
+                println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv_name);
+            }
+        }
+
+        // `anima chat resume <conv>` - resume a paused conversation (supports glob patterns)
+        Some(ChatCommands::Resume { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            // Ask for confirmation if multiple matches or using wildcards
+            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
+                if !confirm_action("resume", &matches)? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            for conv_name in &matches {
+                // Resume the conversation and get the paused_at_msg_id
+                let paused_at_msg_id = store.set_paused(conv_name, false)?;
+                let mut catchup_count = 0;
+
+                // Process catchup items (tool calls and mentions skipped during pause)
+                if let Some(paused_at) = paused_at_msg_id {
+                    if let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at) {
+                        let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
+                        for item in &catchup_items {
+                            // Process @mentions
+                            if !item.mentions.is_empty() {
+                                let _ = notify_mentioned_agents_parallel(
+                                    &store,
+                                    conv_name,
+                                    item.message.id,
+                                    &item.mentions
+                                ).await;
+                                catchup_count += item.mentions.len();
+                            }
+                            // Note: Tool calls in catchup items will be handled
+                            // by the agent when it processes the follow-up notification
                         }
-                        // Note: Tool calls in catchup items will be handled
-                        // by the agent when it processes the follow-up notification
                     }
                 }
-            }
 
-            // Also check for pending notifications (for agents that weren't running)
-            let pending = store.get_pending_notifications_for_conversation(&conv)?;
-            let pending_count = pending.len();
+                // Also check for pending notifications (for agents that weren't running)
+                let pending = store.get_pending_notifications_for_conversation(conv_name)?;
+                let pending_count = pending.len();
 
-            if pending_count > 0 {
-                // Process pending notifications
-                for notification in &pending {
-                    let mentions = vec![notification.agent.clone()];
-                    let _ = notify_mentioned_agents_parallel(
-                        &store,
-                        &conv,
-                        notification.message_id,
-                        &mentions
-                    ).await;
+                if pending_count > 0 {
+                    // Process pending notifications
+                    for notification in &pending {
+                        let mentions = vec![notification.agent.clone()];
+                        let _ = notify_mentioned_agents_parallel(
+                            &store,
+                            conv_name,
+                            notification.message_id,
+                            &mentions
+                        ).await;
 
-                    // Clear this notification after processing
-                    let _ = store.delete_pending_notification(notification.id);
+                        // Clear this notification after processing
+                        let _ = store.delete_pending_notification(notification.id);
+                    }
+                    catchup_count += pending_count;
                 }
-                catchup_count += pending_count;
-            }
 
-            if catchup_count > 0 {
-                println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)", conv, catchup_count);
-            } else {
-                println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv);
+                if catchup_count > 0 {
+                    println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)", conv_name, catchup_count);
+                } else {
+                    println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv_name);
+                }
             }
         }
 
-        // `anima chat delete <name>` - delete a conversation
-        Some(ChatCommands::Delete { name }) => {
-            // Check if conversation exists
-            if store.find_by_name(&name)?.is_none() {
-                return Err(format!("Conversation '{}' not found", name).into());
+        // `anima chat delete <name>` - delete a conversation (supports glob patterns)
+        Some(ChatCommands::Delete { name, force }) => {
+            let matches = store.match_conversations(&name)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", name).into());
             }
 
-            store.delete_conversation(&name)?;
-            println!("Deleted conversation '\x1b[36m{}\x1b[0m'", name);
+            // Ask for confirmation if multiple matches or using wildcards
+            if !force && (matches.len() > 1 || has_wildcards(&name)) {
+                if !confirm_action("delete", &matches)? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            for conv_name in &matches {
+                store.delete_conversation(conv_name)?;
+                println!("Deleted conversation '\x1b[36m{}\x1b[0m'", conv_name);
+            }
         }
 
-        // `anima chat clear <conv>` - clear all messages from a conversation
-        Some(ChatCommands::Clear { conv }) => {
-            let deleted = store.clear_messages(&conv)?;
-            println!("Cleared {} messages from '\x1b[36m{}\x1b[0m'", deleted, conv);
+        // `anima chat clear <conv>` - clear all messages from a conversation (supports glob patterns)
+        Some(ChatCommands::Clear { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            // Ask for confirmation if multiple matches or using wildcards
+            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
+                if !confirm_action("clear", &matches)? {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            for conv_name in &matches {
+                let deleted = store.clear_messages(conv_name)?;
+                println!("Cleared {} messages from '\x1b[36m{}\x1b[0m'", deleted, conv_name);
+            }
         }
 
         // `anima chat cleanup` - run cleanup_expired
@@ -1541,6 +1606,26 @@ fn format_relative_time(timestamp: i64) -> String {
     } else {
         format!("{}w ago", diff / 604800)
     }
+}
+
+/// Check if a pattern contains glob wildcards (* or ?).
+fn has_wildcards(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// Ask for user confirmation before a destructive operation.
+/// Returns true if user confirms (enters 'y' or 'Y').
+fn confirm_action(action: &str, items: &[String]) -> Result<bool, Box<dyn std::error::Error>> {
+    println!("This will {} {} conversation(s):", action, items.len());
+    for name in items {
+        println!("  - {}", name);
+    }
+    print!("Continue? [y/N] ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
 /// Run an agent from a directory and start an interactive REPL
