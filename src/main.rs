@@ -1,5 +1,5 @@
 use anima::{
-    Runtime, OpenAIClient, AnthropicClient, OllamaClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
+    Runtime, OpenAIClient, AnthropicClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
     InMemoryStore, SqliteMemory, LLM, ConversationStore,
     parse_mentions, expand_all_mention, notify_mentioned_agents_parallel, NotifyResult,
     SemanticMemoryStore, format_age,

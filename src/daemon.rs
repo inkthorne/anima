@@ -2398,7 +2398,7 @@ async fn handle_connection(
                     let mut current_message = content.clone();
                     let max_tool_calls = 10;
                     let mut tool_call_count = 0;
-                    let mut final_json_response = String::new();
+                    let final_json_response: String;
 
                     loop {
                         let options = ThinkOptions {
