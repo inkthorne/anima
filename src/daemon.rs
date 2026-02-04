@@ -157,7 +157,7 @@ fn expand_inject_directives(
     let has_tools_directive = content.contains(TOOLS_DIRECTIVE);
     let has_memories_directive = content.contains(MEMORIES_DIRECTIVE);
 
-    // No directives found — signal to use fallback append behavior
+    // No directives found — signal that user opted out of auto-injection
     if !has_tools_directive && !has_memories_directive {
         return None;
     }
@@ -197,9 +197,11 @@ fn expand_inject_directives(
 
 /// Build the effective always prompt by combining tools, memory, base always, and model always.
 ///
-/// If base_always contains injection directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
-/// tools and memories are expanded in-place at those positions.
-/// Otherwise, tools and memories are prepended (backward compatible behavior).
+/// Injection behavior:
+/// - If base_always contains directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
+///   tools and memories are expanded in-place at those positions.
+/// - If base_always exists but has no directives, it's used as-is (user opted out of injection).
+/// - If base_always is None, tools and memories are injected as sensible defaults.
 fn build_effective_always(
     tools_injection: &str,
     memory_injection: &str,
@@ -216,16 +218,17 @@ fn build_effective_always(
     if let Some(expanded) = expanded_base {
         // Directives were found and expanded — use the expanded content
         parts.push(expanded);
+    } else if let Some(base) = base_always {
+        // always.md exists but has no directives — user opted out of auto-injection
+        // Just use the always.md content as-is
+        parts.push(base.clone());
     } else {
-        // No directives found — fall back to prepend behavior
+        // No always.md at all — inject tools/memories as sensible defaults
         if !tools_injection.is_empty() {
             parts.push(tools_injection.to_string());
         }
         if !memory_injection.is_empty() {
             parts.push(memory_injection.to_string());
-        }
-        if let Some(base) = base_always {
-            parts.push(base.clone());
         }
     }
 
@@ -3520,15 +3523,26 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_effective_always_without_directives_fallback() {
+    fn test_build_effective_always_without_directives_no_injection() {
+        // If always.md exists but has no directives, user opted out of injection
         let base = Some("Just content, no directives".to_string());
         let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
-        // Fallback: tools and memories prepended
-        let tools_pos = effective.find("TOOLS").unwrap();
-        let content_pos = effective.find("Just content").unwrap();
-        assert!(tools_pos < content_pos);
+        // Should NOT contain tools or memories - user opted out
+        assert!(!effective.contains("TOOLS"));
+        assert!(!effective.contains("MEMORIES"));
+        assert!(effective.contains("Just content"));
+    }
+
+    #[test]
+    fn test_build_effective_always_no_base_injects_defaults() {
+        // If no always.md at all, inject tools/memories as sensible defaults
+        let result = build_effective_always("TOOLS", "MEMORIES", &None, &None);
+        assert!(result.is_some());
+        let effective = result.unwrap();
+        assert!(effective.contains("TOOLS"));
+        assert!(effective.contains("MEMORIES"));
     }
 
     #[test]

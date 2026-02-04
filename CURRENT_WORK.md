@@ -1,53 +1,29 @@
-# Current Work: Templated Always.md Injection
+# Current Work: Opt-in Injection Behavior
 
 **Date:** 2026-02-04
 **Status:** Complete ✅
 
 ## Summary
 
-Add support for injection directives in `always.md` so users can control what gets injected and where, instead of fixed append behavior.
+Change injection behavior so that creating an always.md means opting into manual control.
 
-## Directives
+## New Behavior
 
-```markdown
-<!-- @inject:tools -->     <!-- Expand to relevant tools -->
-<!-- @inject:memories -->  <!-- Expand to semantic memories -->
-<!-- @inject:agents -->    <!-- Expand to relevant agent descriptions (future) -->
-```
+| Scenario | Behavior |
+|----------|----------|
+| No always.md | Inject tools + memories (sensible defaults) |
+| always.md **with** directives | Expand in-place at directive positions |
+| always.md **without** directives | Use as-is, no injection (user opted out) |
 
-## Behavior
+## Rationale
 
-1. **If directives present**: Replace each directive with its content at that location
-2. **If no directives**: Fall back to current behavior (append tools, then memories)
-3. **If directive present but empty result**: Remove the directive line (no empty sections)
+Creating an always.md signals that the user wants explicit control over what gets injected. If they want tools/memories, they add the directives. If they don't add them, they're intentionally leaving them out.
 
-## Implementation Plan
+## Changes
 
-### Phase 1: Parser
-- [x] Add function to detect `<!-- @inject:TYPE -->` directives in always.md content
-- [x] `expand_inject_directives()` function added (lines 140-195)
-
-### Phase 2: Injection Logic  
-- [x] Modified `build_effective_always()` in daemon.rs (lines 197-235)
-- [x] If directives found: expand in-place
-- [x] If no directives found: fallback to append (backward compatible)
-
-### Phase 3: Testing
-- [x] 11 new tests added covering all cases
-- [x] All tests passing
-
-## Files Likely Involved
-
-- `src/daemon.rs` — system prompt building, notify handling
-- `src/agent.rs` — if prompt assembly happens here
-- `src/prompt.rs` — if there's dedicated prompt logic
-- `src/memory.rs` — memory injection formatting
-
-## Notes
-
-- Keep existing `<!-- @include:file.md -->` pattern as reference
-- Directive syntax should be HTML-comment style (invisible in rendered markdown)
-- Consider: should we support `<!-- @inject:tools:5 -->` for limit? (future)
+- Modified `build_effective_always()` in daemon.rs
+- Updated tests to reflect new behavior
+- Added test for "no base always" case
 
 ---
 
