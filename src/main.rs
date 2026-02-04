@@ -596,7 +596,7 @@ async fn chat_with_conversation(
                         );
                         println!("{}", msg.content);
                         println!(); // Blank line between messages
-                        print!("\x1b[36myou>\x1b[0m "); // Re-print prompt
+                        print!("\x1b[36m#{}\x1b[90m›\x1b[0m ", poll_conv_name); // Re-print prompt
                         let _ = io::stdout().flush();
                     }
                     // Update last seen ID regardless of sender
@@ -608,10 +608,10 @@ async fn chat_with_conversation(
 
     // Use rustyline for interactive input
     let mut rl = rustyline::DefaultEditor::new()?;
-    let prompt = "\x1b[36myou>\x1b[0m ";
+    let prompt = format!("\x1b[36m#{}\x1b[90m›\x1b[0m ", conv_name);
 
     loop {
-        match rl.readline(prompt) {
+        match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim();
                 if line.is_empty() {
@@ -743,6 +743,9 @@ async fn chat_with_conversation(
                 // Update last_seen_id to the user's message to avoid re-displaying it
                 last_seen_id.store(user_msg_id, Ordering::SeqCst);
 
+                // Blank line before agent response
+                println!();
+
                 // Notify mentioned agents (initial notifications only)
                 // The daemon now handles all follow-up @mention chains autonomously
                 if !expanded_mentions.is_empty() {
@@ -754,7 +757,7 @@ async fn chat_with_conversation(
                             NotifyResult::Acknowledged => {
                                 // Fire-and-forget: agent received notification, processing async
                                 // The background poller will display the response when it arrives
-                                println!("\x1b[90m[@{} notified, processing...]\x1b[0m", agent);
+                                // (no message needed - "joined the conversation" already shown)
                             }
                             NotifyResult::Notified { response_message_id } => {
                                 // Synchronous response (backwards compat)
@@ -1753,9 +1756,16 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                 // Format updated_at as relative time
                 let updated = format_relative_time(conv.updated_at);
 
+                // Show paused indicator
+                let name_display = if conv.paused {
+                    format!("{} \x1b[33m⏸\x1b[0m", conv.name)
+                } else {
+                    conv.name.clone()
+                };
+
                 println!(
                     "{:<30} {:>6}   {:<10} {}",
-                    conv.name,
+                    name_display,
                     msg_count,
                     updated,
                     agents.join(", ")
