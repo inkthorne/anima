@@ -153,6 +153,8 @@ pub struct Agent {
     history: Vec<ChatMessage>,
     /// Agent directory path for context dumping
     agent_dir: Option<PathBuf>,
+    /// Current conversation name for debug file naming (turns/{name}.json)
+    current_conversation: Option<String>,
 }
 
 impl Agent {
@@ -169,6 +171,7 @@ impl Agent {
             router: None,
             history: Vec::new(),
             agent_dir: None,
+            current_conversation: None,
         }
     }
 
@@ -176,6 +179,12 @@ impl Agent {
     pub fn with_agent_dir(mut self, dir: PathBuf) -> Self {
         self.agent_dir = Some(dir);
         self
+    }
+
+    /// Set the current conversation name for debug file naming.
+    /// Used to write debug files to turns/{name}.json instead of last_turn.json.
+    pub fn set_current_conversation(&mut self, name: Option<String>) {
+        self.current_conversation = name;
     }
 
     /// Attach an observer for monitoring agent activity.
@@ -491,7 +500,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
         Some(context)
     }
 
-    /// Dump the raw LLM request payload to last_turn.json in the agent directory.
+    /// Dump the raw LLM request payload to turns/{conv_name}.json in the agent directory.
     /// This is called before each LLM request to provide the exact JSON for debugging/reproduction.
     fn dump_context(
         &self,
@@ -505,7 +514,23 @@ pub async fn forget(&mut self, key: &str) -> bool {
             None => return, // No agent dir configured, skip dump
         };
 
-        let file_path = agent_dir.join("last_turn.json");
+        // Determine conversation name for the file
+        let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
+
+        // Create turns/ directory if it doesn't exist
+        let turns_dir = agent_dir.join("turns");
+        if let Err(e) = std::fs::create_dir_all(&turns_dir) {
+            eprintln!("[agent:{}] Failed to create turns directory: {}", self.id, e);
+            return;
+        }
+
+        // Create .gitignore to make turns/ self-ignoring (debug files shouldn't be committed)
+        let gitignore_path = turns_dir.join(".gitignore");
+        if !gitignore_path.exists() {
+            let _ = std::fs::write(&gitignore_path, "*\n!.gitignore\n");
+        }
+
+        let file_path = turns_dir.join(format!("{}.json", conv_name));
 
         // Get model name from LLM if available
         let model = self.llm.as_ref()
@@ -1303,6 +1328,7 @@ pub async fn forget(&mut self, key: &str) -> bool {
             router,
             history: Vec::new(),  // Child starts with fresh history
             agent_dir: parent.agent_dir.clone(),  // Inherit agent_dir for context dumps
+            current_conversation: parent.current_conversation.clone(),  // Inherit conversation context
         }
     }
 

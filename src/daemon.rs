@@ -1450,6 +1450,12 @@ async fn process_message_work(
 ) -> MessageWorkResult {
     let start_time = std::time::Instant::now();
 
+    // Set current conversation for debug file naming
+    {
+        let mut agent_guard = agent.lock().await;
+        agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
+    }
+
     // Create tool execution context
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
@@ -1808,6 +1814,12 @@ async fn handle_notify(
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
+
+    // Set current conversation for debug file naming
+    {
+        let mut agent_guard = agent.lock().await;
+        agent_guard.set_current_conversation(Some(conv_id.to_string()));
+    }
 
     // Open conversation store
     let store = match ConversationStore::init() {
@@ -2194,6 +2206,12 @@ async fn run_heartbeat(
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
 ) {
+    // Set current conversation for debug file naming
+    {
+        let mut agent_guard = agent.lock().await;
+        agent_guard.set_current_conversation(Some("heartbeat".to_string()));
+    }
+
     // 1. Load heartbeat.md content
     let heartbeat_prompt = match std::fs::read_to_string(&config.heartbeat_path) {
         Ok(content) if !content.trim().is_empty() => content,
