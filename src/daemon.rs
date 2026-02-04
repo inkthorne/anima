@@ -1349,6 +1349,8 @@ async fn handle_notify(
     };
 
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    // Version without memories for tool continuation turns - still has tools + always.md
+    let effective_always_no_memory = build_effective_always(&tools_injection, "", always, model_always);
 
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
@@ -1369,6 +1371,10 @@ async fn handle_notify(
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
 
+    // First iteration gets full always (tools + memories + always.md).
+    // Subsequent iterations get tools + always.md but NO memories (memories are query-specific).
+    let mut is_first_iteration = true;
+
     loop {
         // Clear agent's internal history EACH iteration to avoid duplication.
         // think_with_options adds to self.history, and agent.rs injects self.history
@@ -1378,7 +1384,7 @@ async fn handle_notify(
 
         let options = ThinkOptions {
             system_prompt: persona.clone(),
-            always_prompt: effective_always.clone(),
+            always_prompt: if is_first_iteration { effective_always.clone() } else { effective_always_no_memory.clone() },
             conversation_history: Some(conversation_history.clone()),
             ..Default::default()
         };
@@ -1460,6 +1466,8 @@ async fn handle_notify(
                                 let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
                             }
+                            // Subsequent iterations are tool continuations - no need to re-inject always
+                            is_first_iteration = false;
                             // Continue to next iteration
                         }
                         Err(e) => {
@@ -1474,6 +1482,8 @@ async fn handle_notify(
                                 let (refreshed_history, _) = format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
                             }
+                            // Subsequent iterations are tool continuations - no need to re-inject always
+                            is_first_iteration = false;
                             // Continue to next iteration to let LLM handle the error
                         }
                     }
