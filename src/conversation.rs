@@ -28,6 +28,9 @@ pub struct Conversation {
     pub created_at: i64,
     pub updated_at: i64,
     pub paused: bool,
+    /// The message ID at which the conversation was paused.
+    /// Used during resume to catch up on skipped tool calls and @mentions.
+    pub paused_at_msg_id: Option<i64>,
 }
 
 /// A participant in a conversation.
@@ -58,6 +61,21 @@ pub struct PendingNotification {
     pub conv_name: String,
     pub message_id: i64,
     pub created_at: i64,
+}
+
+/// Represents an item that needs catchup processing after a conversation is resumed.
+#[derive(Debug, Clone)]
+pub struct CatchupItem {
+    /// The message that needs catchup processing.
+    pub message: ConversationMessage,
+    /// Whether this message contains a tool call that needs execution.
+    /// This is only relevant for agent messages (not "user" or "tool").
+    pub has_tool_call: bool,
+    /// The raw content that may contain a tool call block.
+    /// The caller should use daemon::extract_tool_call() to parse this.
+    pub raw_content: String,
+    /// @mentions found in this message that need forwarding.
+    pub mentions: Vec<String>,
 }
 
 /// Default message TTL: 7 days in seconds.
@@ -117,7 +135,8 @@ impl ConversationStore {
                     name TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    paused INTEGER DEFAULT 0
+                    paused INTEGER DEFAULT 0,
+                    paused_at_msg_id INTEGER DEFAULT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS participants (
@@ -158,6 +177,9 @@ impl ConversationStore {
         // Migrate: add paused column if it doesn't exist (for existing DBs)
         self.migrate_add_paused_column()?;
 
+        // Migrate: add paused_at_msg_id column if it doesn't exist
+        self.migrate_add_paused_at_msg_id_column()?;
+
         Ok(())
     }
 
@@ -173,6 +195,25 @@ impl ConversationStore {
         if !has_paused {
             self.conn.execute(
                 "ALTER TABLE conversations ADD COLUMN paused INTEGER DEFAULT 0",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add the paused_at_msg_id column if it doesn't exist.
+    fn migrate_add_paused_at_msg_id_column(&self) -> Result<(), ConversationError> {
+        // Check if conversations table has paused_at_msg_id column
+        let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
+        let has_column = stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            Ok(col_name)
+        })?.any(|r| r.map(|n| n == "paused_at_msg_id").unwrap_or(false));
+
+        if !has_column {
+            self.conn.execute(
+                "ALTER TABLE conversations ADD COLUMN paused_at_msg_id INTEGER DEFAULT NULL",
                 [],
             )?;
         }
@@ -214,7 +255,8 @@ impl ConversationStore {
                 name TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                paused INTEGER DEFAULT 0
+                paused INTEGER DEFAULT 0,
+                paused_at_msg_id INTEGER DEFAULT NULL
             );
 
             CREATE TABLE participants_new (
@@ -357,7 +399,7 @@ impl ConversationStore {
     /// List all conversations.
     pub fn list_conversations(&self) -> Result<Vec<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at, paused FROM conversations ORDER BY updated_at DESC",
+            "SELECT name, created_at, updated_at, paused, paused_at_msg_id FROM conversations ORDER BY updated_at DESC",
         )?;
 
         let conversations = stmt
@@ -367,6 +409,7 @@ impl ConversationStore {
                     created_at: row.get(1)?,
                     updated_at: row.get(2)?,
                     paused: row.get::<_, i64>(3)? != 0,
+                    paused_at_msg_id: row.get(4)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -377,7 +420,7 @@ impl ConversationStore {
     /// Get a conversation by name.
     pub fn get_conversation(&self, name: &str) -> Result<Option<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at, paused FROM conversations WHERE name = ?1",
+            "SELECT name, created_at, updated_at, paused, paused_at_msg_id FROM conversations WHERE name = ?1",
         )?;
 
         let mut rows = stmt.query(params![name])?;
@@ -387,6 +430,7 @@ impl ConversationStore {
                 created_at: row.get(1)?,
                 updated_at: row.get(2)?,
                 paused: row.get::<_, i64>(3)? != 0,
+                paused_at_msg_id: row.get(4)?,
             }))
         } else {
             Ok(None)
@@ -402,18 +446,89 @@ impl ConversationStore {
     }
 
     /// Set the paused state of a conversation.
-    pub fn set_paused(&self, conv_name: &str, paused: bool) -> Result<(), ConversationError> {
-        // Verify conversation exists
-        if self.get_conversation(conv_name)?.is_none() {
-            return Err(ConversationError::NotFound(conv_name.to_string()));
+    /// When pausing, records the current max message ID.
+    /// When resuming, returns the paused_at_msg_id for catchup processing.
+    pub fn set_paused(&self, conv_name: &str, paused: bool) -> Result<Option<i64>, ConversationError> {
+        // Verify conversation exists and get current state
+        let conv = self.get_conversation(conv_name)?
+            .ok_or_else(|| ConversationError::NotFound(conv_name.to_string()))?;
+
+        if paused {
+            // Pausing: record the current max message ID
+            let max_msg_id: Option<i64> = self.conn.query_row(
+                "SELECT MAX(id) FROM messages WHERE conv_name = ?1",
+                params![conv_name],
+                |row| row.get(0),
+            ).ok();
+
+            self.conn.execute(
+                "UPDATE conversations SET paused = 1, paused_at_msg_id = ?1 WHERE name = ?2",
+                params![max_msg_id, conv_name],
+            )?;
+
+            Ok(None)
+        } else {
+            // Resuming: get the paused_at_msg_id before clearing
+            let paused_at_msg_id = conv.paused_at_msg_id;
+
+            self.conn.execute(
+                "UPDATE conversations SET paused = 0, paused_at_msg_id = NULL WHERE name = ?1",
+                params![conv_name],
+            )?;
+
+            Ok(paused_at_msg_id)
+        }
+    }
+
+    /// Get messages that need catchup processing after resume.
+    /// Returns messages with id > paused_at_msg_id for the given conversation.
+    pub fn get_catchup_messages(
+        &self,
+        conv_name: &str,
+        paused_at_msg_id: i64,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        self.get_messages_filtered(conv_name, None, Some(paused_at_msg_id))
+    }
+
+    /// Build catchup items from messages that were skipped during pause.
+    /// Returns a list of CatchupItem structs for processing.
+    ///
+    /// For agent messages (not "user" or "tool"):
+    /// - Checks if message may contain a tool call (has JSON block)
+    /// - Extracts @mentions for forwarding
+    ///
+    /// For user messages:
+    /// - Only extracts @mentions for forwarding
+    ///
+    /// Tool result messages are skipped (they'll be re-created when tools are executed).
+    pub fn build_catchup_items(messages: &[ConversationMessage]) -> Vec<CatchupItem> {
+        let mut items = Vec::new();
+
+        for msg in messages {
+            // Skip tool result messages - they'll be regenerated
+            if msg.from_agent == "tool" {
+                continue;
+            }
+
+            // Check if this is an agent message that might have a tool call
+            let is_agent_msg = msg.from_agent != "user" && msg.from_agent != "tool";
+            let has_tool_call = is_agent_msg && msg.content.contains("```json");
+
+            // Parse @mentions from the message
+            let mentions = parse_mentions(&msg.content);
+
+            // Only include if there's something to process
+            if has_tool_call || !mentions.is_empty() {
+                items.push(CatchupItem {
+                    message: msg.clone(),
+                    has_tool_call,
+                    raw_content: msg.content.clone(),
+                    mentions,
+                });
+            }
         }
 
-        self.conn.execute(
-            "UPDATE conversations SET paused = ?1 WHERE name = ?2",
-            params![paused as i64, conv_name],
-        )?;
-
-        Ok(())
+        items
     }
 
     /// Get participants for a conversation.
@@ -838,6 +953,7 @@ impl ConversationStore {
             created_at: now,
             updated_at: now,
             paused: false,
+            paused_at_msg_id: None,
         })
     }
 }

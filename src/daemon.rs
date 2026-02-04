@@ -1404,6 +1404,15 @@ async fn handle_notify(
                 let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
 
                 if let Some(tc) = tool_call {
+                    // Check if conversation is paused - skip tool execution if so
+                    if store.is_paused(conv_id).unwrap_or(false) {
+                        logger.log("[notify] Conversation paused, skipping tool execution");
+                        // Store the FULL response (including tool call block) so it can be
+                        // re-extracted and executed during catchup on resume
+                        final_response = Some(after_remember.clone());
+                        break;
+                    }
+
                     tool_call_count += 1;
                     if tool_call_count > max_tool_calls {
                         logger.tool("[notify] Max tool calls reached, stopping");

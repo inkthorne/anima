@@ -550,8 +550,31 @@ async fn chat_with_conversation(
                         }
                         "/resume" => {
                             match store.set_paused(conv_name, false) {
-                                Ok(_) => {
-                                    // Check for pending notifications and process them
+                                Ok(paused_at_msg_id) => {
+                                    let mut catchup_count = 0;
+
+                                    // Process catchup items (tool calls and mentions skipped during pause)
+                                    if let Some(paused_at) = paused_at_msg_id {
+                                        if let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at) {
+                                            let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
+                                            for item in &catchup_items {
+                                                // Process @mentions
+                                                if !item.mentions.is_empty() {
+                                                    let _ = notify_mentioned_agents_parallel(
+                                                        &store,
+                                                        conv_name,
+                                                        item.message.id,
+                                                        &item.mentions
+                                                    ).await;
+                                                    catchup_count += item.mentions.len();
+                                                }
+                                                // Note: Tool calls in catchup items will be handled
+                                                // by the agent when it processes the follow-up notification
+                                            }
+                                        }
+                                    }
+
+                                    // Also check for pending notifications (for agents that weren't running)
                                     match store.get_pending_notifications_for_conversation(conv_name) {
                                         Ok(pending) => {
                                             let pending_count = pending.len();
@@ -566,12 +589,16 @@ async fn chat_with_conversation(
                                                     ).await;
                                                     let _ = store.delete_pending_notification(notification.id);
                                                 }
-                                                println!("\x1b[90mConversation resumed. {} pending notification(s) processed.\x1b[0m", pending_count);
-                                            } else {
-                                                println!("\x1b[90mConversation resumed.\x1b[0m");
+                                                catchup_count += pending_count;
                                             }
                                         }
-                                        Err(_) => println!("\x1b[90mConversation resumed.\x1b[0m"),
+                                        Err(_) => {}
+                                    }
+
+                                    if catchup_count > 0 {
+                                        println!("\x1b[90mConversation resumed. {} pending item(s) processed.\x1b[0m", catchup_count);
+                                    } else {
+                                        println!("\x1b[90mConversation resumed.\x1b[0m");
                                     }
                                 }
                                 Err(e) => eprintln!("\x1b[31mFailed to resume: {}\x1b[0m", e),
@@ -1359,7 +1386,7 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
         // `anima chat pause <conv>` - pause notifications for a conversation
         Some(ChatCommands::Pause { conv }) => {
             // Check if conversation exists (set_paused will return error if not found)
-            store.set_paused(&conv, true)?;
+            let _ = store.set_paused(&conv, true)?;
             println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv);
         }
 
@@ -1370,10 +1397,32 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                 return Err(format!("Conversation '{}' not found", conv).into());
             }
 
-            // Resume the conversation
-            store.set_paused(&conv, false)?;
+            // Resume the conversation and get the paused_at_msg_id
+            let paused_at_msg_id = store.set_paused(&conv, false)?;
+            let mut catchup_count = 0;
 
-            // Check for pending notifications for this conversation and process them
+            // Process catchup items (tool calls and mentions skipped during pause)
+            if let Some(paused_at) = paused_at_msg_id {
+                if let Ok(catchup_msgs) = store.get_catchup_messages(&conv, paused_at) {
+                    let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
+                    for item in &catchup_items {
+                        // Process @mentions
+                        if !item.mentions.is_empty() {
+                            let _ = notify_mentioned_agents_parallel(
+                                &store,
+                                &conv,
+                                item.message.id,
+                                &item.mentions
+                            ).await;
+                            catchup_count += item.mentions.len();
+                        }
+                        // Note: Tool calls in catchup items will be handled
+                        // by the agent when it processes the follow-up notification
+                    }
+                }
+            }
+
+            // Also check for pending notifications (for agents that weren't running)
             let pending = store.get_pending_notifications_for_conversation(&conv)?;
             let pending_count = pending.len();
 
@@ -1391,8 +1440,11 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                     // Clear this notification after processing
                     let _ = store.delete_pending_notification(notification.id);
                 }
+                catchup_count += pending_count;
+            }
 
-                println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending notifications processed)", conv, pending_count);
+            if catchup_count > 0 {
+                println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)", conv, catchup_count);
             } else {
                 println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv);
             }
