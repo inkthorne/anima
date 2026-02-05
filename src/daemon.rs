@@ -1860,7 +1860,29 @@ async fn process_message_work(
         agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
     }
 
+    // Build recall (tools + memories)
+    let recall_result = build_recall_for_query(
+        content,
+        allowed_tools,
+        semantic_memory,
+        embedding_client,
+        tool_registry,
+        use_native_tools,
+        recall,
+        model_recall,
+        recall_limit,
+        logger,
+    )
+    .await;
+
+    // Store recall content in conversation DB BEFORE loading history
+    // This way the loaded history will include the recall we just stored
+    if let Some(cname) = conv_name {
+        store_recall_in_db(cname, &recall_result.recall_content, logger);
+    }
+
     // Load conversation history if conv_name is provided
+    // History now includes the recall we just stored above
     let conversation_history: Vec<ChatMessage> = if let Some(cname) = conv_name {
         match ConversationStore::init() {
             Ok(store) => match store.get_messages(cname, Some(history_limit)) {
@@ -1900,26 +1922,6 @@ async fn process_message_work(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
     };
-
-    // Build recall (tools + memories)
-    let recall_result = build_recall_for_query(
-        content,
-        allowed_tools,
-        semantic_memory,
-        embedding_client,
-        tool_registry,
-        use_native_tools,
-        recall,
-        model_recall,
-        recall_limit,
-        logger,
-    )
-    .await;
-
-    // Store recall content in conversation DB before processing
-    if let Some(cname) = conv_name {
-        store_recall_in_db(cname, &recall_result.recall_content, logger);
-    }
 
     // Process with or without streaming
     let (final_response, _tool_calls, tool_trace) = if use_native_tools {
@@ -2275,7 +2277,7 @@ async fn handle_notify(
         }
     };
 
-    // Fetch recent messages from conversation for context
+    // First fetch: get messages to extract final_user_content for recall query
     let context_messages = match store.get_messages(conv_id, Some(history_limit)) {
         Ok(msgs) => msgs,
         Err(e) => {
@@ -2293,16 +2295,8 @@ async fn handle_notify(
         };
     }
 
-    // Format conversation into proper user/assistant ChatMessages
-    // This maps self→assistant (raw), others→user (JSON wrapped), with batching for alternation
-    let (conversation_history, final_user_content) =
-        format_conversation_history(&context_messages, agent_name);
-
-    logger.log(&format!(
-        "[notify] Context: {} messages → {} history + final user turn",
-        context_messages.len(),
-        conversation_history.len()
-    ));
+    // Extract final_user_content for building recall
+    let (_, final_user_content) = format_conversation_history(&context_messages, agent_name);
 
     // Build recall (tools + memories)
     let recall_result = build_recall_for_query(
@@ -2319,7 +2313,7 @@ async fn handle_notify(
     )
     .await;
 
-    // Store recall content in conversation DB before processing
+    // Store recall content in conversation DB BEFORE re-loading history
     if let Some(ref recall_text) = recall_result.recall_content
         && !recall_text.is_empty()
         && let Err(e) = store.add_message(conv_id, "recall", recall_text, &[])
@@ -2329,6 +2323,27 @@ async fn handle_notify(
             e
         ));
     }
+
+    // Re-fetch messages: now includes the recall we just stored
+    let context_messages = match store.get_messages(conv_id, Some(history_limit)) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            logger.log(&format!("[notify] Failed to reload messages: {}", e));
+            return Response::Error {
+                message: format!("Failed to reload messages: {}", e),
+            };
+        }
+    };
+
+    // Format conversation into proper user/assistant ChatMessages
+    // History now includes recall, so no manual prepending needed
+    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+
+    logger.log(&format!(
+        "[notify] Context: {} messages → {} history + final user turn",
+        context_messages.len(),
+        conversation_history.len()
+    ));
 
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
