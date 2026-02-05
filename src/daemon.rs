@@ -1534,6 +1534,7 @@ fn create_llm_from_config(
 
 /// Worker task that owns the agent and processes work items sequentially.
 /// This ensures no race conditions between Message, Notify, and Heartbeat handlers.
+#[allow(clippy::too_many_arguments)]
 async fn agent_worker(
     mut work_rx: mpsc::UnboundedReceiver<AgentWork>,
     agent: Arc<Mutex<Agent>>,
@@ -1654,6 +1655,7 @@ async fn agent_worker(
 
 /// Process a Message work item: handle memory/tools injection, streaming, and tool execution.
 /// Returns the final response (or error) for the oneshot channel.
+#[allow(clippy::too_many_arguments)]
 async fn process_message_work(
     content: &str,
     conv_name: Option<&str>,
@@ -1873,6 +1875,7 @@ async fn process_message_work(
 }
 
 /// Process message in native tool mode (tools = true in model config)
+#[allow(clippy::too_many_arguments)]
 async fn process_native_tool_mode(
     content: &str,
     effective_always: &Option<String>,
@@ -1953,6 +1956,7 @@ async fn process_native_tool_mode(
 }
 
 /// Process message in JSON-block tool mode (tools = false in model config)
+#[allow(clippy::too_many_arguments)]
 async fn process_json_block_mode(
     content: &str,
     effective_always: &Option<String>,
@@ -2027,8 +2031,8 @@ async fn process_json_block_mode(
                 }
             }
 
-            if !code_block_buffer.is_empty()
-                && !(code_block_buffer.contains("\"tool\"")
+            if !(code_block_buffer.is_empty()
+                || code_block_buffer.contains("\"tool\"")
                     && code_block_buffer.contains("\"params\""))
             {
                 let _ = tx_clone.send(code_block_buffer).await;
@@ -2110,6 +2114,7 @@ const MAX_MENTION_DEPTH: u32 = 100;
 
 /// Handle a Notify request: fetch conversation context, generate response, store it,
 /// and forward @mentions to other agents (daemon-to-daemon).
+#[allow(clippy::too_many_arguments)]
 async fn handle_notify(
     conv_id: &str,
     _message_id: i64,
@@ -2674,6 +2679,7 @@ async fn forward_notify_to_agent(
 }
 
 /// Execute a heartbeat: load heartbeat.md, think, store response in <agent>-heartbeat conversation.
+#[allow(clippy::too_many_arguments)]
 async fn run_heartbeat(
     config: &HeartbeatDaemonConfig,
     agent: &Arc<Mutex<Agent>>,
@@ -3096,6 +3102,7 @@ async fn notify_task_complete(
 }
 
 /// Handle a single connection from a client.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut api: SocketApi,
     agent: Arc<Mutex<Agent>>,

@@ -818,10 +818,12 @@ impl LLM for AnthropicClient {
 }
 
 /// Parse thinking prefix from message content.
+///
 /// Returns (thinking_override, stripped_content):
 /// - "/think ..." → (Some(true), "...")
 /// - "/no_think ..." → (Some(false), "...")
 /// - "..." → (None, "...")
+///
 /// Case-insensitive, trims whitespace after prefix.
 fn parse_thinking_prefix(content: &str) -> (Option<bool>, &str) {
     let content_lower = content.to_lowercase();

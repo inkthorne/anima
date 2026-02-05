@@ -779,6 +779,7 @@ impl ConversationStore {
 
     /// Add a message to a conversation with all optional fields including token tracking.
     /// Returns the message ID.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_message_with_tokens(
         &self,
         conv_name: &str,
@@ -806,6 +807,7 @@ impl ConversationStore {
 
     /// Add a message to a conversation with all optional fields.
     /// Returns the message ID.
+    #[allow(clippy::too_many_arguments)]
     fn add_message_full(
         &self,
         conv_name: &str,
@@ -899,8 +901,10 @@ impl ConversationStore {
     }
 
     /// Get messages for a conversation with filtering options.
+    ///
     /// - `limit`: Return at most N messages (applied after filtering)
     /// - `since_id`: Only return messages with ID > since_id
+    ///
     /// Messages are returned in chronological order (oldest first).
     pub fn get_messages_filtered(
         &self,

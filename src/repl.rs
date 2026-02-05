@@ -435,8 +435,8 @@ impl Repl {
         debug::log(&format!("INPUT: {}", input));
 
         // Check for slash command prefix first
-        if input.starts_with('/') {
-            return self.handle_command(&input[1..]).await;
+        if let Some(cmd) = input.strip_prefix('/') {
+            return self.handle_command(cmd).await;
         }
 
         // Otherwise, treat as conversation with @mentions
@@ -466,8 +466,8 @@ impl Repl {
             self.cmd_status();
         } else if input == "list" {
             self.cmd_list();
-        } else if input.starts_with("clear ") {
-            self.cmd_clear(&input[6..]).await;
+        } else if let Some(name) = input.strip_prefix("clear ") {
+            self.cmd_clear(name).await;
         } else if input == "clear" {
             // Clear with no args - if single connection, clear it
             if self.connections.len() == 1 {

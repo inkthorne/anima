@@ -2543,7 +2543,8 @@ async fn run_agent_task(
             let path = config.memory.path.as_deref().unwrap_or("anima.db");
             Box::new(SqliteMemory::open(path, &config.agent.name)?)
         }
-        "in_memory" | _ => Box::new(InMemoryStore::new()),
+        "in_memory" => Box::new(InMemoryStore::new()),
+        _ => Box::new(InMemoryStore::new()),
     };
 
     // 4. Create agent, register enabled tools

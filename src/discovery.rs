@@ -37,41 +37,39 @@ pub fn discover_daemons() -> Vec<DaemonInfo> {
 
     // Iterate over all directories in the agents directory
     if let Ok(entries) = fs::read_dir(&agents_dir) {
-        for entry in entries {
-            if let Ok(entry) = entry {
-                let agent_dir = entry.path();
+        for entry in entries.flatten() {
+            let agent_dir = entry.path();
 
-                // Skip if not a directory
-                if !agent_dir.is_dir() {
-                    continue;
-                }
+            // Skip if not a directory
+            if !agent_dir.is_dir() {
+                continue;
+            }
 
-                // Get agent name from directory name
-                let name = agent_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
+            // Get agent name from directory name
+            let name = agent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
 
-                // Check for daemon.pid file
-                let pid_file = agent_dir.join("daemon.pid");
-                if pid_file.exists()
-                    && let Ok(pid_content) = fs::read_to_string(&pid_file)
-                    && let Ok(pid) = pid_content.trim().parse::<u32>()
-                {
-                    // Check if process is alive
-                    let is_alive = is_process_alive(pid);
+            // Check for daemon.pid file
+            let pid_file = agent_dir.join("daemon.pid");
+            if pid_file.exists()
+                && let Ok(pid_content) = fs::read_to_string(&pid_file)
+                && let Ok(pid) = pid_content.trim().parse::<u32>()
+            {
+                // Check if process is alive
+                let is_alive = is_process_alive(pid);
 
-                    // Construct socket path
-                    let socket_path = agent_dir.join("agent.sock").to_string_lossy().to_string();
+                // Construct socket path
+                let socket_path = agent_dir.join("agent.sock").to_string_lossy().to_string();
 
-                    daemons.push(DaemonInfo {
-                        name,
-                        pid,
-                        socket_path,
-                        is_alive,
-                    });
-                }
+                daemons.push(DaemonInfo {
+                    name,
+                    pid,
+                    socket_path,
+                    is_alive,
+                });
             }
         }
     }
