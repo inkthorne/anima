@@ -105,7 +105,7 @@ use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
 use crate::tool_registry::{ToolRegistry, ToolDefinition};
-use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
+use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SafeShellTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, is_process_running};
@@ -1352,6 +1352,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(WriteFileTool));
         agent.register_tool(Arc::new(HttpTool::new()));
         agent.register_tool(Arc::new(ShellTool::new()));
+        agent.register_tool(Arc::new(SafeShellTool::new()));
 
         // Register daemon-aware messaging tools
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
