@@ -21,7 +21,7 @@ use tokio::net::UnixStream;
 use crate::agent::strip_thinking;
 use crate::debug;
 use crate::discovery::{self, RunningAgent};
-use crate::socket_api::{SocketApi, Request, Response};
+use crate::socket_api::{Request, Response, SocketApi};
 
 /// Parse @mentions from input text.
 /// Pattern: `@([a-zA-Z][a-zA-Z0-9_-]*)`
@@ -60,7 +60,10 @@ const BANNER_ART: &str = r#"
 
 fn print_banner() {
     println!("{}", BANNER_ART);
-    println!("Interactive REPL v{} (daemon mode) - Type '/help' for commands\n", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Interactive REPL v{} (daemon mode) - Type '/help' for commands\n",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// REPL helper for tab completion
@@ -100,7 +103,7 @@ impl Completer for ReplHelper {
             let cmd_partial = &line[1..pos]; // Skip the leading /
             let slash_commands = [
                 "/start", "/load", "/stop", "/restart", "/create", "/status", "/list", "/clear",
-                "/help", "/quit", "/exit"
+                "/help", "/quit", "/exit",
             ];
 
             for cmd in &slash_commands {
@@ -114,9 +117,12 @@ impl Completer for ReplHelper {
             }
 
             // Complete agent names after commands that use them
-            if line.starts_with("/load ") || line.starts_with("/start ") ||
-               line.starts_with("/stop ") || line.starts_with("/restart ") ||
-               line.starts_with("/clear ") {
+            if line.starts_with("/load ")
+                || line.starts_with("/start ")
+                || line.starts_with("/stop ")
+                || line.starts_with("/restart ")
+                || line.starts_with("/clear ")
+            {
                 for name in &self.agent_names {
                     if name.starts_with(partial) {
                         completions.push(Pair {
@@ -128,8 +134,8 @@ impl Completer for ReplHelper {
             }
         } else {
             // @mentions for conversation
-            if partial.starts_with('@') {
-                let mention_partial = &partial[1..]; // Skip @
+            if let Some(mention_partial) = partial.strip_prefix('@') {
+                // Skip @
 
                 // Add @all option
                 if "all".starts_with(mention_partial) {
@@ -245,10 +251,18 @@ impl Repl {
             for cursor in self.agent_cursors.values_mut() {
                 *cursor = cursor.saturating_sub(trim_count);
             }
-            debug::log(&format!("LOG: trimmed {} entries, {} remain", trim_count, self.conversation_log.len()));
+            debug::log(&format!(
+                "LOG: trimmed {} entries, {} remain",
+                trim_count,
+                self.conversation_log.len()
+            ));
         }
 
-        debug::log(&format!("LOG: {} entries, added from {}", self.conversation_log.len(), sender));
+        debug::log(&format!(
+            "LOG: {} entries, added from {}",
+            self.conversation_log.len(),
+            sender
+        ));
     }
 
     /// Get unseen conversation context for an agent and update their cursor.
@@ -259,7 +273,12 @@ impl Repl {
 
     /// Get conversation context for an agent up to a specific log index.
     /// If update_cursor is true, updates the agent's cursor to the snapshot point.
-    fn get_context_for_agent_up_to(&mut self, agent_name: &str, snapshot: usize, update_cursor: bool) -> String {
+    fn get_context_for_agent_up_to(
+        &mut self,
+        agent_name: &str,
+        snapshot: usize,
+        update_cursor: bool,
+    ) -> String {
         let cursor = self.agent_cursors.get(agent_name).copied().unwrap_or(0);
         let end = snapshot.min(self.conversation_log.len());
         let unseen = &self.conversation_log[cursor..end];
@@ -273,11 +292,15 @@ impl Repl {
         unseen
             .iter()
             .map(|entry| {
-                let escaped = entry.content
+                let escaped = entry
+                    .content
                     .replace('\\', "\\\\")
                     .replace('"', "\\\"")
                     .replace('\n', "\\n");
-                format!("{{\"from\": \"{}\", \"text\": \"{}\"}}", entry.sender, escaped)
+                format!(
+                    "{{\"from\": \"{}\", \"text\": \"{}\"}}",
+                    entry.sender, escaped
+                )
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -297,7 +320,8 @@ impl Repl {
         // Ensure the daemon is running and connect to it
         repl.ensure_daemon_running(&name).await;
         if let Some(agent) = discovery::get_running_agent(&name) {
-            repl.connections.insert(name.clone(), AgentConnection::from_running(&agent));
+            repl.connections
+                .insert(name.clone(), AgentConnection::from_running(&agent));
         }
 
         repl
@@ -323,10 +347,7 @@ impl Repl {
         };
 
         // Start daemon as background process
-        match Command::new(&exe)
-            .args(["start", name])
-            .spawn()
-        {
+        match Command::new(&exe).args(["start", name]).spawn() {
             Ok(_) => {
                 // Wait a bit for daemon to start
                 for _ in 0..20 {
@@ -488,7 +509,8 @@ impl Repl {
                 } else if discovery::is_agent_running(mention) {
                     // Auto-connect to running agent
                     if let Some(agent) = discovery::get_running_agent(mention) {
-                        self.connections.insert(mention.to_string(), AgentConnection::from_running(&agent));
+                        self.connections
+                            .insert(mention.to_string(), AgentConnection::from_running(&agent));
                         println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
                         targets.push(mention.clone());
                     }
@@ -502,11 +524,22 @@ impl Repl {
             if self.connections.len() == 1 {
                 self.connections.keys().cloned().collect()
             } else if self.connections.is_empty() {
-                println!("\x1b[31mNo agents connected. Use /start <name> to connect to an agent.\x1b[0m");
+                println!(
+                    "\x1b[31mNo agents connected. Use /start <name> to connect to an agent.\x1b[0m"
+                );
                 return;
             } else {
-                println!("\x1b[31mMultiple agents connected. Use @name to specify recipient.\x1b[0m");
-                println!("\x1b[33mConnected agents: {}\x1b[0m", self.connections.keys().cloned().collect::<Vec<_>>().join(", "));
+                println!(
+                    "\x1b[31mMultiple agents connected. Use @name to specify recipient.\x1b[0m"
+                );
+                println!(
+                    "\x1b[33mConnected agents: {}\x1b[0m",
+                    self.connections
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
                 return;
             }
         };
@@ -537,7 +570,11 @@ impl Repl {
     async fn send_broadcast_to_daemons(&mut self, agents: &[String]) {
         // Snapshot the current log position BEFORE sending to anyone
         let snapshot = self.conversation_log.len();
-        debug::log(&format!("BROADCAST: snapshot at {} for {} agents", snapshot, agents.len()));
+        debug::log(&format!(
+            "BROADCAST: snapshot at {} for {} agents",
+            snapshot,
+            agents.len()
+        ));
 
         // Collect contexts for all agents using the snapshot (don't update cursors yet)
         let mut contexts: HashMap<String, String> = HashMap::new();
@@ -551,10 +588,12 @@ impl Repl {
         // Send to all agents and collect responses (without logging yet)
         let mut responses: Vec<(String, String)> = Vec::new();
         for agent_name in agents {
-            if let Some(context) = contexts.get(agent_name) {
-                if let Some(response) = self.send_message_to_daemon_no_log(agent_name, context).await {
-                    responses.push((agent_name.clone(), response));
-                }
+            if let Some(context) = contexts.get(agent_name)
+                && let Some(response) = self
+                    .send_message_to_daemon_no_log(agent_name, context)
+                    .await
+            {
+                responses.push((agent_name.clone(), response));
             }
         }
 
@@ -580,7 +619,9 @@ impl Repl {
 
                 // Handle @all in response
                 if mention == "all" {
-                    let others: Vec<String> = self.connections.keys()
+                    let others: Vec<String> = self
+                        .connections
+                        .keys()
                         .filter(|&name| name != &agent_name)
                         .cloned()
                         .collect();
@@ -595,7 +636,8 @@ impl Repl {
                 if !self.connections.contains_key(&mention) {
                     if discovery::is_agent_running(&mention) {
                         if let Some(agent) = discovery::get_running_agent(&mention) {
-                            self.connections.insert(mention.clone(), AgentConnection::from_running(&agent));
+                            self.connections
+                                .insert(mention.clone(), AgentConnection::from_running(&agent));
                             println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
                         } else {
                             continue;
@@ -613,7 +655,11 @@ impl Repl {
 
     /// Send a message to a daemon and return the response without logging it.
     /// Used for broadcast sends where we need to collect all responses before logging.
-    async fn send_message_to_daemon_no_log(&self, agent_name: &str, context: &str) -> Option<String> {
+    async fn send_message_to_daemon_no_log(
+        &self,
+        agent_name: &str,
+        context: &str,
+    ) -> Option<String> {
         let connection = match self.connections.get(agent_name) {
             Some(c) => c.clone(),
             None => {
@@ -625,20 +671,30 @@ impl Repl {
         print!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
         let _ = io::stdout().flush();
         let start = Instant::now();
-        debug::log(&format!("BROADCAST CONV: {} <- context ({} chars)", agent_name, context.len()));
+        debug::log(&format!(
+            "BROADCAST CONV: {} <- context ({} chars)",
+            agent_name,
+            context.len()
+        ));
 
         // Connect to daemon
         let mut api = match connection.connect().await {
             Ok(api) => api,
             Err(e) => {
                 println!("{}", format_elapsed(start.elapsed()));
-                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
+                println!(
+                    "\x1b[31mFailed to connect to '{}': {}\x1b[0m",
+                    agent_name, e
+                );
                 return None;
             }
         };
 
         // Send message request with conversation context
-        let request = Request::Message { content: context.to_string(), conv_name: None };
+        let request = Request::Message {
+            content: context.to_string(),
+            conv_name: None,
+        };
         if let Err(e) = api.write_request(&request).await {
             println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
@@ -650,10 +706,24 @@ impl Repl {
             Ok(Some(Response::Message { content })) => {
                 println!("{}", format_elapsed(start.elapsed()));
                 let stripped = strip_thinking(&content);
-                debug::log(&format!("BROADCAST RESPONSE (raw, {} chars): {}", content.len(),
-                    if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));
-                debug::log(&format!("BROADCAST RESPONSE (stripped, {} chars): {}", stripped.len(),
-                    if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+                debug::log(&format!(
+                    "BROADCAST RESPONSE (raw, {} chars): {}",
+                    content.len(),
+                    if content.len() > 300 {
+                        format!("{}...", &content[..300])
+                    } else {
+                        content.clone()
+                    }
+                ));
+                debug::log(&format!(
+                    "BROADCAST RESPONSE (stripped, {} chars): {}",
+                    stripped.len(),
+                    if stripped.len() > 300 {
+                        format!("{}...", &stripped[..300])
+                    } else {
+                        stripped.clone()
+                    }
+                ));
 
                 println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
                 Some(stripped)
@@ -671,7 +741,10 @@ impl Repl {
                 None
             }
             Err(e) => {
-                println!("\x1b[31mFailed to read response from '{}': {}\x1b[0m", agent_name, e);
+                println!(
+                    "\x1b[31mFailed to read response from '{}': {}\x1b[0m",
+                    agent_name, e
+                );
                 None
             }
         }
@@ -685,14 +758,13 @@ impl Repl {
 
     /// Inner implementation that uses depth limit to prevent runaway loops.
     /// Gets unseen context from conversation_log and updates the agent's cursor.
-    async fn send_message_to_daemon_inner(
-        &mut self,
-        agent_name: &str,
-        depth: u32,
-    ) {
+    async fn send_message_to_daemon_inner(&mut self, agent_name: &str, depth: u32) {
         // Safety limit: stop after 15 hops to prevent runaway loops
         if depth > 15 {
-            debug::log(&format!("DEPTH LIMIT: stopping at depth {} for {}", depth, agent_name));
+            debug::log(&format!(
+                "DEPTH LIMIT: stopping at depth {} for {}",
+                depth, agent_name
+            ));
             return;
         }
         let connection = match self.connections.get(agent_name) {
@@ -713,20 +785,30 @@ impl Repl {
         print!("\x1b[33m[{}]\x1b[0m thinking...", agent_name);
         let _ = io::stdout().flush();
         let start = Instant::now();
-        debug::log(&format!("CONV: {} <- context ({} chars)", agent_name, context.len()));
+        debug::log(&format!(
+            "CONV: {} <- context ({} chars)",
+            agent_name,
+            context.len()
+        ));
 
         // Connect to daemon
         let mut api = match connection.connect().await {
             Ok(api) => api,
             Err(e) => {
                 println!("{}", format_elapsed(start.elapsed()));
-                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", agent_name, e);
+                println!(
+                    "\x1b[31mFailed to connect to '{}': {}\x1b[0m",
+                    agent_name, e
+                );
                 return;
             }
         };
 
         // Send message request with conversation context
-        let request = Request::Message { content: context, conv_name: None };
+        let request = Request::Message {
+            content: context,
+            conv_name: None,
+        };
         if let Err(e) = api.write_request(&request).await {
             println!("{}", format_elapsed(start.elapsed()));
             println!("\x1b[31mFailed to send message: {}\x1b[0m", e);
@@ -738,10 +820,24 @@ impl Repl {
             Ok(Some(Response::Message { content })) => {
                 println!("{}", format_elapsed(start.elapsed()));
                 let stripped = strip_thinking(&content);
-                debug::log(&format!("RESPONSE (raw, {} chars): {}", content.len(),
-                    if content.len() > 300 { format!("{}...", &content[..300]) } else { content.clone() }));
-                debug::log(&format!("RESPONSE (stripped, {} chars): {}", stripped.len(),
-                    if stripped.len() > 300 { format!("{}...", &stripped[..300]) } else { stripped.clone() }));
+                debug::log(&format!(
+                    "RESPONSE (raw, {} chars): {}",
+                    content.len(),
+                    if content.len() > 300 {
+                        format!("{}...", &content[..300])
+                    } else {
+                        content.clone()
+                    }
+                ));
+                debug::log(&format!(
+                    "RESPONSE (stripped, {} chars): {}",
+                    stripped.len(),
+                    if stripped.len() > 300 {
+                        format!("{}...", &stripped[..300])
+                    } else {
+                        stripped.clone()
+                    }
+                ));
 
                 println!("\x1b[33m[{}]\x1b[0m {}", agent_name, stripped);
 
@@ -758,7 +854,9 @@ impl Repl {
 
                     // Handle @all: expand to all connected agents except sender
                     if mention == "all" {
-                        let others: Vec<String> = self.connections.keys()
+                        let others: Vec<String> = self
+                            .connections
+                            .keys()
                             .filter(|&name| name != agent_name)
                             .cloned()
                             .collect();
@@ -774,7 +872,8 @@ impl Repl {
                         if discovery::is_agent_running(&mention) {
                             // Auto-connect to running agent
                             if let Some(agent) = discovery::get_running_agent(&mention) {
-                                self.connections.insert(mention.clone(), AgentConnection::from_running(&agent));
+                                self.connections
+                                    .insert(mention.clone(), AgentConnection::from_running(&agent));
                                 println!("\x1b[32m✓ Connected to '{}'\x1b[0m", mention);
                             } else {
                                 continue;
@@ -799,7 +898,10 @@ impl Repl {
                 println!("\x1b[31mConnection closed by '{}'\x1b[0m", agent_name);
             }
             Err(e) => {
-                println!("\x1b[31mFailed to read response from '{}': {}\x1b[0m", agent_name, e);
+                println!(
+                    "\x1b[31mFailed to read response from '{}': {}\x1b[0m",
+                    agent_name, e
+                );
             }
         }
     }
@@ -821,7 +923,10 @@ impl Repl {
         // Check if agent config exists
         let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
         if !agent_exists {
-            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
+            println!(
+                "\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m",
+                name
+            );
             return;
         }
 
@@ -833,7 +938,8 @@ impl Repl {
 
         // Connect
         if let Some(agent) = discovery::get_running_agent(name) {
-            self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
+            self.connections
+                .insert(name.to_string(), AgentConnection::from_running(&agent));
             println!("\x1b[32m✓ Connected to '{}'\x1b[0m", name);
         } else {
             println!("\x1b[31mFailed to connect to '{}'\x1b[0m", name);
@@ -851,19 +957,23 @@ impl Repl {
         // Check if agent config exists
         let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
         if !agent_exists {
-            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
+            println!(
+                "\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m",
+                name
+            );
             return;
         }
 
         // Check if already running
         if discovery::is_agent_running(name) {
             // Just connect if not already
-            if !self.connections.contains_key(name) {
-                if let Some(agent) = discovery::get_running_agent(name) {
-                    self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
-                    println!("\x1b[32m✓ Connected to already-running '{}'\x1b[0m", name);
-                    return;
-                }
+            if !self.connections.contains_key(name)
+                && let Some(agent) = discovery::get_running_agent(name)
+            {
+                self.connections
+                    .insert(name.to_string(), AgentConnection::from_running(&agent));
+                println!("\x1b[32m✓ Connected to already-running '{}'\x1b[0m", name);
+                return;
             }
             println!("\x1b[33m'{}' is already running\x1b[0m", name);
             return;
@@ -884,7 +994,10 @@ impl Repl {
         // Check if agent config exists
         let agent_exists = discovery::list_saved_agents().contains(&name.to_string());
         if !agent_exists {
-            println!("\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m", name);
+            println!(
+                "\x1b[31mAgent '{}' not found in ~/.anima/agents/\x1b[0m",
+                name
+            );
             return;
         }
 
@@ -893,13 +1006,13 @@ impl Repl {
             println!("Stopping {}...", name);
 
             // Send shutdown request
-            if let Some(socket_path) = discovery::agent_socket_path(name) {
-                if let Ok(stream) = UnixStream::connect(&socket_path).await {
-                    let mut api = SocketApi::new(stream);
-                    let _ = api.write_request(&Request::Shutdown).await;
-                    // Wait for response (brief)
-                    let _ = api.read_response().await;
-                }
+            if let Some(socket_path) = discovery::agent_socket_path(name)
+                && let Ok(stream) = UnixStream::connect(&socket_path).await
+            {
+                let mut api = SocketApi::new(stream);
+                let _ = api.write_request(&Request::Shutdown).await;
+                // Wait for response (brief)
+                let _ = api.read_response().await;
             }
 
             // Remove from connections
@@ -926,7 +1039,8 @@ impl Repl {
 
         // Connect
         if let Some(agent) = discovery::get_running_agent(name) {
-            self.connections.insert(name.to_string(), AgentConnection::from_running(&agent));
+            self.connections
+                .insert(name.to_string(), AgentConnection::from_running(&agent));
             println!("\x1b[32m✓ Connected to '{}'\x1b[0m", name);
         } else {
             println!("\x1b[31mFailed to connect to '{}'\x1b[0m", name);
@@ -951,7 +1065,10 @@ impl Repl {
         let socket_path = match discovery::agent_socket_path(name) {
             Some(p) => p,
             None => {
-                println!("\x1b[31mFailed to determine socket path for '{}'\x1b[0m", name);
+                println!(
+                    "\x1b[31mFailed to determine socket path for '{}'\x1b[0m",
+                    name
+                );
                 return;
             }
         };
@@ -1028,7 +1145,9 @@ impl Repl {
         let running = discovery::discover_running_agents();
 
         if self.connections.is_empty() && running.is_empty() {
-            println!("\x1b[33mNo agents connected or running. Use /start <name> to connect.\x1b[0m");
+            println!(
+                "\x1b[33mNo agents connected or running. Use /start <name> to connect.\x1b[0m"
+            );
             return;
         }
 
@@ -1042,7 +1161,8 @@ impl Repl {
         }
 
         // Show running but not connected
-        let not_connected: Vec<_> = running.iter()
+        let not_connected: Vec<_> = running
+            .iter()
             .filter(|a| !self.connections.contains_key(&a.name))
             .collect();
 
@@ -1062,29 +1182,32 @@ impl Repl {
             Some(c) => c,
             None => {
                 // Try to connect if running
-                if discovery::is_agent_running(name) {
-                    if let Some(socket_path) = discovery::agent_socket_path(name) {
-                        match UnixStream::connect(&socket_path).await {
-                            Ok(stream) => {
-                                let mut api = SocketApi::new(stream);
-                                if let Err(e) = api.write_request(&Request::Clear).await {
-                                    println!("\x1b[31mFailed to send clear: {}\x1b[0m", e);
-                                    return;
-                                }
-                                match api.read_response().await {
-                                    Ok(Some(Response::Ok)) => {
-                                        println!("\x1b[32m✓ Cleared history for '{}'\x1b[0m", name);
-                                    }
-                                    _ => {
-                                        println!("\x1b[31mFailed to clear history for '{}'\x1b[0m", name);
-                                    }
-                                }
+                if discovery::is_agent_running(name)
+                    && let Some(socket_path) = discovery::agent_socket_path(name)
+                {
+                    match UnixStream::connect(&socket_path).await {
+                        Ok(stream) => {
+                            let mut api = SocketApi::new(stream);
+                            if let Err(e) = api.write_request(&Request::Clear).await {
+                                println!("\x1b[31mFailed to send clear: {}\x1b[0m", e);
                                 return;
                             }
-                            Err(e) => {
-                                println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", name, e);
-                                return;
+                            match api.read_response().await {
+                                Ok(Some(Response::Ok)) => {
+                                    println!("\x1b[32m✓ Cleared history for '{}'\x1b[0m", name);
+                                }
+                                _ => {
+                                    println!(
+                                        "\x1b[31mFailed to clear history for '{}'\x1b[0m",
+                                        name
+                                    );
+                                }
                             }
+                            return;
+                        }
+                        Err(e) => {
+                            println!("\x1b[31mFailed to connect to '{}': {}\x1b[0m", name, e);
+                            return;
                         }
                     }
                 }
@@ -1170,7 +1293,9 @@ impl Repl {
         println!();
         println!("  \x1b[36m@name message\x1b[0m      Send message to specific agent");
         println!("  \x1b[36m@all message\x1b[0m       Send to all connected agents");
-        println!("  \x1b[36mmessage\x1b[0m            Send to single connected agent (if only one)");
+        println!(
+            "  \x1b[36mmessage\x1b[0m            Send to single connected agent (if only one)"
+        );
         println!();
         println!("\x1b[1mAgent Management:\x1b[0m");
         println!();
@@ -1380,7 +1505,10 @@ mod tests {
 
         // First time getting context for gendry - should get full log
         let context = repl.get_context_for_agent("gendry");
-        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@arya hello\"}\n{\"from\": \"arya\", \"text\": \"hey there!\"}");
+        assert_eq!(
+            context,
+            "{\"from\": \"user\", \"text\": \"@arya hello\"}\n{\"from\": \"arya\", \"text\": \"hey there!\"}"
+        );
         assert_eq!(repl.agent_cursors.get("gendry"), Some(&2));
     }
 
@@ -1400,7 +1528,10 @@ mod tests {
 
         // arya should only see the new messages
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}");
+        assert_eq!(
+            context,
+            "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}"
+        );
         assert_eq!(repl.agent_cursors.get("arya"), Some(&3));
     }
 
@@ -1436,7 +1567,10 @@ mod tests {
 
         // arya receives only new messages
         let context = repl.get_context_for_agent("arya");
-        assert_eq!(context, "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}");
+        assert_eq!(
+            context,
+            "{\"from\": \"arya\", \"text\": \"hey there!\"}\n{\"from\": \"user\", \"text\": \"@arya ask gendry\"}"
+        );
 
         // arya responds: "@gendry what do you think?"
         repl.log_message("arya", "@gendry what do you think?");
@@ -1459,13 +1593,19 @@ mod tests {
 
         // Get context for arya with snapshot, don't update cursor
         let arya_context = repl.get_context_for_agent_up_to("arya", snapshot, false);
-        assert_eq!(arya_context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        assert_eq!(
+            arya_context,
+            "{\"from\": \"user\", \"text\": \"@all hello everyone\"}"
+        );
         // Cursor should NOT be updated
         assert_eq!(repl.agent_cursors.get("arya"), None);
 
         // Get context for gendry with snapshot, don't update cursor
         let gendry_context = repl.get_context_for_agent_up_to("gendry", snapshot, false);
-        assert_eq!(gendry_context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        assert_eq!(
+            gendry_context,
+            "{\"from\": \"user\", \"text\": \"@all hello everyone\"}"
+        );
         // Cursor should NOT be updated
         assert_eq!(repl.agent_cursors.get("gendry"), None);
 
@@ -1482,7 +1622,10 @@ mod tests {
 
         // Get context with cursor update
         let context = repl.get_context_for_agent_up_to("arya", snapshot, true);
-        assert_eq!(context, "{\"from\": \"user\", \"text\": \"@all hello everyone\"}");
+        assert_eq!(
+            context,
+            "{\"from\": \"user\", \"text\": \"@all hello everyone\"}"
+        );
         // Cursor SHOULD be updated
         assert_eq!(repl.agent_cursors.get("arya"), Some(&1));
     }
@@ -1505,15 +1648,24 @@ mod tests {
 
         // Even after arya's response is logged, gendry's snapshot context
         // should NOT include arya's response
-        assert_eq!(arya_context, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}");
-        assert_eq!(gendry_context, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}");
+        assert_eq!(
+            arya_context,
+            "{\"from\": \"user\", \"text\": \"@all what do you think?\"}"
+        );
+        assert_eq!(
+            gendry_context,
+            "{\"from\": \"user\", \"text\": \"@all what do you think?\"}"
+        );
 
         // Both got exactly the same context
         assert_eq!(arya_context, gendry_context);
 
         // Now if we get fresh context for gendry (without snapshot), it would include arya's response
         let gendry_fresh = repl.get_context_for_agent("gendry");
-        assert_eq!(gendry_fresh, "{\"from\": \"user\", \"text\": \"@all what do you think?\"}\n{\"from\": \"arya\", \"text\": \"I think it's great!\"}");
+        assert_eq!(
+            gendry_fresh,
+            "{\"from\": \"user\", \"text\": \"@all what do you think?\"}\n{\"from\": \"arya\", \"text\": \"I think it's great!\"}"
+        );
     }
 
     #[test]

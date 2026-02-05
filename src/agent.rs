@@ -6,17 +6,17 @@ use std::time::Instant;
 use regex::Regex;
 
 use crate::error::ToolError;
-use crate::tool::Tool;
-use crate::message::Message;
+use crate::llm::{ChatMessage, LLM, LLMError, ToolSpec};
 use crate::memory::{Memory, MemoryError};
-use crate::llm::{LLM, ChatMessage, ToolSpec, LLMError};
-use crate::observe::{Observer, Event};
-use crate::retry::{RetryPolicy, with_retry};
+use crate::message::Message;
 use crate::messaging::{AgentMessage, MessageRouter, MessagingError};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use crate::observe::{Event, Observer};
+use crate::retry::{RetryPolicy, with_retry};
+use crate::supervision::{ChildConfig, ChildHandle, ChildStatus};
+use crate::tool::Tool;
 use serde_json::Value;
-use crate::supervision::{ChildHandle, ChildConfig, ChildStatus};
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
 /// Strip thinking tags from LLM response content for conversation history storage.
@@ -26,7 +26,7 @@ pub fn strip_thinking(content: &str) -> String {
     // First, remove complete think blocks
     let re = Regex::new(r"(?si)<think(?:ing)?>.*?</think(?:ing)?>").unwrap();
     let result = re.replace_all(content, "");
-    
+
     // Then remove any stray opening or closing tags
     let stray_tags = Regex::new(r"(?i)</?\s*think(?:ing)?\s*/?>").unwrap();
     stray_tags.replace_all(&result, "").trim().to_string()
@@ -38,21 +38,33 @@ fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) 
     match tool_name {
         "write_file" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let bytes = params.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            let bytes = params
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.len())
+                .unwrap_or(0);
             Some(format!("path={} bytes={}", path, bytes))
         }
         "read_file" => {
             let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let bytes = result.and_then(|r| r.get("content")).and_then(|v| v.as_str()).map(|s| s.len());
+            let bytes = result
+                .and_then(|r| r.get("content"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.len());
             match bytes {
                 Some(b) => Some(format!("path={} bytes={}", path, b)),
                 None => Some(format!("path={}", path)),
             }
         }
         "shell" | "safe_shell" => {
-            let cmd = params.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+            let cmd = params
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let cmd_short = if cmd.len() > 40 { &cmd[..40] } else { cmd };
-            let exit_code = result.and_then(|r| r.get("exit_code")).and_then(|v| v.as_i64());
+            let exit_code = result
+                .and_then(|r| r.get("exit_code"))
+                .and_then(|v| v.as_i64());
             match exit_code {
                 Some(code) => Some(format!("cmd='{}' exit={}", cmd_short, code)),
                 None => Some(format!("cmd='{}'", cmd_short)),
@@ -60,12 +72,19 @@ fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) 
         }
         "http" => {
             let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("?");
-            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let method = params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET");
             Some(format!("{} {}", method.to_uppercase(), url))
         }
         "remember" => {
             let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            let preview = if content.len() > 50 { &content[..50] } else { content };
+            let preview = if content.len() > 50 {
+                &content[..50]
+            } else {
+                content
+            };
             Some(format!("'{}'", preview))
         }
         _ => None, // No special summary for other tools
@@ -125,7 +144,9 @@ pub struct ReflectionConfig {
 impl Default for ReflectionConfig {
     fn default() -> Self {
         Self {
-            prompt: String::from("Evaluate your response. Is it complete and correct? If not, explain what needs to change."),
+            prompt: String::from(
+                "Evaluate your response. Is it complete and correct? If not, explain what needs to change.",
+            ),
             max_revisions: 1,
         }
     }
@@ -267,12 +288,10 @@ impl Agent {
         let start = Instant::now();
 
         if let Some(tool) = self.tools.get(name) {
-            let input_value: Value =
-                serde_json::from_str(input).map_err(|e| {
-                    let err = ToolError::InvalidInput(e.to_string());
-                    // Note: We can't emit here since it's sync context within map_err
-                    err
-                })?;
+            let input_value: Value = serde_json::from_str(input).map_err(|e| {
+                // Note: We can't emit here since it's sync context within map_err
+                ToolError::InvalidInput(e.to_string())
+            })?;
 
             let result = (*tool).execute(input_value.clone()).await;
             let duration_ms = start.elapsed().as_millis() as u64;
@@ -287,7 +306,8 @@ impl Agent {
                         error: None,
                         params: Some(input_value),
                         result_summary: summary,
-                    }).await;
+                    })
+                    .await;
                     Ok(val.to_string())
                 }
                 Err(e) => {
@@ -298,7 +318,8 @@ impl Agent {
                         error: Some(e.to_string()),
                         params: Some(input_value),
                         result_summary: None,
-                    }).await;
+                    })
+                    .await;
                     result.map(|v| v.to_string())
                 }
             }
@@ -311,7 +332,8 @@ impl Agent {
                 error: Some(err.to_string()),
                 params: None,
                 result_summary: None,
-            }).await;
+            })
+            .await;
             Err(err)
         }
     }
@@ -406,7 +428,9 @@ impl Agent {
         }
 
         // Wait for the reply
-        rx.await.map(|m| m.content).map_err(|_| MessagingError::ChannelClosed)
+        rx.await
+            .map(|m| m.content)
+            .map_err(|_| MessagingError::ChannelClosed)
     }
 
     /// Receive the next message (non-blocking)
@@ -424,14 +448,21 @@ impl Agent {
         timeout: std::time::Duration,
     ) -> Option<AgentMessage> {
         if let Some(rx) = &mut self.message_rx {
-            tokio::time::timeout(timeout, rx.recv()).await.ok().flatten()
+            tokio::time::timeout(timeout, rx.recv())
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         }
     }
 
     /// Reply to a message (used for request-response pattern)
-    pub async fn reply_to(&self, original: &AgentMessage, content: &str) -> Result<(), MessagingError> {
+    pub async fn reply_to(
+        &self,
+        original: &AgentMessage,
+        content: &str,
+    ) -> Result<(), MessagingError> {
         let router = self.router.as_ref().ok_or(MessagingError::NotRegistered)?;
 
         if let Some(reply_id) = &original.reply_to {
@@ -481,7 +512,11 @@ impl Agent {
         }
     }
 
-    pub async fn remember(&mut self, key: &str, value: serde_json::Value) -> Result<(), MemoryError> {
+    pub async fn remember(
+        &mut self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> Result<(), MemoryError> {
         match &mut self.memory {
             Some(mem) => mem.set(key, value).await,
             None => Err(MemoryError::StorageError("No memory attached".to_string())),
@@ -495,19 +530,22 @@ impl Agent {
         }
     }
 
-pub async fn forget(&mut self, key: &str) -> bool {
-          match &mut self.memory {
-              Some(mem) => mem.delete(key).await,
-              None => false,
-          }
-      }
+    pub async fn forget(&mut self, key: &str) -> bool {
+        match &mut self.memory {
+            Some(mem) => mem.delete(key).await,
+            None => false,
+        }
+    }
 
     pub fn list_tools_for_llm(&self) -> Vec<ToolSpec> {
-        self.tools.values().map(|t| ToolSpec {
-            name: t.name().to_string(),
-            description: t.description().to_string(),
-            parameters: t.schema(),
-        }).collect()
+        self.tools
+            .values()
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                parameters: t.schema(),
+            })
+            .collect()
     }
 
     /// Build memory context string for auto-injection into thinking
@@ -586,7 +624,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
         // Create turns/ directory if it doesn't exist
         let turns_dir = agent_dir.join("turns");
         if let Err(e) = std::fs::create_dir_all(&turns_dir) {
-            eprintln!("[agent:{}] Failed to create turns directory: {}", self.id, e);
+            eprintln!(
+                "[agent:{}] Failed to create turns directory: {}",
+                self.id, e
+            );
             return;
         }
 
@@ -599,38 +640,46 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let file_path = turns_dir.join(format!("{}.json", conv_name));
 
         // Get model name from LLM if available
-        let model = self.llm.as_ref()
+        let model = self
+            .llm
+            .as_ref()
             .map(|l| l.model_name().to_string())
             .unwrap_or_else(|| "unknown".to_string());
 
         // Format messages for Ollama API (tool_calls arguments as objects, not strings)
-        let formatted_messages: Vec<serde_json::Value> = messages.iter().map(|msg| {
-            let mut formatted = serde_json::json!({
-                "role": msg.role,
-            });
-            if let Some(ref content) = msg.content {
-                formatted["content"] = serde_json::Value::String(content.clone());
-            }
-            if let Some(ref tool_call_id) = msg.tool_call_id {
-                formatted["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
-            }
-            if let Some(ref tool_calls) = msg.tool_calls {
-                if !tool_calls.is_empty() {
-                    let formatted_tool_calls: Vec<serde_json::Value> = tool_calls.iter().map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments  // Object, not string (Ollama native format)
-                            }
+        let formatted_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|msg| {
+                let mut formatted = serde_json::json!({
+                    "role": msg.role,
+                });
+                if let Some(ref content) = msg.content {
+                    formatted["content"] = serde_json::Value::String(content.clone());
+                }
+                if let Some(ref tool_call_id) = msg.tool_call_id {
+                    formatted["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
+                }
+                if let Some(ref tool_calls) = msg.tool_calls
+                    && !tool_calls.is_empty()
+                {
+                    let formatted_tool_calls: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments  // Object, not string (Ollama native format)
+                                }
+                            })
                         })
-                    }).collect();
+                        .collect();
                     formatted["tool_calls"] = serde_json::Value::Array(formatted_tool_calls);
                 }
-            }
-            formatted
-        }).collect();
+                formatted
+            })
+            .collect();
 
         // Build request body matching Ollama /api/chat format
         let mut request_body = serde_json::json!({
@@ -640,9 +689,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
         });
 
         // Add tools if present (Ollama format)
-        if let Some(tool_list) = tools {
-            if !tool_list.is_empty() {
-                let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
+        if let Some(tool_list) = tools
+            && !tool_list.is_empty()
+        {
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
                     serde_json::json!({
                         "type": "function",
                         "function": {
@@ -651,15 +703,15 @@ pub async fn forget(&mut self, key: &str) -> bool {
                             "parameters": t.parameters
                         }
                     })
-                }).collect();
-                request_body["tools"] = serde_json::Value::Array(formatted_tools);
-                request_body["tool_choice"] = serde_json::json!("auto");
-            }
+                })
+                .collect();
+            request_body["tools"] = serde_json::Value::Array(formatted_tools);
+            request_body["tool_choice"] = serde_json::json!("auto");
         }
 
         // Write pretty-printed JSON for readability while maintaining valid JSON
-        let content = serde_json::to_string_pretty(&request_body)
-            .unwrap_or_else(|_| "{}".to_string());
+        let content =
+            serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "{}".to_string());
 
         // Write to file (best-effort, don't fail the agent on IO errors)
         if let Err(e) = std::fs::write(&file_path, content) {
@@ -667,14 +719,19 @@ pub async fn forget(&mut self, key: &str) -> bool {
         }
     }
 
-    pub async fn think_with_options(&mut self, task: &str, options: ThinkOptions) -> Result<ThinkResult, crate::error::AgentError> {
+    pub async fn think_with_options(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+    ) -> Result<ThinkResult, crate::error::AgentError> {
         let agent_start = Instant::now();
 
         // Emit agent start event
         self.emit(Event::AgentStart {
             agent_id: self.id.clone(),
             task: task.to_string(),
-        }).await;
+        })
+        .await;
 
         let result = self.think_with_options_inner(task, options).await;
 
@@ -684,20 +741,26 @@ pub async fn forget(&mut self, key: &str) -> bool {
             agent_id: self.id.clone(),
             duration_ms,
             success: result.is_ok(),
-        }).await;
+        })
+        .await;
 
         if let Err(ref e) = result {
             self.emit(Event::Error {
                 context: format!("agent:{}", self.id),
                 message: e.to_string(),
-            }).await;
+            })
+            .await;
         }
 
         result
     }
 
     /// Inner implementation of think_with_options (without event wrapper).
-    async fn think_with_options_inner(&mut self, task: &str, options: ThinkOptions) -> Result<ThinkResult, crate::error::AgentError> {
+    async fn think_with_options_inner(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+    ) -> Result<ThinkResult, crate::error::AgentError> {
         // Drain any pending messages from inbox (must happen before borrowing llm)
         let pending_messages = self.drain_inbox();
         let effective_task = if pending_messages.is_empty() {
@@ -708,16 +771,28 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}", inbox_text, task)
+            format!(
+                "You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}",
+                inbox_text, task
+            )
         };
 
-        let llm = self.llm.as_ref().ok_or_else(||
-            crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let llm = self
+            .llm
+            .as_ref()
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
         // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
+        let tools_list = options
+            .external_tools
+            .clone()
+            .unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
+            None
+        } else {
+            Some(tools_list)
+        };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -820,25 +895,30 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         async move { llm.chat_complete(m, t).await }
                     },
                     |e: &LLMError| e.is_retryable,
-                ).await;
+                )
+                .await;
 
                 // Emit retry events if attempts > 1
-                if result.attempts > 1 {
-                    if let Some(obs) = &observer {
-                        for attempt in 1..result.attempts {
-                            let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
-                            obs.observe(Event::Retry {
-                                operation: "llm_call".to_string(),
-                                attempt,
-                                delay_ms,
-                            }).await;
-                        }
+                if result.attempts > 1
+                    && let Some(obs) = &observer
+                {
+                    for attempt in 1..result.attempts {
+                        let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
+                        obs.observe(Event::Retry {
+                            operation: "llm_call".to_string(),
+                            attempt,
+                            delay_ms,
+                        })
+                        .await;
                     }
                 }
 
-                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+                result
+                    .result
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete(messages.clone(), tools.clone()).await
+                llm.chat_complete(messages.clone(), tools.clone())
+                    .await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
 
@@ -849,7 +929,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
                 tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
                 duration_ms: llm_duration_ms,
-            }).await;
+            })
+            .await;
 
             // Accumulate token usage
             if let Some(ref usage) = response.usage {
@@ -860,7 +941,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
-                let final_response = response.content.unwrap_or_else(|| "No response".to_string());
+                let final_response = response
+                    .content
+                    .unwrap_or_else(|| "No response".to_string());
 
                 // Add final assistant response to internal history (strip thinking tags)
                 let stripped_response = strip_thinking(&final_response);
@@ -876,20 +959,25 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
                 // Apply reflection if configured
                 if let Some(ref config) = options.reflection {
-                    let reflected_response = self.reflect_and_revise(
-                        task,
-                        &final_response,
-                        config,
-                        &options,
-                    ).await?;
+                    let reflected_response = self
+                        .reflect_and_revise(task, &final_response, config, &options)
+                        .await?;
                     return Ok(ThinkResult {
                         response: reflected_response,
                         tools_used: !tool_names_used.is_empty(),
                         tool_names: tool_names_used,
                         last_tool_calls,
                         tool_trace,
-                        tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
-                        tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
+                        tokens_in: if has_token_data {
+                            Some(total_tokens_in)
+                        } else {
+                            None
+                        },
+                        tokens_out: if has_token_data {
+                            Some(total_tokens_out)
+                        } else {
+                            None
+                        },
                     });
                 }
 
@@ -899,8 +987,16 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     tool_names: tool_names_used,
                     last_tool_calls,
                     tool_trace,
-                    tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
-                    tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
+                    tokens_in: if has_token_data {
+                        Some(total_tokens_in)
+                    } else {
+                        None
+                    },
+                    tokens_out: if has_token_data {
+                        Some(total_tokens_out)
+                    } else {
+                        None
+                    },
                 });
             }
 
@@ -924,7 +1020,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 // Track tool name
                 tool_names_used.push(tool_call.name.clone());
 
-                let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
+                let result = self
+                    .call_tool(&tool_call.name, &tool_call.arguments.to_string())
+                    .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
                 // Record tool execution for persistence
@@ -949,7 +1047,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
         // Trim history even on error path
         self.trim_history();
 
-        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
+        Err(crate::error::AgentError::MaxIterationsExceeded(
+            options.max_iterations,
+        ))
     }
 
     pub async fn think(&mut self, task: &str) -> Result<ThinkResult, crate::error::AgentError> {
@@ -964,7 +1064,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
         task: &str,
         token_tx: mpsc::Sender<String>,
     ) -> Result<String, crate::error::AgentError> {
-        self.think_streaming_with_options(task, ThinkOptions::default(), token_tx).await
+        self.think_streaming_with_options(task, ThinkOptions::default(), token_tx)
+            .await
     }
 
     /// Think with streaming output and custom options.
@@ -980,9 +1081,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
         self.emit(Event::AgentStart {
             agent_id: self.id.clone(),
             task: task.to_string(),
-        }).await;
+        })
+        .await;
 
-        let result = self.think_streaming_with_options_inner(task, options, token_tx).await;
+        let result = self
+            .think_streaming_with_options_inner(task, options, token_tx)
+            .await;
 
         // Emit agent complete event
         let duration_ms = agent_start.elapsed().as_millis() as u64;
@@ -990,13 +1094,15 @@ pub async fn forget(&mut self, key: &str) -> bool {
             agent_id: self.id.clone(),
             duration_ms,
             success: result.is_ok(),
-        }).await;
+        })
+        .await;
 
         if let Err(ref e) = result {
             self.emit(Event::Error {
                 context: format!("agent:{}", self.id),
                 message: e.to_string(),
-            }).await;
+            })
+            .await;
         }
 
         result
@@ -1019,16 +1125,28 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}", inbox_text, task)
+            format!(
+                "You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}",
+                inbox_text, task
+            )
         };
 
-        let llm = self.llm.as_ref().ok_or_else(||
-            crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let llm = self
+            .llm
+            .as_ref()
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
         // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
+        let tools_list = options
+            .external_tools
+            .clone()
+            .unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
+            None
+        } else {
+            Some(tools_list)
+        };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -1122,29 +1240,31 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         async move { llm.chat_complete_stream(m, t, tx_clone).await }
                     },
                     |e: &LLMError| e.is_retryable,
-                ).await;
+                )
+                .await;
 
                 // Emit retry events if attempts > 1
-                if result.attempts > 1 {
-                    if let Some(obs) = &observer {
-                        for attempt in 1..result.attempts {
-                            let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
-                            obs.observe(Event::Retry {
-                                operation: "llm_call_stream".to_string(),
-                                attempt,
-                                delay_ms,
-                            }).await;
-                        }
+                if result.attempts > 1
+                    && let Some(obs) = &observer
+                {
+                    for attempt in 1..result.attempts {
+                        let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
+                        obs.observe(Event::Retry {
+                            operation: "llm_call_stream".to_string(),
+                            attempt,
+                            delay_ms,
+                        })
+                        .await;
                     }
                 }
 
-                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+                result
+                    .result
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete_stream(
-                    messages.clone(),
-                    tools.clone(),
-                    token_tx.clone(),
-                ).await.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+                llm.chat_complete_stream(messages.clone(), tools.clone(), token_tx.clone())
+                    .await
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
 
             // Emit LLM call event
@@ -1154,11 +1274,14 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
                 tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
                 duration_ms: llm_duration_ms,
-            }).await;
+            })
+            .await;
 
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
-                let final_response = response.content.unwrap_or_else(|| "No response".to_string());
+                let final_response = response
+                    .content
+                    .unwrap_or_else(|| "No response".to_string());
 
                 // Add final assistant response to internal history (strip thinking tags)
                 let stripped_response = strip_thinking(&final_response);
@@ -1189,7 +1312,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
             // Execute each tool and add results
             for tool_call in &response.tool_calls {
-                let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
+                let result = self
+                    .call_tool(&tool_call.name, &tool_call.arguments.to_string())
+                    .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
                 let tool_message = ChatMessage {
@@ -1208,7 +1333,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
         // Trim history even on error path
         self.trim_history();
 
-        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
+        Err(crate::error::AgentError::MaxIterationsExceeded(
+            options.max_iterations,
+        ))
     }
 
     /// Reflect on a response and potentially revise it
@@ -1220,25 +1347,27 @@ pub async fn forget(&mut self, key: &str) -> bool {
         options: &ThinkOptions,
     ) -> Result<String, crate::error::AgentError> {
         let mut current_response = response.to_string();
-        
+
         for _revision in 0..config.max_revisions {
             // Clone LLM for this scope to avoid borrow issues
-            let llm = self.llm.clone().ok_or_else(|| 
-                crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-            
+            let llm = self
+                .llm
+                .clone()
+                .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+
             // Ask LLM to reflect on the response
             let reflection_prompt = format!(
                 "{}\n\nOriginal task: {}\n\nResponse to evaluate:\n{}\n\nRespond with either:\n- ACCEPTED: if the response is complete and correct\n- REVISE: <feedback> if changes are needed",
                 config.prompt, original_task, current_response
             );
-            
+
             let reflection_messages = vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(reflection_prompt),
                 tool_call_id: None,
                 tool_calls: None,
             }];
-            
+
             // Call with retry if policy configured
             let reflection = if let Some(ref policy) = options.retry_policy {
                 let llm_ref = llm.clone();
@@ -1251,33 +1380,37 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         async move { llm.chat_complete(m, None).await }
                     },
                     |e: &LLMError| e.is_retryable,
-                ).await;
-                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+                )
+                .await;
+                result
+                    .result
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete(reflection_messages, None).await
+                llm.chat_complete(reflection_messages, None)
+                    .await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
-            
+
             let reflection_text = reflection.content.unwrap_or_default();
-            
+
             // Parse reflection result
             if reflection_text.to_uppercase().starts_with("ACCEPTED") {
                 return Ok(current_response);
             }
-            
+
             // Extract feedback and revise
             let feedback = if reflection_text.to_uppercase().starts_with("REVISE:") {
                 reflection_text[7..].trim().to_string()
             } else {
                 reflection_text.clone()
             };
-            
+
             // Generate revised response
             let revision_prompt = format!(
                 "Original task: {}\n\nYour previous response:\n{}\n\nFeedback:\n{}\n\nPlease provide an improved response.",
                 original_task, current_response, feedback
             );
-            
+
             let revision_options = ThinkOptions {
                 max_iterations: options.max_iterations,
                 system_prompt: options.system_prompt.clone(),
@@ -1289,27 +1422,38 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 conversation_history: options.conversation_history.clone(),
                 external_tools: options.external_tools.clone(),
             };
-            
-            current_response = self.run_agentic_loop(&revision_prompt, &revision_options).await?;
+
+            current_response = self
+                .run_agentic_loop(&revision_prompt, &revision_options)
+                .await?;
         }
-        
+
         // Return final response after max revisions
         Ok(current_response)
     }
-    
+
     /// Core agentic loop extracted for reuse
     async fn run_agentic_loop(
         &mut self,
         task: &str,
         options: &ThinkOptions,
     ) -> Result<String, crate::error::AgentError> {
-        let llm = self.llm.as_ref().ok_or_else(||
-            crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let llm = self
+            .llm
+            .as_ref()
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
         // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options.external_tools.clone().unwrap_or_else(|| self.list_tools_for_llm());
+        let tools_list = options
+            .external_tools
+            .clone()
+            .unwrap_or_else(|| self.list_tools_for_llm());
         // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() { None } else { Some(tools_list) };
+        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
+            None
+        } else {
+            Some(tools_list)
+        };
 
         // Build auto-memory context if configured
         let memory_context = self.build_memory_context(&options.auto_memory).await;
@@ -1365,15 +1509,21 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         async move { llm.chat_complete(m, t).await }
                     },
                     |e: &LLMError| e.is_retryable,
-                ).await;
-                result.result.map_err(|e| crate::error::AgentError::LlmError(e.message))?
+                )
+                .await;
+                result
+                    .result
+                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             } else {
-                llm.chat_complete(messages.clone(), tools.clone()).await
+                llm.chat_complete(messages.clone(), tools.clone())
+                    .await
                     .map_err(|e| crate::error::AgentError::LlmError(e.message))?
             };
 
             if response.tool_calls.is_empty() {
-                return Ok(response.content.unwrap_or_else(|| "No response".to_string()));
+                return Ok(response
+                    .content
+                    .unwrap_or_else(|| "No response".to_string()));
             }
 
             messages.push(ChatMessage {
@@ -1384,7 +1534,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
             });
 
             for tool_call in &response.tool_calls {
-                let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
+                let result = self
+                    .call_tool(&tool_call.name, &tool_call.arguments.to_string())
+                    .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
                 messages.push(ChatMessage {
@@ -1396,7 +1548,9 @@ pub async fn forget(&mut self, key: &str) -> bool {
             }
         }
 
-        Err(crate::error::AgentError::MaxIterationsExceeded(options.max_iterations))
+        Err(crate::error::AgentError::MaxIterationsExceeded(
+            options.max_iterations,
+        ))
     }
 
     /// Helper to create a child agent with cloned tools/LLM/observer
@@ -1416,17 +1570,17 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         Agent {
             id: child_id,
-            tools: parent.tools.clone(),  // Arc clones are cheap
+            tools: parent.tools.clone(), // Arc clones are cheap
             inbox: rx,
             memory: None,
-            llm: parent.llm.clone(),  // Arc clone
+            llm: parent.llm.clone(), // Arc clone
             children: std::collections::HashMap::new(),
-            observer: parent.observer.clone(),  // Inherit observer
+            observer: parent.observer.clone(), // Inherit observer
             message_rx,
             router,
-            history: Vec::new(),  // Child starts with fresh history
-            agent_dir: parent.agent_dir.clone(),  // Inherit agent_dir for context dumps
-            current_conversation: parent.current_conversation.clone(),  // Inherit conversation context
+            history: Vec::new(), // Child starts with fresh history
+            agent_dir: parent.agent_dir.clone(), // Inherit agent_dir for context dumps
+            current_conversation: parent.current_conversation.clone(), // Inherit conversation context
         }
     }
 
@@ -1454,9 +1608,11 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
     /// Wait for a specific child to complete
     pub async fn wait_for_child(&mut self, child_id: &str) -> Result<String, String> {
-        let handle = self.children.get_mut(child_id)
+        let handle = self
+            .children
+            .get_mut(child_id)
             .ok_or_else(|| format!("Child {} not found", child_id))?;
-        
+
         if let Some(rx) = handle.result_rx.take() {
             match rx.await {
                 Ok(Ok(result)) => {
@@ -1500,8 +1656,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{AddTool, EchoTool};
     use crate::memory::InMemoryStore;
+    use crate::tools::{AddTool, EchoTool};
     use serde_json::json;
 
     fn create_test_agent(id: &str) -> Agent {
@@ -1595,7 +1751,10 @@ mod tests {
         let mut agent = create_test_agent("test-agent");
         agent.register_tool(Arc::new(EchoTool));
 
-        let result = agent.call_tool("echo", r#"{"message": "hello"}"#).await.unwrap();
+        let result = agent
+            .call_tool("echo", r#"{"message": "hello"}"#)
+            .await
+            .unwrap();
         assert!(result.contains("hello"));
     }
 
@@ -1803,7 +1962,10 @@ mod tests {
 
         // Create 5 memories
         for i in 0..5 {
-            agent.remember(&format!("key{}", i), json!(i)).await.unwrap();
+            agent
+                .remember(&format!("key{}", i), json!(i))
+                .await
+                .unwrap();
         }
 
         // Limit to 2 entries
@@ -1826,7 +1988,10 @@ mod tests {
         let mut agent = agent.with_memory(memory);
 
         agent.remember("user:name", json!("Bob")).await.unwrap();
-        agent.remember("user:email", json!("bob@example.com")).await.unwrap();
+        agent
+            .remember("user:email", json!("bob@example.com"))
+            .await
+            .unwrap();
         agent.remember("config:theme", json!("dark")).await.unwrap();
 
         // Only get user: prefixed keys
@@ -1856,7 +2021,9 @@ mod tests {
     #[tokio::test]
     async fn test_think_with_options_without_llm() {
         let mut agent = create_test_agent("test-agent");
-        let result = agent.think_with_options("do something", ThinkOptions::default()).await;
+        let result = agent
+            .think_with_options("do something", ThinkOptions::default())
+            .await;
         assert!(matches!(result, Err(crate::error::AgentError::LlmError(_))));
     }
 
@@ -1923,7 +2090,9 @@ mod tests {
         agent.register_tool(Arc::new(AddTool));
 
         // Call tool with invalid input
-        let _ = agent.call_tool("add", r#"{"a": "not a number", "b": 3}"#).await;
+        let _ = agent
+            .call_tool("add", r#"{"a": "not a number", "b": 3}"#)
+            .await;
 
         let snapshot = observer.snapshot();
         assert_eq!(snapshot.tool_calls, 1);
@@ -1955,8 +2124,7 @@ mod tests {
             let mut router_guard = router.lock().await;
             router_guard.register(id)
         };
-        Agent::new(id.to_string(), rx)
-            .with_router_and_rx(router, message_rx)
+        Agent::new(id.to_string(), rx).with_router_and_rx(router, message_rx)
     }
 
     #[tokio::test]
@@ -1966,7 +2134,10 @@ mod tests {
         let mut agent2 = create_test_agent_with_router("agent-2", router.clone()).await;
 
         // Agent 1 sends message to Agent 2
-        agent1.send_message("agent-2", "hello from agent 1").await.unwrap();
+        agent1
+            .send_message("agent-2", "hello from agent 1")
+            .await
+            .unwrap();
 
         // Agent 2 receives the message
         let msg = agent2.receive_message().await;
@@ -2045,17 +2216,16 @@ mod tests {
         // Spawn a task to handle the request
         let handle = tokio::spawn(async move {
             // Wait for the message
-            let msg = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                async {
-                    loop {
-                        if let Some(m) = agent2.receive_message().await {
-                            return m;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if let Some(m) = agent2.receive_message().await {
+                        return m;
                     }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-            ).await.unwrap();
+            })
+            .await
+            .unwrap();
 
             assert_eq!(msg.content, "what is 2+2?");
             assert!(msg.reply_to.is_some());
@@ -2077,7 +2247,9 @@ mod tests {
         let mut agent = create_test_agent_with_router("agent-1", router.clone()).await;
 
         // Should timeout since no messages
-        let msg = agent.receive_message_timeout(std::time::Duration::from_millis(50)).await;
+        let msg = agent
+            .receive_message_timeout(std::time::Duration::from_millis(50))
+            .await;
         assert!(msg.is_none());
     }
 
@@ -2094,7 +2266,9 @@ mod tests {
         });
 
         // Should receive the message within timeout
-        let msg = agent2.receive_message_timeout(std::time::Duration::from_secs(1)).await;
+        let msg = agent2
+            .receive_message_timeout(std::time::Duration::from_secs(1))
+            .await;
         assert!(msg.is_some());
         assert_eq!(msg.unwrap().content, "hello");
     }
@@ -2136,7 +2310,8 @@ mod tests {
 
     #[test]
     fn test_strip_thinking_multiple_blocks() {
-        let input = "<think>first thought</think>Some text<thinking>second thought</thinking>More text";
+        let input =
+            "<think>first thought</think>Some text<thinking>second thought</thinking>More text";
         let result = strip_thinking(input);
         assert_eq!(result, "Some textMore text");
     }
@@ -2249,7 +2424,10 @@ mod tests {
 
         // Verify order: system prompt at index 0
         assert_eq!(messages[0].role, "system");
-        assert_eq!(messages[0].content.as_ref().unwrap(), "You are a helpful assistant.");
+        assert_eq!(
+            messages[0].content.as_ref().unwrap(),
+            "You are a helpful assistant."
+        );
 
         // History at indices 1 and 2
         assert_eq!(messages[1].role, "user");
@@ -2316,7 +2494,12 @@ mod tests {
         // Count how many messages contain always_content
         let always_count = messages_turn_2
             .iter()
-            .filter(|m| m.content.as_ref().map(|c| c.contains(always_content)).unwrap_or(false))
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map(|c| c.contains(always_content))
+                    .unwrap_or(false)
+            })
             .count();
 
         // Should appear exactly once (prepended to the current user message only)
@@ -2328,8 +2511,20 @@ mod tests {
         // Verify the always prompt is prepended to the last user message
         let last_msg = &messages_turn_2[messages_turn_2.len() - 1];
         assert_eq!(last_msg.role, "user");
-        assert!(last_msg.content.as_ref().unwrap().starts_with(always_content));
-        assert!(last_msg.content.as_ref().unwrap().ends_with("Second question"));
+        assert!(
+            last_msg
+                .content
+                .as_ref()
+                .unwrap()
+                .starts_with(always_content)
+        );
+        assert!(
+            last_msg
+                .content
+                .as_ref()
+                .unwrap()
+                .ends_with("Second question")
+        );
     }
 
     /// Test 3: Verify backward compatibility when always.md is not configured or missing.

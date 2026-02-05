@@ -95,9 +95,9 @@ impl EmbeddingClient {
         let floats: Result<Vec<f32>, _> = embedding
             .iter()
             .map(|v| {
-                v.as_f64()
-                    .map(|f| f as f32)
-                    .ok_or_else(|| EmbeddingError::ParseError("Invalid float in embedding".to_string()))
+                v.as_f64().map(|f| f as f32).ok_or_else(|| {
+                    EmbeddingError::ParseError("Invalid float in embedding".to_string())
+                })
             })
             .collect();
 

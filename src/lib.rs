@@ -22,18 +22,34 @@ pub mod tool_registry;
 pub mod tools;
 
 // Re-export main types for convenience
-pub use agent::{Agent, ThinkOptions, ThinkResult, ToolExecution, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
+pub use agent::{
+    Agent, AutoMemoryConfig, ReflectionConfig, ReflectionResult, ThinkOptions, ThinkResult,
+    ToolExecution,
+};
+pub use conversation::{
+    Conversation, ConversationError, ConversationMessage, ConversationStore, NotifyResult,
+    Participant, PendingNotification, expand_all_mention, generate_fun_name,
+    notify_mentioned_agents, notify_mentioned_agents_fire_and_forget,
+    notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned, parse_mentions,
+};
 pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
-pub use error::{AgentError, ToolError, ErrorContext};
-pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory, SemanticMemoryStore, SemanticMemoryEntry, SaveResult, extract_remember_tags, build_memory_injection, format_age};
+pub use error::{AgentError, ErrorContext, ToolError};
+pub use llm::{
+    AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient, OpenAIClient, ToolCall,
+    ToolSpec, UsageInfo, strip_thinking_tags,
+};
+pub use memory::{
+    InMemoryStore, Memory, MemoryEntry, MemoryError, SaveResult, SemanticMemoryEntry,
+    SemanticMemoryStore, SqliteMemory, build_memory_injection, extract_remember_tags, format_age,
+};
 pub use message::Message;
-pub use messaging::{AgentMessage, AgentMailbox, MessageRouter, MessagingError};
-pub use observe::{Observer, Event, ConsoleObserver, MetricsCollector, MetricsSnapshot, MultiObserver};
+pub use messaging::{AgentMailbox, AgentMessage, MessageRouter, MessagingError};
+pub use observe::{
+    ConsoleObserver, Event, MetricsCollector, MetricsSnapshot, MultiObserver, Observer,
+};
 pub use retry::{RetryPolicy, RetryResult, with_retry};
 pub use runtime::Runtime;
+pub use supervision::{ChildConfig, ChildHandle, ChildStatus};
 pub use tool::{Tool, ToolInfo};
-pub use tools::{SendMessageTool, ListAgentsTool};
-pub use llm::{LLM, ChatMessage, ToolSpec, ToolCall, LLMResponse, LLMError, OpenAIClient, AnthropicClient, OllamaClient, UsageInfo, strip_thinking_tags};
-pub use supervision::{ChildHandle, ChildConfig, ChildStatus};
-pub use tool_registry::{ToolRegistry, ToolDefinition, ToolRegistryError};
-pub use conversation::{ConversationStore, Conversation, ConversationMessage, Participant, PendingNotification, ConversationError, generate_fun_name, parse_mentions, expand_all_mention, notify_mentioned_agents, notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned, notify_mentioned_agents_fire_and_forget, NotifyResult};
+pub use tool_registry::{ToolDefinition, ToolRegistry, ToolRegistryError};
+pub use tools::{ListAgentsTool, SendMessageTool};

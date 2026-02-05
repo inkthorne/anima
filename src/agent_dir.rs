@@ -107,8 +107,7 @@ fn default_semantic_memory_path() -> String {
 }
 
 fn default_embedding_url() -> String {
-    std::env::var("OLLAMA_HOST")
-        .unwrap_or_else(|_| "http://localhost:11434".to_string())
+    std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
 
 /// Configuration for embedding-based semantic search.
@@ -194,11 +193,11 @@ impl AgentDir {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, AgentDirError> {
         let path = path.as_ref().to_path_buf();
         let config_path = path.join("config.toml");
-        
+
         if !config_path.exists() {
             return Err(AgentDirError::ConfigNotFound(config_path));
         }
-        
+
         let content = std::fs::read_to_string(&config_path)?;
         let config: AgentDirConfig = toml::from_str(&content)?;
         Ok(Self { path, config })
@@ -209,14 +208,14 @@ impl AgentDir {
     pub fn expand_env_vars(s: &str) -> Result<String, AgentDirError> {
         let re = Regex::new(r"\$\{([^}]+)\}").unwrap();
         let mut result = s.to_string();
-        
+
         for cap in re.captures_iter(s) {
             let var_name = &cap[1];
             let value = std::env::var(var_name)
                 .map_err(|_| AgentDirError::EnvVarNotSet(var_name.to_string()))?;
             result = result.replace(&cap[0], &value);
         }
-        
+
         Ok(result)
     }
 
@@ -256,7 +255,11 @@ impl AgentDir {
         if agent_always_path.exists() {
             let content = std::fs::read_to_string(&agent_always_path)?;
             let mut seen = HashSet::new();
-            seen.insert(agent_always_path.canonicalize().unwrap_or(agent_always_path));
+            seen.insert(
+                agent_always_path
+                    .canonicalize()
+                    .unwrap_or(agent_always_path),
+            );
             let expanded = self.expand_includes(&content, &mut seen)?;
             return Ok(Some(expanded));
         }
@@ -310,7 +313,8 @@ impl AgentDir {
                 .map_err(|_| AgentDirError::IncludeNotFound(include_path))?;
 
             // Recursively expand includes in the included content
-            let expanded_include = Self::expand_includes_with_base(&include_content, base_path, seen)?;
+            let expanded_include =
+                Self::expand_includes_with_base(&include_content, base_path, seen)?;
 
             result = result.replace(&full_match, &expanded_include);
         }
@@ -401,36 +405,48 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
     // Apply overrides from agent config on top of base (model file or direct config)
     // For model_file case: agent's llm_section values override model file values
     // For direct config case: just use the values directly
-    let provider = llm_section.provider.clone()
+    let provider = llm_section
+        .provider
+        .clone()
         .or(base_config.provider.clone())
         .ok_or_else(|| AgentDirError::ModelFileMissingField {
             field: "provider".to_string(),
-            path: llm_section.model_file.as_ref()
+            path: llm_section
+                .model_file
+                .as_ref()
                 .map(|n| models_dir().join(format!("{}.toml", n)))
                 .unwrap_or_default(),
         })?;
 
-    let model = llm_section.model.clone()
+    let model = llm_section
+        .model
+        .clone()
         .or(base_config.model.clone())
         .ok_or_else(|| AgentDirError::ModelFileMissingField {
             field: "model".to_string(),
-            path: llm_section.model_file.as_ref()
+            path: llm_section
+                .model_file
+                .as_ref()
                 .map(|n| models_dir().join(format!("{}.toml", n)))
                 .unwrap_or_default(),
         })?;
 
     // For optional fields, agent config overrides model file
     let api_key = llm_section.api_key.clone().or(base_config.api_key.clone());
-    let base_url = llm_section.base_url.clone().or(base_config.base_url.clone());
+    let base_url = llm_section
+        .base_url
+        .clone()
+        .or(base_config.base_url.clone());
     let thinking = llm_section.thinking.or(base_config.thinking);
     let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
     let always = llm_section.always.clone().or(base_config.always.clone());
-    let allowed_tools = llm_section.allowed_tools.clone().or(base_config.allowed_tools.clone());
+    let allowed_tools = llm_section
+        .allowed_tools
+        .clone()
+        .or(base_config.allowed_tools.clone());
 
     // tools: agent override takes precedence, then model file, then default true
-    let tools = llm_section.tools
-        .or(base_config.tools)
-        .unwrap_or(true);
+    let tools = llm_section.tools.or(base_config.tools).unwrap_or(true);
 
     Ok(ResolvedLlmConfig {
         provider,
@@ -464,7 +480,8 @@ pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirErr
     std::fs::create_dir_all(&agent_path)?;
 
     // Write config.toml template
-    let config_content = format!(r#"[agent]
+    let config_content = format!(
+        r#"[agent]
 name = "{name}"
 system_file = "system.md"
 always_file = "always.md"
@@ -482,11 +499,13 @@ path = "memory.db"
 # enabled = true
 # interval = "5m"
 # message = "Heartbeat — check for anything interesting"
-"#);
+"#
+    );
     std::fs::write(agent_path.join("config.toml"), config_content)?;
 
     // Write system.md template
-    let system_content = format!(r#"# {name}
+    let system_content = format!(
+        r#"# {name}
 
 You are {name}, an AI agent running in the Anima runtime.
 
@@ -507,7 +526,8 @@ You have access to tools for:
 - Think step by step before acting
 - Use tools when needed to accomplish tasks
 - Be proactive about using your memory to track important information
-"#);
+"#
+    );
     std::fs::write(agent_path.join("system.md"), system_content)?;
 
     // Write always.md template
@@ -541,7 +561,11 @@ Only @mentions actually reach the other agent.
 "#;
     std::fs::write(agent_path.join("always.md"), always_content)?;
 
-    println!("\x1b[32m✓ Created agent '{}' at {}\x1b[0m", name, agent_path.display());
+    println!(
+        "\x1b[32m✓ Created agent '{}' at {}\x1b[0m",
+        name,
+        agent_path.display()
+    );
     println!();
     println!("  Files created:");
     println!("    \x1b[36mconfig.toml\x1b[0m  — agent configuration");
@@ -848,11 +872,7 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(
-            dir.path().join("system.md"),
-            "{{include:nonexistent.md}}",
-        )
-        .unwrap();
+        fs::write(dir.path().join("system.md"), "{{include:nonexistent.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let result = agent_dir.load_system();
@@ -914,7 +934,11 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("system.md"), "Plain content with no includes.").unwrap();
+        fs::write(
+            dir.path().join("system.md"),
+            "Plain content with no includes.",
+        )
+        .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let system_prompt = agent_dir.load_system().unwrap().unwrap();
@@ -1082,7 +1106,11 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("my_always.md"), "Agent-specific always content").unwrap();
+        fs::write(
+            dir.path().join("my_always.md"),
+            "Agent-specific always content",
+        )
+        .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let always = agent_dir.load_always().unwrap();
@@ -1134,7 +1162,11 @@ model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
         // Agent-specific always.md
-        fs::write(agent_dir_path.path().join("always.md"), "Agent-specific always").unwrap();
+        fs::write(
+            agent_dir_path.path().join("always.md"),
+            "Agent-specific always",
+        )
+        .unwrap();
 
         // Override HOME temporarily
         let original_home = std::env::var("HOME").ok();
@@ -1242,7 +1274,11 @@ model = "gpt-4"
         let global_always_dir = fake_home.path().join(".anima").join("agents");
         fs::create_dir_all(&global_always_dir).unwrap();
         // Shared file that agents can include
-        fs::write(global_always_dir.join("shared-tools.md"), "Tool instructions here").unwrap();
+        fs::write(
+            global_always_dir.join("shared-tools.md"),
+            "Tool instructions here",
+        )
+        .unwrap();
 
         // Create agent directory with always.md that includes the shared file
         let agent_dir_path = tempdir().unwrap();
@@ -1259,7 +1295,10 @@ model = "gpt-4"
         let global_path = global_always_dir.join("shared-tools.md");
         fs::write(
             agent_dir_path.path().join("always.md"),
-            format!("Agent header\n{{{{include:{}}}}}\nAgent footer", global_path.display()),
+            format!(
+                "Agent header\n{{{{include:{}}}}}\nAgent footer",
+                global_path.display()
+            ),
         )
         .unwrap();
 
@@ -1267,7 +1306,10 @@ model = "gpt-4"
         let always = agent_dir.load_always().unwrap();
 
         // Includes should be expanded
-        assert_eq!(always, Some("Agent header\nTool instructions here\nAgent footer".to_string()));
+        assert_eq!(
+            always,
+            Some("Agent header\nTool instructions here\nAgent footer".to_string())
+        );
     }
 
     // =========================================================================
@@ -1483,7 +1525,10 @@ model_file = "incomplete"
             None => unsafe { std::env::remove_var("HOME") },
         }
 
-        assert!(matches!(result, Err(AgentDirError::ModelFileMissingField { .. })));
+        assert!(matches!(
+            result,
+            Err(AgentDirError::ModelFileMissingField { .. })
+        ));
     }
 
     /// Test: Partial overrides - only specified fields are overridden
@@ -1537,7 +1582,10 @@ num_ctx = 65536
         assert_eq!(resolved.model, "gemma3:27b");
         assert_eq!(resolved.tools, false);
         assert_eq!(resolved.thinking, Some(true));
-        assert_eq!(resolved.base_url, Some("http://localhost:11434".to_string()));
+        assert_eq!(
+            resolved.base_url,
+            Some("http://localhost:11434".to_string())
+        );
 
         // Only this field was overridden
         assert_eq!(resolved.num_ctx, Some(65536));

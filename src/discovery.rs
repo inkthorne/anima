@@ -55,24 +55,22 @@ pub fn discover_daemons() -> Vec<DaemonInfo> {
 
                 // Check for daemon.pid file
                 let pid_file = agent_dir.join("daemon.pid");
-                if pid_file.exists() {
-                    if let Ok(pid_content) = fs::read_to_string(&pid_file) {
-                        if let Ok(pid) = pid_content.trim().parse::<u32>() {
-                            // Check if process is alive
-                            let is_alive = is_process_alive(pid);
+                if pid_file.exists()
+                    && let Ok(pid_content) = fs::read_to_string(&pid_file)
+                    && let Ok(pid) = pid_content.trim().parse::<u32>()
+                {
+                    // Check if process is alive
+                    let is_alive = is_process_alive(pid);
 
-                            // Construct socket path
-                            let socket_path =
-                                agent_dir.join("agent.sock").to_string_lossy().to_string();
+                    // Construct socket path
+                    let socket_path = agent_dir.join("agent.sock").to_string_lossy().to_string();
 
-                            daemons.push(DaemonInfo {
-                                name,
-                                pid,
-                                socket_path,
-                                is_alive,
-                            });
-                        }
-                    }
+                    daemons.push(DaemonInfo {
+                        name,
+                        pid,
+                        socket_path,
+                        is_alive,
+                    });
                 }
             }
         }
@@ -106,10 +104,10 @@ pub fn is_agent_running(name: &str) -> bool {
     if !pid_file.exists() {
         return false;
     }
-    if let Ok(content) = fs::read_to_string(&pid_file) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return is_process_alive(pid);
-        }
+    if let Ok(content) = fs::read_to_string(&pid_file)
+        && let Ok(pid) = content.trim().parse::<u32>()
+    {
+        return is_process_alive(pid);
     }
     false
 }
@@ -181,10 +179,7 @@ pub fn match_agents(pattern: &str) -> Vec<String> {
         Err(_) => return vec![],
     };
 
-    agents
-        .into_iter()
-        .filter(|a| regex.is_match(a))
-        .collect()
+    agents.into_iter().filter(|a| regex.is_match(a)).collect()
 }
 
 #[cfg(unix)]

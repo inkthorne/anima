@@ -1,11 +1,11 @@
 use crate::agent::Agent;
-use crate::message::Message;
 use crate::memory::Memory;
+use crate::message::Message;
 use crate::messaging::MessageRouter;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 pub struct Runtime {
     agents: HashMap<String, Agent>,
@@ -13,6 +13,12 @@ pub struct Runtime {
     parent_map: HashMap<String, String>,
     /// Message router for agent-to-agent communication
     router: Arc<Mutex<MessageRouter>>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Runtime {
@@ -40,14 +46,17 @@ impl Runtime {
             router.register(&id)
         };
 
-        let agent = Agent::new(id.clone(), rx)
-            .with_router_and_rx(self.router.clone(), message_rx);
+        let agent = Agent::new(id.clone(), rx).with_router_and_rx(self.router.clone(), message_rx);
         self.agents.insert(id.clone(), agent);
         self.agents.remove(&id).unwrap()
     }
 
     /// Spawn a new agent with the given ID and memory (auto-registers with message router)
-    pub async fn spawn_agent_with_memory(&mut self, id: String, memory: Box<dyn Memory>) -> &mut Agent {
+    pub async fn spawn_agent_with_memory(
+        &mut self,
+        id: String,
+        memory: Box<dyn Memory>,
+    ) -> &mut Agent {
         let (tx, rx) = mpsc::channel::<Message>(32);
 
         // Register with message router
@@ -106,7 +115,8 @@ impl Runtime {
 
     /// Get the children of an agent
     pub fn get_children(&self, agent_id: &str) -> Vec<&str> {
-        self.parent_map.iter()
+        self.parent_map
+            .iter()
             .filter(|(_, parent)| *parent == agent_id)
             .map(|(child, _)| child.as_str())
             .collect()
@@ -135,12 +145,13 @@ impl Runtime {
 
     /// Terminate all children of an agent (recursive)
     pub async fn terminate_children(&mut self, parent_id: &str) {
-        let children: Vec<String> = self.parent_map
+        let children: Vec<String> = self
+            .parent_map
             .iter()
             .filter(|(_, p)| *p == parent_id)
             .map(|(c, _)| c.clone())
             .collect();
-        
+
         for child_id in children {
             Box::pin(self.terminate_children(&child_id)).await; // Recursive
             self.terminate_child(&child_id).await;

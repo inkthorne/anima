@@ -10,10 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug, Clone, Serialize)]
 pub enum Event {
     /// Agent started processing a task
-    AgentStart {
-        agent_id: String,
-        task: String,
-    },
+    AgentStart { agent_id: String, task: String },
     /// Agent completed a task
     AgentComplete {
         agent_id: String,
@@ -45,10 +42,7 @@ pub enum Event {
         delay_ms: u64,
     },
     /// Error occurred
-    Error {
-        context: String,
-        message: String,
-    },
+    Error { context: String, message: String },
 }
 
 /// Trait for observability backends.
@@ -83,13 +77,22 @@ impl Observer for ConsoleObserver {
                     eprintln!("[AGENT] {} starting: {}", agent_id, truncate(task, 50));
                 }
             }
-            Event::AgentComplete { agent_id, duration_ms, success } => {
+            Event::AgentComplete {
+                agent_id,
+                duration_ms,
+                success,
+            } => {
                 if self.verbose || !success {
                     let status = if *success { "completed" } else { "failed" };
                     eprintln!("[AGENT] {} {} in {}ms", agent_id, status, duration_ms);
                 }
             }
-            Event::LlmCall { model, tokens_in, tokens_out, duration_ms } => {
+            Event::LlmCall {
+                model,
+                tokens_in,
+                tokens_out,
+                duration_ms,
+            } => {
                 if self.verbose {
                     let tokens = match (tokens_in, tokens_out) {
                         (Some(i), Some(o)) => format!(" ({}→{} tokens)", i, o),
@@ -98,20 +101,40 @@ impl Observer for ConsoleObserver {
                     eprintln!("[LLM] {} call took {}ms{}", model, duration_ms, tokens);
                 }
             }
-            Event::ToolCall { tool_name, duration_ms, success, error, result_summary, .. } => {
+            Event::ToolCall {
+                tool_name,
+                duration_ms,
+                success,
+                error,
+                result_summary,
+                ..
+            } => {
                 if self.verbose || !success {
                     let status = if *success {
                         "ok".to_string()
                     } else {
                         format!("error: {}", error.as_deref().unwrap_or("unknown"))
                     };
-                    let summary = result_summary.as_deref().map(|s| format!(" {}", s)).unwrap_or_default();
-                    eprintln!("[TOOL] {} {}{} ({}ms)", tool_name, status, summary, duration_ms);
+                    let summary = result_summary
+                        .as_deref()
+                        .map(|s| format!(" {}", s))
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[TOOL] {} {}{} ({}ms)",
+                        tool_name, status, summary, duration_ms
+                    );
                 }
             }
-            Event::Retry { operation, attempt, delay_ms } => {
+            Event::Retry {
+                operation,
+                attempt,
+                delay_ms,
+            } => {
                 if self.verbose {
-                    eprintln!("[RETRY] {} attempt {} after {}ms", operation, attempt, delay_ms);
+                    eprintln!(
+                        "[RETRY] {} attempt {} after {}ms",
+                        operation, attempt, delay_ms
+                    );
                 }
             }
             Event::Error { context, message } => {
@@ -177,7 +200,12 @@ impl Default for MetricsCollector {
 impl Observer for MetricsCollector {
     async fn observe(&self, event: Event) {
         match event {
-            Event::LlmCall { tokens_in, tokens_out, duration_ms, .. } => {
+            Event::LlmCall {
+                tokens_in,
+                tokens_out,
+                duration_ms,
+                ..
+            } => {
                 self.llm_calls.fetch_add(1, Ordering::Relaxed);
                 self.llm_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
                 if let Some(t_in) = tokens_in {
@@ -187,7 +215,11 @@ impl Observer for MetricsCollector {
                     self.total_tokens.fetch_add(t_out as u64, Ordering::Relaxed);
                 }
             }
-            Event::ToolCall { duration_ms, success, .. } => {
+            Event::ToolCall {
+                duration_ms,
+                success,
+                ..
+            } => {
                 self.tool_calls.fetch_add(1, Ordering::Relaxed);
                 self.tool_time_ms.fetch_add(duration_ms, Ordering::Relaxed);
                 if !success {
@@ -237,33 +269,68 @@ impl Observer for AgentLoggerObserver {
     async fn observe(&self, event: Event) {
         match &event {
             Event::AgentStart { agent_id: _, task } => {
-                self.logger.log(&format!("Agent starting: {}", truncate(task, 80)));
+                self.logger
+                    .log(&format!("Agent starting: {}", truncate(task, 80)));
             }
-            Event::AgentComplete { agent_id: _, duration_ms, success } => {
+            Event::AgentComplete {
+                agent_id: _,
+                duration_ms,
+                success,
+            } => {
                 let status = if *success { "completed" } else { "failed" };
-                self.logger.log(&format!("Agent {} in {}ms", status, duration_ms));
+                self.logger
+                    .log(&format!("Agent {} in {}ms", status, duration_ms));
             }
-            Event::LlmCall { model, tokens_in, tokens_out, duration_ms } => {
+            Event::LlmCall {
+                model,
+                tokens_in,
+                tokens_out,
+                duration_ms,
+            } => {
                 let tokens = match (tokens_in, tokens_out) {
                     (Some(i), Some(o)) => format!(" ({}→{} tokens)", i, o),
                     _ => String::new(),
                 };
-                self.logger.log(&format!("LLM {} call took {}ms{}", model, duration_ms, tokens));
+                self.logger.log(&format!(
+                    "LLM {} call took {}ms{}",
+                    model, duration_ms, tokens
+                ));
             }
-            Event::ToolCall { tool_name, duration_ms, success, error, result_summary, .. } => {
+            Event::ToolCall {
+                tool_name,
+                duration_ms,
+                success,
+                error,
+                result_summary,
+                ..
+            } => {
                 let status = if *success {
                     "ok".to_string()
                 } else {
                     format!("error: {}", error.as_deref().unwrap_or("unknown"))
                 };
-                let summary = result_summary.as_deref().map(|s| format!(" {}", s)).unwrap_or_default();
-                self.logger.tool(&format!("{} {}{} ({}ms)", tool_name, status, summary, duration_ms));
+                let summary = result_summary
+                    .as_deref()
+                    .map(|s| format!(" {}", s))
+                    .unwrap_or_default();
+                self.logger.tool(&format!(
+                    "{} {}{} ({}ms)",
+                    tool_name, status, summary, duration_ms
+                ));
             }
-            Event::Retry { operation, attempt, delay_ms } => {
-                self.logger.log(&format!("[retry] {} attempt {} after {}ms", operation, attempt, delay_ms));
+            Event::Retry {
+                operation,
+                attempt,
+                delay_ms,
+            } => {
+                self.logger.log(&format!(
+                    "[retry] {} attempt {} after {}ms",
+                    operation, attempt, delay_ms
+                ));
             }
             Event::Error { context, message } => {
-                self.logger.log(&format!("[error] {}: {}", context, message));
+                self.logger
+                    .log(&format!("[error] {}: {}", context, message));
             }
         }
     }
@@ -372,36 +439,44 @@ mod tests {
     async fn test_metrics_collector_counts() {
         let collector = MetricsCollector::new();
 
-        collector.observe(Event::LlmCall {
-            model: "test".to_string(),
-            tokens_in: Some(100),
-            tokens_out: Some(50),
-            duration_ms: 500,
-        }).await;
+        collector
+            .observe(Event::LlmCall {
+                model: "test".to_string(),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                duration_ms: 500,
+            })
+            .await;
 
-        collector.observe(Event::ToolCall {
-            tool_name: "echo".to_string(),
-            duration_ms: 10,
-            success: true,
-            error: None,
-            params: None,
-            result_summary: None,
-        }).await;
+        collector
+            .observe(Event::ToolCall {
+                tool_name: "echo".to_string(),
+                duration_ms: 10,
+                success: true,
+                error: None,
+                params: None,
+                result_summary: None,
+            })
+            .await;
 
-        collector.observe(Event::ToolCall {
-            tool_name: "add".to_string(),
-            duration_ms: 5,
-            success: false,
-            error: Some("failed".to_string()),
-            params: None,
-            result_summary: None,
-        }).await;
+        collector
+            .observe(Event::ToolCall {
+                tool_name: "add".to_string(),
+                duration_ms: 5,
+                success: false,
+                error: Some("failed".to_string()),
+                params: None,
+                result_summary: None,
+            })
+            .await;
 
-        collector.observe(Event::Retry {
-            operation: "llm".to_string(),
-            attempt: 1,
-            delay_ms: 100,
-        }).await;
+        collector
+            .observe(Event::Retry {
+                operation: "llm".to_string(),
+                attempt: 1,
+                delay_ms: 100,
+            })
+            .await;
 
         let snapshot = collector.snapshot();
         assert_eq!(snapshot.llm_calls, 1);
@@ -417,29 +492,37 @@ mod tests {
     async fn test_console_observer_verbose() {
         // Just ensure it doesn't panic
         let observer = ConsoleObserver::new(true);
-        observer.observe(Event::AgentStart {
-            agent_id: "test".to_string(),
-            task: "do something".to_string(),
-        }).await;
-        observer.observe(Event::AgentComplete {
-            agent_id: "test".to_string(),
-            duration_ms: 100,
-            success: true,
-        }).await;
+        observer
+            .observe(Event::AgentStart {
+                agent_id: "test".to_string(),
+                task: "do something".to_string(),
+            })
+            .await;
+        observer
+            .observe(Event::AgentComplete {
+                agent_id: "test".to_string(),
+                duration_ms: 100,
+                success: true,
+            })
+            .await;
     }
 
     #[tokio::test]
     async fn test_console_observer_non_verbose() {
         let observer = ConsoleObserver::new(false);
         // In non-verbose mode, only errors and completions print
-        observer.observe(Event::AgentStart {
-            agent_id: "test".to_string(),
-            task: "do something".to_string(),
-        }).await;
-        observer.observe(Event::Error {
-            context: "test".to_string(),
-            message: "something went wrong".to_string(),
-        }).await;
+        observer
+            .observe(Event::AgentStart {
+                agent_id: "test".to_string(),
+                task: "do something".to_string(),
+            })
+            .await;
+        observer
+            .observe(Event::Error {
+                context: "test".to_string(),
+                message: "something went wrong".to_string(),
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -448,12 +531,14 @@ mod tests {
         let metrics2 = Arc::new(MetricsCollector::new());
         let multi = MultiObserver::new(vec![metrics1.clone(), metrics2.clone()]);
 
-        multi.observe(Event::LlmCall {
-            model: "test".to_string(),
-            tokens_in: Some(10),
-            tokens_out: Some(20),
-            duration_ms: 100,
-        }).await;
+        multi
+            .observe(Event::LlmCall {
+                model: "test".to_string(),
+                tokens_in: Some(10),
+                tokens_out: Some(20),
+                duration_ms: 100,
+            })
+            .await;
 
         // Both collectors should have recorded the event
         assert_eq!(metrics1.snapshot().llm_calls, 1);

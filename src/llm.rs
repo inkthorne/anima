@@ -27,39 +27,45 @@ pub trait LLM: Send + Sync {
 
 /// Format tool calls for OpenAI-compatible API (arguments as JSON string)
 fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
-    tool_calls.iter().map(|tc| {
-        serde_json::json!({
-            "id": tc.id,
-            "type": "function",
-            "function": {
-                "name": tc.name,
-                "arguments": tc.arguments.to_string()
-            }
+    tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": tc.arguments.to_string()
+                }
+            })
         })
-    }).collect()
+        .collect()
 }
 
 /// Format tool calls for native Ollama API (arguments as object, not string)
 fn format_tool_calls_for_ollama(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
-    tool_calls.iter().map(|tc| {
-        serde_json::json!({
-            "id": tc.id,
-            "type": "function",
-            "function": {
-                "name": tc.name,
-                "arguments": tc.arguments
-            }
+    tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.name,
+                    "arguments": tc.arguments
+                }
+            })
         })
-    }).collect()
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
-    pub role: String,      // "system", "user", "assistant", "tool"
+    pub role: String, // "system", "user", "assistant", "tool"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,  // For tool responses
+    pub tool_call_id: Option<String>, // For tool responses
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
@@ -68,7 +74,7 @@ pub struct ChatMessage {
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
-    pub parameters: Value,  // OpenAI uses parameters instead of input_schema
+    pub parameters: Value, // OpenAI uses parameters instead of input_schema
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,11 +245,12 @@ impl LLM for OpenAIClient {
         let mut formatted_messages = Vec::new();
         for message in messages {
             let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls {
-                if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
-                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
-                }
+            if let Some(tool_calls) = message.tool_calls
+                && !tool_calls.is_empty()
+            {
+                let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                formatted_message["tool_calls"] =
+                    serde_json::to_value(formatted_tool_calls).unwrap();
             }
             formatted_messages.push(formatted_message);
         }
@@ -253,20 +260,23 @@ impl LLM for OpenAIClient {
             "messages": formatted_messages
         });
 
-         if let Some(tool_list) = tools {
-             let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                 serde_json::json!({
-                     "type": "function",
-                     "function": {
-                         "name": t.name,
-                         "description": t.description,
-                         "parameters": t.parameters
-                     }
-                 })
-             }).collect();
-             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
-             request_body["tool_choice"] = serde_json::json!("auto");
-         }
+        if let Some(tool_list) = tools {
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
+                })
+                .collect();
+            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
 
         let response = self
             .client
@@ -283,13 +293,10 @@ impl LLM for OpenAIClient {
 
         let status = response.status().as_u16();
 
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| {
-                // Read errors are retryable
-                LLMError::retryable(format!("Failed to read response: {}", e))
-            })?;
+        let response_text = response.text().await.map_err(|e| {
+            // Read errors are retryable
+            LLMError::retryable(format!("Failed to read response: {}", e))
+        })?;
 
         // Check for HTTP errors before parsing
         if status >= 400 {
@@ -299,8 +306,8 @@ impl LLM for OpenAIClient {
             ));
         }
 
-        let openai_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| {
+        let openai_response: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|e| {
                 // Parse errors are not retryable
                 LLMError::permanent(format!("Failed to parse response: {}", e))
             })?;
@@ -309,26 +316,36 @@ impl LLM for OpenAIClient {
             .as_str()
             .map(|s| s.to_string());
 
-         let tool_calls = openai_response["choices"][0]["message"]["tool_calls"]
-             .as_array()
-             .map(|tool_calls_array| {
-                 tool_calls_array
-                     .iter()
-                     .filter_map(|tool_call| {
-                         let id = tool_call["id"].as_str().map(|s| s.to_string())?;
-                         let name = tool_call["function"]["name"].as_str().map(|s| s.to_string())?;
-                         let arguments_str = tool_call["function"]["arguments"].as_str()?;
-                         let arguments: serde_json::Value = serde_json::from_str(arguments_str).ok()?;
-                         Some(ToolCall { id, name, arguments })
-                     })
-                     .collect()
-             })
-             .unwrap_or_default();
+        let tool_calls = openai_response["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .map(|tool_calls_array| {
+                tool_calls_array
+                    .iter()
+                    .filter_map(|tool_call| {
+                        let id = tool_call["id"].as_str().map(|s| s.to_string())?;
+                        let name = tool_call["function"]["name"]
+                            .as_str()
+                            .map(|s| s.to_string())?;
+                        let arguments_str = tool_call["function"]["arguments"].as_str()?;
+                        let arguments: serde_json::Value =
+                            serde_json::from_str(arguments_str).ok()?;
+                        Some(ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Extract usage information
         let usage = openai_response["usage"].as_object().map(|u| UsageInfo {
             prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            completion_tokens: u.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            completion_tokens: u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
         });
 
         Ok(LLMResponse {
@@ -352,11 +369,12 @@ impl LLM for OpenAIClient {
         let mut formatted_messages = Vec::new();
         for message in messages {
             let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls {
-                if !tool_calls.is_empty() {
-                    let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
-                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
-                }
+            if let Some(tool_calls) = message.tool_calls
+                && !tool_calls.is_empty()
+            {
+                let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
+                formatted_message["tool_calls"] =
+                    serde_json::to_value(formatted_tool_calls).unwrap();
             }
             formatted_messages.push(formatted_message);
         }
@@ -368,16 +386,19 @@ impl LLM for OpenAIClient {
         });
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters
-                    }
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
@@ -390,14 +411,18 @@ impl LLM for OpenAIClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
 
         let status = response.status().as_u16();
         if status >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", error_text),
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -408,9 +433,8 @@ impl LLM for OpenAIClient {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
-            })?;
+            let chunk = chunk_result
+                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -427,30 +451,31 @@ impl LLM for OpenAIClient {
                     break;
                 }
 
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        // Handle content delta
-                        if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
-                            full_content.push_str(content);
-                            let _ = tx.send(content.to_string()).await;
-                        }
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
+                {
+                    // Handle content delta
+                    if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
+                        full_content.push_str(content);
+                        let _ = tx.send(content.to_string()).await;
+                    }
 
-                        // Handle tool calls delta
-                        if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
-                            for tc in tc_array {
-                                let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                                let entry = tool_call_builders.entry(index)
-                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
+                    // Handle tool calls delta
+                    if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
+                        for tc in tc_array {
+                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                            let entry = tool_call_builders
+                                .entry(index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
 
-                                if let Some(id) = tc["id"].as_str() {
-                                    entry.0 = id.to_string();
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    entry.1.push_str(name);
-                                }
-                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                    entry.2.push_str(args);
-                                }
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.0 = id.to_string();
+                            }
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                entry.1.push_str(name);
+                            }
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                entry.2.push_str(args);
                             }
                         }
                     }
@@ -462,15 +487,23 @@ impl LLM for OpenAIClient {
         let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
         indices.sort();
         for index in indices {
-            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index) {
-                if let Ok(arguments) = serde_json::from_str(&arguments_str) {
-                    tool_calls.push(ToolCall { id, name, arguments });
-                }
+            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index)
+                && let Ok(arguments) = serde_json::from_str(&arguments_str)
+            {
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
         }
 
         Ok(LLMResponse {
-            content: if full_content.is_empty() { None } else { Some(full_content) },
+            content: if full_content.is_empty() {
+                None
+            } else {
+                Some(full_content)
+            },
             tool_calls,
             usage: None, // Streaming typically doesn't provide usage info
         })
@@ -488,40 +521,43 @@ impl LLM for AnthropicClient {
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/v1/messages", self.base_url);
-        
+
         // Separate system prompt from messages
         let system_prompt = messages
             .iter()
             .find(|msg| msg.role == "system")
             .and_then(|msg| msg.content.as_ref())
             .cloned();
-        
+
         let filtered_messages: Vec<ChatMessage> = messages
             .into_iter()
             .filter(|msg| msg.role != "system")
             .collect();
-        
+
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": filtered_messages,
         });
-        
+
         if let Some(system) = system_prompt {
             request_body["system"] = serde_json::Value::String(system);
         }
-        
+
         if let Some(tool_list) = tools {
             // Anthropic uses input_schema instead of parameters, and tools are top-level (not wrapped in function)
-            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters
+                    })
                 })
-            }).collect();
+                .collect();
             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
         }
-        
+
         let response = self
             .client
             .post(&url)
@@ -531,18 +567,14 @@ impl LLM for AnthropicClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
 
         let status = response.status().as_u16();
 
         let response_text = response
             .text()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to read response: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to read response: {}", e)))?;
 
         // Check for HTTP errors before parsing
         if status >= 400 {
@@ -553,14 +585,12 @@ impl LLM for AnthropicClient {
         }
 
         let anthropic_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| {
-                LLMError::permanent(format!("Failed to parse response: {}", e))
-            })?;
+            .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
 
         // Extract content (text and tool_use blocks)
         let mut content_text = String::new();
         let mut tool_calls = Vec::new();
-        
+
         if let Some(content_array) = anthropic_response["content"].as_array() {
             for content_block in content_array {
                 match content_block["type"].as_str() {
@@ -570,16 +600,26 @@ impl LLM for AnthropicClient {
                         }
                     }
                     Some("tool_use") => {
-                        let id = content_block["id"].as_str().map(|s| s.to_string()).unwrap_or_default();
-                        let name = content_block["name"].as_str().map(|s| s.to_string()).unwrap_or_default();
+                        let id = content_block["id"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        let name = content_block["name"]
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
                         let input = content_block["input"].clone();
-                        tool_calls.push(ToolCall { id, name, arguments: input });
+                        tool_calls.push(ToolCall {
+                            id,
+                            name,
+                            arguments: input,
+                        });
                     }
                     _ => {}
                 }
             }
         }
-        
+
         // Extract usage information (Anthropic format)
         let usage = anthropic_response["usage"].as_object().map(|u| UsageInfo {
             prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
@@ -587,7 +627,11 @@ impl LLM for AnthropicClient {
         });
 
         Ok(LLMResponse {
-            content: if content_text.is_empty() { None } else { Some(content_text) },
+            content: if content_text.is_empty() {
+                None
+            } else {
+                Some(content_text)
+            },
             tool_calls,
             usage,
         })
@@ -626,13 +670,16 @@ impl LLM for AnthropicClient {
         }
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.parameters
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name,
+                        "description": t.description,
+                        "input_schema": t.parameters
+                    })
                 })
-            }).collect();
+                .collect();
             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
         }
 
@@ -645,14 +692,18 @@ impl LLM for AnthropicClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
 
         let status = response.status().as_u16();
         if status >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", error_text),
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -663,9 +714,8 @@ impl LLM for AnthropicClient {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
-            })?;
+            let chunk = chunk_result
+                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -679,75 +729,88 @@ impl LLM for AnthropicClient {
                 }
 
                 // Anthropic uses "event:" lines followed by "data:" lines
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = parsed["type"].as_str().unwrap_or("");
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
+                {
+                    let event_type = parsed["type"].as_str().unwrap_or("");
 
-                        match event_type {
-                            "content_block_start" => {
-                                // Check if this is a tool_use block
-                                if let Some(content_block) = parsed["content_block"].as_object() {
-                                    if content_block.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
-                                        let id = content_block.get("id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let name = content_block.get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        current_tool_use = Some((id, name, String::new()));
-                                    }
-                                }
+                    match event_type {
+                        "content_block_start" => {
+                            // Check if this is a tool_use block
+                            if let Some(content_block) = parsed["content_block"].as_object()
+                                && content_block.get("type").and_then(|v| v.as_str())
+                                    == Some("tool_use")
+                            {
+                                let id = content_block
+                                    .get("id")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                let name = content_block
+                                    .get("name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                current_tool_use = Some((id, name, String::new()));
                             }
-                            "content_block_delta" => {
-                                if let Some(delta) = parsed["delta"].as_object() {
-                                    // Text delta
-                                    if delta.get("type").and_then(|v| v.as_str()) == Some("text_delta") {
-                                        if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
-                                            full_content.push_str(text);
-                                            let _ = tx.send(text.to_string()).await;
-                                        }
-                                    }
-                                    // Input JSON delta for tool_use
-                                    if delta.get("type").and_then(|v| v.as_str()) == Some("input_json_delta") {
-                                        if let Some(partial_json) = delta.get("partial_json").and_then(|v| v.as_str()) {
-                                            if let Some((_, _, ref mut input_str)) = current_tool_use {
-                                                input_str.push_str(partial_json);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            "content_block_stop" => {
-                                // Finalize tool_use if we were building one
-                                if let Some((id, name, input_str)) = current_tool_use.take() {
-                                    if !id.is_empty() && !name.is_empty() {
-                                        if let Ok(arguments) = serde_json::from_str(&input_str) {
-                                            tool_calls.push(ToolCall { id, name, arguments });
-                                        } else if input_str.is_empty() {
-                                            // Empty input is valid (tool with no parameters)
-                                            tool_calls.push(ToolCall {
-                                                id,
-                                                name,
-                                                arguments: serde_json::json!({}),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            "message_stop" => {
-                                // End of message
-                            }
-                            _ => {}
                         }
+                        "content_block_delta" => {
+                            if let Some(delta) = parsed["delta"].as_object() {
+                                // Text delta
+                                if delta.get("type").and_then(|v| v.as_str()) == Some("text_delta")
+                                    && let Some(text) = delta.get("text").and_then(|v| v.as_str())
+                                {
+                                    full_content.push_str(text);
+                                    let _ = tx.send(text.to_string()).await;
+                                }
+                                // Input JSON delta for tool_use
+                                if delta.get("type").and_then(|v| v.as_str())
+                                    == Some("input_json_delta")
+                                    && let Some(partial_json) =
+                                        delta.get("partial_json").and_then(|v| v.as_str())
+                                    && let Some((_, _, ref mut input_str)) = current_tool_use
+                                {
+                                    input_str.push_str(partial_json);
+                                }
+                            }
+                        }
+                        "content_block_stop" => {
+                            // Finalize tool_use if we were building one
+                            if let Some((id, name, input_str)) = current_tool_use.take()
+                                && !id.is_empty()
+                                && !name.is_empty()
+                            {
+                                if let Ok(arguments) = serde_json::from_str(&input_str) {
+                                    tool_calls.push(ToolCall {
+                                        id,
+                                        name,
+                                        arguments,
+                                    });
+                                } else if input_str.is_empty() {
+                                    // Empty input is valid (tool with no parameters)
+                                    tool_calls.push(ToolCall {
+                                        id,
+                                        name,
+                                        arguments: serde_json::json!({}),
+                                    });
+                                }
+                            }
+                        }
+                        "message_stop" => {
+                            // End of message
+                        }
+                        _ => {}
                     }
                 }
             }
         }
 
         Ok(LLMResponse {
-            content: if full_content.is_empty() { None } else { Some(full_content) },
+            content: if full_content.is_empty() {
+                None
+            } else {
+                Some(full_content)
+            },
             tool_calls,
             usage: None, // Streaming typically doesn't provide usage info
         })
@@ -792,8 +855,8 @@ pub struct OllamaClient {
 
 impl OllamaClient {
     pub fn new() -> Self {
-        let base_url = std::env::var("OLLAMA_HOST")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string());
+        let base_url =
+            std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
         Self {
             client: Client::new(),
             base_url,
@@ -849,13 +912,13 @@ impl LLM for OllamaClient {
         let mut stripped_user_content: Option<String> = None;
         let last_user_idx = messages.iter().rposition(|m| m.role == "user");
 
-        if let Some(idx) = last_user_idx {
-            if let Some(ref content) = messages[idx].content {
-                let (prefix_override, stripped) = parse_thinking_prefix(content);
-                if prefix_override.is_some() {
-                    thinking_override = prefix_override;
-                    stripped_user_content = Some(stripped.to_string());
-                }
+        if let Some(idx) = last_user_idx
+            && let Some(ref content) = messages[idx].content
+        {
+            let (prefix_override, stripped) = parse_thinking_prefix(content);
+            if prefix_override.is_some() {
+                thinking_override = prefix_override;
+                stripped_user_content = Some(stripped.to_string());
             }
         }
 
@@ -867,17 +930,18 @@ impl LLM for OllamaClient {
         for (i, message) in messages.iter().enumerate() {
             let mut formatted_message = serde_json::to_value(message).unwrap();
             // Use stripped content for the last user message if we have it
-            if Some(i) == last_user_idx {
-                if let Some(ref stripped) = stripped_user_content {
-                    formatted_message["content"] = serde_json::Value::String(stripped.clone());
-                }
+            if Some(i) == last_user_idx
+                && let Some(ref stripped) = stripped_user_content
+            {
+                formatted_message["content"] = serde_json::Value::String(stripped.clone());
             }
-            if let Some(ref tool_calls) = message.tool_calls {
-                if !tool_calls.is_empty() {
-                    // Use native Ollama format (arguments as object, not string)
-                    let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
-                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
-                }
+            if let Some(ref tool_calls) = message.tool_calls
+                && !tool_calls.is_empty()
+            {
+                // Use native Ollama format (arguments as object, not string)
+                let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
+                formatted_message["tool_calls"] =
+                    serde_json::to_value(formatted_tool_calls).unwrap();
             }
             formatted_messages.push(formatted_message);
         }
@@ -900,16 +964,19 @@ impl LLM for OllamaClient {
         crate::debug::log_json("OLLAMA REQUEST (chat_complete)", &request_body);
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters
-                    }
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
@@ -921,18 +988,14 @@ impl LLM for OllamaClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
 
         let status = response.status().as_u16();
 
         let response_text = response
             .text()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to read response: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to read response: {}", e)))?;
 
         if status >= 400 {
             return Err(LLMError::from_status(
@@ -942,9 +1005,7 @@ impl LLM for OllamaClient {
         }
 
         let ollama_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| {
-                LLMError::permanent(format!("Failed to parse response: {}", e))
-            })?;
+            .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
 
         // Debug log the response
         crate::debug::log_json("OLLAMA RESPONSE (chat_complete)", &ollama_response);
@@ -960,17 +1021,25 @@ impl LLM for OllamaClient {
                 tool_calls_array
                     .iter()
                     .filter_map(|tool_call| {
-                        let id = tool_call["id"].as_str()
+                        let id = tool_call["id"]
+                            .as_str()
                             .or_else(|| tool_call["function"]["name"].as_str()) // fallback to name if no id
                             .map(|s| s.to_string())?;
-                        let name = tool_call["function"]["name"].as_str().map(|s| s.to_string())?;
+                        let name = tool_call["function"]["name"]
+                            .as_str()
+                            .map(|s| s.to_string())?;
                         // Arguments might be a string (OpenAI style) or object (Ollama native)
-                        let arguments = if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                            serde_json::from_str(args_str).ok()?
-                        } else {
-                            tool_call["function"]["arguments"].clone()
-                        };
-                        Some(ToolCall { id, name, arguments })
+                        let arguments =
+                            if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
+                                serde_json::from_str(args_str).ok()?
+                            } else {
+                                tool_call["function"]["arguments"].clone()
+                            };
+                        Some(ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        })
                     })
                     .collect()
             })
@@ -979,8 +1048,14 @@ impl LLM for OllamaClient {
         // Native Ollama uses eval_count/prompt_eval_count instead of usage
         let usage = if let Some(usage_obj) = ollama_response["usage"].as_object() {
             Some(UsageInfo {
-                prompt_tokens: usage_obj.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: usage_obj.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                prompt_tokens: usage_obj
+                    .get("prompt_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                completion_tokens: usage_obj
+                    .get("completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
             })
         } else {
             Some(UsageInfo {
@@ -1012,13 +1087,13 @@ impl LLM for OllamaClient {
         let mut stripped_user_content: Option<String> = None;
         let last_user_idx = messages.iter().rposition(|m| m.role == "user");
 
-        if let Some(idx) = last_user_idx {
-            if let Some(ref content) = messages[idx].content {
-                let (prefix_override, stripped) = parse_thinking_prefix(content);
-                if prefix_override.is_some() {
-                    thinking_override = prefix_override;
-                    stripped_user_content = Some(stripped.to_string());
-                }
+        if let Some(idx) = last_user_idx
+            && let Some(ref content) = messages[idx].content
+        {
+            let (prefix_override, stripped) = parse_thinking_prefix(content);
+            if prefix_override.is_some() {
+                thinking_override = prefix_override;
+                stripped_user_content = Some(stripped.to_string());
             }
         }
 
@@ -1030,17 +1105,18 @@ impl LLM for OllamaClient {
         for (i, message) in messages.iter().enumerate() {
             let mut formatted_message = serde_json::to_value(message).unwrap();
             // Use stripped content for the last user message if we have it
-            if Some(i) == last_user_idx {
-                if let Some(ref stripped) = stripped_user_content {
-                    formatted_message["content"] = serde_json::Value::String(stripped.clone());
-                }
+            if Some(i) == last_user_idx
+                && let Some(ref stripped) = stripped_user_content
+            {
+                formatted_message["content"] = serde_json::Value::String(stripped.clone());
             }
-            if let Some(ref tool_calls) = message.tool_calls {
-                if !tool_calls.is_empty() {
-                    // Use native Ollama format (arguments as object, not string)
-                    let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
-                    formatted_message["tool_calls"] = serde_json::to_value(formatted_tool_calls).unwrap();
-                }
+            if let Some(ref tool_calls) = message.tool_calls
+                && !tool_calls.is_empty()
+            {
+                // Use native Ollama format (arguments as object, not string)
+                let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
+                formatted_message["tool_calls"] =
+                    serde_json::to_value(formatted_tool_calls).unwrap();
             }
             formatted_messages.push(formatted_message);
         }
@@ -1056,16 +1132,19 @@ impl LLM for OllamaClient {
         crate::debug::log_json("OLLAMA REQUEST (chat_complete_stream)", &request_body);
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list.iter().map(|t| {
-                serde_json::json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters
-                    }
+            let formatted_tools: Vec<serde_json::Value> = tool_list
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": t.name,
+                            "description": t.description,
+                            "parameters": t.parameters
+                        }
+                    })
                 })
-            }).collect();
+                .collect();
             request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
@@ -1077,14 +1156,18 @@ impl LLM for OllamaClient {
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| {
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
 
         let status = response.status().as_u16();
         if status >= 400 {
-            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(LLMError::from_status(status, format!("API error: {}", error_text)));
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", error_text),
+            ));
         }
 
         let mut stream = response.bytes_stream();
@@ -1095,9 +1178,8 @@ impl LLM for OllamaClient {
         let mut buffer = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| {
-                LLMError::retryable(format!("Failed to read stream chunk: {}", e))
-            })?;
+            let chunk = chunk_result
+                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -1117,18 +1199,19 @@ impl LLM for OllamaClient {
                     }
 
                     // Native Ollama: message.content (not delta)
-                    if let Some(content) = parsed["message"]["content"].as_str() {
-                        if !content.is_empty() {
-                            full_content.push_str(content);
-                            let _ = tx.send(content.to_string()).await;
-                        }
+                    if let Some(content) = parsed["message"]["content"].as_str()
+                        && !content.is_empty()
+                    {
+                        full_content.push_str(content);
+                        let _ = tx.send(content.to_string()).await;
                     }
 
                     // Handle tool calls in native format
                     if let Some(tc_array) = parsed["message"]["tool_calls"].as_array() {
                         for tc in tc_array {
                             let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                            let entry = tool_call_builders.entry(index)
+                            let entry = tool_call_builders
+                                .entry(index)
                                 .or_insert_with(|| (String::new(), String::new(), String::new()));
 
                             if let Some(id) = tc["id"].as_str() {
@@ -1152,15 +1235,23 @@ impl LLM for OllamaClient {
         let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
         indices.sort();
         for index in indices {
-            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index) {
-                if let Ok(arguments) = serde_json::from_str(&arguments_str) {
-                    tool_calls.push(ToolCall { id, name, arguments });
-                }
+            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index)
+                && let Ok(arguments) = serde_json::from_str(&arguments_str)
+            {
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    arguments,
+                });
             }
         }
 
         Ok(LLMResponse {
-            content: if full_content.is_empty() { None } else { Some(full_content) },
+            content: if full_content.is_empty() {
+                None
+            } else {
+                Some(full_content)
+            },
             tool_calls,
             usage: None,
         })
@@ -1185,13 +1276,13 @@ mod tests {
                 }
             }),
         };
-        
+
         let formatted = serde_json::json!({
             "name": tool.name,
             "description": tool.description,
             "input_schema": tool.parameters
         });
-        
+
         assert_eq!(formatted["name"], "add");
         assert_eq!(formatted["input_schema"]["type"], "object");
     }
@@ -1205,7 +1296,7 @@ mod tests {
             tool_call_id: Some("call_123".to_string()),
             tool_calls: None,
         };
-        
+
         // This is how it should be formatted for Anthropic
         let formatted = serde_json::json!({
             "role": "user",
@@ -1215,7 +1306,7 @@ mod tests {
                 "content": tool_msg.content
             }]
         });
-        
+
         assert_eq!(formatted["role"], "user");
         assert_eq!(formatted["content"][0]["type"], "tool_result");
         assert_eq!(formatted["content"][0]["tool_use_id"], "call_123");

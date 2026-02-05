@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use tokio::sync::{mpsc, oneshot};
-use serde::{Serialize, Deserialize};
 
 /// Error types for messaging operations
 #[derive(Debug, Clone)]
@@ -131,9 +131,9 @@ impl MessageRouter {
 
     /// Get a mailbox for sending messages to an agent
     pub fn get_mailbox(&self, agent_id: &str) -> Option<AgentMailbox> {
-        self.agents.get(agent_id).map(|sender| {
-            AgentMailbox::new(agent_id.to_string(), sender.clone())
-        })
+        self.agents
+            .get(agent_id)
+            .map(|sender| AgentMailbox::new(agent_id.to_string(), sender.clone()))
     }
 
     /// Send a message to an agent

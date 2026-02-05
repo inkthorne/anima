@@ -132,10 +132,10 @@ impl ToolRegistry {
     /// Always includes `list_tools` meta-tool for discoverability.
     pub fn format_for_prompt(tools: &[&ToolDefinition]) -> String {
         let mut output = String::from("**Available tools:**\n");
-        
+
         // Always include list_tools for discoverability
         output.push_str("- `list_tools` — List all available tools. Use to discover what tools you can call. Params: \n");
-        
+
         for tool in tools {
             output.push_str(&format!(
                 "- `{}` — {}. Params: {}\n",
@@ -286,7 +286,10 @@ category = "system"
 
     #[test]
     fn test_keyword_overlap_partial_match() {
-        let query: HashSet<String> = ["read", "something"].iter().map(|s| s.to_string()).collect();
+        let query: HashSet<String> = ["read", "something"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let tool_keywords = vec!["read".to_string(), "file".to_string()];
         let score = keyword_overlap(&query, &tool_keywords);
         assert!((score - 0.5).abs() < 0.001);

@@ -145,10 +145,9 @@ impl TaskStore {
         )?;
 
         // Migration: add conv_id column if it doesn't exist (for existing databases)
-        let _ = self.conn.execute(
-            "ALTER TABLE claude_code_tasks ADD COLUMN conv_id TEXT",
-            [],
-        );
+        let _ = self
+            .conn
+            .execute("ALTER TABLE claude_code_tasks ADD COLUMN conv_id TEXT", []);
 
         Ok(())
     }
@@ -197,7 +196,7 @@ impl TaskStore {
         )?;
 
         let tasks = stmt
-            .query_map([], |row| task_from_row(row))?
+            .query_map([], task_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tasks)
@@ -211,7 +210,7 @@ impl TaskStore {
         )?;
 
         let tasks = stmt
-            .query_map(params![agent], |row| task_from_row(row))?
+            .query_map(params![agent], task_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tasks)
@@ -251,7 +250,7 @@ impl TaskStore {
         )?;
 
         let tasks = stmt
-            .query_map([], |row| task_from_row(row))?
+            .query_map([], task_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(tasks)
@@ -302,10 +301,10 @@ fn escape_shell_arg(s: &str) -> String {
 
 /// Expand ~ to home directory.
 fn expand_home(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(&path[2..]);
-        }
+    if path.starts_with("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(&path[2..]);
     }
     PathBuf::from(path)
 }
@@ -333,7 +332,11 @@ impl ClaudeCodeTool {
     }
 
     /// Create a new Claude Code tool with a conversation ID for notifications.
-    pub fn with_conv_id(agent_name: String, task_store: Arc<Mutex<TaskStore>>, conv_id: Option<String>) -> Self {
+    pub fn with_conv_id(
+        agent_name: String,
+        task_store: Arc<Mutex<TaskStore>>,
+        conv_id: Option<String>,
+    ) -> Self {
         Self {
             agent_name,
             task_store,
@@ -378,10 +381,9 @@ impl Tool for ClaudeCodeTool {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        let task = input
-            .get("task")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'task' field".to_string()))?;
+        let task = input.get("task").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolError::InvalidInput("Missing or invalid 'task' field".to_string())
+        })?;
 
         let workdir = input
             .get("workdir")
@@ -416,7 +418,9 @@ impl Tool for ClaudeCodeTool {
             .arg(&cmd)
             .output()
             .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to launch Claude Code: {}", e)))?;
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to launch Claude Code: {}", e))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -435,9 +439,16 @@ impl Tool for ClaudeCodeTool {
         // Store task record
         {
             let store = self.task_store.lock().await;
-            store.create_task(&task_id, &self.agent_name, self.conv_id.as_deref(), task, &workdir, pid).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to store task: {}", e))
-            })?;
+            store
+                .create_task(
+                    &task_id,
+                    &self.agent_name,
+                    self.conv_id.as_deref(),
+                    task,
+                    &workdir,
+                    pid,
+                )
+                .map_err(|e| ToolError::ExecutionFailed(format!("Failed to store task: {}", e)))?;
         }
 
         Ok(serde_json::json!({
@@ -459,8 +470,14 @@ mod tests {
         assert_eq!(TaskStatus::Completed.to_string(), "completed");
         assert_eq!(TaskStatus::Failed.to_string(), "failed");
 
-        assert_eq!("running".parse::<TaskStatus>().unwrap(), TaskStatus::Running);
-        assert_eq!("completed".parse::<TaskStatus>().unwrap(), TaskStatus::Completed);
+        assert_eq!(
+            "running".parse::<TaskStatus>().unwrap(),
+            TaskStatus::Running
+        );
+        assert_eq!(
+            "completed".parse::<TaskStatus>().unwrap(),
+            TaskStatus::Completed
+        );
         assert_eq!("failed".parse::<TaskStatus>().unwrap(), TaskStatus::Failed);
     }
 
@@ -484,7 +501,16 @@ mod tests {
         let store = TaskStore::open(temp_file.path()).unwrap();
 
         // Create a task with conv_id
-        store.create_task("test123", "gendry", Some("test-conv"), "Fix the bug", "/home/test", 12345).unwrap();
+        store
+            .create_task(
+                "test123",
+                "gendry",
+                Some("test-conv"),
+                "Fix the bug",
+                "/home/test",
+                12345,
+            )
+            .unwrap();
 
         // Get the task
         let task = store.get_task("test123").unwrap().unwrap();
@@ -502,7 +528,9 @@ mod tests {
         assert_eq!(running.len(), 1);
 
         // Complete the task
-        store.complete_task("test123", TaskStatus::Completed, 0, "All done!").unwrap();
+        store
+            .complete_task("test123", TaskStatus::Completed, 0, "All done!")
+            .unwrap();
 
         // Verify completion
         let task = store.get_task("test123").unwrap().unwrap();
@@ -525,9 +553,15 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let store = TaskStore::open(temp_file.path()).unwrap();
 
-        store.create_task("task1", "gendry", None, "Task 1", "/home", 1001).unwrap();
-        store.create_task("task2", "arya", Some("conv-a"), "Task 2", "/home", 1002).unwrap();
-        store.create_task("task3", "gendry", Some("conv-b"), "Task 3", "/home", 1003).unwrap();
+        store
+            .create_task("task1", "gendry", None, "Task 1", "/home", 1001)
+            .unwrap();
+        store
+            .create_task("task2", "arya", Some("conv-a"), "Task 2", "/home", 1002)
+            .unwrap();
+        store
+            .create_task("task3", "gendry", Some("conv-b"), "Task 3", "/home", 1003)
+            .unwrap();
 
         let gendry_tasks = store.get_tasks_for_agent("gendry").unwrap();
         assert_eq!(gendry_tasks.len(), 2);

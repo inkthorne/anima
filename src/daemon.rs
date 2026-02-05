@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use chrono::Local;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 /// Agent-specific logger that writes to {agent_dir}/agent.log
 pub struct AgentLogger {
@@ -27,35 +27,35 @@ impl AgentLogger {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)  // Fresh log each restart
+            .truncate(true) // Fresh log each restart
             .open(&log_path)?;
-        
+
         Ok(Self {
             file: std::sync::Mutex::new(file),
             agent_name: agent_name.to_string(),
         })
     }
-    
+
     /// Log a message with timestamp
     pub fn log(&self, msg: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
         let line = format!("[{}] [{}] {}\n", timestamp, self.agent_name, msg);
-        
+
         // Write to file
         if let Ok(mut file) = self.file.lock() {
             let _ = file.write_all(line.as_bytes());
             let _ = file.flush();
         }
-        
+
         // Also print to stdout for interactive use
         print!("{}", line);
     }
-    
+
     /// Log a memory-related event
     pub fn memory(&self, msg: &str) {
         self.log(&format!("[memory] {}", msg));
     }
-    
+
     /// Log a tool-related event
     pub fn tool(&self, msg: &str) {
         self.log(&format!("[tool] {}", msg));
@@ -75,40 +75,50 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
     // Only accept fenced ```json ... ``` blocks for tool calls
     // This is unambiguous and handles nested braces correctly
     let fenced_re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
-    
-    if let Some(cap) = fenced_re.captures(output) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1]) {
-            if let Some(tool_name) = json.get("tool").and_then(|t| t.as_str()) {
-                let params = json.get("params").cloned().unwrap_or(serde_json::json!({}));
-                let cleaned = fenced_re.replace(output, "").trim().to_string();
-                return (cleaned, Some(ToolCall {
-                    tool: tool_name.to_string(),
-                    params,
-                }));
-            }
-        }
+
+    if let Some(cap) = fenced_re.captures(output)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1])
+        && let Some(tool_name) = json.get("tool").and_then(|t| t.as_str())
+    {
+        let params = json.get("params").cloned().unwrap_or(serde_json::json!({}));
+        let cleaned = fenced_re.replace(output, "").trim().to_string();
+        return (
+            cleaned,
+            Some(ToolCall {
+                tool: tool_name.to_string(),
+                params,
+            }),
+        );
     }
-    
+
     (output.to_string(), None)
 }
 
 use crate::agent::{Agent, ThinkOptions};
-use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, ResolvedLlmConfig};
+use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection};
+use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
-use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, ChatMessage, strip_thinking_tags};
-use crate::conversation::ConversationMessage;
-use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
+use crate::llm::{
+    AnthropicClient, ChatMessage, LLM, OllamaClient, OpenAIClient, ToolSpec, strip_thinking_tags,
+};
+use crate::memory::{
+    InMemoryStore, Memory, SaveResult, SemanticMemoryStore, SqliteMemory, build_memory_injection,
+    extract_remember_tags,
+};
 use crate::observe::AgentLoggerObserver;
 use crate::runtime::Runtime;
-use crate::socket_api::{SocketApi, Request, Response};
+use crate::socket_api::{Request, Response, SocketApi};
 use crate::tool::Tool;
-use crate::tool_registry::{ToolRegistry, ToolDefinition};
-use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SafeShellTool, DaemonRememberTool};
-use crate::tools::send_message::DaemonSendMessageTool;
+use crate::tool_registry::{ToolDefinition, ToolRegistry};
+use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_process_running};
 use crate::tools::list_agents::DaemonListAgentsTool;
-use crate::tools::claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, is_process_running};
+use crate::tools::send_message::DaemonSendMessageTool;
+use crate::tools::{
+    AddTool, DaemonRememberTool, EchoTool, HttpTool, ReadFileTool, SafeShellTool, ShellTool,
+    WriteFileTool,
+};
 
 /// Work items that are serialized through the agent worker.
 /// These operations require exclusive access to the Agent to prevent race conditions.
@@ -305,7 +315,8 @@ fn format_conversation_history(
             flush_user_batch(&mut pending_user_batch, &mut history);
 
             // Deserialize tool_calls if present (for native tool mode persistence)
-            let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg.tool_calls
+            let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg
+                .tool_calls
                 .as_ref()
                 .and_then(|json| serde_json::from_str(json).ok());
 
@@ -327,7 +338,8 @@ fn format_conversation_history(
             });
         } else {
             // Other speaker → accumulate for user batch with JSON wrapper
-            let escaped = msg.content
+            let escaped = msg
+                .content
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('\n', "\\n");
@@ -373,7 +385,7 @@ async fn execute_tool_call(
 ) -> Result<String, String> {
     match tool_call.tool.as_str() {
         "read_file" => {
-            let tool = ReadFileTool::default();
+            let tool = ReadFileTool;
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
@@ -382,11 +394,11 @@ async fn execute_tool_call(
                         Ok(result.to_string())
                     }
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "write_file" => {
-            let tool = WriteFileTool::default();
+            let tool = WriteFileTool;
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
@@ -395,23 +407,25 @@ async fn execute_tool_call(
                         Ok(result.to_string())
                     }
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "shell" | "safe_shell" => {
             // Validate command against allowed_commands if set
-            if let Some(def) = tool_def {
-                if let Some(ref allowed) = def.allowed_commands {
-                    let command = tool_call.params.get("command")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("");
-                    let first_word = command.split_whitespace().next().unwrap_or("");
-                    if !allowed.iter().any(|a| a == first_word) {
-                        return Err(format!(
-                            "Command '{}' not in allowed list. Allowed: {:?}",
-                            first_word, allowed
-                        ));
-                    }
+            if let Some(def) = tool_def
+                && let Some(ref allowed) = def.allowed_commands
+            {
+                let command = tool_call
+                    .params
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("");
+                let first_word = command.split_whitespace().next().unwrap_or("");
+                if !allowed.iter().any(|a| a == first_word) {
+                    return Err(format!(
+                        "Command '{}' not in allowed list. Allowed: {:?}",
+                        first_word, allowed
+                    ));
                 }
             }
 
@@ -421,7 +435,10 @@ async fn execute_tool_call(
                     // Shell returns stdout, stderr, and exit_code
                     let stdout = result.get("stdout").and_then(|s| s.as_str()).unwrap_or("");
                     let stderr = result.get("stderr").and_then(|s| s.as_str()).unwrap_or("");
-                    let exit_code = result.get("exit_code").and_then(|c| c.as_i64()).unwrap_or(0);
+                    let exit_code = result
+                        .get("exit_code")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(0);
 
                     let mut output = String::new();
                     if !stdout.is_empty() {
@@ -429,7 +446,7 @@ async fn execute_tool_call(
                     }
                     if !stderr.is_empty() {
                         if !output.is_empty() {
-                            output.push_str("\n");
+                            output.push('\n');
                         }
                         output.push_str("[stderr] ");
                         output.push_str(stderr);
@@ -439,7 +456,7 @@ async fn execute_tool_call(
                     }
                     Ok(output)
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "http" => {
@@ -450,16 +467,22 @@ async fn execute_tool_call(
                     let body = result.get("body").and_then(|b| b.as_str()).unwrap_or("");
                     Ok(format!("[HTTP {}]\n{}", status, body))
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "claude_code" => {
             // Claude Code tool requires agent context and task store
             let ctx = context.ok_or("claude_code tool requires execution context")?;
-            let task_store = ctx.task_store.as_ref()
+            let task_store = ctx
+                .task_store
+                .as_ref()
                 .ok_or("claude_code tool requires task store to be initialized")?;
 
-            let tool = ClaudeCodeTool::with_conv_id(ctx.agent_name.clone(), task_store.clone(), ctx.conv_id.clone());
+            let tool = ClaudeCodeTool::with_conv_id(
+                ctx.agent_name.clone(),
+                task_store.clone(),
+                ctx.conv_id.clone(),
+            );
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
@@ -468,16 +491,20 @@ async fn execute_tool_call(
                         Ok(result.to_string())
                     }
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "remember" => {
             // Remember tool requires semantic memory store
             let ctx = context.ok_or("remember tool requires execution context")?;
-            let mem_store = ctx.semantic_memory_store.as_ref()
+            let mem_store = ctx
+                .semantic_memory_store
+                .as_ref()
                 .ok_or("remember tool requires semantic memory to be enabled")?;
 
-            let content = tool_call.params.get("content")
+            let content = tool_call
+                .params
+                .get("content")
                 .and_then(|c| c.as_str())
                 .ok_or("remember tool requires 'content' parameter")?;
 
@@ -495,12 +522,15 @@ async fn execute_tool_call(
                     let msg = match result {
                         SaveResult::New(id) => format!("Remembered: {} (id={})", content, id),
                         SaveResult::Reinforced(id, old_imp, new_imp) => {
-                            format!("Reinforced memory: {} (id={}, importance {:.2} → {:.2})", content, id, old_imp, new_imp)
+                            format!(
+                                "Reinforced memory: {} (id={}, importance {:.2} → {:.2})",
+                                content, id, old_imp, new_imp
+                            )
                         }
                     };
                     Ok(msg)
                 }
-                Err(e) => Err(format!("Failed to save memory: {}", e))
+                Err(e) => Err(format!("Failed to save memory: {}", e)),
             }
         }
         "list_agents" => {
@@ -513,16 +543,22 @@ async fn execute_tool_call(
                         Ok(summary.to_string())
                     } else {
                         // Fallback: format from agents array (handles both string and object formats)
-                        let agents = result.get("agents")
+                        let agents = result
+                            .get("agents")
                             .and_then(|a| a.as_array())
-                            .map(|arr| arr.iter()
-                                .filter_map(|v| {
-                                    // Handle both string format and object format
-                                    v.as_str().map(|s| s.to_string())
-                                        .or_else(|| v.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", "))
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| {
+                                        // Handle both string format and object format
+                                        v.as_str().map(|s| s.to_string()).or_else(|| {
+                                            v.get("name")
+                                                .and_then(|n| n.as_str())
+                                                .map(|s| s.to_string())
+                                        })
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
                             .unwrap_or_default();
                         let count = result.get("count").and_then(|c| c.as_u64()).unwrap_or(0);
                         if count == 0 {
@@ -532,7 +568,7 @@ async fn execute_tool_call(
                         }
                     }
                 }
-                Err(e) => Err(format!("Tool error: {}", e))
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         "list_tools" => {
@@ -540,34 +576,39 @@ async fn execute_tool_call(
             let tools_path = dirs::home_dir()
                 .map(|h| h.join(".anima").join("tools.toml"))
                 .ok_or("Could not determine home directory")?;
-            
+
             // Get allowed tools from context (if available)
             let allowed = context.and_then(|ctx| ctx.allowed_tools.as_ref());
-            
+
             match ToolRegistry::load_from_file(&tools_path) {
                 Ok(registry) => {
-                    let all_tools: Vec<&str> = registry.all_tools().iter()
+                    let all_tools: Vec<&str> = registry
+                        .all_tools()
+                        .iter()
                         .map(|t| t.name.as_str())
                         .collect();
-                    
+
                     // Filter by allowlist if present
                     let tool_names: Vec<&str> = match allowed {
-                        Some(allowlist) => all_tools.into_iter()
+                        Some(allowlist) => all_tools
+                            .into_iter()
                             .filter(|t| allowlist.iter().any(|a| a == *t))
                             .collect(),
                         None => all_tools, // No allowlist = show all (for testing)
                     };
-                    
+
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
                     for builtin in &["list_tools", "list_agents", "remember", "send_message"] {
-                        if !result.contains(builtin) {
-                            if allowed.map(|a| a.iter().any(|x| x == *builtin)).unwrap_or(true) {
-                                result.push(builtin);
-                            }
+                        if !result.contains(builtin)
+                            && allowed
+                                .map(|a| a.iter().any(|x| x == *builtin))
+                                .unwrap_or(true)
+                        {
+                            result.push(builtin);
                         }
                     }
-                    
+
                     if result.is_empty() {
                         Ok("No tools available for this agent.".to_string())
                     } else {
@@ -576,11 +617,14 @@ async fn execute_tool_call(
                 }
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
-                    Ok(format!("Built-in tools: list_tools, list_agents, remember, send_message\n(Note: tools.toml failed to load: {})", e))
+                    Ok(format!(
+                        "Built-in tools: list_tools, list_agents, remember, send_message\n(Note: tools.toml failed to load: {})",
+                        e
+                    ))
                 }
             }
         }
-        _ => Err(format!("Unknown tool: {}", tool_call.tool))
+        _ => Err(format!("Unknown tool: {}", tool_call.tool)),
     }
 }
 
@@ -617,19 +661,20 @@ fn convert_params_to_json_schema(params: &serde_json::Value) -> serde_json::Valu
             "type": "object",
             "properties": {},
             "required": []
-        })
+        }),
     }
 }
 
 /// Convert ToolDefinitions from registry to ToolSpecs for native LLM tool calling.
 fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
-    definitions.iter().map(|def| {
-        ToolSpec {
+    definitions
+        .iter()
+        .map(|def| ToolSpec {
             name: def.name.clone(),
             description: def.description.clone(),
             parameters: convert_params_to_json_schema(&def.params),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
@@ -638,8 +683,11 @@ fn filter_by_allowlist<'a>(
     allowed_tools: &Option<Vec<String>>,
 ) -> Vec<&'a ToolDefinition> {
     match allowed_tools {
-        Some(allowed) => tools.into_iter().filter(|t| allowed.contains(&t.name)).collect(),
-        None => Vec::new(),  // No allowlist = no tools
+        Some(allowed) => tools
+            .into_iter()
+            .filter(|t| allowed.contains(&t.name))
+            .collect(),
+        None => Vec::new(), // No allowlist = no tools
     }
 }
 
@@ -707,7 +755,10 @@ impl DaemonConfig {
             if t.enabled {
                 parse_duration(&t.interval).map(|interval| TimerConfig {
                     interval,
-                    message: t.message.clone().unwrap_or_else(|| "Timer trigger".to_string()),
+                    message: t
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "Timer trigger".to_string()),
                 })
             } else {
                 None
@@ -717,12 +768,17 @@ impl DaemonConfig {
         // Parse heartbeat config if enabled and interval set
         let heartbeat_path = dir_path.join("heartbeat.md");
         let heartbeat = if agent_dir.config.heartbeat.enabled {
-            agent_dir.config.heartbeat.interval.as_ref().and_then(|interval_str| {
-                parse_duration(interval_str).map(|interval| HeartbeatDaemonConfig {
-                    interval,
-                    heartbeat_path: heartbeat_path.clone(),
+            agent_dir
+                .config
+                .heartbeat
+                .interval
+                .as_ref()
+                .and_then(|interval_str| {
+                    parse_duration(interval_str).map(|interval| HeartbeatDaemonConfig {
+                        interval,
+                        heartbeat_path: heartbeat_path.clone(),
+                    })
                 })
-            })
         } else {
             None
         };
@@ -739,10 +795,9 @@ impl DaemonConfig {
         let allowed_tools = llm_config.allowed_tools;
 
         // Build runtime context and append to system prompt
-        let host = gethostname::gethostname()
-            .to_string_lossy()
-            .to_string();
-        let runtime_context = build_runtime_context(&name, &llm_config.model, &host, llm_config.tools);
+        let host = gethostname::gethostname().to_string_lossy().to_string();
+        let runtime_context =
+            build_runtime_context(&name, &llm_config.model, &host, llm_config.tools);
 
         let system_prompt = match system_prompt {
             Some(p) => Some(format!("{}\n\n{}", p, runtime_context)),
@@ -789,7 +844,9 @@ fn parse_duration(s: &str) -> Option<Duration> {
 
     while !remaining.is_empty() {
         // Find the end of the numeric part
-        let num_end = remaining.find(|c: char| !c.is_ascii_digit()).unwrap_or(remaining.len());
+        let num_end = remaining
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(remaining.len());
         if num_end == 0 {
             return None;
         }
@@ -798,7 +855,9 @@ fn parse_duration(s: &str) -> Option<Duration> {
         remaining = &remaining[num_end..];
 
         // Find the end of the unit part
-        let unit_end = remaining.find(|c: char| c.is_ascii_digit()).unwrap_or(remaining.len());
+        let unit_end = remaining
+            .find(|c: char| c.is_ascii_digit())
+            .unwrap_or(remaining.len());
         let unit = &remaining[..unit_end];
         remaining = &remaining[unit_end..];
 
@@ -838,18 +897,17 @@ impl PidFile {
     /// Read the PID from an existing PID file.
     pub fn read(path: impl AsRef<Path>) -> std::io::Result<u32> {
         let content = std::fs::read_to_string(path)?;
-        content.trim().parse().map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })
+        content
+            .trim()
+            .parse()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
 
     /// Check if a PID file exists and the process is still running.
     pub fn is_running(path: impl AsRef<Path>) -> bool {
         if let Ok(pid) = Self::read(&path) {
             // Check if process exists by sending signal 0
-            unsafe {
-                libc::kill(pid as i32, 0) == 0
-            }
+            unsafe { libc::kill(pid as i32, 0) == 0 }
         } else {
             false
         }
@@ -897,7 +955,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             "Agent '{}' is already running (PID file: {})",
             config.name,
             config.pid_path.display()
-        ).into());
+        )
+        .into());
     }
 
     // Clean up stale socket file if it exists
@@ -910,15 +969,22 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create agent-specific logger
     let logger = Arc::new(AgentLogger::new(&config.agent_dir, &config.name)?);
-    
+
     logger.log(&format!("Starting daemon for agent '{}'", config.name));
     logger.log(&format!("  PID file: {}", config.pid_path.display()));
     logger.log(&format!("  Socket: {}", config.socket_path.display()));
     if let Some(ref timer) = config.timer {
-        logger.log(&format!("  Timer: every {:?}, message: \"{}\"", timer.interval, timer.message));
+        logger.log(&format!(
+            "  Timer: every {:?}, message: \"{}\"",
+            timer.interval, timer.message
+        ));
     }
     if let Some(ref hb) = config.heartbeat {
-        logger.log(&format!("  Heartbeat: every {:?}, file: {}", hb.interval, hb.heartbeat_path.display()));
+        logger.log(&format!(
+            "  Heartbeat: every {:?}, file: {}",
+            hb.interval,
+            hb.heartbeat_path.display()
+        ));
     }
 
     // Create the agent
@@ -927,29 +993,37 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     logger.log(&format!("  Native tools: {}", use_native_tools));
 
     // Create embedding client if configured
-    let embedding_client: Option<Arc<EmbeddingClient>> = if let Some(ref emb_config) = config.semantic_memory.embedding {
-        if emb_config.provider == "ollama" {
-            let client = EmbeddingClient::new(&emb_config.model, Some(&emb_config.url));
-            logger.log(&format!("  Embedding client: {} via {} at {}",
-                emb_config.model, emb_config.provider, emb_config.url));
-            Some(Arc::new(client))
+    let embedding_client: Option<Arc<EmbeddingClient>> =
+        if let Some(ref emb_config) = config.semantic_memory.embedding {
+            if emb_config.provider == "ollama" {
+                let client = EmbeddingClient::new(&emb_config.model, Some(&emb_config.url));
+                logger.log(&format!(
+                    "  Embedding client: {} via {} at {}",
+                    emb_config.model, emb_config.provider, emb_config.url
+                ));
+                Some(Arc::new(client))
+            } else {
+                logger.log(&format!(
+                    "  Embedding client: unsupported provider '{}'",
+                    emb_config.provider
+                ));
+                None
+            }
         } else {
-            logger.log(&format!("  Embedding client: unsupported provider '{}'", emb_config.provider));
             None
-        }
-    } else {
-        None
-    };
+        };
 
     // Create semantic memory store if enabled
-    let semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>> = if config.semantic_memory.enabled {
-        let mem_path = config.agent_dir.join(&config.semantic_memory.path);
-        let store = SemanticMemoryStore::open(&mem_path, &config.name)?;
-        logger.log(&format!("  Semantic memory: {}", mem_path.display()));
+    let semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>> =
+        if config.semantic_memory.enabled {
+            let mem_path = config.agent_dir.join(&config.semantic_memory.path);
+            let store = SemanticMemoryStore::open(&mem_path, &config.name)?;
+            logger.log(&format!("  Semantic memory: {}", mem_path.display()));
 
-        // Backfill embeddings if needed
-        if let Some(ref emb_client) = embedding_client {
-            if store.needs_backfill(emb_client.model())? {
+            // Backfill embeddings if needed
+            if let Some(ref emb_client) = embedding_client
+                && store.needs_backfill(emb_client.model())?
+            {
                 logger.log("  Backfilling embeddings...");
                 let memories = store.get_memories_needing_embeddings()?;
                 logger.log(&format!("    {} memories need embeddings", memories.len()));
@@ -958,11 +1032,17 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                     match emb_client.embed(&content).await {
                         Ok(embedding) => {
                             if let Err(e) = store.update_embedding(id, &embedding) {
-                                logger.log(&format!("    Failed to update embedding for #{}: {}", id, e));
+                                logger.log(&format!(
+                                    "    Failed to update embedding for #{}: {}",
+                                    id, e
+                                ));
                             }
                         }
                         Err(e) => {
-                            logger.log(&format!("    Failed to generate embedding for #{}: {}", id, e));
+                            logger.log(&format!(
+                                "    Failed to generate embedding for #{}: {}",
+                                id, e
+                            ));
                         }
                     }
                 }
@@ -971,20 +1051,17 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 store.set_embedding_model(emb_client.model())?;
                 logger.log("  Backfill complete");
             }
-        }
 
-        Some(Arc::new(Mutex::new(store)))
-    } else {
-        None
-    };
+            Some(Arc::new(Mutex::new(store)))
+        } else {
+            None
+        };
 
     // Register DaemonRememberTool if semantic memory is enabled and native tools are supported
     if use_native_tools {
         if let Some(ref mem_store) = semantic_memory_store {
-            let remember_tool = DaemonRememberTool::new(
-                Arc::clone(mem_store),
-                embedding_client.clone(),
-            );
+            let remember_tool =
+                DaemonRememberTool::new(Arc::clone(mem_store), embedding_client.clone());
             agent.lock().await.register_tool(Arc::new(remember_tool));
             logger.log("  Registered DaemonRememberTool");
         } else {
@@ -995,7 +1072,10 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Load tool registry (if available)
     let tool_registry: Option<Arc<ToolRegistry>> = match ToolRegistry::load_global() {
         Ok(registry) => {
-            logger.log(&format!("  Tool registry: {} tools loaded", registry.all_tools().len()));
+            logger.log(&format!(
+                "  Tool registry: {} tools loaded",
+                registry.all_tools().len()
+            ));
             Some(Arc::new(registry))
         }
         Err(e) => {
@@ -1021,10 +1101,15 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         match conv_store.get_pending_notifications(&config.name) {
             Ok(pending) => {
                 if !pending.is_empty() {
-                    logger.log(&format!("Processing {} pending notifications...", pending.len()));
+                    logger.log(&format!(
+                        "Processing {} pending notifications...",
+                        pending.len()
+                    ));
                     for notification in &pending {
-                        logger.log(&format!("  Processing notification: conv={} msg_id={}",
-                            notification.conv_name, notification.message_id));
+                        logger.log(&format!(
+                            "  Processing notification: conv={} msg_id={}",
+                            notification.conv_name, notification.message_id
+                        ));
 
                         let response = handle_notify(
                             &notification.conv_name,
@@ -1045,11 +1130,17 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &task_store,
                             config.num_ctx,
                             config.max_iterations,
-                        ).await;
+                        )
+                        .await;
 
                         match response {
-                            Response::Notified { response_message_id } => {
-                                logger.log(&format!("  Responded with msg_id={}", response_message_id));
+                            Response::Notified {
+                                response_message_id,
+                            } => {
+                                logger.log(&format!(
+                                    "  Responded with msg_id={}",
+                                    response_message_id
+                                ));
                             }
                             Response::Error { message } => {
                                 logger.log(&format!("  Failed: {}", message));
@@ -1081,13 +1172,11 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Handle SIGTERM and SIGINT
     tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate()
-        ).expect("Failed to create SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM handler");
 
-        let mut sigint = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt()
-        ).expect("Failed to create SIGINT handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to create SIGINT handler");
 
         tokio::select! {
             _ = sigterm.recv() => {
@@ -1142,7 +1231,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_heartbeat_config,
                 worker_num_ctx,
                 worker_max_iterations,
-            ).await
+            )
+            .await
         })
     };
 
@@ -1247,12 +1337,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         logger.log("  Task watcher: started");
         Some(tokio::spawn(async move {
-            task_watcher_loop(
-                ts_clone,
-                agent_name,
-                tw_logger,
-                shutdown_clone,
-            ).await
+            task_watcher_loop(ts_clone, agent_name, tw_logger, shutdown_clone).await
         }))
     } else {
         None
@@ -1479,7 +1564,12 @@ async fn agent_worker(
         }
 
         match work {
-            AgentWork::Message { content, conv_name, response_tx, token_tx } => {
+            AgentWork::Message {
+                content,
+                conv_name,
+                response_tx,
+                token_tx,
+            } => {
                 logger.log(&format!("[worker] Processing message: {}", content));
                 let result = process_message_work(
                     &content,
@@ -1498,11 +1588,19 @@ async fn agent_worker(
                     &logger,
                     recall_limit,
                     &task_store,
-                ).await;
+                )
+                .await;
                 let _ = response_tx.send(result);
             }
-            AgentWork::Notify { conv_id, message_id, depth } => {
-                logger.log(&format!("[worker] Processing notify: conv={} msg_id={} depth={}", conv_id, message_id, depth));
+            AgentWork::Notify {
+                conv_id,
+                message_id,
+                depth,
+            } => {
+                logger.log(&format!(
+                    "[worker] Processing notify: conv={} msg_id={} depth={}",
+                    conv_id, message_id, depth
+                ));
                 let _response = handle_notify(
                     &conv_id,
                     message_id,
@@ -1522,7 +1620,8 @@ async fn agent_worker(
                     &task_store,
                     num_ctx,
                     max_iterations,
-                ).await;
+                )
+                .await;
             }
             AgentWork::Heartbeat => {
                 logger.log("[worker] Processing heartbeat");
@@ -1541,7 +1640,8 @@ async fn agent_worker(
                         use_native_tools,
                         &logger,
                         recall_limit,
-                    ).await;
+                    )
+                    .await;
                 } else {
                     logger.log("[worker] Heartbeat work received but no heartbeat config");
                 }
@@ -1602,7 +1702,10 @@ async fn process_message_work(
             Vec::new()
         };
         if !all_tools.is_empty() {
-            logger.tool(&format!("[worker] Native tools: {} allowed", all_tools.len()));
+            logger.tool(&format!(
+                "[worker] Native tools: {} allowed",
+                all_tools.len()
+            ));
         }
         let specs = if !all_tools.is_empty() {
             Some(tool_definitions_to_specs(&all_tools))
@@ -1616,7 +1719,10 @@ async fn process_message_work(
             let relevant = registry.find_relevant(content, recall_limit);
             let relevant = filter_by_allowlist(relevant, allowed_tools);
             if !relevant.is_empty() {
-                logger.tool(&format!("[worker] Recall: {} tools for query", relevant.len()));
+                logger.tool(&format!(
+                    "[worker] Recall: {} tools for query",
+                    relevant.len()
+                ));
                 for t in &relevant {
                     logger.tool(&format!("  - {}", t.name));
                 }
@@ -1635,7 +1741,10 @@ async fn process_message_work(
             match emb_client.embed(content).await {
                 Ok(emb) => Some(emb),
                 Err(e) => {
-                    logger.log(&format!("[worker] Failed to generate query embedding: {}", e));
+                    logger.log(&format!(
+                        "[worker] Failed to generate query embedding: {}",
+                        e
+                    ));
                     None
                 }
             }
@@ -1647,7 +1756,10 @@ async fn process_message_work(
         match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
             Ok(memories) => {
                 if !memories.is_empty() {
-                    logger.memory(&format!("[worker] Recall: {} memories for query", memories.len()));
+                    logger.memory(&format!(
+                        "[worker] Recall: {} memories for query",
+                        memories.len()
+                    ));
                     for (m, score) in &memories {
                         logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
                     }
@@ -1664,7 +1776,8 @@ async fn process_message_work(
         String::new()
     };
 
-    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    let effective_always =
+        build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
     // Process with or without streaming
     let (final_response, _tool_calls, tool_trace) = if use_native_tools {
@@ -1679,7 +1792,8 @@ async fn process_message_work(
             semantic_memory,
             embedding_client,
             logger,
-        ).await;
+        )
+        .await;
         (result.response, result.tool_calls, result.tool_trace)
     } else {
         // JSON-block mode with optional streaming (no native tool_calls)
@@ -1695,7 +1809,8 @@ async fn process_message_work(
             tool_registry,
             logger,
             &tool_context,
-        ).await;
+        )
+        .await;
         (response, None, Vec::new())
     };
 
@@ -1710,22 +1825,43 @@ async fn process_message_work(
                     // Store the tool call (as an assistant message with tool_calls)
                     let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
                     // The content for intermediate tool-calling messages is typically empty or minimal
-                    if let Err(e) = store.add_message_with_tool_calls(cname, agent_name, "", &[], None, tool_calls_json.as_deref()) {
+                    if let Err(e) = store.add_message_with_tool_calls(
+                        cname,
+                        agent_name,
+                        "",
+                        &[],
+                        None,
+                        tool_calls_json.as_deref(),
+                    ) {
                         logger.log(&format!("[worker] Failed to store tool call: {}", e));
                     }
                     // Store the tool result
-                    let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+                    let tool_result_msg =
+                        format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
                     if let Err(e) = store.add_message(cname, "tool", &tool_result_msg, &[]) {
                         logger.log(&format!("[worker] Failed to store tool result: {}", e));
                     }
                 }
                 // Store the final response (no tool_calls since this is the terminal response)
-                if let Err(e) = store.add_message_with_tool_calls(cname, agent_name, &final_response, &[], Some(duration_ms), None) {
-                    logger.log(&format!("[worker] Failed to store response in conversation: {}", e));
+                if let Err(e) = store.add_message_with_tool_calls(
+                    cname,
+                    agent_name,
+                    &final_response,
+                    &[],
+                    Some(duration_ms),
+                    None,
+                ) {
+                    logger.log(&format!(
+                        "[worker] Failed to store response in conversation: {}",
+                        e
+                    ));
                 }
             }
             Err(e) => {
-                logger.log(&format!("[worker] Failed to init conversation store: {}", e));
+                logger.log(&format!(
+                    "[worker] Failed to init conversation store: {}",
+                    e
+                ));
             }
         }
     }
@@ -1762,7 +1898,9 @@ async fn process_native_tool_mode(
 
         let handle = tokio::spawn(async move {
             let mut agent_guard = agent_clone.lock().await;
-            agent_guard.think_streaming_with_options(&content_clone, options, tx).await
+            agent_guard
+                .think_streaming_with_options(&content_clone, options, tx)
+                .await
         });
 
         match handle.await {
@@ -1784,20 +1922,25 @@ async fn process_native_tool_mode(
     let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
     // Save memories
-    if !memories_to_save.is_empty() {
-        if let Some(mem_store) = semantic_memory {
-            let store = mem_store.lock().await;
-            for memory in &memories_to_save {
-                let embedding = if let Some(emb_client) = embedding_client {
-                    emb_client.embed(memory).await.ok()
-                } else {
-                    None
-                };
-                match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                    Ok(SaveResult::New(id)) => logger.memory(&format!("[worker] Save #{}: \"{}\"", id, memory)),
-                    Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("[worker] Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                    Err(e) => logger.log(&format!("[worker] Failed to save memory: {}", e)),
+    if !memories_to_save.is_empty()
+        && let Some(mem_store) = semantic_memory
+    {
+        let store = mem_store.lock().await;
+        for memory in &memories_to_save {
+            let embedding = if let Some(emb_client) = embedding_client {
+                emb_client.embed(memory).await.ok()
+            } else {
+                None
+            };
+            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                Ok(SaveResult::New(id)) => {
+                    logger.memory(&format!("[worker] Save #{}: \"{}\"", id, memory))
                 }
+                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
+                    "[worker] Reinforce #{}: \"{}\" ({:.2} → {:.2})",
+                    id, memory, old, new
+                )),
+                Err(e) => logger.log(&format!("[worker] Failed to save memory: {}", e)),
             }
         }
     }
@@ -1843,7 +1986,9 @@ async fn process_json_block_mode(
 
             let handle = tokio::spawn(async move {
                 let mut agent_guard = agent_clone.lock().await;
-                agent_guard.think_streaming_with_options(&current_message_clone, options, internal_tx).await
+                agent_guard
+                    .think_streaming_with_options(&current_message_clone, options, internal_tx)
+                    .await
             });
 
             // Forward tokens, suppressing tool call blocks
@@ -1857,7 +2002,9 @@ async fn process_json_block_mode(
                         in_code_block = true;
                         code_block_buffer = token;
                         if code_block_buffer.matches("```").count() >= 2 {
-                            if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                            if !(code_block_buffer.contains("\"tool\"")
+                                && code_block_buffer.contains("\"params\""))
+                            {
                                 let _ = tx_clone.send(code_block_buffer.clone()).await;
                             }
                             in_code_block = false;
@@ -1869,7 +2016,9 @@ async fn process_json_block_mode(
                 } else {
                     code_block_buffer.push_str(&token);
                     if code_block_buffer.matches("```").count() >= 2 {
-                        if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
+                        if !(code_block_buffer.contains("\"tool\"")
+                            && code_block_buffer.contains("\"params\""))
+                        {
                             let _ = tx_clone.send(code_block_buffer.clone()).await;
                         }
                         in_code_block = false;
@@ -1878,10 +2027,11 @@ async fn process_json_block_mode(
                 }
             }
 
-            if !code_block_buffer.is_empty() {
-                if !(code_block_buffer.contains("\"tool\"") && code_block_buffer.contains("\"params\"")) {
-                    let _ = tx_clone.send(code_block_buffer).await;
-                }
+            if !code_block_buffer.is_empty()
+                && !(code_block_buffer.contains("\"tool\"")
+                    && code_block_buffer.contains("\"params\""))
+            {
+                let _ = tx_clone.send(code_block_buffer).await;
             }
 
             match handle.await {
@@ -1892,7 +2042,10 @@ async fn process_json_block_mode(
         } else {
             // Non-streaming mode
             let mut agent_guard = agent.lock().await;
-            match agent_guard.think_with_options(&current_message, options).await {
+            match agent_guard
+                .think_with_options(&current_message, options)
+                .await
+            {
                 Ok(result) => result.response,
                 Err(e) => return format!("Error: {}", e),
             }
@@ -1903,17 +2056,17 @@ async fn process_json_block_mode(
         let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
         // Save memories
-        if !memories_to_save.is_empty() {
-            if let Some(mem_store) = semantic_memory {
-                let store = mem_store.lock().await;
-                for memory in &memories_to_save {
-                    let embedding = if let Some(emb_client) = embedding_client {
-                        emb_client.embed(memory).await.ok()
-                    } else {
-                        None
-                    };
-                    let _ = store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
-                }
+        if !memories_to_save.is_empty()
+            && let Some(mem_store) = semantic_memory
+        {
+            let store = mem_store.lock().await;
+            for memory in &memories_to_save {
+                let embedding = if let Some(emb_client) = embedding_client {
+                    emb_client.embed(memory).await.ok()
+                } else {
+                    None
+                };
+                let _ = store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
             }
         }
 
@@ -1927,9 +2080,14 @@ async fn process_json_block_mode(
                 return cleaned_response;
             }
 
-            logger.tool(&format!("[worker] Executing: {} with params {}", tc.tool, tc.params));
+            logger.tool(&format!(
+                "[worker] Executing: {} with params {}",
+                tc.tool, tc.params
+            ));
 
-            let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
+            let tool_def = tool_registry
+                .as_ref()
+                .and_then(|r| r.find_by_name(&tc.tool));
 
             match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                 Ok(tool_result) => {
@@ -1985,8 +2143,13 @@ async fn handle_notify(
     let store = match ConversationStore::init() {
         Ok(s) => s,
         Err(e) => {
-            logger.log(&format!("[notify] Failed to open conversation store: {}", e));
-            return Response::Error { message: format!("Failed to open conversation store: {}", e) };
+            logger.log(&format!(
+                "[notify] Failed to open conversation store: {}",
+                e
+            ));
+            return Response::Error {
+                message: format!("Failed to open conversation store: {}", e),
+            };
         }
     };
 
@@ -1995,21 +2158,29 @@ async fn handle_notify(
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
-            return Response::Error { message: format!("Failed to get messages: {}", e) };
+            return Response::Error {
+                message: format!("Failed to get messages: {}", e),
+            };
         }
     };
 
     if context_messages.is_empty() {
         logger.log("[notify] No messages in conversation");
-        return Response::Error { message: "No messages in conversation".to_string() };
+        return Response::Error {
+            message: "No messages in conversation".to_string(),
+        };
     }
 
     // Format conversation into proper user/assistant ChatMessages
     // This maps self→assistant (raw), others→user (JSON wrapped), with batching for alternation
-    let (conversation_history, final_user_content) = format_conversation_history(&context_messages, agent_name);
+    let (conversation_history, final_user_content) =
+        format_conversation_history(&context_messages, agent_name);
 
-    logger.log(&format!("[notify] Context: {} messages → {} history + final user turn",
-        context_messages.len(), conversation_history.len()));
+    logger.log(&format!(
+        "[notify] Context: {} messages → {} history + final user turn",
+        context_messages.len(),
+        conversation_history.len()
+    ));
 
     // Build tools injection or tool specs
     // Native mode: pass ALL allowed tools (model can only call tools in the array)
@@ -2023,7 +2194,10 @@ async fn handle_notify(
             Vec::new()
         };
         if !all_tools.is_empty() {
-            logger.tool(&format!("[notify] Native tools: {} allowed", all_tools.len()));
+            logger.tool(&format!(
+                "[notify] Native tools: {} allowed",
+                all_tools.len()
+            ));
         }
         let specs = if !all_tools.is_empty() {
             Some(tool_definitions_to_specs(&all_tools))
@@ -2037,7 +2211,10 @@ async fn handle_notify(
             let relevant = registry.find_relevant(&final_user_content, recall_limit);
             let relevant = filter_by_allowlist(relevant, allowed_tools);
             if !relevant.is_empty() {
-                logger.tool(&format!("[notify] Recall: {} tools for query", relevant.len()));
+                logger.tool(&format!(
+                    "[notify] Recall: {} tools for query",
+                    relevant.len()
+                ));
             }
             relevant
         } else {
@@ -2055,20 +2232,26 @@ async fn handle_notify(
         };
 
         let store_guard = mem_store.lock().await;
-        match store_guard.recall_with_embedding(&final_user_content, recall_limit, query_embedding.as_deref()) {
+        match store_guard.recall_with_embedding(
+            &final_user_content,
+            recall_limit,
+            query_embedding.as_deref(),
+        ) {
             Ok(memories) => {
                 let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
                 build_memory_injection(&entries)
             }
-            Err(_) => String::new()
+            Err(_) => String::new(),
         }
     } else {
         String::new()
     };
 
-    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    let effective_always =
+        build_effective_always(&tools_injection, &memory_injection, always, model_always);
     // Version without memories for tool continuation turns - still has tools + always.md
-    let effective_always_no_memory = build_effective_always(&tools_injection, "", always, model_always);
+    let effective_always_no_memory =
+        build_effective_always(&tools_injection, "", always, model_always);
 
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
@@ -2108,7 +2291,11 @@ async fn handle_notify(
 
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
-            always_prompt: if is_first_iteration { effective_always.clone() } else { effective_always_no_memory.clone() },
+            always_prompt: if is_first_iteration {
+                effective_always.clone()
+            } else {
+                effective_always_no_memory.clone()
+            },
             conversation_history: Some(conversation_history.clone()),
             external_tools: external_tools.clone(),
             max_iterations: max_iterations.unwrap_or(10),
@@ -2117,7 +2304,9 @@ async fn handle_notify(
 
         // Generate response
         let mut agent_guard = agent.lock().await;
-        let result = agent_guard.think_with_options(&current_message, options).await;
+        let result = agent_guard
+            .think_with_options(&current_message, options)
+            .await;
         drop(agent_guard); // Release lock before potential tool execution
 
         match result {
@@ -2140,17 +2329,22 @@ async fn handle_notify(
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
                 // Save memories
-                if !memories_to_save.is_empty() {
-                    if let Some(mem_store) = semantic_memory {
-                        let store_guard = mem_store.lock().await;
-                        for memory in &memories_to_save {
-                            let embedding = if let Some(emb_client) = embedding_client {
-                                emb_client.embed(memory).await.ok()
-                            } else {
-                                None
-                            };
-                            let _ = store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
-                        }
+                if !memories_to_save.is_empty()
+                    && let Some(mem_store) = semantic_memory
+                {
+                    let store_guard = mem_store.lock().await;
+                    for memory in &memories_to_save {
+                        let embedding = if let Some(emb_client) = embedding_client {
+                            emb_client.embed(memory).await.ok()
+                        } else {
+                            None
+                        };
+                        let _ = store_guard.save_with_embedding(
+                            memory,
+                            0.9,
+                            "explicit",
+                            embedding.as_deref(),
+                        );
                     }
                 }
 
@@ -2179,25 +2373,39 @@ async fn handle_notify(
                     // Use after_remember (not cleaned_response) to preserve the tool call JSON block
                     // so the model can see what it called in conversation history
                     if !after_remember.trim().is_empty() {
-                        if let Err(e) = store.add_message(conv_id, agent_name, &after_remember, &[]) {
-                            logger.log(&format!("[notify] Failed to store intermediate response: {}", e));
+                        if let Err(e) = store.add_message(conv_id, agent_name, &after_remember, &[])
+                        {
+                            logger.log(&format!(
+                                "[notify] Failed to store intermediate response: {}",
+                                e
+                            ));
                         } else {
-                            logger.log(&format!("[notify] Stored intermediate response: {} bytes", after_remember.len()));
+                            logger.log(&format!(
+                                "[notify] Stored intermediate response: {} bytes",
+                                after_remember.len()
+                            ));
                         }
                     }
 
-                    logger.tool(&format!("[notify] Executing: {} with params {}", tc.tool, tc.params));
+                    logger.tool(&format!(
+                        "[notify] Executing: {} with params {}",
+                        tc.tool, tc.params
+                    ));
 
                     // Look up the tool definition to get allowed_commands
-                    let tool_def = tool_registry.as_ref()
+                    let tool_def = tool_registry
+                        .as_ref()
                         .and_then(|r| r.find_by_name(&tc.tool));
 
                     match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
                         Ok(tool_result) => {
                             logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
-                            current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
+                            current_message =
+                                format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
                             // Store tool result in conversation
-                            if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
+                            if let Err(e) =
+                                store.add_message(conv_id, "tool", &current_message, &[])
+                            {
                                 logger.log(&format!("[notify] Failed to store tool result: {}", e));
                             }
                             // Refresh conversation_history from DB to include the tool result we just stored.
@@ -2206,7 +2414,8 @@ async fn handle_notify(
                             // IMPORTANT: Also update current_message from refreshed_final to avoid passing
                             // the tool result twice (once in history, once as the task).
                             if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
-                                let (refreshed_history, refreshed_final) = format_conversation_history(&msgs, agent_name);
+                                let (refreshed_history, refreshed_final) =
+                                    format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
                                 current_message = refreshed_final;
                             }
@@ -2218,14 +2427,17 @@ async fn handle_notify(
                             logger.tool(&format!("[notify] Error: {}", e));
                             current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
                             // Store tool error in conversation
-                            if let Err(e) = store.add_message(conv_id, "tool", &current_message, &[]) {
+                            if let Err(e) =
+                                store.add_message(conv_id, "tool", &current_message, &[])
+                            {
                                 logger.log(&format!("[notify] Failed to store tool error: {}", e));
                             }
                             // Refresh conversation_history from DB (same as success case)
                             // IMPORTANT: Also update current_message from refreshed_final to avoid passing
                             // the tool result twice (once in history, once as the task).
                             if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
-                                let (refreshed_history, refreshed_final) = format_conversation_history(&msgs, agent_name);
+                                let (refreshed_history, refreshed_final) =
+                                    format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
                                 current_message = refreshed_final;
                             }
@@ -2242,7 +2454,9 @@ async fn handle_notify(
             }
             Err(e) => {
                 logger.log(&format!("[notify] Agent error: {}", e));
-                return Response::Error { message: e.to_string() };
+                return Response::Error {
+                    message: e.to_string(),
+                };
             }
         }
     }
@@ -2251,19 +2465,42 @@ async fn handle_notify(
     let cleaned_response = final_response.unwrap_or_default();
     let duration_ms = start_time.elapsed().as_millis() as i64;
     // Serialize tool_calls to JSON for persistence
-    let tool_calls_json = last_tool_calls.as_ref().and_then(|tc| serde_json::to_string(tc).ok());
+    let tool_calls_json = last_tool_calls
+        .as_ref()
+        .and_then(|tc| serde_json::to_string(tc).ok());
     // Token tracking: only include if we have any token data
-    let tokens_in = if total_tokens_in > 0 { Some(total_tokens_in as i64) } else { None };
-    let tokens_out = if total_tokens_out > 0 { Some(total_tokens_out as i64) } else { None };
+    let tokens_in = if total_tokens_in > 0 {
+        Some(total_tokens_in as i64)
+    } else {
+        None
+    };
+    let tokens_out = if total_tokens_out > 0 {
+        Some(total_tokens_out as i64)
+    } else {
+        None
+    };
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
-    match store.add_message_with_tokens(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms), tool_calls_json.as_deref(), tokens_in, tokens_out, num_ctx_i64) {
+    match store.add_message_with_tokens(
+        conv_id,
+        agent_name,
+        &cleaned_response,
+        &[],
+        Some(duration_ms),
+        tool_calls_json.as_deref(),
+        tokens_in,
+        tokens_out,
+        num_ctx_i64,
+    ) {
         Ok(response_msg_id) => {
-            logger.log(&format!("[notify] Stored response as msg_id={} ({}ms)", response_msg_id, duration_ms));
+            logger.log(&format!(
+                "[notify] Stored response as msg_id={} ({}ms)",
+                response_msg_id, duration_ms
+            ));
 
             // Parse @mentions from our response and forward to other agents
             // Only forward if not paused and not at depth limit
-            let should_forward = depth < MAX_MENTION_DEPTH
-                && !store.is_paused(conv_id).unwrap_or(false);
+            let should_forward =
+                depth < MAX_MENTION_DEPTH && !store.is_paused(conv_id).unwrap_or(false);
 
             if should_forward {
                 // Parse @mentions from our response
@@ -2277,13 +2514,20 @@ async fn handle_notify(
                     .collect();
 
                 if !valid_mentions.is_empty() {
-                    logger.log(&format!("[notify] Forwarding to {} agents at depth {}: {:?}",
-                        valid_mentions.len(), depth + 1, valid_mentions));
+                    logger.log(&format!(
+                        "[notify] Forwarding to {} agents at depth {}: {:?}",
+                        valid_mentions.len(),
+                        depth + 1,
+                        valid_mentions
+                    ));
 
                     // Add mentioned agents as participants if not already
                     for mention in &valid_mentions {
                         if let Err(e) = store.add_participant(conv_id, mention) {
-                            logger.log(&format!("[notify] Warning: Could not add {} as participant: {}", mention, e));
+                            logger.log(&format!(
+                                "[notify] Warning: Could not add {} as participant: {}",
+                                mention, e
+                            ));
                         }
                     }
 
@@ -2295,18 +2539,26 @@ async fn handle_notify(
                             response_msg_id,
                             depth + 1,
                             logger,
-                        ).await;
+                        )
+                        .await;
                     }
                 }
             } else if depth >= MAX_MENTION_DEPTH {
-                logger.log(&format!("[notify] Skipping forwarding: depth limit reached ({})", depth));
+                logger.log(&format!(
+                    "[notify] Skipping forwarding: depth limit reached ({})",
+                    depth
+                ));
             }
 
-            Response::Notified { response_message_id: response_msg_id }
+            Response::Notified {
+                response_message_id: response_msg_id,
+            }
         }
         Err(e) => {
             logger.log(&format!("[notify] Failed to store response: {}", e));
-            Response::Error { message: format!("Failed to store response: {}", e) }
+            Response::Error {
+                message: format!("Failed to store response: {}", e),
+            }
         }
     }
 }
@@ -2329,10 +2581,16 @@ async fn forward_notify_to_agent(
     let queue_notification = |agent: &str, cid: &str, mid: i64, log: &AgentLogger| {
         if let Ok(store) = ConversationStore::init() {
             if let Err(e) = store.add_pending_notification(agent, cid, mid) {
-                log.log(&format!("[notify] Failed to queue notification for @{}: {}", agent, e));
+                log.log(&format!(
+                    "[notify] Failed to queue notification for @{}: {}",
+                    agent, e
+                ));
             }
         } else {
-            log.log(&format!("[notify] Failed to open store to queue notification for @{}", agent));
+            log.log(&format!(
+                "[notify] Failed to open store to queue notification for @{}",
+                agent
+            ));
         }
     };
 
@@ -2350,7 +2608,10 @@ async fn forward_notify_to_agent(
                 };
 
                 if let Err(e) = api.write_request(&request).await {
-                    logger.log(&format!("[notify] Failed to send to @{}: {}", agent_name, e));
+                    logger.log(&format!(
+                        "[notify] Failed to send to @{}: {}",
+                        agent_name, e
+                    ));
                     // Queue notification for later
                     queue_notification(agent_name, conv_id, message_id, logger);
                     return;
@@ -2359,10 +2620,17 @@ async fn forward_notify_to_agent(
                 // Read response (but don't wait too long)
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(300), // 5 min timeout for agent response
-                    api.read_response()
-                ).await {
-                    Ok(Ok(Some(Response::Notified { response_message_id }))) => {
-                        logger.log(&format!("[notify] @{} responded with msg_id={}", agent_name, response_message_id));
+                    api.read_response(),
+                )
+                .await
+                {
+                    Ok(Ok(Some(Response::Notified {
+                        response_message_id,
+                    }))) => {
+                        logger.log(&format!(
+                            "[notify] @{} responded with msg_id={}",
+                            agent_name, response_message_id
+                        ));
                     }
                     Ok(Ok(Some(Response::Error { message }))) => {
                         logger.log(&format!("[notify] @{} error: {}", agent_name, message));
@@ -2380,18 +2648,27 @@ async fn forward_notify_to_agent(
                         logger.log(&format!("[notify] @{} read error: {}", agent_name, e));
                     }
                     Err(_) => {
-                        logger.log(&format!("[notify] @{} timeout waiting for response", agent_name));
+                        logger.log(&format!(
+                            "[notify] @{} timeout waiting for response",
+                            agent_name
+                        ));
                     }
                 }
             }
             Err(e) => {
-                logger.log(&format!("[notify] @{} not reachable ({}), queuing", agent_name, e));
+                logger.log(&format!(
+                    "[notify] @{} not reachable ({}), queuing",
+                    agent_name, e
+                ));
                 queue_notification(agent_name, conv_id, message_id, logger);
             }
         }
     } else {
         // Agent not running - queue notification
-        logger.log(&format!("[notify] @{} not running, queuing notification", agent_name));
+        logger.log(&format!(
+            "[notify] @{} not running, queuing notification",
+            agent_name
+        ));
         queue_notification(agent_name, conv_id, message_id, logger);
     }
 }
@@ -2431,14 +2708,20 @@ async fn run_heartbeat(
         }
     };
 
-    logger.log(&format!("[heartbeat] Running with prompt: {} chars", heartbeat_prompt.len()));
+    logger.log(&format!(
+        "[heartbeat] Running with prompt: {} chars",
+        heartbeat_prompt.len()
+    ));
 
     // 2. Get or create <agent>-heartbeat conversation
     let conv_name = format!("{}-heartbeat", agent_name);
     let store = match ConversationStore::init() {
         Ok(s) => s,
         Err(e) => {
-            logger.log(&format!("[heartbeat] Failed to open conversation store: {}", e));
+            logger.log(&format!(
+                "[heartbeat] Failed to open conversation store: {}",
+                e
+            ));
             return;
         }
     };
@@ -2455,10 +2738,15 @@ async fn run_heartbeat(
     // 3. Get conversation context (recent heartbeat outputs for continuity)
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
-    let context_messages = store.get_messages(&conv_name, Some(recall_limit)).unwrap_or_default();
+    let context_messages = store
+        .get_messages(&conv_name, Some(recall_limit))
+        .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
-    logger.log(&format!("[heartbeat] Context: {} previous outputs", conversation_history.len()));
+    logger.log(&format!(
+        "[heartbeat] Context: {} previous outputs",
+        conversation_history.len()
+    ));
 
     // 4. Build effective always with tools and memory injection
     // Native mode: pass ALL allowed tools (model can only call tools in the array)
@@ -2472,7 +2760,10 @@ async fn run_heartbeat(
             Vec::new()
         };
         if !all_tools.is_empty() {
-            logger.tool(&format!("[heartbeat] Native tools: {} allowed", all_tools.len()));
+            logger.tool(&format!(
+                "[heartbeat] Native tools: {} allowed",
+                all_tools.len()
+            ));
         }
         let specs = if !all_tools.is_empty() {
             Some(tool_definitions_to_specs(&all_tools))
@@ -2497,7 +2788,11 @@ async fn run_heartbeat(
         };
 
         let store_guard = mem_store.lock().await;
-        match store_guard.recall_with_embedding(&heartbeat_prompt, recall_limit, query_embedding.as_deref()) {
+        match store_guard.recall_with_embedding(
+            &heartbeat_prompt,
+            recall_limit,
+            query_embedding.as_deref(),
+        ) {
             Ok(memories) => {
                 if !memories.is_empty() {
                     logger.memory(&format!("[heartbeat] Recall: {} memories", memories.len()));
@@ -2505,25 +2800,33 @@ async fn run_heartbeat(
                 let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
                 build_memory_injection(&entries)
             }
-            Err(_) => String::new()
+            Err(_) => String::new(),
         }
     } else {
         String::new()
     };
 
-    let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    let effective_always =
+        build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
     // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
         always_prompt: effective_always,
-        conversation_history: if conversation_history.is_empty() { None } else { Some(conversation_history) },
+        conversation_history: if conversation_history.is_empty() {
+            None
+        } else {
+            Some(conversation_history)
+        },
         external_tools,
         ..Default::default()
     };
 
     let mut agent_guard = agent.lock().await;
-    let result = match agent_guard.think_with_options(&heartbeat_prompt, options).await {
+    let result = match agent_guard
+        .think_with_options(&heartbeat_prompt, options)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             logger.log(&format!("[heartbeat] Think error: {}", e));
@@ -2537,20 +2840,25 @@ async fn run_heartbeat(
     let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
 
     // Save memories
-    if !memories_to_save.is_empty() {
-        if let Some(mem_store) = semantic_memory {
-            let store_guard = mem_store.lock().await;
-            for memory in &memories_to_save {
-                let embedding = if let Some(emb_client) = embedding_client {
-                    emb_client.embed(memory).await.ok()
-                } else {
-                    None
-                };
-                match store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                    Ok(SaveResult::New(id)) => logger.memory(&format!("[heartbeat] Save #{}: \"{}\"", id, memory)),
-                    Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("[heartbeat] Reinforce #{}: ({:.2} → {:.2})", id, old, new)),
-                    Err(e) => logger.log(&format!("[heartbeat] Failed to save memory: {}", e)),
+    if !memories_to_save.is_empty()
+        && let Some(mem_store) = semantic_memory
+    {
+        let store_guard = mem_store.lock().await;
+        for memory in &memories_to_save {
+            let embedding = if let Some(emb_client) = embedding_client {
+                emb_client.embed(memory).await.ok()
+            } else {
+                None
+            };
+            match store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                Ok(SaveResult::New(id)) => {
+                    logger.memory(&format!("[heartbeat] Save #{}: \"{}\"", id, memory))
                 }
+                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
+                    "[heartbeat] Reinforce #{}: ({:.2} → {:.2})",
+                    id, old, new
+                )),
+                Err(e) => logger.log(&format!("[heartbeat] Failed to save memory: {}", e)),
             }
         }
     }
@@ -2574,28 +2882,36 @@ async fn run_heartbeat(
         .collect();
 
     if !valid_mentions.is_empty() {
-        logger.log(&format!("[heartbeat] Notifying {} agents: {:?}", valid_mentions.len(), valid_mentions));
+        logger.log(&format!(
+            "[heartbeat] Notifying {} agents: {:?}",
+            valid_mentions.len(),
+            valid_mentions
+        ));
 
         // Get the message ID we just stored
-        if let Ok(msgs) = store.get_messages(&conv_name, Some(1)) {
-            if let Some(last_msg) = msgs.last() {
-                for mention in valid_mentions {
-                    // Add mentioned agent as participant
-                    let _ = store.add_participant(&conv_name, &mention);
+        if let Ok(msgs) = store.get_messages(&conv_name, Some(1))
+            && let Some(last_msg) = msgs.last()
+        {
+            for mention in valid_mentions {
+                // Add mentioned agent as participant
+                let _ = store.add_participant(&conv_name, &mention);
 
-                    forward_notify_to_agent(
-                        &mention,
-                        &conv_name,
-                        last_msg.id,
-                        0, // Start at depth 0
-                        logger,
-                    ).await;
-                }
+                forward_notify_to_agent(
+                    &mention,
+                    &conv_name,
+                    last_msg.id,
+                    0, // Start at depth 0
+                    logger,
+                )
+                .await;
             }
         }
     }
 
-    logger.log(&format!("[heartbeat] Complete. Response: {} chars", cleaned_response.len()));
+    logger.log(&format!(
+        "[heartbeat] Complete. Response: {} chars",
+        cleaned_response.len()
+    ));
 }
 
 /// Task watcher loop for Claude Code tasks.
@@ -2626,8 +2942,8 @@ async fn task_watcher_loop(
                 };
 
                 for task in running_tasks {
-                    if let Some(pid) = task.pid {
-                        if !is_process_running(pid) {
+                    if let Some(pid) = task.pid
+                        && !is_process_running(pid) {
                             // Task has completed - read log and update status
                             logger.log(&format!("[task-watcher] Task {} (pid {}) completed", task.id, pid));
 
@@ -2652,7 +2968,6 @@ async fn task_watcher_loop(
                             // Notify the agent via a conversation message
                             notify_task_complete(&task.agent, &task.id, task.conv_id.as_deref(), status, exit_code, &output_summary, &logger).await;
                         }
-                    }
                 }
             }
             _ = shutdown.notified() => {
@@ -2670,7 +2985,10 @@ fn read_task_output(log_path: &str, logger: &AgentLogger) -> (i32, String) {
     let log_content = match std::fs::read_to_string(log_path) {
         Ok(content) => content,
         Err(e) => {
-            logger.log(&format!("[task-watcher] Error reading log {}: {}", log_path, e));
+            logger.log(&format!(
+                "[task-watcher] Error reading log {}: {}",
+                log_path, e
+            ));
             return (-1, format!("Error reading log: {}", e));
         }
     };
@@ -2685,11 +3003,15 @@ fn read_task_output(log_path: &str, logger: &AgentLogger) -> (i32, String) {
 
     // Try to extract exit code from the log
     // Look for patterns like "exit code: N" or "exited with N"
-    let exit_code = if log_content.contains("exit code: 0") || log_content.contains("exited with 0") {
+    let exit_code = if log_content.contains("exit code: 0") || log_content.contains("exited with 0")
+    {
         0
     } else if log_content.contains("exit code: 1") || log_content.contains("exited with 1") {
         1
-    } else if log_content.contains("error") || log_content.contains("Error") || log_content.contains("ERROR") {
+    } else if log_content.contains("error")
+        || log_content.contains("Error")
+        || log_content.contains("ERROR")
+    {
         // Assume failure if errors present
         1
     } else {
@@ -2715,7 +3037,10 @@ async fn notify_task_complete(
     let conv_name = match conv_id {
         Some(id) => id.to_string(),
         None => {
-            logger.log(&format!("[task-watcher] Task {} has no conv_id, cannot notify", task_id));
+            logger.log(&format!(
+                "[task-watcher] Task {} has no conv_id, cannot notify",
+                task_id
+            ));
             return;
         }
     };
@@ -2724,7 +3049,10 @@ async fn notify_task_complete(
     let store = match ConversationStore::init() {
         Ok(s) => s,
         Err(e) => {
-            logger.log(&format!("[task-watcher] Failed to open conversation store: {}", e));
+            logger.log(&format!(
+                "[task-watcher] Failed to open conversation store: {}",
+                e
+            ));
             return;
         }
     };
@@ -2745,21 +3073,24 @@ async fn notify_task_complete(
     // Add message to conversation
     match store.add_message(&conv_name, "system", &message, &[agent_name]) {
         Ok(msg_id) => {
-            logger.log(&format!("[task-watcher] Stored notification as msg_id={}", msg_id));
+            logger.log(&format!(
+                "[task-watcher] Stored notification as msg_id={}",
+                msg_id
+            ));
 
             // Forward the notification to the agent daemon if it's running
-            forward_notify_to_agent(
-                agent_name,
-                &conv_name,
-                msg_id,
-                0,
-                logger,
-            ).await;
+            forward_notify_to_agent(agent_name, &conv_name, msg_id, 0, logger).await;
 
-            logger.log(&format!("[task-watcher] Notified @{} about task {}", agent_name, task_id));
+            logger.log(&format!(
+                "[task-watcher] Notified @{} about task {}",
+                agent_name, task_id
+            ));
         }
         Err(e) => {
-            logger.log(&format!("[task-watcher] Failed to store notification: {}", e));
+            logger.log(&format!(
+                "[task-watcher] Failed to store notification: {}",
+                e
+            ));
         }
     }
 }
@@ -2813,7 +3144,10 @@ async fn handle_connection(
         };
 
         let response = match request {
-            Request::Message { ref content, ref conv_name } => {
+            Request::Message {
+                ref content,
+                ref conv_name,
+            } => {
                 logger.log(&format!("[socket] Received message: {}", content));
 
                 // Create streaming channel for tokens
@@ -2823,12 +3157,15 @@ async fn handle_connection(
                 let (response_tx, response_rx) = oneshot::channel();
 
                 // Send work to the worker
-                if work_tx.send(AgentWork::Message {
-                    content: content.clone(),
-                    conv_name: conv_name.clone(),
-                    response_tx,
-                    token_tx: Some(token_tx),
-                }).is_err() {
+                if work_tx
+                    .send(AgentWork::Message {
+                        content: content.clone(),
+                        conv_name: conv_name.clone(),
+                        response_tx,
+                        token_tx: Some(token_tx),
+                    })
+                    .is_err()
+                {
                     logger.log("[socket] Worker channel closed");
                     break;
                 }
@@ -2848,7 +3185,10 @@ async fn handle_connection(
                         if let Err(e) = api.write_response(&Response::Done).await {
                             logger.log(&format!("[socket] Error writing Done: {}", e));
                         }
-                        logger.log(&format!("[socket] Final response: {} bytes", result.response.len()));
+                        logger.log(&format!(
+                            "[socket] Final response: {} bytes",
+                            result.response.len()
+                        ));
                     }
                     Err(_) => {
                         logger.log("[socket] Worker dropped response channel");
@@ -2862,8 +3202,14 @@ async fn handle_connection(
                 continue;
             }
 
-            Request::IncomingMessage { ref from, ref content } => {
-                logger.log(&format!("[socket] Incoming message from {}: {}", from, content));
+            Request::IncomingMessage {
+                ref from,
+                ref content,
+            } => {
+                logger.log(&format!(
+                    "[socket] Incoming message from {}: {}",
+                    from, content
+                ));
 
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
@@ -2880,7 +3226,10 @@ async fn handle_connection(
                         Vec::new()
                     };
                     if !all_tools.is_empty() {
-                        logger.tool(&format!("[socket] Native tools: {} allowed", all_tools.len()));
+                        logger.tool(&format!(
+                            "[socket] Native tools: {} allowed",
+                            all_tools.len()
+                        ));
                     }
                     let specs = if !all_tools.is_empty() {
                         Some(tool_definitions_to_specs(&all_tools))
@@ -2910,7 +3259,10 @@ async fn handle_connection(
                         match emb_client.embed(content).await {
                             Ok(emb) => Some(emb),
                             Err(e) => {
-                                logger.log(&format!("[socket] Failed to generate query embedding: {}", e));
+                                logger.log(&format!(
+                                    "[socket] Failed to generate query embedding: {}",
+                                    e
+                                ));
                                 None
                             }
                         }
@@ -2919,12 +3271,22 @@ async fn handle_connection(
                     };
 
                     let store = mem_store.lock().await;
-                    match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
+                    match store.recall_with_embedding(
+                        content,
+                        recall_limit,
+                        query_embedding.as_deref(),
+                    ) {
                         Ok(memories) => {
                             if !memories.is_empty() {
-                                logger.memory(&format!("Recall: {} memories for incoming", memories.len()));
+                                logger.memory(&format!(
+                                    "Recall: {} memories for incoming",
+                                    memories.len()
+                                ));
                                 for (m, score) in &memories {
-                                    logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
+                                    logger.memory(&format!(
+                                        "  ({:.3}) \"{}\" [#{}]",
+                                        score, m.content, m.id
+                                    ));
                                 }
                             }
                             let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
@@ -2940,7 +3302,12 @@ async fn handle_connection(
                 };
 
                 // Combine tools, memory injection, and always prompt
-                let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
+                let effective_always = build_effective_always(
+                    &tools_injection,
+                    &memory_injection,
+                    &always,
+                    &model_always,
+                );
 
                 let options = ThinkOptions {
                     system_prompt: system_prompt.clone(),
@@ -2950,49 +3317,81 @@ async fn handle_connection(
                 };
 
                 let mut agent_guard = agent.lock().await;
-                match agent_guard.think_with_options(&formatted_message, options).await {
+                match agent_guard
+                    .think_with_options(&formatted_message, options)
+                    .await
+                {
                     Ok(result) => {
                         // Strip thinking tags and extract [REMEMBER: ...] tags
                         let without_thinking = strip_thinking_tags(&result.response);
-                        let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
+                        let (cleaned_response, memories_to_save) =
+                            extract_remember_tags(&without_thinking);
 
-                        if !memories_to_save.is_empty() {
-                            if let Some(ref mem_store) = semantic_memory {
-                                let store = mem_store.lock().await;
-                                for memory in &memories_to_save {
-                                    // Generate embedding if we have a client
-                                    let embedding = if let Some(ref emb_client) = embedding_client {
-                                        match emb_client.embed(memory).await {
-                                            Ok(emb) => Some(emb),
-                                            Err(e) => {
-                                                logger.log(&format!("[socket] Failed to generate embedding: {}", e));
-                                                None
-                                            }
+                        if !memories_to_save.is_empty()
+                            && let Some(ref mem_store) = semantic_memory
+                        {
+                            let store = mem_store.lock().await;
+                            for memory in &memories_to_save {
+                                // Generate embedding if we have a client
+                                let embedding = if let Some(ref emb_client) = embedding_client {
+                                    match emb_client.embed(memory).await {
+                                        Ok(emb) => Some(emb),
+                                        Err(e) => {
+                                            logger.log(&format!(
+                                                "[socket] Failed to generate embedding: {}",
+                                                e
+                                            ));
+                                            None
                                         }
-                                    } else {
-                                        None
-                                    };
-
-                                    match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                                        Ok(SaveResult::New(id)) => logger.memory(&format!("Save #{}: \"{}\"", id, memory)),
-                                        Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!("Reinforce #{}: \"{}\" ({:.2} → {:.2})", id, memory, old, new)),
-                                        Err(e) => logger.log(&format!("[socket] Failed to save memory: {}", e)),
                                     }
+                                } else {
+                                    None
+                                };
+
+                                match store.save_with_embedding(
+                                    memory,
+                                    0.9,
+                                    "explicit",
+                                    embedding.as_deref(),
+                                ) {
+                                    Ok(SaveResult::New(id)) => {
+                                        logger.memory(&format!("Save #{}: \"{}\"", id, memory))
+                                    }
+                                    Ok(SaveResult::Reinforced(id, old, new)) => {
+                                        logger.memory(&format!(
+                                            "Reinforce #{}: \"{}\" ({:.2} → {:.2})",
+                                            id, memory, old, new
+                                        ))
+                                    }
+                                    Err(e) => logger
+                                        .log(&format!("[socket] Failed to save memory: {}", e)),
                                 }
                             }
                         }
 
-                        logger.log(&format!("[socket] Response to {}: {}", from, cleaned_response));
-                        Response::Message { content: cleaned_response }
+                        logger.log(&format!(
+                            "[socket] Response to {}: {}",
+                            from, cleaned_response
+                        ));
+                        Response::Message {
+                            content: cleaned_response,
+                        }
                     }
-                    Err(e) => {
-                        Response::Error { message: e.to_string() }
-                    }
+                    Err(e) => Response::Error {
+                        message: e.to_string(),
+                    },
                 }
             }
 
-            Request::Notify { ref conv_id, message_id, depth } => {
-                logger.log(&format!("[socket] Notify: conv={} msg_id={} depth={}", conv_id, message_id, depth));
+            Request::Notify {
+                ref conv_id,
+                message_id,
+                depth,
+            } => {
+                logger.log(&format!(
+                    "[socket] Notify: conv={} msg_id={} depth={}",
+                    conv_id, message_id, depth
+                ));
 
                 // Send immediate ack - fire-and-forget semantics
                 if let Err(e) = api.write_response(&Response::NotifyReceived).await {
@@ -3001,11 +3400,14 @@ async fn handle_connection(
                 }
 
                 // Send Notify work to the worker - serialized with other agent work
-                if work_tx.send(AgentWork::Notify {
-                    conv_id: conv_id.clone(),
-                    message_id,
-                    depth,
-                }).is_err() {
+                if work_tx
+                    .send(AgentWork::Notify {
+                        conv_id: conv_id.clone(),
+                        message_id,
+                        depth,
+                    })
+                    .is_err()
+                {
                     logger.log("[socket] Worker channel closed");
                 }
 
@@ -3045,8 +3447,12 @@ async fn handle_connection(
 
             Request::System => {
                 logger.log("[socket] System prompt requested");
-                let system_content = system_prompt.clone().unwrap_or_else(|| "(no system prompt configured)".to_string());
-                Response::System { system_prompt: system_content }
+                let system_content = system_prompt
+                    .clone()
+                    .unwrap_or_else(|| "(no system prompt configured)".to_string());
+                Response::System {
+                    system_prompt: system_content,
+                }
             }
 
             Request::Heartbeat => {
@@ -3057,12 +3463,16 @@ async fn handle_connection(
                     // Check if heartbeat.md exists
                     if !hb_config.heartbeat_path.exists() {
                         logger.log("[socket] heartbeat.md not found");
-                        Response::Error { message: "heartbeat.md not found".to_string() }
+                        Response::Error {
+                            message: "heartbeat.md not found".to_string(),
+                        }
                     } else {
                         // Send heartbeat work to the worker - serialized with other agent work
                         if work_tx.send(AgentWork::Heartbeat).is_err() {
                             logger.log("[socket] Worker channel closed");
-                            Response::Error { message: "Worker channel closed".to_string() }
+                            Response::Error {
+                                message: "Worker channel closed".to_string(),
+                            }
                         } else {
                             Response::HeartbeatTriggered
                         }
@@ -3122,8 +3532,14 @@ mod tests {
     #[test]
     fn test_parse_duration_compound() {
         // Compound durations like "2h30m", "1h30m15s"
-        assert_eq!(parse_duration("2h30m"), Some(Duration::from_secs(2 * 3600 + 30 * 60)));
-        assert_eq!(parse_duration("1h30m15s"), Some(Duration::from_secs(3600 + 30 * 60 + 15)));
+        assert_eq!(
+            parse_duration("2h30m"),
+            Some(Duration::from_secs(2 * 3600 + 30 * 60))
+        );
+        assert_eq!(
+            parse_duration("1h30m15s"),
+            Some(Duration::from_secs(3600 + 30 * 60 + 15))
+        );
         assert_eq!(parse_duration("1m30s"), Some(Duration::from_secs(60 + 30)));
     }
 
@@ -3368,7 +3784,11 @@ api_key = "sk-test"
             params: serde_json::json!({"command": "string"}),
             keywords: vec!["shell".to_string()],
             category: Some("system".to_string()),
-            allowed_commands: Some(vec!["ls".to_string(), "grep".to_string(), "cat".to_string()]),
+            allowed_commands: Some(vec![
+                "ls".to_string(),
+                "grep".to_string(),
+                "cat".to_string(),
+            ]),
         };
 
         let tool_call = ToolCall {
@@ -3391,7 +3811,11 @@ api_key = "sk-test"
             params: serde_json::json!({"command": "string"}),
             keywords: vec!["shell".to_string()],
             category: Some("system".to_string()),
-            allowed_commands: Some(vec!["ls".to_string(), "grep".to_string(), "cat".to_string()]),
+            allowed_commands: Some(vec![
+                "ls".to_string(),
+                "grep".to_string(),
+                "cat".to_string(),
+            ]),
         };
 
         let tool_call = ToolCall {
@@ -3417,7 +3841,7 @@ api_key = "sk-test"
             params: serde_json::json!({"command": "string"}),
             keywords: vec!["shell".to_string()],
             category: Some("system".to_string()),
-            allowed_commands: None,  // No restrictions
+            allowed_commands: None, // No restrictions
         };
 
         let tool_call = ToolCall {
@@ -3495,7 +3919,13 @@ api_key = "sk-test"
         // History should have 2 messages: user JSON, assistant raw
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "user");
-        assert!(history[0].content.as_ref().unwrap().contains("\"from\": \"user\""));
+        assert!(
+            history[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("\"from\": \"user\"")
+        );
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].content.as_ref().unwrap(), "hey there!");
 
@@ -3543,7 +3973,13 @@ api_key = "sk-test"
         // gendry → user JSON, arya → assistant raw
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, "user");
-        assert!(history[0].content.as_ref().unwrap().contains("\"from\": \"gendry\""));
+        assert!(
+            history[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("\"from\": \"gendry\"")
+        );
         assert_eq!(history[1].role, "assistant");
         assert_eq!(history[1].content.as_ref().unwrap(), "what do you need?");
 
@@ -3683,7 +4119,8 @@ api_key = "sk-test"
 
     #[test]
     fn test_build_effective_always_with_directives() {
-        let base = Some("Header\n<!-- @inject:tools -->\n<!-- @inject:memories -->\nFooter".to_string());
+        let base =
+            Some("Header\n<!-- @inject:tools -->\n<!-- @inject:memories -->\nFooter".to_string());
         let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();

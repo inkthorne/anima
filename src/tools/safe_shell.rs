@@ -1,15 +1,14 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::process::Command;
 
 /// Default list of safe commands that can be executed.
 const DEFAULT_SAFE_COMMANDS: &[&str] = &[
-    "ls", "grep", "find", "cat", "head", "tail", "wc", "pwd",
-    "echo", "which", "file", "stat", "du", "df", "env", "date",
-    "whoami", "hostname", "uname"
+    "ls", "grep", "find", "cat", "head", "tail", "wc", "pwd", "echo", "which", "file", "stat",
+    "du", "df", "env", "date", "whoami", "hostname", "uname",
 ];
 
 /// Tool for executing shell commands with command allowlist validation.
@@ -26,14 +25,20 @@ impl SafeShellTool {
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(30),
-            allowed_commands: DEFAULT_SAFE_COMMANDS.iter().map(|s| s.to_string()).collect(),
+            allowed_commands: DEFAULT_SAFE_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
         Self {
             timeout,
-            allowed_commands: DEFAULT_SAFE_COMMANDS.iter().map(|s| s.to_string()).collect(),
+            allowed_commands: DEFAULT_SAFE_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -52,7 +57,7 @@ impl SafeShellTool {
         // Split on common shell operators
         // This is a simplified parser - it won't handle all edge cases
         // but covers the common usage patterns
-        for segment in command.split(|c| c == '|' || c == ';') {
+        for segment in command.split(['|', ';']) {
             // Also handle && and || by splitting on those
             for part in segment.split("&&") {
                 for subpart in part.split("||") {
@@ -136,21 +141,22 @@ impl Tool for SafeShellTool {
         let command = input
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'command' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'command' field".to_string())
+            })?;
 
         // Validate all commands in the input
         self.validate_command(command)
-            .map_err(|e| ToolError::InvalidInput(e))?;
+            .map_err(ToolError::InvalidInput)?;
 
         let output = tokio::time::timeout(
             self.timeout,
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .output()
+            Command::new("sh").arg("-c").arg(command).output(),
         )
         .await
-        .map_err(|_| ToolError::ExecutionFailed(format!("Command timed out after {:?}", self.timeout)))?
+        .map_err(|_| {
+            ToolError::ExecutionFailed(format!("Command timed out after {:?}", self.timeout))
+        })?
         .map_err(|e| ToolError::ExecutionFailed(format!("Failed to execute command: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -188,7 +194,12 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("command")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("command"))
+        );
     }
 
     #[test]
@@ -259,7 +270,10 @@ mod tests {
     #[tokio::test]
     async fn test_safe_shell_simple_command() {
         let tool = SafeShellTool::new();
-        let result = tool.execute(json!({"command": "echo hello"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
         assert_eq!(result["exit_code"], 0);
     }
@@ -267,7 +281,10 @@ mod tests {
     #[tokio::test]
     async fn test_safe_shell_piped_command() {
         let tool = SafeShellTool::new();
-        let result = tool.execute(json!({"command": "echo hello | cat"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo hello | cat"}))
+            .await
+            .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
     }
 

@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -10,10 +10,10 @@ fn expand_tilde(path: &str) -> PathBuf {
         if let Some(home) = dirs::home_dir() {
             return home.join(&path[2..]);
         }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
     }
     PathBuf::from(path)
 }
@@ -50,32 +50,35 @@ impl Tool for WriteFileTool {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        let path_str = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'path' field".to_string()))?;
+        let path_str = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolError::InvalidInput("Missing or invalid 'path' field".to_string())
+        })?;
 
         let content = input
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'content' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'content' field".to_string())
+            })?;
 
         let path = expand_tilde(path_str);
 
         // Create parent directories if they don't exist
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| ToolError::ExecutionFailed(format!("Failed to create parent directories: {}", e)))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to create parent directories: {}", e))
+            })?;
         }
 
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e)))?;
+        tokio::fs::write(&path, content).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e))
+        })?;
 
-        Ok(serde_json::json!({ "success": true, "message": format!("Successfully wrote to '{}'", path.display()) }))
+        Ok(
+            serde_json::json!({ "success": true, "message": format!("Successfully wrote to '{}'", path.display()) }),
+        )
     }
 }
 
@@ -83,7 +86,7 @@ impl Tool for WriteFileTool {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tempfile::{tempdir, NamedTempFile};
+    use tempfile::{NamedTempFile, tempdir};
 
     #[test]
     fn test_write_file_tool_name() {
@@ -104,8 +107,18 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["content"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
-        assert!(schema["required"].as_array().unwrap().contains(&json!("content")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("path"))
+        );
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("content"))
+        );
     }
 
     #[tokio::test]
@@ -115,7 +128,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let tool = WriteFileTool;
-        let result = tool.execute(json!({"path": path_str, "content": "hello world"})).await.unwrap();
+        let result = tool
+            .execute(json!({"path": path_str, "content": "hello world"}))
+            .await
+            .unwrap();
         assert!(result["success"].as_bool().unwrap());
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -128,8 +144,12 @@ mod tests {
         let path = file.path().to_str().unwrap();
 
         let tool = WriteFileTool;
-        tool.execute(json!({"path": path, "content": "original"})).await.unwrap();
-        tool.execute(json!({"path": path, "content": "updated"})).await.unwrap();
+        tool.execute(json!({"path": path, "content": "original"}))
+            .await
+            .unwrap();
+        tool.execute(json!({"path": path, "content": "updated"}))
+            .await
+            .unwrap();
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(contents, "updated");
@@ -142,7 +162,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let tool = WriteFileTool;
-        let result = tool.execute(json!({"path": path_str, "content": "nested content"})).await.unwrap();
+        let result = tool
+            .execute(json!({"path": path_str, "content": "nested content"}))
+            .await
+            .unwrap();
         assert!(result["success"].as_bool().unwrap());
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -170,7 +193,10 @@ mod tests {
         let path_str = path.to_str().unwrap();
 
         let tool = WriteFileTool;
-        let result = tool.execute(json!({"path": path_str, "content": ""})).await.unwrap();
+        let result = tool
+            .execute(json!({"path": path_str, "content": ""}))
+            .await
+            .unwrap();
         assert!(result["success"].as_bool().unwrap());
 
         let contents = std::fs::read_to_string(&path).unwrap();

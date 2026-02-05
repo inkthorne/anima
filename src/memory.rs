@@ -1,3 +1,4 @@
+use crate::debug;
 use async_trait::async_trait;
 use rusqlite::{Connection, params};
 use serde_json::Value;
@@ -5,10 +6,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::debug;
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +95,12 @@ impl Memory for InMemoryStore {
 
     async fn list_keys(&self, prefix: Option<&str>) -> Vec<String> {
         match prefix {
-            Some(p) => self.data.keys().filter(|k| k.starts_with(p)).cloned().collect(),
+            Some(p) => self
+                .data
+                .keys()
+                .filter(|k| k.starts_with(p))
+                .cloned()
+                .collect(),
             None => self.data.keys().cloned().collect(),
         }
     }
@@ -111,9 +119,8 @@ pub struct SqliteMemory {
 impl SqliteMemory {
     /// Open or create a SQLite database at the given path
     pub fn open(path: &str, agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open(path)
-            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
-        
+        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
         let memory = SqliteMemory {
             conn: Arc::new(Mutex::new(conn)),
             agent_id: agent_id.to_string(),
@@ -124,9 +131,9 @@ impl SqliteMemory {
 
     /// Create an in-memory SQLite database (useful for testing)
     pub fn open_in_memory(agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
-        
+        let conn =
+            Connection::open_in_memory().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
         let memory = SqliteMemory {
             conn: Arc::new(Mutex::new(conn)),
             agent_id: agent_id.to_string(),
@@ -149,46 +156,64 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_memories_agent ON memories(agent_id);
             CREATE INDEX IF NOT EXISTS idx_memories_agent_key ON memories(agent_id, key);
-            CREATE INDEX IF NOT EXISTS idx_memories_time ON memories(agent_id, updated_at);"
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            CREATE INDEX IF NOT EXISTS idx_memories_time ON memories(agent_id, updated_at);",
+        )
+        .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
     /// Query memories by time range (episodic memory)
-    pub async fn query_by_time(&self, since: u64, until: Option<u64>) -> Result<Vec<(String, MemoryEntry)>, MemoryError> {
+    pub async fn query_by_time(
+        &self,
+        since: u64,
+        until: Option<u64>,
+    ) -> Result<Vec<(String, MemoryEntry)>, MemoryError> {
         let conn = self.conn.clone();
         let agent_id = self.agent_id.clone();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             // Use i64 for SQLite compatibility (i64::MAX is ~292 billion years from epoch, plenty)
             let since_i64 = since as i64;
             let until_i64 = until.map(|u| u as i64).unwrap_or(i64::MAX);
-            
-            let mut stmt = conn.prepare(
-                "SELECT key, value, created_at, updated_at FROM memories 
+
+            let mut stmt = conn
+                .prepare(
+                    "SELECT key, value, created_at, updated_at FROM memories
                  WHERE agent_id = ?1 AND updated_at >= ?2 AND updated_at <= ?3
-                 ORDER BY updated_at ASC"
-            ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-            
-            let rows = stmt.query_map(params![agent_id, since_i64, until_i64], |row| {
-                let key: String = row.get(0)?;
-                let value_str: String = row.get(1)?;
-                let created_at: i64 = row.get(2)?;
-                let updated_at: i64 = row.get(3)?;
-                Ok((key, value_str, created_at, updated_at))
-            }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-            
+                 ORDER BY updated_at ASC",
+                )
+                .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
+            let rows = stmt
+                .query_map(params![agent_id, since_i64, until_i64], |row| {
+                    let key: String = row.get(0)?;
+                    let value_str: String = row.get(1)?;
+                    let created_at: i64 = row.get(2)?;
+                    let updated_at: i64 = row.get(3)?;
+                    Ok((key, value_str, created_at, updated_at))
+                })
+                .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
             let mut results = Vec::new();
             for row in rows {
-                let (key, value_str, created_at, updated_at) = row
-                    .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+                let (key, value_str, created_at, updated_at) =
+                    row.map_err(|e| MemoryError::StorageError(e.to_string()))?;
                 let value: Value = serde_json::from_str(&value_str)
                     .map_err(|e| MemoryError::SerializationError(e.to_string()))?;
-                results.push((key, MemoryEntry { value, created_at, updated_at }));
+                results.push((
+                    key,
+                    MemoryEntry {
+                        value,
+                        created_at,
+                        updated_at,
+                    },
+                ));
             }
             Ok(results)
-        }).await.map_err(|e| MemoryError::StorageError(e.to_string()))?
+        })
+        .await
+        .map_err(|e| MemoryError::StorageError(e.to_string()))?
     }
 }
 
@@ -198,7 +223,7 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let agent_id = self.agent_id.clone();
         let key = key.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let result: Result<(String, i64, i64), _> = conn.query_row(
@@ -206,7 +231,7 @@ impl Memory for SqliteMemory {
                 params![agent_id, key],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             );
-            
+
             match result {
                 Ok((value_str, created_at, updated_at)) => {
                     serde_json::from_str(&value_str).ok().map(|value| {
@@ -225,81 +250,95 @@ impl Memory for SqliteMemory {
         let value_str = serde_json::to_string(&value)
             .map_err(|e| MemoryError::SerializationError(e.to_string()))?;
         let timestamp = now();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            
+
             // Check if exists to preserve created_at
-            let existing: Option<i64> = conn.query_row(
-                "SELECT created_at FROM memories WHERE agent_id = ?1 AND key = ?2",
-                params![agent_id, key],
-                |row| row.get(0)
-            ).ok();
-            
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT created_at FROM memories WHERE agent_id = ?1 AND key = ?2",
+                    params![agent_id, key],
+                    |row| row.get(0),
+                )
+                .ok();
+
             let created_at = existing.unwrap_or(timestamp);
-            
+
             conn.execute(
-                "INSERT OR REPLACE INTO memories (agent_id, key, value, created_at, updated_at) 
+                "INSERT OR REPLACE INTO memories (agent_id, key, value, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![agent_id, key, value_str, created_at, timestamp]
-            ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-            
+                params![agent_id, key, value_str, created_at, timestamp],
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+
             Ok(())
-        }).await.map_err(|e| MemoryError::StorageError(e.to_string()))?
+        })
+        .await
+        .map_err(|e| MemoryError::StorageError(e.to_string()))?
     }
 
     async fn delete(&mut self, key: &str) -> bool {
         let conn = self.conn.clone();
         let agent_id = self.agent_id.clone();
         let key = key.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let rows = conn.execute(
-                "DELETE FROM memories WHERE agent_id = ?1 AND key = ?2",
-                params![agent_id, key]
-            ).unwrap_or(0);
+            let rows = conn
+                .execute(
+                    "DELETE FROM memories WHERE agent_id = ?1 AND key = ?2",
+                    params![agent_id, key],
+                )
+                .unwrap_or(0);
             rows > 0
-        }).await.unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn list_keys(&self, prefix: Option<&str>) -> Vec<String> {
         let conn = self.conn.clone();
         let agent_id = self.agent_id.clone();
         let prefix = prefix.map(|s| s.to_string());
-        
+
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut keys = Vec::new();
-            
+
             match &prefix {
                 Some(p) => {
-                    let mut stmt = match conn.prepare(
-                        "SELECT key FROM memories WHERE agent_id = ?1 AND key LIKE ?2"
-                    ) {
+                    let mut stmt = match conn
+                        .prepare("SELECT key FROM memories WHERE agent_id = ?1 AND key LIKE ?2")
+                    {
                         Ok(s) => s,
                         Err(_) => return keys,
                     };
                     let pattern = format!("{}%", p);
-                    if let Ok(rows) = stmt.query_map(params![agent_id, pattern], |row| row.get::<_, String>(0)) {
+                    if let Ok(rows) =
+                        stmt.query_map(params![agent_id, pattern], |row| row.get::<_, String>(0))
+                    {
                         keys = rows.filter_map(|r| r.ok()).collect();
                     }
                 }
                 None => {
-                    let mut stmt = match conn.prepare(
-                        "SELECT key FROM memories WHERE agent_id = ?1"
-                    ) {
-                        Ok(s) => s,
-                        Err(_) => return keys,
-                    };
-                    if let Ok(rows) = stmt.query_map(params![agent_id], |row| row.get::<_, String>(0)) {
+                    let mut stmt =
+                        match conn.prepare("SELECT key FROM memories WHERE agent_id = ?1") {
+                            Ok(s) => s,
+                            Err(_) => return keys,
+                        };
+                    if let Ok(rows) =
+                        stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))
+                    {
                         keys = rows.filter_map(|r| r.ok()).collect();
                     }
                 }
             }
-            
+
             keys
-        }).await.unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 }
 
@@ -350,16 +389,14 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
 
 /// Common English stopwords to filter from keyword extraction.
 const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-    "has", "he", "in", "is", "it", "its", "of", "on", "that", "the",
-    "to", "was", "were", "will", "with", "the", "this", "but", "they",
-    "have", "had", "what", "when", "where", "who", "which", "why", "how",
-    "all", "each", "every", "both", "few", "more", "most", "other", "some",
-    "such", "no", "not", "only", "own", "same", "so", "than", "too", "very",
-    "can", "just", "should", "now", "i", "you", "we", "my", "your", "our",
-    "me", "him", "her", "them", "us", "do", "does", "did", "doing", "done",
-    "would", "could", "might", "must", "shall", "may", "am", "been", "being",
-    "over", "under", "into", "out", "up", "down", "about", "after", "before",
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he", "in", "is", "it",
+    "its", "of", "on", "that", "the", "to", "was", "were", "will", "with", "the", "this", "but",
+    "they", "have", "had", "what", "when", "where", "who", "which", "why", "how", "all", "each",
+    "every", "both", "few", "more", "most", "other", "some", "such", "no", "not", "only", "own",
+    "same", "so", "than", "too", "very", "can", "just", "should", "now", "i", "you", "we", "my",
+    "your", "our", "me", "him", "her", "them", "us", "do", "does", "did", "doing", "done", "would",
+    "could", "might", "must", "shall", "may", "am", "been", "being", "over", "under", "into",
+    "out", "up", "down", "about", "after", "before",
 ];
 
 /// Extract meaningful keywords from text by filtering stopwords.
@@ -399,8 +436,7 @@ pub fn format_age(created_at: i64) -> String {
 impl SemanticMemoryStore {
     /// Open or create a semantic memory database at the given path.
     pub fn open(path: &std::path::Path, agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open(path)
-            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let store = SemanticMemoryStore {
             conn: Arc::new(Mutex::new(conn)),
@@ -412,8 +448,8 @@ impl SemanticMemoryStore {
 
     /// Create an in-memory semantic memory store (useful for testing).
     pub fn open_in_memory(agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let store = SemanticMemoryStore {
             conn: Arc::new(Mutex::new(conn)),
@@ -449,7 +485,10 @@ impl SemanticMemoryStore {
         ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         // Migration: Add embedding column if it doesn't exist
-        let _ = conn.execute("ALTER TABLE semantic_memories ADD COLUMN embedding BLOB", []);
+        let _ = conn.execute(
+            "ALTER TABLE semantic_memories ADD COLUMN embedding BLOB",
+            [],
+        );
 
         Ok(())
     }
@@ -462,7 +501,12 @@ impl SemanticMemoryStore {
     /// * `importance` - Importance score (0.0-1.0)
     /// * `source` - Source of the memory ("auto", "explicit", etc.)
     /// * `embedding` - Optional embedding vector for semantic search
-    pub fn save(&self, content: &str, importance: f64, source: &str) -> Result<SaveResult, MemoryError> {
+    pub fn save(
+        &self,
+        content: &str,
+        importance: f64,
+        source: &str,
+    ) -> Result<SaveResult, MemoryError> {
         self.save_with_embedding(content, importance, source, None)
     }
 
@@ -481,11 +525,13 @@ impl SemanticMemoryStore {
         let conn = self.conn.lock().unwrap();
 
         // Check for existing exact match
-        let existing: Option<(i64, f64)> = conn.query_row(
-            "SELECT id, importance FROM semantic_memories WHERE agent_id = ?1 AND content = ?2",
-            params![self.agent_id, content],
-            |row| Ok((row.get(0)?, row.get(1)?))
-        ).ok();
+        let existing: Option<(i64, f64)> = conn
+            .query_row(
+                "SELECT id, importance FROM semantic_memories WHERE agent_id = ?1 AND content = ?2",
+                params![self.agent_id, content],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
 
         if let Some((id, old_importance)) = existing {
             // Reinforce: boost importance by 0.05 (cap at 1.0), refresh timestamp, update embedding
@@ -498,12 +544,15 @@ impl SemanticMemoryStore {
             } else {
                 conn.execute(
                     "UPDATE semantic_memories SET importance = ?1, created_at = ?2 WHERE id = ?3",
-                    params![new_importance, timestamp, id]
-                ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+                    params![new_importance, timestamp, id],
+                )
+                .map_err(|e| MemoryError::StorageError(e.to_string()))?;
             }
 
-            debug::log(&format!("[memory] REINFORCE #{}: \"{}\" (importance {} → {})",
-                id, content, old_importance, new_importance));
+            debug::log(&format!(
+                "[memory] REINFORCE #{}: \"{}\" (importance {} → {})",
+                id, content, old_importance, new_importance
+            ));
             Ok(SaveResult::Reinforced(id, old_importance, new_importance))
         } else {
             // New memory
@@ -514,8 +563,15 @@ impl SemanticMemoryStore {
             ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
             let id = conn.last_insert_rowid();
-            debug::log(&format!("[memory] SAVE #{}: \"{}\" (importance={}, source={}, keywords={}, has_embedding={})",
-                id, content, importance, source, keywords, embedding.is_some()));
+            debug::log(&format!(
+                "[memory] SAVE #{}: \"{}\" (importance={}, source={}, keywords={}, has_embedding={})",
+                id,
+                content,
+                importance,
+                source,
+                keywords,
+                embedding.is_some()
+            ));
             Ok(SaveResult::New(id))
         }
     }
@@ -523,8 +579,13 @@ impl SemanticMemoryStore {
     /// Recall relevant memories for a query using keyword-based search.
     /// For embedding-based search, use `recall_with_embedding` instead.
     #[deprecated(note = "Use recall_with_embedding for semantic search")]
-    pub fn recall(&self, query: &str, limit: usize) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
-        Ok(self.recall_with_embedding(query, limit, None)?
+    pub fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
+        Ok(self
+            .recall_with_embedding(query, limit, None)?
             .into_iter()
             .map(|(m, _)| m)
             .collect())
@@ -544,8 +605,12 @@ impl SemanticMemoryStore {
     ) -> Result<Vec<(SemanticMemoryEntry, f64)>, MemoryError> {
         use crate::embedding::cosine_similarity;
 
-        debug::log(&format!("[memory] RECALL query=\"{}\" limit={} has_embedding={}",
-            query.chars().take(100).collect::<String>(), limit, query_embedding.is_some()));
+        debug::log(&format!(
+            "[memory] RECALL query=\"{}\" limit={} has_embedding={}",
+            query.chars().take(100).collect::<String>(),
+            limit,
+            query_embedding.is_some()
+        ));
 
         // Embedding-based recall requires a query embedding
         let query_embedding = match query_embedding {
@@ -566,24 +631,24 @@ impl SemanticMemoryStore {
              ORDER BY created_at DESC"
         ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        let rows = stmt.query_map(params![self.agent_id], |row| {
-            let embedding_blob: Option<Vec<u8>> = row.get(8)?;
-            Ok(SemanticMemoryEntry {
-                id: row.get(0)?,
-                created_at: row.get(1)?,
-                content: row.get(2)?,
-                importance: row.get(3)?,
-                source: row.get(4)?,
-                keywords: row.get(5)?,
-                access_count: row.get(6)?,
-                last_accessed: row.get(7)?,
-                embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+        let rows = stmt
+            .query_map(params![self.agent_id], |row| {
+                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+                Ok(SemanticMemoryEntry {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    content: row.get(2)?,
+                    importance: row.get(3)?,
+                    source: row.get(4)?,
+                    keywords: row.get(5)?,
+                    access_count: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+                })
             })
-        }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        let candidates: Vec<SemanticMemoryEntry> = rows
-            .filter_map(|r| r.ok())
-            .collect();
+        let candidates: Vec<SemanticMemoryEntry> = rows.filter_map(|r| r.ok()).collect();
 
         if candidates.is_empty() {
             debug::log("[memory] RECALL: no memories with embeddings stored");
@@ -609,11 +674,7 @@ impl SemanticMemoryStore {
                 let recency = recency_score(m.created_at, current_time);
                 let score = relevance * recency * m.importance;
 
-                if score > 0.0 {
-                    Some((m, score))
-                } else {
-                    None
-                }
+                if score > 0.0 { Some((m, score)) } else { None }
             })
             .collect();
 
@@ -624,10 +685,17 @@ impl SemanticMemoryStore {
         if scored.is_empty() {
             debug::log("[memory] RECALL: no matching memories found");
         } else {
-            debug::log(&format!("[memory] RECALL: found {} memories:", scored.len()));
+            debug::log(&format!(
+                "[memory] RECALL: found {} memories:",
+                scored.len()
+            ));
             for (m, score) in &scored {
-                debug::log(&format!("[memory]   #{} (score={:.3}): \"{}\"",
-                    m.id, score, m.content.chars().take(80).collect::<String>()));
+                debug::log(&format!(
+                    "[memory]   #{} (score={:.3}): \"{}\"",
+                    m.id,
+                    score,
+                    m.content.chars().take(80).collect::<String>()
+                ));
             }
         }
 
@@ -653,17 +721,22 @@ impl SemanticMemoryStore {
     /// Get the count of memories for this agent.
     pub fn count(&self) -> Result<i64, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1",
-            params![self.agent_id],
-            |row| row.get(0)
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1",
+                params![self.agent_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(count)
     }
 
     /// List all memories, ordered by created_at descending.
     pub fn list_all(&self, limit: Option<usize>) -> Result<Vec<SemanticMemoryEntry>, MemoryError> {
-        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
         let mut stmt = conn.prepare(&format!(
             "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding
@@ -671,42 +744,55 @@ impl SemanticMemoryStore {
             limit_clause
         )).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        let entries = stmt.query_map(params![self.agent_id], |row| {
-            let embedding_blob: Option<Vec<u8>> = row.get(8)?;
-            Ok(SemanticMemoryEntry {
-                id: row.get(0)?,
-                content: row.get(1)?,
-                importance: row.get(2)?,
-                source: row.get(3)?,
-                created_at: row.get(4)?,
-                keywords: row.get(5)?,
-                access_count: row.get(6)?,
-                last_accessed: row.get(7)?,
-                embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+        let entries = stmt
+            .query_map(params![self.agent_id], |row| {
+                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+                Ok(SemanticMemoryEntry {
+                    id: row.get(0)?,
+                    content: row.get(1)?,
+                    importance: row.get(2)?,
+                    source: row.get(3)?,
+                    created_at: row.get(4)?,
+                    keywords: row.get(5)?,
+                    access_count: row.get(6)?,
+                    last_accessed: row.get(7)?,
+                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+                })
             })
-        }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        entries.collect::<Result<Vec<_>, _>>()
+        entries
+            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| MemoryError::StorageError(e.to_string()))
     }
 
     /// Delete a memory by ID. Returns true if deleted, false if not found.
     pub fn delete(&self, id: i64) -> Result<bool, MemoryError> {
-        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
-        let rows = conn.execute(
-            "DELETE FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
-            params![id, self.agent_id]
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
+                params![id, self.agent_id],
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(rows > 0)
     }
 
     /// Delete all memories for this agent. Returns count of deleted memories.
     pub fn clear_all(&self) -> Result<usize, MemoryError> {
-        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
-        let rows = conn.execute(
-            "DELETE FROM semantic_memories WHERE agent_id = ?1",
-            params![self.agent_id]
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM semantic_memories WHERE agent_id = ?1",
+                params![self.agent_id],
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(rows)
     }
 
@@ -717,7 +803,10 @@ impl SemanticMemoryStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let rows = conn.execute(
             "UPDATE semantic_memories SET content = ?1, last_accessed = ?2 WHERE id = ?3 AND agent_id = ?4",
             params![new_content, timestamp, id, self.agent_id]
@@ -727,7 +816,10 @@ impl SemanticMemoryStore {
 
     /// Get a specific memory by ID. Returns None if not found or belongs to different agent.
     pub fn get(&self, id: i64) -> Result<Option<SemanticMemoryEntry>, MemoryError> {
-        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let result = conn.query_row(
             "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
             params![id, self.agent_id],
@@ -759,7 +851,7 @@ impl SemanticMemoryStore {
         let result: Result<String, _> = conn.query_row(
             "SELECT value FROM memory_meta WHERE key = 'embedding_model'",
             [],
-            |row| row.get(0)
+            |row| row.get(0),
         );
         match result {
             Ok(model) => Ok(Some(model)),
@@ -773,19 +865,22 @@ impl SemanticMemoryStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('embedding_model', ?1)",
-            params![model]
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            params![model],
+        )
+        .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
     /// Check if any memories are missing embeddings.
     pub fn has_null_embeddings(&self) -> Result<bool, MemoryError> {
         let conn = self.conn.lock().unwrap();
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NULL",
-            params![self.agent_id],
-            |row| row.get(0)
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NULL",
+                params![self.agent_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(count > 0)
     }
 
@@ -796,9 +891,11 @@ impl SemanticMemoryStore {
             "SELECT id, content FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NULL"
         ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
-        let rows = stmt.query_map(params![self.agent_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        }).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![self.agent_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let results: Vec<(i64, String)> = rows.filter_map(|r| r.ok()).collect();
         Ok(results)
@@ -810,8 +907,9 @@ impl SemanticMemoryStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE semantic_memories SET embedding = ?1 WHERE id = ?2",
-            params![blob, id]
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+            params![blob, id],
+        )
+        .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         Ok(())
     }
 
@@ -851,7 +949,10 @@ pub fn extract_remember_tags(output: &str) -> (String, Vec<String>) {
     let cleaned = cleaned.trim().to_string();
 
     if !memories.is_empty() {
-        debug::log(&format!("[memory] EXTRACT: found {} [REMEMBER:] tags", memories.len()));
+        debug::log(&format!(
+            "[memory] EXTRACT: found {} [REMEMBER:] tags",
+            memories.len()
+        ));
     }
 
     (cleaned, memories)
@@ -871,7 +972,11 @@ pub fn build_memory_injection(memories: &[SemanticMemoryEntry]) -> String {
     }
     injection.push('\n');
 
-    debug::log(&format!("[memory] INJECT: {} memories into context:\n{}", memories.len(), injection));
+    debug::log(&format!(
+        "[memory] INJECT: {} memories into context:\n{}",
+        memories.len(),
+        injection
+    ));
 
     injection
 }
@@ -1266,12 +1371,14 @@ mod tests {
 
         // Save a memory with embedding
         let embedding = vec![0.9, 0.1, 0.0, 0.0];
-        let result = store.save_with_embedding(
-            "User prefers dark mode for coding",
-            0.9,
-            "explicit",
-            Some(&embedding)
-        ).unwrap();
+        let result = store
+            .save_with_embedding(
+                "User prefers dark mode for coding",
+                0.9,
+                "explicit",
+                Some(&embedding),
+            )
+            .unwrap();
         let id = match result {
             SaveResult::New(id) => id,
             SaveResult::Reinforced(id, _, _) => id,
@@ -1280,7 +1387,9 @@ mod tests {
 
         // Recall with matching embedding
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
-        let results = store.recall_with_embedding("dark mode preference", 5, Some(&query_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("dark mode preference", 5, Some(&query_emb))
+            .unwrap();
         assert_eq!(results.len(), 1);
         let (entry, score) = &results[0];
         assert!(entry.content.contains("dark mode"));
@@ -1297,13 +1406,21 @@ mod tests {
         let rust_emb = vec![0.1, 0.9, 0.0, 0.0];
         let coffee_emb = vec![0.0, 0.0, 0.9, 0.1];
 
-        store.save_with_embedding("User prefers dark mode", 0.8, "explicit", Some(&dark_emb)).unwrap();
-        store.save_with_embedding("User works on Rust projects", 0.7, "auto", Some(&rust_emb)).unwrap();
-        store.save_with_embedding("User likes coffee", 0.5, "auto", Some(&coffee_emb)).unwrap();
+        store
+            .save_with_embedding("User prefers dark mode", 0.8, "explicit", Some(&dark_emb))
+            .unwrap();
+        store
+            .save_with_embedding("User works on Rust projects", 0.7, "auto", Some(&rust_emb))
+            .unwrap();
+        store
+            .save_with_embedding("User likes coffee", 0.5, "auto", Some(&coffee_emb))
+            .unwrap();
 
         // Query with embedding similar to "dark mode"
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
-        let results = store.recall_with_embedding("dark theme preference", 5, Some(&query_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("dark theme preference", 5, Some(&query_emb))
+            .unwrap();
         assert!(!results.is_empty());
         assert!(results[0].0.content.contains("dark"));
     }
@@ -1314,11 +1431,15 @@ mod tests {
 
         // Save with embedding
         let embedding = vec![0.9, 0.1, 0.0, 0.0];
-        store.save_with_embedding("User prefers dark mode", 0.8, "explicit", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding("User prefers dark mode", 0.8, "explicit", Some(&embedding))
+            .unwrap();
 
         // Query with orthogonal embedding
         let query_emb = vec![0.0, 0.0, 0.9, 0.1];
-        let results = store.recall_with_embedding("xyz123 completely unrelated", 5, Some(&query_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("xyz123 completely unrelated", 5, Some(&query_emb))
+            .unwrap();
         // With orthogonal vectors, cosine similarity is 0, so relevance after normalization is 0.5
         // But score = relevance * recency * importance, which may still be positive
         // The test passes if results are empty or if similarity is low
@@ -1337,16 +1458,20 @@ mod tests {
         for i in 0..10 {
             let mut emb = base_emb.clone();
             emb[0] += (i as f32) * 0.01; // Slight variation
-            store.save_with_embedding(
-                &format!("Memory about coding number {}", i),
-                0.5,
-                "auto",
-                Some(&emb)
-            ).unwrap();
+            store
+                .save_with_embedding(
+                    &format!("Memory about coding number {}", i),
+                    0.5,
+                    "auto",
+                    Some(&emb),
+                )
+                .unwrap();
         }
 
         // Query with similar embedding, should only return the limited number
-        let results = store.recall_with_embedding("coding memory", 3, Some(&base_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("coding memory", 3, Some(&base_emb))
+            .unwrap();
         assert!(results.len() <= 3);
     }
 
@@ -1356,14 +1481,25 @@ mod tests {
 
         // Save with different importance but same embedding
         let embedding = vec![0.9, 0.1, 0.0, 0.0];
-        store.save_with_embedding("Low importance coding fact", 0.3, "auto", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding("Low importance coding fact", 0.3, "auto", Some(&embedding))
+            .unwrap();
 
         // Wait a tiny bit to ensure different timestamps
         std::thread::sleep(std::time::Duration::from_millis(10));
 
-        store.save_with_embedding("High importance coding fact", 0.95, "explicit", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding(
+                "High importance coding fact",
+                0.95,
+                "explicit",
+                Some(&embedding),
+            )
+            .unwrap();
 
-        let results = store.recall_with_embedding("coding fact", 5, Some(&embedding)).unwrap();
+        let results = store
+            .recall_with_embedding("coding fact", 5, Some(&embedding))
+            .unwrap();
         assert!(!results.is_empty());
         // Higher importance should rank higher (when other factors are equal)
         assert!(results[0].0.importance > 0.9);
@@ -1374,18 +1510,31 @@ mod tests {
         let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
 
         let embedding = vec![0.9, 0.1, 0.0, 0.0];
-        store.save_with_embedding("Test memory for access tracking", 0.5, "auto", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding(
+                "Test memory for access tracking",
+                0.5,
+                "auto",
+                Some(&embedding),
+            )
+            .unwrap();
 
         // First recall
-        let results1 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
+        let results1 = store
+            .recall_with_embedding("access tracking", 5, Some(&embedding))
+            .unwrap();
         assert_eq!(results1[0].0.access_count, 0); // Not incremented yet at read time
 
         // Second recall should show incremented count
-        let results2 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
+        let results2 = store
+            .recall_with_embedding("access tracking", 5, Some(&embedding))
+            .unwrap();
         assert_eq!(results2[0].0.access_count, 1);
 
         // Third recall
-        let results3 = store.recall_with_embedding("access tracking", 5, Some(&embedding)).unwrap();
+        let results3 = store
+            .recall_with_embedding("access tracking", 5, Some(&embedding))
+            .unwrap();
         assert_eq!(results3[0].0.access_count, 2);
     }
 
@@ -1450,19 +1599,17 @@ mod tests {
 
     #[test]
     fn test_build_memory_injection_single() {
-        let memories = vec![
-            SemanticMemoryEntry {
-                id: 1,
-                created_at: now(),
-                content: "User prefers dark mode".to_string(),
-                importance: 0.5,
-                source: "auto".to_string(),
-                keywords: Some("user,prefers,dark,mode".to_string()),
-                access_count: 0,
-                last_accessed: None,
-                embedding: None,
-            },
-        ];
+        let memories = vec![SemanticMemoryEntry {
+            id: 1,
+            created_at: now(),
+            content: "User prefers dark mode".to_string(),
+            importance: 0.5,
+            source: "auto".to_string(),
+            keywords: Some("user,prefers,dark,mode".to_string()),
+            access_count: 0,
+            last_accessed: None,
+            embedding: None,
+        }];
         let injection = build_memory_injection(&memories);
 
         assert!(injection.starts_with("[Relevant memories]"));
@@ -1473,19 +1620,17 @@ mod tests {
 
     #[test]
     fn test_build_memory_injection_high_importance() {
-        let memories = vec![
-            SemanticMemoryEntry {
-                id: 1,
-                created_at: now(),
-                content: "Critical fact".to_string(),
-                importance: 0.95,
-                source: "explicit".to_string(),
-                keywords: Some("critical,fact".to_string()),
-                access_count: 0,
-                last_accessed: None,
-                embedding: None,
-            },
-        ];
+        let memories = vec![SemanticMemoryEntry {
+            id: 1,
+            created_at: now(),
+            content: "Critical fact".to_string(),
+            importance: 0.95,
+            source: "explicit".to_string(),
+            keywords: Some("critical,fact".to_string()),
+            access_count: 0,
+            last_accessed: None,
+            embedding: None,
+        }];
         let injection = build_memory_injection(&memories);
 
         assert!(injection.contains("⭐")); // High importance gets a star
@@ -1512,12 +1657,9 @@ mod tests {
         let store = SemanticMemoryStore::open_in_memory("agent1").unwrap();
         let embedding = vec![0.1, 0.2, 0.3, 0.4, 0.5];
 
-        let result = store.save_with_embedding(
-            "User prefers dark mode",
-            0.9,
-            "explicit",
-            Some(&embedding)
-        ).unwrap();
+        let result = store
+            .save_with_embedding("User prefers dark mode", 0.9, "explicit", Some(&embedding))
+            .unwrap();
 
         match result {
             SaveResult::New(id) => assert!(id > 0),
@@ -1536,13 +1678,26 @@ mod tests {
         let rust_emb = vec![0.1, 0.9, 0.0, 0.0];
         let coffee_emb = vec![0.0, 0.0, 0.9, 0.1];
 
-        store.save_with_embedding("User prefers dark mode", 0.8, "explicit", Some(&dark_mode_emb)).unwrap();
-        store.save_with_embedding("User works on Rust projects", 0.7, "auto", Some(&rust_emb)).unwrap();
-        store.save_with_embedding("User likes coffee", 0.5, "auto", Some(&coffee_emb)).unwrap();
+        store
+            .save_with_embedding(
+                "User prefers dark mode",
+                0.8,
+                "explicit",
+                Some(&dark_mode_emb),
+            )
+            .unwrap();
+        store
+            .save_with_embedding("User works on Rust projects", 0.7, "auto", Some(&rust_emb))
+            .unwrap();
+        store
+            .save_with_embedding("User likes coffee", 0.5, "auto", Some(&coffee_emb))
+            .unwrap();
 
         // Query with embedding similar to "dark mode"
         let query_emb = vec![0.85, 0.15, 0.0, 0.0];
-        let results = store.recall_with_embedding("dark theme", 5, Some(&query_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("dark theme", 5, Some(&query_emb))
+            .unwrap();
 
         assert!(!results.is_empty());
         assert!(results[0].0.content.contains("dark mode"));
@@ -1554,7 +1709,9 @@ mod tests {
 
         // Save memory with embedding
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
-        store.save_with_embedding("Test memory", 0.8, "auto", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding("Test memory", 0.8, "auto", Some(&embedding))
+            .unwrap();
 
         // Recall without query embedding should return empty
         let results = store.recall_with_embedding("test", 5, None).unwrap();
@@ -1570,11 +1727,17 @@ mod tests {
 
         // Set model
         store.set_embedding_model("nomic-embed-text").unwrap();
-        assert_eq!(store.get_embedding_model().unwrap(), Some("nomic-embed-text".to_string()));
+        assert_eq!(
+            store.get_embedding_model().unwrap(),
+            Some("nomic-embed-text".to_string())
+        );
 
         // Update model
         store.set_embedding_model("all-minilm").unwrap();
-        assert_eq!(store.get_embedding_model().unwrap(), Some("all-minilm".to_string()));
+        assert_eq!(
+            store.get_embedding_model().unwrap(),
+            Some("all-minilm".to_string())
+        );
     }
 
     #[test]
@@ -1590,7 +1753,9 @@ mod tests {
 
         // Save with embedding
         let embedding = vec![0.1, 0.2, 0.3];
-        store.save_with_embedding("Memory with embedding", 0.5, "auto", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding("Memory with embedding", 0.5, "auto", Some(&embedding))
+            .unwrap();
         assert!(store.has_null_embeddings().unwrap()); // Still has one null
 
         // Update the one without embedding
@@ -1636,7 +1801,9 @@ mod tests {
 
         // Should now be recallable with embedding
         let query_emb = vec![0.1, 0.2, 0.3, 0.4];
-        let results = store.recall_with_embedding("test", 5, Some(&query_emb)).unwrap();
+        let results = store
+            .recall_with_embedding("test", 5, Some(&query_emb))
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].0.embedding.is_some());
     }
@@ -1647,11 +1814,15 @@ mod tests {
 
         // Save with embedding
         let embedding = vec![0.1, 0.2, 0.3, 0.4];
-        store.save_with_embedding("Test memory", 0.5, "auto", Some(&embedding)).unwrap();
+        store
+            .save_with_embedding("Test memory", 0.5, "auto", Some(&embedding))
+            .unwrap();
 
         // Reinforce with updated embedding
         let new_embedding = vec![0.2, 0.3, 0.4, 0.5];
-        let result = store.save_with_embedding("Test memory", 0.5, "auto", Some(&new_embedding)).unwrap();
+        let result = store
+            .save_with_embedding("Test memory", 0.5, "auto", Some(&new_embedding))
+            .unwrap();
 
         match result {
             SaveResult::Reinforced(_, old, new) => {

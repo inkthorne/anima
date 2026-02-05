@@ -67,7 +67,7 @@ pub struct AgentSection {
 
 #[derive(Debug, Deserialize)]
 pub struct LlmSection {
-    pub provider: String,  // "openai" or "anthropic"
+    pub provider: String, // "openai" or "anthropic"
     pub model: String,
     pub base_url: Option<String>,
     /// Enable thinking mode for Ollama models (default: None = false)
@@ -86,13 +86,13 @@ fn default_tools_enabled() -> bool {
 #[derive(Debug, Deserialize, Default)]
 pub struct ToolsSection {
     #[serde(default)]
-    pub enabled: Vec<String>,  // ["read_file", "shell", etc]
+    pub enabled: Vec<String>, // ["read_file", "shell", etc]
 }
 
 #[derive(Debug, Deserialize)]
 pub struct MemorySection {
     #[serde(default = "default_backend")]
-    pub backend: String,  // "sqlite" or "in_memory"
+    pub backend: String, // "sqlite" or "in_memory"
     pub path: Option<String>,
 }
 
@@ -224,17 +224,11 @@ impl RetrySection {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct ObserveSection {
     /// Print all events when true, only errors/completions when false
     #[serde(default)]
     pub verbose: bool,
-}
-
-impl Default for ObserveSection {
-    fn default() -> Self {
-        Self { verbose: false }
-    }
 }
 
 impl AgentConfig {
@@ -316,9 +310,15 @@ verbose = true
 "#;
         let config: AgentConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.agent.name, "full-agent");
-        assert_eq!(config.agent.system_prompt, Some("You are helpful.".to_string()));
+        assert_eq!(
+            config.agent.system_prompt,
+            Some("You are helpful.".to_string())
+        );
         assert_eq!(config.llm.provider, "anthropic");
-        assert_eq!(config.llm.base_url, Some("https://custom.api.com".to_string()));
+        assert_eq!(
+            config.llm.base_url,
+            Some("https://custom.api.com".to_string())
+        );
         assert_eq!(config.tools.enabled, vec!["echo", "add", "shell"]);
         assert_eq!(config.memory.backend, "sqlite");
         assert_eq!(config.memory.path, Some("/tmp/agent.db".to_string()));

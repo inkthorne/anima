@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::net::UnixStream;
+use tokio::sync::Mutex;
 
 use crate::discovery;
 use crate::error::ToolError;
 use crate::messaging::{AgentMessage, MessageRouter};
-use crate::socket_api::{SocketApi, Request, Response};
+use crate::socket_api::{Request, Response, SocketApi};
 use crate::tool::Tool;
 use serde_json::Value;
 
@@ -69,7 +69,9 @@ impl Tool for SendMessageTool {
         let message = input
             .get("message")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'message' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'message' field".to_string())
+            })?;
 
         let msg = AgentMessage::new(&self.agent_id, to, message);
 
@@ -192,7 +194,9 @@ impl Tool for DaemonSendMessageTool {
         let message = input
             .get("message")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'message' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'message' field".to_string())
+            })?;
 
         // Check if the target agent is running
         if !discovery::is_agent_running(to) {
@@ -203,13 +207,14 @@ impl Tool for DaemonSendMessageTool {
         }
 
         // Get socket path
-        let socket_path = discovery::agent_socket_path(to)
-            .ok_or_else(|| ToolError::ExecutionFailed("Could not determine agent socket path".to_string()))?;
+        let socket_path = discovery::agent_socket_path(to).ok_or_else(|| {
+            ToolError::ExecutionFailed("Could not determine agent socket path".to_string())
+        })?;
 
         // Connect to the target daemon
-        let stream = UnixStream::connect(&socket_path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to connect to agent '{}': {}", to, e)))?;
+        let stream = UnixStream::connect(&socket_path).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to connect to agent '{}': {}", to, e))
+        })?;
 
         let mut api = SocketApi::new(stream);
 
@@ -224,7 +229,8 @@ impl Tool for DaemonSendMessageTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to send message: {}", e)))?;
 
         // Read the response
-        let response = api.read_response()
+        let response = api
+            .read_response()
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response: {}", e)))?;
 
@@ -239,8 +245,12 @@ impl Tool for DaemonSendMessageTool {
                 "response": content
             })),
             Some(Response::Error { message }) => Err(ToolError::ExecutionFailed(message)),
-            None => Err(ToolError::ExecutionFailed("Connection closed unexpectedly".to_string())),
-            _ => Err(ToolError::ExecutionFailed("Unexpected response from agent".to_string())),
+            None => Err(ToolError::ExecutionFailed(
+                "Connection closed unexpectedly".to_string(),
+            )),
+            _ => Err(ToolError::ExecutionFailed(
+                "Unexpected response from agent".to_string(),
+            )),
         }
     }
 }
@@ -278,10 +288,13 @@ mod tests {
         };
 
         let tool = SendMessageTool::new(router, "sender".to_string());
-        let result = tool.execute(json!({
-            "to": "recipient",
-            "message": "hello"
-        })).await.unwrap();
+        let result = tool
+            .execute(json!({
+                "to": "recipient",
+                "message": "hello"
+            }))
+            .await
+            .unwrap();
 
         assert_eq!(result["sent"], true);
         assert_eq!(result["to"], "recipient");
@@ -298,10 +311,12 @@ mod tests {
         let router = Arc::new(Mutex::new(MessageRouter::new()));
         let tool = SendMessageTool::new(router, "sender".to_string());
 
-        let result = tool.execute(json!({
-            "to": "nonexistent",
-            "message": "hello"
-        })).await;
+        let result = tool
+            .execute(json!({
+                "to": "nonexistent",
+                "message": "hello"
+            }))
+            .await;
 
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
     }
@@ -311,9 +326,11 @@ mod tests {
         let router = Arc::new(Mutex::new(MessageRouter::new()));
         let tool = SendMessageTool::new(router, "sender".to_string());
 
-        let result = tool.execute(json!({
-            "message": "hello"
-        })).await;
+        let result = tool
+            .execute(json!({
+                "message": "hello"
+            }))
+            .await;
 
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
@@ -323,9 +340,11 @@ mod tests {
         let router = Arc::new(Mutex::new(MessageRouter::new()));
         let tool = SendMessageTool::new(router, "sender".to_string());
 
-        let result = tool.execute(json!({
-            "to": "recipient"
-        })).await;
+        let result = tool
+            .execute(json!({
+                "to": "recipient"
+            }))
+            .await;
 
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }

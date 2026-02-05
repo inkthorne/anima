@@ -1,22 +1,21 @@
-use anima::{
-    Runtime, OpenAIClient, AnthropicClient, ThinkOptions, AutoMemoryConfig, ReflectionConfig,
-    InMemoryStore, SqliteMemory, LLM, ConversationStore,
-    parse_mentions, expand_all_mention, notify_mentioned_agents_parallel, NotifyResult,
-    SemanticMemoryStore, format_age,
-};
 use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
 use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
 use anima::repl::Repl;
-use anima::socket_api::{SocketApi, Request, Response};
-use anima::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool};
+use anima::socket_api::{Request, Response, SocketApi};
+use anima::tools::{AddTool, EchoTool, HttpTool, ReadFileTool, ShellTool, WriteFileTool};
+use anima::{
+    AnthropicClient, AutoMemoryConfig, ConversationStore, InMemoryStore, LLM, NotifyResult,
+    OpenAIClient, ReflectionConfig, Runtime, SemanticMemoryStore, SqliteMemory, ThinkOptions,
+    expand_all_mention, format_age, notify_mentioned_agents_parallel, parse_mentions,
+};
 use clap::{Parser, Subcommand};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::io::{self, Write};
 use std::time::Duration;
 use tokio::net::UnixStream;
 
@@ -32,7 +31,10 @@ fn format_tool_params(params: &serde_json::Value) -> String {
     }
     // For HTTP requests, show method and URL
     if let Some(url) = params.get("url").and_then(|u| u.as_str()) {
-        let method = params.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+        let method = params
+            .get("method")
+            .and_then(|m| m.as_str())
+            .unwrap_or("GET");
         return format!("{} {}", method, url);
     }
     // Fallback: compact JSON, truncated
@@ -49,7 +51,7 @@ fn format_tool_params(params: &serde_json::Value) -> String {
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
-    
+
     /// Enable debug logging to ~/.anima/repl.log (for REPL/run commands)
     #[arg(long, global = true)]
     log: bool,
@@ -257,6 +259,14 @@ enum ChatCommands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Stop a paused conversation without processing queued notifications. Supports glob patterns.
+    Stop {
+        /// Name or pattern of the conversation(s) to stop
+        conv: String,
+        /// Skip confirmation for multiple matches
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Resume a paused conversation (processes queued notifications). Supports glob patterns (*, ?).
     Resume {
         /// Name or pattern of the conversation(s) to resume
@@ -297,11 +307,9 @@ async fn main() {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
-            } else {
-                if let Err(e) = run_agent_dir(&agent).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
+            } else if let Err(e) = run_agent_dir(&agent).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
             }
         }
         Commands::Create { name, path } => {
@@ -313,7 +321,12 @@ async fn main() {
         Commands::List => {
             list_agents();
         }
-        Commands::Task { config, task, stream, verbose } => {
+        Commands::Task {
+            config,
+            task,
+            stream,
+            verbose,
+        } => {
             if let Err(e) = run_agent_task(&config, &task, stream, verbose).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
@@ -419,15 +432,16 @@ async fn connect_to_agent(agent: &str) -> Result<SocketApi, Box<dyn std::error::
             "Agent '{}' is not running (socket not found: {})",
             agent,
             socket_path.display()
-        ).into());
+        )
+        .into());
     }
 
-    let stream = UnixStream::connect(&socket_path).await
+    let stream = UnixStream::connect(&socket_path)
+        .await
         .map_err(|e| format!("Failed to connect to agent '{}': {}", agent, e))?;
 
     Ok(SocketApi::new(stream))
 }
-
 
 /// Default number of context messages to load from conversation history.
 const DEFAULT_CONTEXT_MESSAGES: usize = 20;
@@ -442,15 +456,14 @@ const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 /// in the background via daemon-to-daemon communication.
 ///
 /// A background polling task displays incoming agent messages in real-time.
-async fn chat_with_conversation(
-    conv_name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize conversation store
     let store = ConversationStore::init()?;
 
     // Load current participants
     let parts = store.get_participants(conv_name)?;
-    let mut participants: Vec<String> = parts.iter()
+    let mut participants: Vec<String> = parts
+        .iter()
         .filter(|p| p.agent != "user")
         .map(|p| p.agent.clone())
         .collect();
@@ -459,10 +472,10 @@ async fn chat_with_conversation(
     let last_seen_id = Arc::new(AtomicI64::new(0));
 
     // Get current last message ID so we don't display old messages
-    if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
-        if let Some(last) = msgs.last() {
-            last_seen_id.store(last.id, Ordering::SeqCst);
-        }
+    if let Ok(msgs) = store.get_messages(conv_name, Some(1))
+        && let Some(last) = msgs.last()
+    {
+        last_seen_id.store(last.id, Ordering::SeqCst);
     }
 
     // Print connection info
@@ -474,39 +487,41 @@ async fn chat_with_conversation(
     }
 
     // Display recent message history for context
-    if let Ok(recent_msgs) = store.get_messages(conv_name, Some(25)) {
-        if !recent_msgs.is_empty() {
-            println!("\x1b[90m--- Recent messages ---\x1b[0m");
-            for msg in &recent_msgs {
-                // Skip tool messages
-                if msg.from_agent == "tool" {
-                    continue;
-                }
-                let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
-                let datetime = format_timestamp_pretty(msg.created_at);
-                // Show duration and context usage for agent messages if available
-                let duration_str = if msg.from_agent != "user" {
-                    msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let ctx_str = if msg.from_agent != "user" {
-                    format_context_usage(msg)
-                } else {
-                    String::new()
-                };
-                println!(
-                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}",
-                    msg.id, datetime, color, msg.from_agent, duration_str, ctx_str
-                );
-                println!("{}", msg.content);
-                println!(); // Blank line between messages
+    if let Ok(recent_msgs) = store.get_messages(conv_name, Some(25))
+        && !recent_msgs.is_empty()
+    {
+        println!("\x1b[90m--- Recent messages ---\x1b[0m");
+        for msg in &recent_msgs {
+            // Skip tool messages
+            if msg.from_agent == "tool" {
+                continue;
             }
+            let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
+            let datetime = format_timestamp_pretty(msg.created_at);
+            // Show duration and context usage for agent messages if available
+            let duration_str = if msg.from_agent != "user" {
+                msg.duration_ms
+                    .map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d)))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let ctx_str = if msg.from_agent != "user" {
+                format_context_usage(msg)
+            } else {
+                String::new()
+            };
+            println!(
+                "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}",
+                msg.id, datetime, color, msg.from_agent, duration_str, ctx_str
+            );
+            println!("{}", msg.content);
+            println!(); // Blank line between messages
+        }
 
-            // Update last_seen_id to the most recent message
-            if let Some(last) = recent_msgs.last() {
-                last_seen_id.store(last.id, Ordering::SeqCst);
-            }
+        // Update last_seen_id to the most recent message
+        if let Some(last) = recent_msgs.last() {
+            last_seen_id.store(last.id, Ordering::SeqCst);
         }
     }
 
@@ -533,7 +548,8 @@ async fn chat_with_conversation(
             tokio::time::sleep(Duration::from_millis(500)).await;
 
             let last_id = poll_last_seen.load(Ordering::SeqCst);
-            if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id)) {
+            if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id))
+            {
                 for msg in msgs {
                     // Only display messages from agents (not from "user" or "tool")
                     if msg.from_agent != "user" && msg.from_agent != "tool" {
@@ -541,7 +557,15 @@ async fn chat_with_conversation(
                         print!("\r\x1b[K"); // Clear current line (in case user was typing)
                         let datetime = format_timestamp_pretty(msg.created_at);
                         // Show duration and context usage if available
-                        let duration_str = msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default();
+                        let duration_str = msg
+                            .duration_ms
+                            .map(|d| {
+                                format!(
+                                    " \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m",
+                                    format_duration_ms(d)
+                                )
+                            })
+                            .unwrap_or_default();
                         let ctx_str = format_context_usage(&msg);
                         println!(
                             "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}{}",
@@ -588,7 +612,9 @@ async fn chat_with_conversation(
                         }
                         "/pause" => {
                             match store.set_paused(conv_name, true) {
-                                Ok(_) => println!("\x1b[90mConversation paused. Notifications will be queued.\x1b[0m"),
+                                Ok(_) => println!(
+                                    "\x1b[90mConversation paused. Notifications will be queued.\x1b[0m"
+                                ),
                                 Err(e) => eprintln!("\x1b[31mFailed to pause: {}\x1b[0m", e),
                             }
                             continue;
@@ -599,49 +625,56 @@ async fn chat_with_conversation(
                                     let mut catchup_count = 0;
 
                                     // Process catchup items (tool calls and mentions skipped during pause)
-                                    if let Some(paused_at) = paused_at_msg_id {
-                                        if let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at) {
-                                            let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
-                                            for item in &catchup_items {
-                                                // Process @mentions
-                                                if !item.mentions.is_empty() {
-                                                    let _ = notify_mentioned_agents_parallel(
-                                                        &store,
-                                                        conv_name,
-                                                        item.message.id,
-                                                        &item.mentions
-                                                    ).await;
-                                                    catchup_count += item.mentions.len();
-                                                }
-                                                // Note: Tool calls in catchup items will be handled
-                                                // by the agent when it processes the follow-up notification
+                                    if let Some(paused_at) = paused_at_msg_id
+                                        && let Ok(catchup_msgs) =
+                                            store.get_catchup_messages(conv_name, paused_at)
+                                    {
+                                        let catchup_items =
+                                            ConversationStore::build_catchup_items(&catchup_msgs);
+                                        for item in &catchup_items {
+                                            // Process @mentions
+                                            if !item.mentions.is_empty() {
+                                                let _ = notify_mentioned_agents_parallel(
+                                                    &store,
+                                                    conv_name,
+                                                    item.message.id,
+                                                    &item.mentions,
+                                                )
+                                                .await;
+                                                catchup_count += item.mentions.len();
                                             }
+                                            // Note: Tool calls in catchup items will be handled
+                                            // by the agent when it processes the follow-up notification
                                         }
                                     }
 
                                     // Also check for pending notifications (for agents that weren't running)
-                                    match store.get_pending_notifications_for_conversation(conv_name) {
-                                        Ok(pending) => {
-                                            let pending_count = pending.len();
-                                            if pending_count > 0 {
-                                                for notification in &pending {
-                                                    let mentions = vec![notification.agent.clone()];
-                                                    let _ = notify_mentioned_agents_parallel(
-                                                        &store,
-                                                        conv_name,
-                                                        notification.message_id,
-                                                        &mentions
-                                                    ).await;
-                                                    let _ = store.delete_pending_notification(notification.id);
-                                                }
-                                                catchup_count += pending_count;
+                                    if let Ok(pending) =
+                                        store.get_pending_notifications_for_conversation(conv_name)
+                                    {
+                                        let pending_count = pending.len();
+                                        if pending_count > 0 {
+                                            for notification in &pending {
+                                                let mentions = vec![notification.agent.clone()];
+                                                let _ = notify_mentioned_agents_parallel(
+                                                    &store,
+                                                    conv_name,
+                                                    notification.message_id,
+                                                    &mentions,
+                                                )
+                                                .await;
+                                                let _ = store
+                                                    .delete_pending_notification(notification.id);
                                             }
+                                            catchup_count += pending_count;
                                         }
-                                        Err(_) => {}
                                     }
 
                                     if catchup_count > 0 {
-                                        println!("\x1b[90mConversation resumed. {} pending item(s) processed.\x1b[0m", catchup_count);
+                                        println!(
+                                            "\x1b[90mConversation resumed. {} pending item(s) processed.\x1b[0m",
+                                            catchup_count
+                                        );
                                     } else {
                                         println!("\x1b[90mConversation resumed.\x1b[0m");
                                     }
@@ -651,11 +684,15 @@ async fn chat_with_conversation(
                             continue;
                         }
                         "/help" => {
-                            println!("\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m");
+                            println!(
+                                "\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m"
+                            );
                             continue;
                         }
                         _ => {
-                            eprintln!("\x1b[33mUnknown command. Type /help for available commands.\x1b[0m");
+                            eprintln!(
+                                "\x1b[33mUnknown command. Type /help for available commands.\x1b[0m"
+                            );
                             continue;
                         }
                     }
@@ -666,7 +703,9 @@ async fn chat_with_conversation(
 
                 // Require @mentions to send messages
                 if mentions.is_empty() {
-                    eprintln!("\x1b[33m⚠ Use @mentions to notify agents (e.g., @arya what do you think?)\x1b[0m");
+                    eprintln!(
+                        "\x1b[33m⚠ Use @mentions to notify agents (e.g., @arya what do you think?)\x1b[0m"
+                    );
                     continue;
                 }
 
@@ -676,10 +715,16 @@ async fn chat_with_conversation(
                         // Only add if agent actually exists
                         if anima::discovery::agent_exists(agent_name) {
                             if let Err(e) = store.add_participant(conv_name, agent_name) {
-                                eprintln!("\x1b[33mWarning: Could not add {} as participant: {}\x1b[0m", agent_name, e);
+                                eprintln!(
+                                    "\x1b[33mWarning: Could not add {} as participant: {}\x1b[0m",
+                                    agent_name, e
+                                );
                             } else {
                                 participants.push(agent_name.clone());
-                                println!("\x1b[90m[@{} joined the conversation]\x1b[0m", agent_name);
+                                println!(
+                                    "\x1b[90m[@{} joined the conversation]\x1b[0m",
+                                    agent_name
+                                );
                             }
                         }
                     }
@@ -688,7 +733,8 @@ async fn chat_with_conversation(
                 // Expand @all to all participants (excluding "user")
                 let expanded_mentions = expand_all_mention(&mentions, &participants);
 
-                let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
+                let mention_refs: Vec<&str> =
+                    expanded_mentions.iter().map(|s| s.as_str()).collect();
 
                 // Store user message in conversation with mentions
                 let user_msg_id = store.add_message(conv_name, "user", line, &mention_refs)?;
@@ -702,7 +748,13 @@ async fn chat_with_conversation(
                 // Notify mentioned agents (initial notifications only)
                 // The daemon now handles all follow-up @mention chains autonomously
                 if !expanded_mentions.is_empty() {
-                    let notify_results = notify_mentioned_agents_parallel(&store, conv_name, user_msg_id, &expanded_mentions).await;
+                    let notify_results = notify_mentioned_agents_parallel(
+                        &store,
+                        conv_name,
+                        user_msg_id,
+                        &expanded_mentions,
+                    )
+                    .await;
 
                     // Display results for each initially notified agent
                     for (agent, result) in &notify_results {
@@ -712,24 +764,40 @@ async fn chat_with_conversation(
                                 // The background poller will display the response when it arrives
                                 // (no message needed - "joined the conversation" already shown)
                             }
-                            NotifyResult::Notified { response_message_id } => {
+                            NotifyResult::Notified {
+                                response_message_id,
+                            } => {
                                 // Synchronous response (backwards compat)
                                 // Update last_seen_id so poller doesn't re-display
                                 last_seen_id.store(*response_message_id, Ordering::SeqCst);
-                                if let Ok(msgs) = store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES)) {
-                                    if let Some(response_msg) = msgs.iter().find(|m| m.id == *response_message_id) {
-                                        println!("\n\x1b[36m[{}]:\x1b[0m {}\n", agent, response_msg.content);
-                                    }
+                                if let Ok(msgs) =
+                                    store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES))
+                                    && let Some(response_msg) =
+                                        msgs.iter().find(|m| m.id == *response_message_id)
+                                {
+                                    println!(
+                                        "\n\x1b[36m[{}]:\x1b[0m {}\n",
+                                        agent, response_msg.content
+                                    );
                                 }
                             }
                             NotifyResult::Queued { notification_id: _ } => {
-                                eprintln!("\x1b[90m[@{} offline, notification queued]\x1b[0m", agent);
+                                eprintln!(
+                                    "\x1b[90m[@{} offline, notification queued]\x1b[0m",
+                                    agent
+                                );
                             }
                             NotifyResult::UnknownAgent => {
-                                eprintln!("\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m", agent);
+                                eprintln!(
+                                    "\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m",
+                                    agent
+                                );
                             }
                             NotifyResult::Failed { reason } => {
-                                eprintln!("\x1b[33m[@{} notification failed: {}]\x1b[0m", agent, reason);
+                                eprintln!(
+                                    "\x1b[33m[@{} notification failed: {}]\x1b[0m",
+                                    agent, reason
+                                );
                             }
                         }
                     }
@@ -766,7 +834,10 @@ fn show_status() {
     let agents_path = agents_dir();
 
     if !agents_path.exists() {
-        println!("\x1b[33mNo agents directory found at {}\x1b[0m", agents_path.display());
+        println!(
+            "\x1b[33mNo agents directory found at {}\x1b[0m",
+            agents_path.display()
+        );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
         return;
     }
@@ -784,13 +855,19 @@ fn show_status() {
     };
 
     if entries.is_empty() {
-        println!("\x1b[33mNo agents found in {}\x1b[0m", agents_path.display());
+        println!(
+            "\x1b[33mNo agents found in {}\x1b[0m",
+            agents_path.display()
+        );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
         return;
     }
 
     // Print header
-    println!("\x1b[1m{:<20} {:<10} {:<10}\x1b[0m", "AGENT", "STATUS", "PID");
+    println!(
+        "\x1b[1m{:<20} {:<10} {:<10}\x1b[0m",
+        "AGENT", "STATUS", "PID"
+    );
     println!("{}", "-".repeat(42));
 
     for entry in entries {
@@ -832,8 +909,8 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
     if !discovery::is_agent_running(&agent_name) {
         eprintln!("\x1b[33mStarting daemon for '{}'...\x1b[0m", agent_name);
 
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Failed to get executable path: {}", e))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
 
         Command::new(&exe)
             .args(["start", &agent_name])
@@ -872,11 +949,17 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
     api.write_request(&Request::Message {
         content: message.to_string(),
         conv_name: Some(conv_name),
-    }).await.map_err(|e| format!("Failed to send message: {}", e))?;
+    })
+    .await
+    .map_err(|e| format!("Failed to send message: {}", e))?;
 
     // Read responses (streaming)
     loop {
-        match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+        match api
+            .read_response()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+        {
             Some(Response::Chunk { text }) => {
                 // Streaming: print tokens as they arrive
                 print!("{}", text);
@@ -889,7 +972,7 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
             }
             Some(Response::Done) => {
                 // Streaming complete
-                println!();  // Final newline
+                println!(); // Final newline
                 break;
             }
             Some(Response::Message { content }) => {
@@ -932,8 +1015,8 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
     }
 
     // Get path to current executable
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to get current executable: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current executable: {}", e))?;
 
     // Open log file for stdout/stderr redirection
     let log_path = agent_path.join("agent.log");
@@ -942,7 +1025,8 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
         .append(true)
         .open(&log_path)
         .map_err(|e| format!("Failed to open log file: {}", e))?;
-    let log_file_err = log_file.try_clone()
+    let log_file_err = log_file
+        .try_clone()
         .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
 
     // Spawn daemon process in background
@@ -1003,7 +1087,7 @@ fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Start all configured agents that are not currently running.
 fn start_all_agents() -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::{list_saved_agents, is_agent_running};
+    use anima::discovery::{is_agent_running, list_saved_agents};
 
     let all_agents = list_saved_agents();
 
@@ -1040,8 +1124,13 @@ fn start_all_agents() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Stop a running agent daemon.
-/// If `quiet` is true, suppresses output (used by restart_all_agents).
-async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// - `quiet`: suppress output (used by restart_all_agents)
+/// - `force`: if true, SIGKILL without prompting on timeout; if false, prompt user
+async fn stop_agent_impl(
+    agent: &str,
+    quiet: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let agent_path = resolve_agent_path(agent);
     let pid_path = agent_path.join("daemon.pid");
 
@@ -1086,8 +1175,8 @@ async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::er
     // If socket shutdown didn't work, send SIGTERM
     unsafe {
         if libc::kill(pid as i32, libc::SIGTERM) == 0 {
-            // Wait for process to terminate
-            for _ in 0..20 {
+            // Wait for process to terminate (3 seconds)
+            for _ in 0..30 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 if !PidFile::is_running(&pid_path) {
                     if !quiet {
@@ -1096,13 +1185,59 @@ async fn stop_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::er
                     return Ok(());
                 }
             }
+
+            // Still running - try SIGKILL
             if !quiet {
                 eprintln!("Warning: Agent did not stop within timeout");
             }
-        } else {
-            if !quiet {
-                eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
+
+            // Determine if we should SIGKILL
+            let should_kill = if force {
+                true
+            } else if quiet {
+                false // Don't auto-kill in quiet mode without force
+            } else {
+                // Prompt user
+                use std::io::{self, Write};
+                print!("Stop timed out, do you want to kill {}? (y/N) ", agent);
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_ok() {
+                    input.trim().eq_ignore_ascii_case("y")
+                        || input.trim().eq_ignore_ascii_case("yes")
+                } else {
+                    false
+                }
+            };
+
+            if should_kill {
+                if libc::kill(pid as i32, libc::SIGKILL) == 0 {
+                    // Wait briefly for cleanup
+                    for _ in 0..10 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        if !PidFile::is_running(&pid_path) {
+                            break;
+                        }
+                    }
+                    // Clean up stale pid file if process is gone
+                    if !PidFile::is_running(&pid_path) {
+                        let _ = std::fs::remove_file(&pid_path);
+                    }
+                    if !quiet {
+                        println!("Killed {}", agent);
+                    }
+                } else if !quiet {
+                    eprintln!("Warning: Failed to send SIGKILL to pid {}", pid);
+                }
+                return Ok(());
+            } else {
+                if !quiet {
+                    println!("Agent {} still running (pid {})", agent, pid);
+                }
+                return Ok(());
             }
+        } else if !quiet {
+            eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
         }
     }
 
@@ -1132,7 +1267,8 @@ async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let mut stopped = Vec::new();
         for name in &matches {
-            match stop_agent_impl(name, true).await {
+            match stop_agent_impl(name, true, true).await {
+                // force=true for batch
                 Ok(()) => stopped.push(name.clone()),
                 Err(e) => eprintln!("Failed to stop {}: {}", name, e),
             }
@@ -1145,7 +1281,7 @@ async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    stop_agent_impl(agent, false).await
+    stop_agent_impl(agent, false, false).await // Interactive: prompt before kill
 }
 
 /// Stop all running agent daemons.
@@ -1165,7 +1301,8 @@ async fn stop_all_agents() -> Result<(), Box<dyn std::error::Error>> {
         print!("Stopping {}... ", agent.name);
         io::stdout().flush()?;
 
-        match stop_agent_impl(&agent.name, true).await {
+        match stop_agent_impl(&agent.name, true, true).await {
+            // force=true for batch
             Ok(()) => {
                 println!("stopped");
                 stopped_count += 1;
@@ -1218,8 +1355,8 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             print!("Restarting {}... ", name);
             io::stdout().flush()?;
 
-            // Stop the agent (quiet mode)
-            if let Err(e) = stop_agent_impl(name, true).await {
+            // Stop the agent (quiet mode, force kill if needed)
+            if let Err(e) = stop_agent_impl(name, true, true).await {
                 println!("failed to stop: {}", e);
                 continue;
             }
@@ -1235,11 +1372,11 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                     let mut pid = 0u32;
                     for _ in 0..20 {
                         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        if let Ok(p) = PidFile::read(&pid_path) {
-                            if p > 0 {
-                                pid = p;
-                                break;
-                            }
+                        if let Ok(p) = PidFile::read(&pid_path)
+                            && p > 0
+                        {
+                            pid = p;
+                            break;
                         }
                     }
                     println!("done (pid {})", pid);
@@ -1251,7 +1388,11 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        println!("Restarted {} agent{}", restarted.len(), if restarted.len() == 1 { "" } else { "s" });
+        println!(
+            "Restarted {} agent{}",
+            restarted.len(),
+            if restarted.len() == 1 { "" } else { "s" }
+        );
 
         return Ok(());
     }
@@ -1299,8 +1440,8 @@ async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
         print!("Restarting {}... ", agent.name);
         io::stdout().flush()?;
 
-        // Stop the agent (quiet mode - no output)
-        if let Err(e) = stop_agent_impl(&agent.name, true).await {
+        // Stop the agent (quiet mode, force kill if needed)
+        if let Err(e) = stop_agent_impl(&agent.name, true, true).await {
             println!("failed to stop: {}", e);
             continue;
         }
@@ -1316,11 +1457,11 @@ async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
                 let mut pid = 0u32;
                 for _ in 0..20 {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    if let Ok(p) = PidFile::read(&pid_path) {
-                        if p > 0 {
-                            pid = p;
-                            break;
-                        }
+                    if let Ok(p) = PidFile::read(&pid_path)
+                        && p > 0
+                    {
+                        pid = p;
+                        break;
                     }
                 }
                 println!("done (pid {})", pid);
@@ -1332,7 +1473,11 @@ async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("Restarted {} agent{}", restarted_count, if restarted_count == 1 { "" } else { "s" });
+    println!(
+        "Restarted {} agent{}",
+        restarted_count,
+        if restarted_count == 1 { "" } else { "s" }
+    );
 
     Ok(())
 }
@@ -1342,11 +1487,16 @@ async fn clear_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut api = connect_to_agent(agent).await?;
 
     // Send clear request
-    api.write_request(&Request::Clear).await
+    api.write_request(&Request::Clear)
+        .await
         .map_err(|e| format!("Failed to send clear request: {}", e))?;
 
     // Read the response
-    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
         Some(Response::Ok) => {
             println!("Cleared conversation for {}", agent);
         }
@@ -1369,11 +1519,16 @@ async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error
     let mut api = connect_to_agent(agent).await?;
 
     // Send system request
-    api.write_request(&Request::System).await
+    api.write_request(&Request::System)
+        .await
         .map_err(|e| format!("Failed to send system request: {}", e))?;
 
     // Read the response
-    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
         Some(Response::System { system_prompt }) => {
             println!("{}", system_prompt);
         }
@@ -1396,16 +1551,24 @@ async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>
     let mut api = connect_to_agent(agent).await?;
 
     // Send heartbeat request
-    api.write_request(&Request::Heartbeat).await
+    api.write_request(&Request::Heartbeat)
+        .await
         .map_err(|e| format!("Failed to send heartbeat request: {}", e))?;
 
     // Read the response
-    match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
         Some(Response::HeartbeatTriggered) => {
             println!("Heartbeat triggered for {}", agent);
         }
         Some(Response::HeartbeatNotConfigured) => {
-            println!("Heartbeat not configured for {} (add [heartbeat] section to config.toml)", agent);
+            println!(
+                "Heartbeat not configured for {} (add [heartbeat] section to config.toml)",
+                agent
+            );
         }
         Some(Response::Error { message }) => {
             return Err(format!("Error from agent: {}", message).into());
@@ -1422,7 +1585,9 @@ async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Handle chat subcommands.
-async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_chat_command(
+    command: Option<ChatCommands>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = ConversationStore::init()?;
 
     match command {
@@ -1447,7 +1612,11 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
         Some(ChatCommands::Join { name }) => {
             // Check if conversation exists
             if store.find_by_name(&name)?.is_none() {
-                return Err(format!("Conversation '{}' not found. Use 'anima chat create {}' to create it.", name, name).into());
+                return Err(format!(
+                    "Conversation '{}' not found. Use 'anima chat create {}' to create it.",
+                    name, name
+                )
+                .into());
             }
 
             chat_with_conversation(&name).await?;
@@ -1465,25 +1634,30 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
             // Get current participants
             let parts = store.get_participants(&conv)?;
-            let participants: Vec<String> = parts.iter()
+            let participants: Vec<String> = parts
+                .iter()
                 .filter(|p| p.agent != "user")
                 .map(|p| p.agent.clone())
                 .collect();
 
             // Add mentioned agents as participants if they exist and not already in
             for agent_name in &mentions {
-                if agent_name != "all" && !participants.contains(agent_name) {
-                    if anima::discovery::agent_exists(agent_name) {
-                        if let Err(e) = store.add_participant(&conv, agent_name) {
-                            eprintln!("Warning: Could not add {} as participant: {}", agent_name, e);
-                        }
-                    }
+                if agent_name != "all"
+                    && !participants.contains(agent_name)
+                    && anima::discovery::agent_exists(agent_name)
+                    && let Err(e) = store.add_participant(&conv, agent_name)
+                {
+                    eprintln!(
+                        "Warning: Could not add {} as participant: {}",
+                        agent_name, e
+                    );
                 }
             }
 
             // Expand @all to all participants
             let updated_parts = store.get_participants(&conv)?;
-            let updated_participants: Vec<String> = updated_parts.iter()
+            let updated_participants: Vec<String> = updated_parts
+                .iter()
                 .filter(|p| p.agent != "user")
                 .map(|p| p.agent.clone())
                 .collect();
@@ -1497,7 +1671,13 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             // Notify mentioned agents - wait for acknowledgments but not responses
             // The daemon processes notifications asynchronously after acknowledging
             if !expanded_mentions.is_empty() {
-                let results = notify_mentioned_agents_parallel(&store, &conv, user_msg_id, &expanded_mentions).await;
+                let results = notify_mentioned_agents_parallel(
+                    &store,
+                    &conv,
+                    user_msg_id,
+                    &expanded_mentions,
+                )
+                .await;
 
                 // Report results
                 let mut notified = Vec::new();
@@ -1506,15 +1686,23 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
                 for (agent, result) in results {
                     match result {
-                        NotifyResult::Acknowledged | NotifyResult::Notified { .. } => notified.push(agent),
+                        NotifyResult::Acknowledged | NotifyResult::Notified { .. } => {
+                            notified.push(agent)
+                        }
                         NotifyResult::Queued { .. } => queued.push(agent),
                         NotifyResult::UnknownAgent => failed.push(format!("{} (unknown)", agent)),
-                        NotifyResult::Failed { reason } => failed.push(format!("{} ({})", agent, reason)),
+                        NotifyResult::Failed { reason } => {
+                            failed.push(format!("{} ({})", agent, reason))
+                        }
                     }
                 }
 
                 if !notified.is_empty() {
-                    println!("Sent message to '{}', notified: {}", conv, notified.join(", "));
+                    println!(
+                        "Sent message to '{}', notified: {}",
+                        conv,
+                        notified.join(", ")
+                    );
                 }
                 if !queued.is_empty() {
                     println!("Queued for offline agents: {}", queued.join(", "));
@@ -1528,7 +1716,12 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
         }
 
         // `anima chat view <conv>` - view messages (pretty by default, --raw for scripts)
-        Some(ChatCommands::View { conv, limit, since, raw }) => {
+        Some(ChatCommands::View {
+            conv,
+            limit,
+            since,
+            raw,
+        }) => {
             // Check if conversation exists
             if store.find_by_name(&conv)?.is_none() {
                 return Err(format!("Conversation '{}' not found", conv).into());
@@ -1538,16 +1731,23 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             let messages = store.get_messages_filtered(&conv, limit, since)?;
 
             // Filter out tool messages from display (they clutter the chat)
-            let messages: Vec<_> = messages.into_iter().filter(|m| m.from_agent != "tool").collect();
+            let messages: Vec<_> = messages
+                .into_iter()
+                .filter(|m| m.from_agent != "tool")
+                .collect();
 
             if raw {
                 // Raw format: ID|TIMESTAMP|FROM|CONTENT (one line per message, escaped)
                 for msg in messages {
-                    let escaped_content = msg.content
+                    let escaped_content = msg
+                        .content
                         .replace('\\', "\\\\")
                         .replace('\n', "\\n")
                         .replace('|', "\\|");
-                    println!("{}|{}|{}|{}", msg.id, msg.created_at, msg.from_agent, escaped_content);
+                    println!(
+                        "{}|{}|{}|{}",
+                        msg.id, msg.created_at, msg.from_agent, escaped_content
+                    );
                 }
             } else {
                 // Pretty format (human-readable)
@@ -1557,7 +1757,14 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
 
                     // Show duration and context usage for agent messages if available
                     let duration_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
-                        msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
+                        msg.duration_ms
+                            .map(|d| {
+                                format!(
+                                    " \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m",
+                                    format_duration_ms(d)
+                                )
+                            })
+                            .unwrap_or_default()
                     } else {
                         String::new()
                     };
@@ -1589,16 +1796,45 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
 
             // Ask for confirmation if multiple matches or using wildcards
-            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
-                if !confirm_action("pause", &matches)? {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("pause", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
             }
 
             for conv_name in &matches {
                 let _ = store.set_paused(conv_name, true)?;
                 println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv_name);
+            }
+        }
+
+        // `anima chat stop <conv>` - stop a paused conversation without processing catchup (supports glob patterns)
+        Some(ChatCommands::Stop { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            // Ask for confirmation if multiple matches or using wildcards
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("stop", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                // Resume without processing catchup (just clears paused state)
+                let _ = store.set_paused(conv_name, false)?;
+                // Clear any catchup items by not processing them
+                println!(
+                    "Stopped conversation '\x1b[36m{}\x1b[0m' (catchup discarded)",
+                    conv_name
+                );
             }
         }
 
@@ -1611,11 +1847,12 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
 
             // Ask for confirmation if multiple matches or using wildcards
-            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
-                if !confirm_action("resume", &matches)? {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("resume", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
             }
 
             for conv_name in &matches {
@@ -1624,23 +1861,24 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                 let mut catchup_count = 0;
 
                 // Process catchup items (tool calls and mentions skipped during pause)
-                if let Some(paused_at) = paused_at_msg_id {
-                    if let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at) {
-                        let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
-                        for item in &catchup_items {
-                            // Process @mentions
-                            if !item.mentions.is_empty() {
-                                let _ = notify_mentioned_agents_parallel(
-                                    &store,
-                                    conv_name,
-                                    item.message.id,
-                                    &item.mentions
-                                ).await;
-                                catchup_count += item.mentions.len();
-                            }
-                            // Note: Tool calls in catchup items will be handled
-                            // by the agent when it processes the follow-up notification
+                if let Some(paused_at) = paused_at_msg_id
+                    && let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at)
+                {
+                    let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
+                    for item in &catchup_items {
+                        // Process @mentions
+                        if !item.mentions.is_empty() {
+                            let _ = notify_mentioned_agents_parallel(
+                                &store,
+                                conv_name,
+                                item.message.id,
+                                &item.mentions,
+                            )
+                            .await;
+                            catchup_count += item.mentions.len();
                         }
+                        // Note: Tool calls in catchup items will be handled
+                        // by the agent when it processes the follow-up notification
                     }
                 }
 
@@ -1656,8 +1894,9 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                             &store,
                             conv_name,
                             notification.message_id,
-                            &mentions
-                        ).await;
+                            &mentions,
+                        )
+                        .await;
 
                         // Clear this notification after processing
                         let _ = store.delete_pending_notification(notification.id);
@@ -1666,7 +1905,10 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                 }
 
                 if catchup_count > 0 {
-                    println!("Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)", conv_name, catchup_count);
+                    println!(
+                        "Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)",
+                        conv_name, catchup_count
+                    );
                 } else {
                     println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv_name);
                 }
@@ -1682,11 +1924,12 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
 
             // Ask for confirmation if multiple matches or using wildcards
-            if !force && (matches.len() > 1 || has_wildcards(&name)) {
-                if !confirm_action("delete", &matches)? {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            if !force
+                && (matches.len() > 1 || has_wildcards(&name))
+                && !confirm_action("delete", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
             }
 
             for conv_name in &matches {
@@ -1704,16 +1947,20 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
 
             // Ask for confirmation if multiple matches or using wildcards
-            if !force && (matches.len() > 1 || has_wildcards(&conv)) {
-                if !confirm_action("clear", &matches)? {
-                    println!("Aborted.");
-                    return Ok(());
-                }
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("clear", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
             }
 
             for conv_name in &matches {
                 let deleted = store.clear_messages(conv_name)?;
-                println!("Cleared {} messages from '\x1b[36m{}\x1b[0m'", deleted, conv_name);
+                println!(
+                    "Cleared {} messages from '\x1b[36m{}\x1b[0m'",
+                    deleted, conv_name
+                );
             }
         }
 
@@ -1736,7 +1983,10 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
             }
 
             // Column order: NAME, MSGS, UPDATED, PARTICIPANTS (last so it can overflow)
-            println!("\x1b[1m{:<30} {:>6}   {:<10} {}\x1b[0m", "NAME", "MSGS", "UPDATED", "PARTICIPANTS");
+            println!(
+                "\x1b[1m{:<30} {:>6}   {:<10} PARTICIPANTS\x1b[0m",
+                "NAME", "MSGS", "UPDATED"
+            );
             println!("{}", "-".repeat(80));
 
             for conv in conversations {
@@ -1778,7 +2028,12 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
@@ -1790,7 +2045,10 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             }
 
             // Print header
-            println!("\x1b[1m{:<6} {:<12} {:<10} {}\x1b[0m", "ID", "CREATED", "SOURCE", "CONTENT");
+            println!(
+                "\x1b[1m{:<6} {:<12} {:<10} CONTENT\x1b[0m",
+                "ID", "CREATED", "SOURCE"
+            );
             println!("{}", "─".repeat(110));
 
             for m in memories {
@@ -1805,16 +2063,28 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
                 // Replace newlines with spaces for single-line display
                 let content_display = content_display.replace('\n', " ");
 
-                println!("{:<6} {:<12} {:<10} {}", m.id, age, m.source, content_display);
+                println!(
+                    "{:<6} {:<12} {:<10} {}",
+                    m.id, age, m.source, content_display
+                );
             }
         }
 
-        MemoryCommands::Search { agent, query, limit } => {
+        MemoryCommands::Search {
+            agent,
+            query,
+            limit,
+        } => {
             let agent_path = resolve_agent_path(&agent);
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
@@ -1824,13 +2094,16 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let embedding_result = get_query_embedding(&query).await;
 
             let results = match embedding_result {
-                Ok(embedding) => {
+                Ok(embedding) =>
+                {
                     #[allow(deprecated)]
                     store.recall_with_embedding(&query, limit, Some(&embedding))?
                 }
                 Err(_) => {
                     // Fall back to listing all and doing simple text search
-                    eprintln!("\x1b[33mWarning: Could not generate embedding, falling back to text search\x1b[0m");
+                    eprintln!(
+                        "\x1b[33mWarning: Could not generate embedding, falling back to text search\x1b[0m"
+                    );
                     let all = store.list_all(None)?;
                     let query_lower = query.to_lowercase();
                     all.into_iter()
@@ -1842,12 +2115,18 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             };
 
             if results.is_empty() {
-                println!("No memories matching '{}' found for agent '{}'", query, agent);
+                println!(
+                    "No memories matching '{}' found for agent '{}'",
+                    query, agent
+                );
                 return Ok(());
             }
 
             // Print header
-            println!("\x1b[1m{:<6} {:<8} {:<12} {:<10} {}\x1b[0m", "ID", "SCORE", "CREATED", "SOURCE", "CONTENT");
+            println!(
+                "\x1b[1m{:<6} {:<8} {:<12} {:<10} CONTENT\x1b[0m",
+                "ID", "SCORE", "CREATED", "SOURCE"
+            );
             println!("{}", "─".repeat(80));
 
             for (m, score) in results {
@@ -1861,7 +2140,10 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
                 };
                 let content_display = content_display.replace('\n', " ");
 
-                println!("{:<6} {:<8.3} {:<12} {:<10} {}", m.id, score, age, m.source, content_display);
+                println!(
+                    "{:<6} {:<8.3} {:<12} {:<10} {}",
+                    m.id, score, age, m.source, content_display
+                );
             }
         }
 
@@ -1870,7 +2152,12 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
@@ -1888,7 +2175,12 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
@@ -1901,7 +2193,10 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
 
             // Confirm unless --force
             if !force {
-                print!("This will delete {} memories for '{}'. Continue? [y/N] ", count, agent);
+                print!(
+                    "This will delete {} memories for '{}'. Continue? [y/N] ",
+                    count, agent
+                );
                 io::stdout().flush()?;
 
                 let mut input = String::new();
@@ -1921,7 +2216,12 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
@@ -1935,11 +2235,16 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            
+
             match store.get(id)? {
                 Some(entry) => {
                     let age = format_age(entry.created_at);
@@ -1957,22 +2262,29 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             }
         }
 
-        MemoryCommands::Add { agent, content, importance } => {
+        MemoryCommands::Add {
+            agent,
+            content,
+            importance,
+        } => {
             let agent_path = resolve_agent_path(&agent);
             let memory_path = agent_path.join("memory.db");
 
             // Create memory.db if it doesn't exist
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            
+
             // Clamp importance to valid range
             let importance = importance.clamp(0.0, 1.0);
-            
+
             match store.save(&content, importance, "cli")? {
                 anima::memory::SaveResult::New(id) => {
                     println!("Created memory #{} for agent '{}'", id, agent);
                 }
                 anima::memory::SaveResult::Reinforced(id, old_imp, new_imp) => {
-                    println!("Reinforced existing memory #{} (importance: {:.2} → {:.2})", id, old_imp, new_imp);
+                    println!(
+                        "Reinforced existing memory #{} (importance: {:.2} → {:.2})",
+                        id, old_imp, new_imp
+                    );
                 }
             }
         }
@@ -1982,11 +2294,16 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
             let memory_path = agent_path.join("memory.db");
 
             if !memory_path.exists() {
-                return Err(format!("No memory database found for agent '{}' at {}", agent, memory_path.display()).into());
+                return Err(format!(
+                    "No memory database found for agent '{}' at {}",
+                    agent,
+                    memory_path.display()
+                )
+                .into());
             }
 
             let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            
+
             if store.update_content(id, &content)? {
                 println!("Updated memory #{} for agent '{}'", id, agent);
             } else {
@@ -2048,7 +2365,10 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
             let percentage = (total_tokens as f64 / num_ctx as f64 * 100.0) as u32;
             let used_str = format_tokens_short(total_tokens);
             let ctx_str = format_tokens_short(num_ctx);
-            format!(" \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%)\x1b[0m", used_str, ctx_str, percentage)
+            format!(
+                " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%)\x1b[0m",
+                used_str, ctx_str, percentage
+            )
         }
         _ => String::new(),
     }
@@ -2134,7 +2454,10 @@ fn list_agents() {
     let agents_path = agents_dir();
 
     if !agents_path.exists() {
-        println!("\x1b[33mNo agents directory found at {}\x1b[0m", agents_path.display());
+        println!(
+            "\x1b[33mNo agents directory found at {}\x1b[0m",
+            agents_path.display()
+        );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
         return;
     }
@@ -2152,7 +2475,10 @@ fn list_agents() {
     };
 
     if entries.is_empty() {
-        println!("\x1b[33mNo agents found in {}\x1b[0m", agents_path.display());
+        println!(
+            "\x1b[33mNo agents found in {}\x1b[0m",
+            agents_path.display()
+        );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
         return;
     }
@@ -2163,12 +2489,10 @@ fn list_agents() {
 
         // Try to load config to get more info
         let info = match AgentDir::load(entry.path()) {
-            Ok(agent_dir) => {
-                match agent_dir.resolve_llm_config() {
-                    Ok(resolved) => format!(" ({}/{})", resolved.provider, resolved.model),
-                    Err(_) => " (config error)".to_string(),
-                }
-            }
+            Ok(agent_dir) => match agent_dir.resolve_llm_config() {
+                Ok(resolved) => format!(" ({}/{})", resolved.provider, resolved.model),
+                Err(_) => " (config error)".to_string(),
+            },
             Err(_) => " (config error)".to_string(),
         };
 
@@ -2177,7 +2501,12 @@ fn list_agents() {
 }
 
 /// Run an agent with a single task (non-interactive, from config file)
-async fn run_agent_task(config_path: &str, task: &str, stream: bool, verbose_cli: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_agent_task(
+    config_path: &str,
+    task: &str,
+    stream: bool,
+    verbose_cli: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Load config
     let config = AgentConfig::from_file(config_path)?;
 
@@ -2282,7 +2611,9 @@ async fn run_agent_task(config_path: &str, task: &str, stream: bool, verbose_cli
         });
 
         // Run the streaming agent
-        let result = agent.think_streaming_with_options(task, options, tx).await?;
+        let result = agent
+            .think_streaming_with_options(task, options, tx)
+            .await?;
 
         // Wait for print task to complete
         let _ = print_task.await;
@@ -2386,7 +2717,10 @@ mod tests {
     #[test]
     fn test_resolve_agent_socket_with_path() {
         let socket_path = resolve_agent_socket("/custom/path/myagent");
-        assert_eq!(socket_path, PathBuf::from("/custom/path/myagent/agent.sock"));
+        assert_eq!(
+            socket_path,
+            PathBuf::from("/custom/path/myagent/agent.sock")
+        );
     }
 
     #[test]

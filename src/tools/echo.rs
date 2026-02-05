@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 
 #[derive(Debug)]
@@ -63,7 +63,12 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["message"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("message")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("message"))
+        );
     }
 
     #[tokio::test]

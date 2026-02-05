@@ -1,11 +1,11 @@
+use crate::embedding::EmbeddingClient;
+use crate::error::ToolError;
+use crate::memory::SemanticMemoryStore;
+use crate::tool::Tool;
 use async_trait::async_trait;
+use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::error::ToolError;
-use crate::tool::Tool;
-use crate::memory::SemanticMemoryStore;
-use crate::embedding::EmbeddingClient;
-use serde_json::Value;
 
 /// Tool that allows agents to explicitly save memories via tool call.
 /// This provides an alternative to the [REMEMBER: ...] tag syntax.
@@ -64,7 +64,9 @@ impl Tool for DaemonRememberTool {
         let content = input
             .get("content")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'content' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'content' field".to_string())
+            })?;
 
         // Generate embedding if client is available
         let embedding = if let Some(ref client) = self.embedding_client {
@@ -75,7 +77,8 @@ impl Tool for DaemonRememberTool {
 
         // Save to semantic memory
         let store = self.semantic_memory.lock().await;
-        store.save_with_embedding(content, 0.9, "explicit", embedding.as_deref())
+        store
+            .save_with_embedding(content, 0.9, "explicit", embedding.as_deref())
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to save memory: {}", e)))?;
 
         Ok(serde_json::json!({
@@ -113,7 +116,7 @@ impl Tool for RememberTool {
         // because it requires access to SemanticMemoryStore and EmbeddingClient.
         // This method is not called directly.
         Err(ToolError::ExecutionFailed(
-            "RememberTool must be executed through daemon context".to_string()
+            "RememberTool must be executed through daemon context".to_string(),
         ))
     }
 }
@@ -141,6 +144,11 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["content"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("content")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("content"))
+        );
     }
 }

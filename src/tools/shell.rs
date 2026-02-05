@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
 use tokio::process::Command;
@@ -63,17 +63,18 @@ impl Tool for ShellTool {
         let command = input
             .get("command")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'command' field".to_string()))?;
+            .ok_or_else(|| {
+                ToolError::InvalidInput("Missing or invalid 'command' field".to_string())
+            })?;
 
         let output = tokio::time::timeout(
             self.timeout,
-            Command::new("sh")
-                .arg("-c")
-                .arg(command)
-                .output()
+            Command::new("sh").arg("-c").arg(command).output(),
         )
         .await
-        .map_err(|_| ToolError::ExecutionFailed(format!("Command timed out after {:?}", self.timeout)))?
+        .map_err(|_| {
+            ToolError::ExecutionFailed(format!("Command timed out after {:?}", self.timeout))
+        })?
         .map_err(|e| ToolError::ExecutionFailed(format!("Failed to execute command: {}", e)))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -111,7 +112,12 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("command")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("command"))
+        );
     }
 
     #[test]
@@ -129,7 +135,10 @@ mod tests {
     #[tokio::test]
     async fn test_shell_simple_command() {
         let tool = ShellTool::new();
-        let result = tool.execute(json!({"command": "echo hello"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo hello"}))
+            .await
+            .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "hello");
         assert_eq!(result["exit_code"], 0);
     }
@@ -144,7 +153,10 @@ mod tests {
     #[tokio::test]
     async fn test_shell_stderr() {
         let tool = ShellTool::new();
-        let result = tool.execute(json!({"command": "echo error >&2"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo error >&2"}))
+            .await
+            .unwrap();
         assert!(result["stderr"].as_str().unwrap().contains("error"));
     }
 
@@ -168,14 +180,20 @@ mod tests {
     #[tokio::test]
     async fn test_shell_command_with_args() {
         let tool = ShellTool::new();
-        let result = tool.execute(json!({"command": "printf '%s' test"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "printf '%s' test"}))
+            .await
+            .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap(), "test");
     }
 
     #[tokio::test]
     async fn test_shell_piped_command() {
         let tool = ShellTool::new();
-        let result = tool.execute(json!({"command": "echo hello world | tr a-z A-Z"})).await.unwrap();
+        let result = tool
+            .execute(json!({"command": "echo hello world | tr a-z A-Z"}))
+            .await
+            .unwrap();
         assert_eq!(result["stdout"].as_str().unwrap().trim(), "HELLO WORLD");
     }
 }

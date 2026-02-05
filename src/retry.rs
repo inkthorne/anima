@@ -2,9 +2,9 @@
 //!
 //! Provides exponential backoff with jitter for transient failures.
 
+use rand::Rng;
 use std::future::Future;
 use std::time::Duration;
-use rand::Rng;
 
 /// Configuration for retry behavior with exponential backoff.
 #[derive(Debug, Clone)]
@@ -76,8 +76,8 @@ impl RetryPolicy {
         }
 
         // Calculate base delay: initial_delay * base^(attempt-1)
-        let base_delay = self.initial_delay_ms as f64
-            * self.exponential_base.powi((attempt - 1) as i32);
+        let base_delay =
+            self.initial_delay_ms as f64 * self.exponential_base.powi((attempt - 1) as i32);
 
         // Cap at max delay
         let capped_delay = base_delay.min(self.max_delay_ms as f64);
@@ -156,8 +156,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_default_policy() {

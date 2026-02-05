@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// Tool for making HTTP requests.
@@ -100,7 +100,12 @@ impl Tool for HttpTool {
                 }
             }
             "HEAD" => self.client.head(url),
-            _ => return Err(ToolError::InvalidInput(format!("Unsupported HTTP method: {}", method))),
+            _ => {
+                return Err(ToolError::InvalidInput(format!(
+                    "Unsupported HTTP method: {}",
+                    method
+                )));
+            }
         };
 
         let response = request
@@ -109,10 +114,9 @@ impl Tool for HttpTool {
             .map_err(|e| ToolError::ExecutionFailed(format!("HTTP request failed: {}", e)))?;
 
         let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read response body: {}", e)))?;
+        let body = response.text().await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to read response body: {}", e))
+        })?;
 
         Ok(serde_json::json!({
             "status": status,
@@ -146,7 +150,12 @@ mod tests {
         assert!(schema["properties"]["url"].is_object());
         assert!(schema["properties"]["method"].is_object());
         assert!(schema["properties"]["body"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("url")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("url"))
+        );
     }
 
     #[test]
@@ -172,7 +181,9 @@ mod tests {
     #[tokio::test]
     async fn test_http_unsupported_method() {
         let tool = HttpTool::new();
-        let result = tool.execute(json!({"url": "https://example.com", "method": "CONNECT"})).await;
+        let result = tool
+            .execute(json!({"url": "https://example.com", "method": "CONNECT"}))
+            .await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
 
@@ -181,7 +192,10 @@ mod tests {
     #[ignore]
     async fn test_http_get_request() {
         let tool = HttpTool::new();
-        let result = tool.execute(json!({"url": "https://httpbin.org/get"})).await.unwrap();
+        let result = tool
+            .execute(json!({"url": "https://httpbin.org/get"}))
+            .await
+            .unwrap();
         assert_eq!(result["status"], 200);
     }
 
@@ -189,11 +203,14 @@ mod tests {
     #[ignore]
     async fn test_http_post_request() {
         let tool = HttpTool::new();
-        let result = tool.execute(json!({
-            "url": "https://httpbin.org/post",
-            "method": "POST",
-            "body": "test data"
-        })).await.unwrap();
+        let result = tool
+            .execute(json!({
+                "url": "https://httpbin.org/post",
+                "method": "POST",
+                "body": "test data"
+            }))
+            .await
+            .unwrap();
         assert_eq!(result["status"], 200);
     }
 }

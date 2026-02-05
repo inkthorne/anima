@@ -13,14 +13,16 @@ pub mod wait_for_child;
 pub mod write_file;
 
 pub use add::AddTool;
-pub use claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, ClaudeCodeTask, TaskError, is_process_running};
+pub use claude_code::{
+    ClaudeCodeTask, ClaudeCodeTool, TaskError, TaskStatus, TaskStore, is_process_running,
+};
 pub use echo::EchoTool;
 pub use http::HttpTool;
 pub use list_agents::DaemonListAgentsTool;
 pub use read_file::ReadFileTool;
-pub use remember::{RememberTool, DaemonRememberTool};
+pub use remember::{DaemonRememberTool, RememberTool};
 pub use safe_shell::SafeShellTool;
-pub use send_message::{SendMessageTool, ListAgentsTool, DaemonSendMessageTool};
+pub use send_message::{DaemonSendMessageTool, ListAgentsTool, SendMessageTool};
 pub use shell::ShellTool;
 pub use spawn_child::SpawnChildTool;
 pub use wait_for_child::WaitForChildTool;

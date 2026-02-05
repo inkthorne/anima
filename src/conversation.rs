@@ -126,10 +126,12 @@ impl ConversationStore {
 
     /// Get the default database path.
     fn db_path() -> Result<PathBuf, ConversationError> {
-        let home = dirs::home_dir()
-            .ok_or_else(|| ConversationError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotFound, "Could not determine home directory")
-            ))?;
+        let home = dirs::home_dir().ok_or_else(|| {
+            ConversationError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Could not determine home directory",
+            ))
+        })?;
         Ok(home.join(".anima").join("conversations.db"))
     }
 
@@ -209,10 +211,12 @@ impl ConversationStore {
     fn migrate_add_paused_column(&self) -> Result<(), ConversationError> {
         // Check if conversations table has paused column
         let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_paused = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.any(|r| r.map(|n| n == "paused").unwrap_or(false));
+        let has_paused = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .any(|r| r.map(|n| n == "paused").unwrap_or(false));
 
         if !has_paused {
             self.conn.execute(
@@ -228,10 +232,12 @@ impl ConversationStore {
     fn migrate_add_paused_at_msg_id_column(&self) -> Result<(), ConversationError> {
         // Check if conversations table has paused_at_msg_id column
         let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_column = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.any(|r| r.map(|n| n == "paused_at_msg_id").unwrap_or(false));
+        let has_column = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .any(|r| r.map(|n| n == "paused_at_msg_id").unwrap_or(false));
 
         if !has_column {
             self.conn.execute(
@@ -247,10 +253,12 @@ impl ConversationStore {
     fn migrate_add_duration_ms_column(&self) -> Result<(), ConversationError> {
         // Check if messages table has duration_ms column
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let has_column = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.any(|r| r.map(|n| n == "duration_ms").unwrap_or(false));
+        let has_column = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .any(|r| r.map(|n| n == "duration_ms").unwrap_or(false));
 
         if !has_column {
             self.conn.execute(
@@ -266,10 +274,12 @@ impl ConversationStore {
     fn migrate_add_tool_calls_column(&self) -> Result<(), ConversationError> {
         // Check if messages table has tool_calls column
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let has_column = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.any(|r| r.map(|n| n == "tool_calls").unwrap_or(false));
+        let has_column = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .any(|r| r.map(|n| n == "tool_calls").unwrap_or(false));
 
         if !has_column {
             self.conn.execute(
@@ -284,10 +294,13 @@ impl ConversationStore {
     /// Migrate existing databases to add the token tracking columns to messages if they don't exist.
     fn migrate_add_token_columns(&self) -> Result<(), ConversationError> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let columns: Vec<String> = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.filter_map(|r| r.ok()).collect();
+        let columns: Vec<String> = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         if !columns.contains(&"tokens_in".to_string()) {
             self.conn.execute(
@@ -317,7 +330,7 @@ impl ConversationStore {
     fn needs_migration(&self) -> Result<bool, ConversationError> {
         // Check if conversations table exists with old schema (has 'id' column)
         let mut stmt = self.conn.prepare(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'"
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
         )?;
         let exists = stmt.exists([])?;
 
@@ -327,10 +340,12 @@ impl ConversationStore {
 
         // Check if it has the old 'id' column
         let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_id = stmt.query_map([], |row| {
-            let col_name: String = row.get(1)?;
-            Ok(col_name)
-        })?.any(|r| r.map(|n| n == "id").unwrap_or(false));
+        let has_id = stmt
+            .query_map([], |row| {
+                let col_name: String = row.get(1)?;
+                Ok(col_name)
+            })?
+            .any(|r| r.map(|n| n == "id").unwrap_or(false));
 
         Ok(has_id)
     }
@@ -572,18 +587,26 @@ impl ConversationStore {
     /// Set the paused state of a conversation.
     /// When pausing, records the current max message ID.
     /// When resuming, returns the paused_at_msg_id for catchup processing.
-    pub fn set_paused(&self, conv_name: &str, paused: bool) -> Result<Option<i64>, ConversationError> {
+    pub fn set_paused(
+        &self,
+        conv_name: &str,
+        paused: bool,
+    ) -> Result<Option<i64>, ConversationError> {
         // Verify conversation exists and get current state
-        let conv = self.get_conversation(conv_name)?
+        let conv = self
+            .get_conversation(conv_name)?
             .ok_or_else(|| ConversationError::NotFound(conv_name.to_string()))?;
 
         if paused {
             // Pausing: record the current max message ID
-            let max_msg_id: Option<i64> = self.conn.query_row(
-                "SELECT MAX(id) FROM messages WHERE conv_name = ?1",
-                params![conv_name],
-                |row| row.get(0),
-            ).ok();
+            let max_msg_id: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT MAX(id) FROM messages WHERE conv_name = ?1",
+                    params![conv_name],
+                    |row| row.get(0),
+                )
+                .ok();
 
             self.conn.execute(
                 "UPDATE conversations SET paused = 1, paused_at_msg_id = ?1 WHERE name = ?2",
@@ -702,7 +725,9 @@ impl ConversationStore {
         content: &str,
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, None, None, None, None, None)
+        self.add_message_full(
+            conv_name, from_agent, content, mentions, None, None, None, None, None,
+        )
     }
 
     /// Add a message to a conversation with optional response duration.
@@ -715,7 +740,17 @@ impl ConversationStore {
         mentions: &[&str],
         duration_ms: Option<i64>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, None, None, None, None)
+        self.add_message_full(
+            conv_name,
+            from_agent,
+            content,
+            mentions,
+            duration_ms,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Add a message to a conversation with optional response duration and tool_calls.
@@ -729,7 +764,17 @@ impl ConversationStore {
         duration_ms: Option<i64>,
         tool_calls: Option<&str>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls, None, None, None)
+        self.add_message_full(
+            conv_name,
+            from_agent,
+            content,
+            mentions,
+            duration_ms,
+            tool_calls,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Add a message to a conversation with all optional fields including token tracking.
@@ -746,7 +791,17 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx)
+        self.add_message_full(
+            conv_name,
+            from_agent,
+            content,
+            mentions,
+            duration_ms,
+            tool_calls,
+            tokens_in,
+            tokens_out,
+            num_ctx,
+        )
     }
 
     /// Add a message to a conversation with all optional fields.
@@ -994,7 +1049,10 @@ impl ConversationStore {
     }
 
     /// Delete a single pending notification by ID.
-    pub fn delete_pending_notification(&self, notification_id: i64) -> Result<(), ConversationError> {
+    pub fn delete_pending_notification(
+        &self,
+        notification_id: i64,
+    ) -> Result<(), ConversationError> {
         self.conn.execute(
             "DELETE FROM pending_notifications WHERE id = ?1",
             params![notification_id],
@@ -1007,10 +1065,9 @@ impl ConversationStore {
         let now = current_timestamp();
 
         // Delete expired messages
-        let messages_deleted = self.conn.execute(
-            "DELETE FROM messages WHERE expires_at <= ?1",
-            params![now],
-        )?;
+        let messages_deleted = self
+            .conn
+            .execute("DELETE FROM messages WHERE expires_at <= ?1", params![now])?;
 
         // Delete pending notifications for deleted messages
         self.conn.execute(
@@ -1080,9 +1137,9 @@ impl ConversationStore {
     /// Get the count of non-expired messages in a conversation.
     pub fn get_message_count(&self, conv_name: &str) -> Result<i64, ConversationError> {
         let now = current_timestamp();
-        let mut stmt = self.conn.prepare(
-            "SELECT COUNT(*) FROM messages WHERE conv_name = ?1 AND expires_at > ?2",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT COUNT(*) FROM messages WHERE conv_name = ?1 AND expires_at > ?2")?;
         let count: i64 = stmt.query_row(params![conv_name, now], |row| row.get(0))?;
         Ok(count)
     }
@@ -1094,13 +1151,17 @@ impl ConversationStore {
 
     /// Find a conversation by its exact set of participants.
     /// Participants must match exactly (same set, sorted).
-    pub fn find_by_participants(&self, participants: &[&str]) -> Result<Option<Conversation>, ConversationError> {
+    pub fn find_by_participants(
+        &self,
+        participants: &[&str],
+    ) -> Result<Option<Conversation>, ConversationError> {
         // Get all conversations and check participants
         let conversations = self.list_conversations()?;
 
         for conv in conversations {
             let conv_participants = self.get_participants(&conv.name)?;
-            let mut conv_agents: Vec<&str> = conv_participants.iter().map(|p| p.agent.as_str()).collect();
+            let mut conv_agents: Vec<&str> =
+                conv_participants.iter().map(|p| p.agent.as_str()).collect();
             conv_agents.sort();
 
             let mut target: Vec<&str> = participants.to_vec();
@@ -1159,23 +1220,64 @@ pub fn generate_fun_name() -> String {
     use rand::prelude::IndexedRandom;
 
     const ADJECTIVES: &[&str] = &[
-        "swift", "quiet", "wild", "bright", "gentle", "bold", "calm", "clever",
-        "eager", "fancy", "grand", "happy", "jolly", "keen", "lucky", "merry",
-        "noble", "proud", "quick", "rapid", "sharp", "silent", "smooth", "steady",
-        "sunny", "tender", "vivid", "warm", "witty", "zesty", "cosmic", "daring",
-        "frozen", "golden", "hidden", "iron", "jade", "kind", "lazy", "mighty",
-        "nimble", "orange", "purple", "royal", "silver", "tiny", "ultra", "velvet",
+        "swift", "quiet", "wild", "bright", "gentle", "bold", "calm", "clever", "eager", "fancy",
+        "grand", "happy", "jolly", "keen", "lucky", "merry", "noble", "proud", "quick", "rapid",
+        "sharp", "silent", "smooth", "steady", "sunny", "tender", "vivid", "warm", "witty",
+        "zesty", "cosmic", "daring", "frozen", "golden", "hidden", "iron", "jade", "kind", "lazy",
+        "mighty", "nimble", "orange", "purple", "royal", "silver", "tiny", "ultra", "velvet",
         "wiry", "young",
     ];
 
     const NOUNS: &[&str] = &[
-        "falcon", "harbor", "screwdriver", "mountain", "river", "thunder", "whisper",
-        "arrow", "beacon", "canyon", "dagger", "eclipse", "forest", "glacier", "horizon",
-        "island", "jungle", "knight", "lantern", "meadow", "nebula", "ocean", "phoenix",
-        "quartz", "raven", "shadow", "temple", "umbrella", "valley", "waterfall", "xenon",
-        "yarn", "zenith", "anchor", "bridge", "compass", "dragon", "ember", "flame",
-        "garden", "hammer", "iceberg", "jewel", "kite", "lightning", "mirror", "needle",
-        "orbit", "prism",
+        "falcon",
+        "harbor",
+        "screwdriver",
+        "mountain",
+        "river",
+        "thunder",
+        "whisper",
+        "arrow",
+        "beacon",
+        "canyon",
+        "dagger",
+        "eclipse",
+        "forest",
+        "glacier",
+        "horizon",
+        "island",
+        "jungle",
+        "knight",
+        "lantern",
+        "meadow",
+        "nebula",
+        "ocean",
+        "phoenix",
+        "quartz",
+        "raven",
+        "shadow",
+        "temple",
+        "umbrella",
+        "valley",
+        "waterfall",
+        "xenon",
+        "yarn",
+        "zenith",
+        "anchor",
+        "bridge",
+        "compass",
+        "dragon",
+        "ember",
+        "flame",
+        "garden",
+        "hammer",
+        "iceberg",
+        "jewel",
+        "kite",
+        "lightning",
+        "mirror",
+        "needle",
+        "orbit",
+        "prism",
     ];
 
     let mut rng = rand::rng();
@@ -1309,38 +1411,56 @@ pub async fn notify_mentioned_agents(
                     };
 
                     if let Err(e) = api.write_request(&request).await {
-                        results.insert(agent_name.clone(), NotifyResult::Failed {
-                            reason: format!("Failed to send request: {}", e),
-                        });
+                        results.insert(
+                            agent_name.clone(),
+                            NotifyResult::Failed {
+                                reason: format!("Failed to send request: {}", e),
+                            },
+                        );
                         continue;
                     }
 
                     // Read response
                     match api.read_response().await {
-                        Ok(Some(Response::Notified { response_message_id })) => {
-                            results.insert(agent_name.clone(), NotifyResult::Notified {
-                                response_message_id,
-                            });
+                        Ok(Some(Response::Notified {
+                            response_message_id,
+                        })) => {
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Notified {
+                                    response_message_id,
+                                },
+                            );
                         }
                         Ok(Some(Response::Error { message })) => {
-                            results.insert(agent_name.clone(), NotifyResult::Failed {
-                                reason: message,
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Failed { reason: message },
+                            );
                         }
                         Ok(Some(_)) => {
-                            results.insert(agent_name.clone(), NotifyResult::Failed {
-                                reason: "Unexpected response type".to_string(),
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Failed {
+                                    reason: "Unexpected response type".to_string(),
+                                },
+                            );
                         }
                         Ok(None) => {
-                            results.insert(agent_name.clone(), NotifyResult::Failed {
-                                reason: "Connection closed".to_string(),
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Failed {
+                                    reason: "Connection closed".to_string(),
+                                },
+                            );
                         }
                         Err(e) => {
-                            results.insert(agent_name.clone(), NotifyResult::Failed {
-                                reason: format!("Failed to read response: {}", e),
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Failed {
+                                    reason: format!("Failed to read response: {}", e),
+                                },
+                            );
                         }
                     }
                 }
@@ -1353,14 +1473,18 @@ pub async fn notify_mentioned_agents(
                     }
                     match store.add_pending_notification(agent_name, conv_id, message_id) {
                         Ok(notification_id) => {
-                            results.insert(agent_name.clone(), NotifyResult::Queued {
-                                notification_id,
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Queued { notification_id },
+                            );
                         }
                         Err(e) => {
-                            results.insert(agent_name.clone(), NotifyResult::Failed {
-                                reason: format!("Failed to queue notification: {}", e),
-                            });
+                            results.insert(
+                                agent_name.clone(),
+                                NotifyResult::Failed {
+                                    reason: format!("Failed to queue notification: {}", e),
+                                },
+                            );
                         }
                     }
                 }
@@ -1373,14 +1497,15 @@ pub async fn notify_mentioned_agents(
             }
             match store.add_pending_notification(agent_name, conv_id, message_id) {
                 Ok(notification_id) => {
-                    results.insert(agent_name.clone(), NotifyResult::Queued {
-                        notification_id,
-                    });
+                    results.insert(agent_name.clone(), NotifyResult::Queued { notification_id });
                 }
                 Err(e) => {
-                    results.insert(agent_name.clone(), NotifyResult::Failed {
-                        reason: format!("Failed to queue notification: {}", e),
-                    });
+                    results.insert(
+                        agent_name.clone(),
+                        NotifyResult::Failed {
+                            reason: format!("Failed to queue notification: {}", e),
+                        },
+                    );
                 }
             }
         }
@@ -1415,9 +1540,12 @@ async fn notify_single_agent(
                 };
 
                 if let Err(e) = api.write_request(&request).await {
-                    return (agent_name, NotifyResult::Failed {
-                        reason: format!("Failed to send request: {}", e),
-                    });
+                    return (
+                        agent_name,
+                        NotifyResult::Failed {
+                            reason: format!("Failed to send request: {}", e),
+                        },
+                    );
                 }
 
                 // Read response
@@ -1426,44 +1554,60 @@ async fn notify_single_agent(
                         // Fire-and-forget: daemon acknowledged, will process async
                         (agent_name, NotifyResult::Acknowledged)
                     }
-                    Ok(Some(Response::Notified { response_message_id })) => {
+                    Ok(Some(Response::Notified {
+                        response_message_id,
+                    })) => {
                         // Synchronous response (backwards compat)
-                        (agent_name, NotifyResult::Notified { response_message_id })
+                        (
+                            agent_name,
+                            NotifyResult::Notified {
+                                response_message_id,
+                            },
+                        )
                     }
                     Ok(Some(Response::Error { message })) => {
                         (agent_name, NotifyResult::Failed { reason: message })
                     }
-                    Ok(Some(_)) => {
-                        (agent_name, NotifyResult::Failed {
+                    Ok(Some(_)) => (
+                        agent_name,
+                        NotifyResult::Failed {
                             reason: "Unexpected response type".to_string(),
-                        })
-                    }
-                    Ok(None) => {
-                        (agent_name, NotifyResult::Failed {
+                        },
+                    ),
+                    Ok(None) => (
+                        agent_name,
+                        NotifyResult::Failed {
                             reason: "Connection closed".to_string(),
-                        })
-                    }
-                    Err(e) => {
-                        (agent_name, NotifyResult::Failed {
+                        },
+                    ),
+                    Err(e) => (
+                        agent_name,
+                        NotifyResult::Failed {
                             reason: format!("Failed to read response: {}", e),
-                        })
-                    }
+                        },
+                    ),
                 }
             }
             Err(_e) => {
                 // Socket connection failed - agent may have just stopped
                 // For parallel mode, we can't queue (no store reference)
                 // Return failed status - caller can decide to queue
-                (agent_name, NotifyResult::Failed {
-                    reason: "Agent not reachable (socket connection failed)".to_string(),
-                })
+                (
+                    agent_name,
+                    NotifyResult::Failed {
+                        reason: "Agent not reachable (socket connection failed)".to_string(),
+                    },
+                )
             }
         }
     } else {
         // Agent is not running
-        (agent_name, NotifyResult::Failed {
-            reason: "Agent not running".to_string(),
-        })
+        (
+            agent_name,
+            NotifyResult::Failed {
+                reason: "Agent not running".to_string(),
+            },
+        )
     }
 }
 
@@ -1517,21 +1661,25 @@ pub async fn notify_mentioned_agents_parallel_owned(
                         results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
                         continue;
                     }
-                    let queued_result = match store.add_pending_notification(agent_name, &conv_id, message_id) {
-                        Ok(notification_id) => NotifyResult::Queued { notification_id },
-                        Err(e) => NotifyResult::Failed {
-                            reason: format!("Failed to queue notification: {}", e),
-                        },
-                    };
+                    let queued_result =
+                        match store.add_pending_notification(agent_name, &conv_id, message_id) {
+                            Ok(notification_id) => NotifyResult::Queued { notification_id },
+                            Err(e) => NotifyResult::Failed {
+                                reason: format!("Failed to queue notification: {}", e),
+                            },
+                        };
                     results.insert(agent_name.clone(), queued_result);
                 }
             }
             Err(e) => {
                 // Can't queue - mark all as failed
                 for agent_name in &mentions {
-                    results.insert(agent_name.clone(), NotifyResult::Failed {
-                        reason: format!("Conversation paused but failed to queue: {}", e),
-                    });
+                    results.insert(
+                        agent_name.clone(),
+                        NotifyResult::Failed {
+                            reason: format!("Conversation paused but failed to queue: {}", e),
+                        },
+                    );
                 }
             }
         }
@@ -1539,14 +1687,15 @@ pub async fn notify_mentioned_agents_parallel_owned(
     }
 
     // Spawn parallel notification tasks
-    let futures: Vec<_> = mentions.iter().map(|agent_name| {
-        let agent = agent_name.clone();
-        let cid = conv_id.clone();
-        let mid = message_id;
-        tokio::spawn(async move {
-            notify_single_agent(agent, cid, mid).await
+    let futures: Vec<_> = mentions
+        .iter()
+        .map(|agent_name| {
+            let agent = agent_name.clone();
+            let cid = conv_id.clone();
+            let mid = message_id;
+            tokio::spawn(async move { notify_single_agent(agent, cid, mid).await })
         })
-    }).collect();
+        .collect();
 
     // Wait for all notifications to complete
     let outcomes = join_all(futures).await;
@@ -1560,14 +1709,18 @@ pub async fn notify_mentioned_agents_parallel_owned(
             Ok((agent_name, result)) => {
                 // If agent wasn't reachable or not running, mark for queuing
                 let final_result = match &result {
-                    NotifyResult::Failed { reason } if reason.contains("not running") || reason.contains("not reachable") => {
+                    NotifyResult::Failed { reason }
+                        if reason.contains("not running") || reason.contains("not reachable") =>
+                    {
                         // Only queue if agent actually exists
                         if !crate::discovery::agent_exists(&agent_name) {
                             NotifyResult::UnknownAgent
                         } else {
                             agents_to_queue.push(agent_name.clone());
                             // Placeholder - will be updated below
-                            NotifyResult::Failed { reason: "pending_queue".to_string() }
+                            NotifyResult::Failed {
+                                reason: "pending_queue".to_string(),
+                            }
                         }
                     }
                     _ => result,
@@ -1586,21 +1739,25 @@ pub async fn notify_mentioned_agents_parallel_owned(
         match ConversationStore::init() {
             Ok(store) => {
                 for agent in agents_to_queue {
-                    let queued_result = match store.add_pending_notification(&agent, &conv_id, message_id) {
-                        Ok(notification_id) => NotifyResult::Queued { notification_id },
-                        Err(e) => NotifyResult::Failed {
-                            reason: format!("Failed to queue notification: {}", e),
-                        },
-                    };
+                    let queued_result =
+                        match store.add_pending_notification(&agent, &conv_id, message_id) {
+                            Ok(notification_id) => NotifyResult::Queued { notification_id },
+                            Err(e) => NotifyResult::Failed {
+                                reason: format!("Failed to queue notification: {}", e),
+                            },
+                        };
                     results.insert(agent, queued_result);
                 }
             }
             Err(e) => {
                 // Update all queued agents to failed
                 for agent in agents_to_queue {
-                    results.insert(agent, NotifyResult::Failed {
-                        reason: format!("Failed to open store for queuing: {}", e),
-                    });
+                    results.insert(
+                        agent,
+                        NotifyResult::Failed {
+                            reason: format!("Failed to open store for queuing: {}", e),
+                        },
+                    );
                 }
             }
         }
@@ -1696,7 +1853,11 @@ mod tests {
         let name = store.create_conversation(None, &["user", "bot"]).unwrap();
 
         // Should generate a fun name (adjective-noun format)
-        assert!(name.contains('-'), "Generated name should have a hyphen: {}", name);
+        assert!(
+            name.contains('-'),
+            "Generated name should have a hyphen: {}",
+            name
+        );
 
         let conv = store.get_conversation(&name).unwrap().unwrap();
         assert_eq!(conv.name, name);
@@ -1866,7 +2027,9 @@ mod tests {
         let store = test_store();
 
         // Create a conversation with a name
-        let name = store.create_conversation(Some("project-x"), &["arya", "user"]).unwrap();
+        let name = store
+            .create_conversation(Some("project-x"), &["arya", "user"])
+            .unwrap();
 
         // Find by name should work
         let found = store.find_by_name("project-x").unwrap();
@@ -1883,7 +2046,9 @@ mod tests {
         let store = test_store();
 
         // Create a conversation
-        let name = store.create_conversation(Some("test-conv"), &["arya", "user"]).unwrap();
+        let name = store
+            .create_conversation(Some("test-conv"), &["arya", "user"])
+            .unwrap();
 
         // Find by exact participants should work
         let found = store.find_by_participants(&["arya", "user"]).unwrap();
@@ -1906,7 +2071,11 @@ mod tests {
         let conv = store.get_or_create_conversation(&["arya", "user"]).unwrap();
 
         // Should have created a new conversation with a fun name
-        assert!(conv.name.contains('-'), "Should have fun name: {}", conv.name);
+        assert!(
+            conv.name.contains('-'),
+            "Should have fun name: {}",
+            conv.name
+        );
 
         // Participants should be set
         let parts = store.get_participants(&conv.name).unwrap();
@@ -1935,9 +2104,15 @@ mod tests {
         let store = test_store();
 
         // Call multiple times
-        let conv1 = store.get_or_create_conversation(&["arya", "gendry", "user"]).unwrap();
-        let conv2 = store.get_or_create_conversation(&["arya", "gendry", "user"]).unwrap();
-        let conv3 = store.get_or_create_conversation(&["arya", "gendry", "user"]).unwrap();
+        let conv1 = store
+            .get_or_create_conversation(&["arya", "gendry", "user"])
+            .unwrap();
+        let conv2 = store
+            .get_or_create_conversation(&["arya", "gendry", "user"])
+            .unwrap();
+        let conv3 = store
+            .get_or_create_conversation(&["arya", "gendry", "user"])
+            .unwrap();
 
         // All should have the same name
         assert_eq!(conv1.name, conv2.name);
@@ -2019,7 +2194,8 @@ mod tests {
     #[test]
     fn test_parse_mentions_mixed_code_and_real() {
         // Mix of real mentions and code-wrapped mentions
-        let content = "@arya look at `@fake` and also @gendry said:\n```\n@codeonly\n```\ncc @sansa";
+        let content =
+            "@arya look at `@fake` and also @gendry said:\n```\n@codeonly\n```\ncc @sansa";
         let mentions = parse_mentions(content);
         assert_eq!(mentions, vec!["arya", "gendry", "sansa"]);
     }
@@ -2081,7 +2257,9 @@ mod tests {
     fn test_conversation_paused_default() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("test-paused"), &["arya", "user"]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("test-paused"), &["arya", "user"])
+            .unwrap();
         let conv = store.get_conversation(&conv_name).unwrap().unwrap();
 
         // Conversations are not paused by default
@@ -2093,7 +2271,9 @@ mod tests {
     fn test_set_paused() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("pause-test"), &["arya", "user"]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("pause-test"), &["arya", "user"])
+            .unwrap();
 
         // Initially not paused
         assert!(!store.is_paused(&conv_name).unwrap());
@@ -2127,8 +2307,12 @@ mod tests {
     fn test_match_conversations_exact() {
         let store = test_store();
 
-        store.create_conversation(Some("test-conv"), &["arya", "user"]).unwrap();
-        store.create_conversation(Some("other-conv"), &["gendry", "user"]).unwrap();
+        store
+            .create_conversation(Some("test-conv"), &["arya", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("other-conv"), &["gendry", "user"])
+            .unwrap();
 
         // Exact match (no wildcards)
         let matches = store.match_conversations("test-conv").unwrap();
@@ -2143,9 +2327,15 @@ mod tests {
     fn test_match_conversations_star_wildcard() {
         let store = test_store();
 
-        store.create_conversation(Some("test-1"), &["arya", "user"]).unwrap();
-        store.create_conversation(Some("test-2"), &["gendry", "user"]).unwrap();
-        store.create_conversation(Some("other-conv"), &["sansa", "user"]).unwrap();
+        store
+            .create_conversation(Some("test-1"), &["arya", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("test-2"), &["gendry", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("other-conv"), &["sansa", "user"])
+            .unwrap();
 
         // Match all starting with "test-"
         let matches = store.match_conversations("test-*").unwrap();
@@ -2164,9 +2354,15 @@ mod tests {
     fn test_match_conversations_question_wildcard() {
         let store = test_store();
 
-        store.create_conversation(Some("test-1"), &["arya", "user"]).unwrap();
-        store.create_conversation(Some("test-2"), &["gendry", "user"]).unwrap();
-        store.create_conversation(Some("test-10"), &["sansa", "user"]).unwrap();
+        store
+            .create_conversation(Some("test-1"), &["arya", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("test-2"), &["gendry", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("test-10"), &["sansa", "user"])
+            .unwrap();
 
         // ? matches single character
         let matches = store.match_conversations("test-?").unwrap();
@@ -2177,7 +2373,9 @@ mod tests {
     fn test_match_conversations_no_matches() {
         let store = test_store();
 
-        store.create_conversation(Some("test-conv"), &["arya", "user"]).unwrap();
+        store
+            .create_conversation(Some("test-conv"), &["arya", "user"])
+            .unwrap();
 
         let matches = store.match_conversations("other-*").unwrap();
         assert!(matches.is_empty());
@@ -2187,8 +2385,12 @@ mod tests {
     fn test_match_conversations_special_chars() {
         let store = test_store();
 
-        store.create_conversation(Some("test.conv"), &["arya", "user"]).unwrap();
-        store.create_conversation(Some("testXconv"), &["gendry", "user"]).unwrap();
+        store
+            .create_conversation(Some("test.conv"), &["arya", "user"])
+            .unwrap();
+        store
+            .create_conversation(Some("testXconv"), &["gendry", "user"])
+            .unwrap();
 
         // Dots should be escaped (not treated as regex "any char")
         let matches = store.match_conversations("test.conv").unwrap();
@@ -2200,25 +2402,39 @@ mod tests {
         let store = test_store();
 
         // Create two conversations
-        let conv1 = store.create_conversation(Some("conv-1"), &["alice", "bob"]).unwrap();
-        let conv2 = store.create_conversation(Some("conv-2"), &["charlie", "dave"]).unwrap();
+        let conv1 = store
+            .create_conversation(Some("conv-1"), &["alice", "bob"])
+            .unwrap();
+        let conv2 = store
+            .create_conversation(Some("conv-2"), &["charlie", "dave"])
+            .unwrap();
 
         // Add messages
-        let msg1 = store.add_message(&conv1, "alice", "Hey @bob", &["bob"]).unwrap();
-        let msg2 = store.add_message(&conv2, "charlie", "Hey @dave", &["dave"]).unwrap();
+        let msg1 = store
+            .add_message(&conv1, "alice", "Hey @bob", &["bob"])
+            .unwrap();
+        let msg2 = store
+            .add_message(&conv2, "charlie", "Hey @dave", &["dave"])
+            .unwrap();
 
         // Add pending notifications
         store.add_pending_notification("bob", &conv1, msg1).unwrap();
-        store.add_pending_notification("dave", &conv2, msg2).unwrap();
+        store
+            .add_pending_notification("dave", &conv2, msg2)
+            .unwrap();
 
         // Get pending notifications for conv1 only
-        let pending = store.get_pending_notifications_for_conversation(&conv1).unwrap();
+        let pending = store
+            .get_pending_notifications_for_conversation(&conv1)
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].agent, "bob");
         assert_eq!(pending[0].conv_name, conv1);
 
         // Get pending notifications for conv2 only
-        let pending = store.get_pending_notifications_for_conversation(&conv2).unwrap();
+        let pending = store
+            .get_pending_notifications_for_conversation(&conv2)
+            .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].agent, "dave");
         assert_eq!(pending[0].conv_name, conv2);
@@ -2228,11 +2444,17 @@ mod tests {
     fn test_delete_pending_notification() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("chat"), &["alice", "bob"]).unwrap();
-        let msg_id = store.add_message(&conv_name, "alice", "Hey @bob", &["bob"]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("chat"), &["alice", "bob"])
+            .unwrap();
+        let msg_id = store
+            .add_message(&conv_name, "alice", "Hey @bob", &["bob"])
+            .unwrap();
 
         // Add pending notification
-        let notif_id = store.add_pending_notification("bob", &conv_name, msg_id).unwrap();
+        let notif_id = store
+            .add_pending_notification("bob", &conv_name, msg_id)
+            .unwrap();
 
         // Verify it exists
         let pending = store.get_pending_notifications("bob").unwrap();
@@ -2259,10 +2481,18 @@ mod tests {
     fn test_get_messages_filtered_all() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("filter-test"), &["alice", "bob"]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("filter-test"), &["alice", "bob"])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 1", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 2", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 3", &[])
+            .unwrap();
 
         // Get all messages (no limit, no since)
         let messages = store.get_messages_filtered(&conv_name, None, None).unwrap();
@@ -2275,14 +2505,26 @@ mod tests {
     fn test_get_messages_filtered_limit() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("limit-test"), &["alice", "bob"]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("limit-test"), &["alice", "bob"])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 1", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 2", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 3", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 4", &[])
+            .unwrap();
 
         // Get last 2 messages
-        let messages = store.get_messages_filtered(&conv_name, Some(2), None).unwrap();
+        let messages = store
+            .get_messages_filtered(&conv_name, Some(2), None)
+            .unwrap();
         assert_eq!(messages.len(), 2);
         // Should be in chronological order (oldest first among the last 2)
         assert_eq!(messages[0].content, "Message 3");
@@ -2293,20 +2535,34 @@ mod tests {
     fn test_get_messages_filtered_since() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("since-test"), &["alice", "bob"]).unwrap();
-        let msg1 = store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
-        let msg2 = store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("since-test"), &["alice", "bob"])
+            .unwrap();
+        let msg1 = store
+            .add_message(&conv_name, "alice", "Message 1", &[])
+            .unwrap();
+        let msg2 = store
+            .add_message(&conv_name, "bob", "Message 2", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 3", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 4", &[])
+            .unwrap();
 
         // Get messages after msg2
-        let messages = store.get_messages_filtered(&conv_name, None, Some(msg2)).unwrap();
+        let messages = store
+            .get_messages_filtered(&conv_name, None, Some(msg2))
+            .unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "Message 3");
         assert_eq!(messages[1].content, "Message 4");
 
         // Get messages after msg1
-        let messages = store.get_messages_filtered(&conv_name, None, Some(msg1)).unwrap();
+        let messages = store
+            .get_messages_filtered(&conv_name, None, Some(msg1))
+            .unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].content, "Message 2");
     }
@@ -2315,15 +2571,29 @@ mod tests {
     fn test_get_messages_filtered_since_and_limit() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("since-limit-test"), &["alice", "bob"]).unwrap();
-        let msg1 = store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 3", &[]).unwrap();
-        store.add_message(&conv_name, "bob", "Message 4", &[]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 5", &[]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("since-limit-test"), &["alice", "bob"])
+            .unwrap();
+        let msg1 = store
+            .add_message(&conv_name, "alice", "Message 1", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 2", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 3", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "bob", "Message 4", &[])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 5", &[])
+            .unwrap();
 
         // Get 2 messages after msg1
-        let messages = store.get_messages_filtered(&conv_name, Some(2), Some(msg1)).unwrap();
+        let messages = store
+            .get_messages_filtered(&conv_name, Some(2), Some(msg1))
+            .unwrap();
         assert_eq!(messages.len(), 2);
         // When using --since with --limit, we get the first N messages after since_id
         assert_eq!(messages[0].content, "Message 2");
@@ -2334,12 +2604,20 @@ mod tests {
     fn test_get_messages_filtered_since_none_after() {
         let store = test_store();
 
-        let conv_name = store.create_conversation(Some("since-none-test"), &["alice", "bob"]).unwrap();
-        store.add_message(&conv_name, "alice", "Message 1", &[]).unwrap();
-        let msg2 = store.add_message(&conv_name, "bob", "Message 2", &[]).unwrap();
+        let conv_name = store
+            .create_conversation(Some("since-none-test"), &["alice", "bob"])
+            .unwrap();
+        store
+            .add_message(&conv_name, "alice", "Message 1", &[])
+            .unwrap();
+        let msg2 = store
+            .add_message(&conv_name, "bob", "Message 2", &[])
+            .unwrap();
 
         // Get messages after the last message - should be empty
-        let messages = store.get_messages_filtered(&conv_name, None, Some(msg2)).unwrap();
+        let messages = store
+            .get_messages_filtered(&conv_name, None, Some(msg2))
+            .unwrap();
         assert!(messages.is_empty());
     }
 }

@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
+use async_trait::async_trait;
 use serde_json::Value;
 
 /// A tool that an agent can use to interact with the world.

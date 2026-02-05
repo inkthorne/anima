@@ -57,32 +57,19 @@ pub enum Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     /// Response to a message request.
-    Message {
-        content: String,
-    },
+    Message { content: String },
     /// Response to a status request.
-    Status {
-        running: bool,
-        history_len: usize,
-    },
+    Status { running: bool, history_len: usize },
     /// Response to a list_agents request.
-    Agents {
-        agents: Vec<String>,
-    },
+    Agents { agents: Vec<String> },
     /// Response to a system prompt request.
-    System {
-        system_prompt: String,
-    },
+    System { system_prompt: String },
     /// Generic OK response.
     Ok,
     /// Error response.
-    Error {
-        message: String,
-    },
+    Error { message: String },
     /// Streaming: partial text chunk.
-    Chunk {
-        text: String,
-    },
+    Chunk { text: String },
     /// Streaming: tool is being executed.
     ToolCall {
         tool: String,
@@ -124,45 +111,51 @@ impl SocketApi {
     /// Returns None if the connection is closed.
     pub async fn read_request(&mut self) -> Result<Option<Request>, SocketApiError> {
         let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line).await
+        let bytes_read = self
+            .reader
+            .read_line(&mut line)
+            .await
             .map_err(SocketApiError::Io)?;
 
         if bytes_read == 0 {
             return Ok(None);
         }
 
-        let request: Request = serde_json::from_str(line.trim())
-            .map_err(SocketApiError::Json)?;
+        let request: Request = serde_json::from_str(line.trim()).map_err(SocketApiError::Json)?;
 
         Ok(Some(request))
     }
 
     /// Write a response to the socket.
     pub async fn write_response(&mut self, response: &Response) -> Result<(), SocketApiError> {
-        let json = serde_json::to_string(response)
-            .map_err(SocketApiError::Json)?;
+        let json = serde_json::to_string(response).map_err(SocketApiError::Json)?;
 
-        self.writer.write_all(json.as_bytes()).await
+        self.writer
+            .write_all(json.as_bytes())
+            .await
             .map_err(SocketApiError::Io)?;
-        self.writer.write_all(b"\n").await
+        self.writer
+            .write_all(b"\n")
+            .await
             .map_err(SocketApiError::Io)?;
-        self.writer.flush().await
-            .map_err(SocketApiError::Io)?;
+        self.writer.flush().await.map_err(SocketApiError::Io)?;
 
         Ok(())
     }
 
     /// Write a request to the socket (client-side).
     pub async fn write_request(&mut self, request: &Request) -> Result<(), SocketApiError> {
-        let json = serde_json::to_string(request)
-            .map_err(SocketApiError::Json)?;
+        let json = serde_json::to_string(request).map_err(SocketApiError::Json)?;
 
-        self.writer.write_all(json.as_bytes()).await
+        self.writer
+            .write_all(json.as_bytes())
+            .await
             .map_err(SocketApiError::Io)?;
-        self.writer.write_all(b"\n").await
+        self.writer
+            .write_all(b"\n")
+            .await
             .map_err(SocketApiError::Io)?;
-        self.writer.flush().await
-            .map_err(SocketApiError::Io)?;
+        self.writer.flush().await.map_err(SocketApiError::Io)?;
 
         Ok(())
     }
@@ -171,15 +164,17 @@ impl SocketApi {
     /// Returns None if the connection is closed.
     pub async fn read_response(&mut self) -> Result<Option<Response>, SocketApiError> {
         let mut line = String::new();
-        let bytes_read = self.reader.read_line(&mut line).await
+        let bytes_read = self
+            .reader
+            .read_line(&mut line)
+            .await
             .map_err(SocketApiError::Io)?;
 
         if bytes_read == 0 {
             return Ok(None);
         }
 
-        let response: Response = serde_json::from_str(line.trim())
-            .map_err(SocketApiError::Json)?;
+        let response: Response = serde_json::from_str(line.trim()).map_err(SocketApiError::Json)?;
 
         Ok(Some(response))
     }
@@ -331,7 +326,10 @@ mod tests {
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         match parsed {
-            Response::Status { running, history_len } => {
+            Response::Status {
+                running,
+                history_len,
+            } => {
                 assert!(running);
                 assert_eq!(history_len, 5);
             }
@@ -373,9 +371,8 @@ mod tests {
         ));
         assert!(io_error.to_string().contains("IO error"));
 
-        let json_error = SocketApiError::Json(
-            serde_json::from_str::<Request>("invalid json").unwrap_err()
-        );
+        let json_error =
+            SocketApiError::Json(serde_json::from_str::<Request>("invalid json").unwrap_err());
         assert!(json_error.to_string().contains("JSON error"));
     }
 
@@ -503,7 +500,10 @@ mod tests {
         match parsed {
             Response::ToolCall { tool, params } => {
                 assert_eq!(tool, "safe_shell");
-                assert_eq!(params.get("command").and_then(|c| c.as_str()), Some("ls -la"));
+                assert_eq!(
+                    params.get("command").and_then(|c| c.as_str()),
+                    Some("ls -la")
+                );
             }
             _ => panic!("Wrong variant"),
         }
@@ -524,7 +524,11 @@ mod tests {
 
         let parsed: Request = serde_json::from_str(&json).unwrap();
         match parsed {
-            Request::Notify { conv_id, message_id, depth } => {
+            Request::Notify {
+                conv_id,
+                message_id,
+                depth,
+            } => {
                 assert_eq!(conv_id, "1:1:arya:user");
                 assert_eq!(message_id, 42);
                 assert_eq!(depth, 5);
@@ -539,7 +543,11 @@ mod tests {
         let json = r#"{"type":"notify","conv_id":"test-conv","message_id":10}"#;
         let parsed: Request = serde_json::from_str(json).unwrap();
         match parsed {
-            Request::Notify { conv_id, message_id, depth } => {
+            Request::Notify {
+                conv_id,
+                message_id,
+                depth,
+            } => {
                 assert_eq!(conv_id, "test-conv");
                 assert_eq!(message_id, 10);
                 assert_eq!(depth, 0);
@@ -559,7 +567,9 @@ mod tests {
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         match parsed {
-            Response::Notified { response_message_id } => {
+            Response::Notified {
+                response_message_id,
+            } => {
                 assert_eq!(response_message_id, 123);
             }
             _ => panic!("Wrong variant"),

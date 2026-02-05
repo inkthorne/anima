@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::error::ToolError;
 use crate::tool::Tool;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -10,10 +10,10 @@ fn expand_tilde(path: &str) -> PathBuf {
         if let Some(home) = dirs::home_dir() {
             return home.join(&path[2..]);
         }
-    } else if path == "~" {
-        if let Some(home) = dirs::home_dir() {
-            return home;
-        }
+    } else if path == "~"
+        && let Some(home) = dirs::home_dir()
+    {
+        return home;
     }
     PathBuf::from(path)
 }
@@ -46,16 +46,15 @@ impl Tool for ReadFileTool {
     }
 
     async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        let path_str = input
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("Missing or invalid 'path' field".to_string()))?;
+        let path_str = input.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolError::InvalidInput("Missing or invalid 'path' field".to_string())
+        })?;
 
         let path = expand_tilde(path_str);
 
-        let contents = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file '{}': {}", path.display(), e)))?;
+        let contents = tokio::fs::read_to_string(&path).await.map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to read file '{}': {}", path.display(), e))
+        })?;
 
         Ok(serde_json::json!({ "contents": contents }))
     }
@@ -86,7 +85,12 @@ mod tests {
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["path"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("path"))
+        );
     }
 
     #[tokio::test]
@@ -103,7 +107,9 @@ mod tests {
     #[tokio::test]
     async fn test_read_missing_file() {
         let tool = ReadFileTool;
-        let result = tool.execute(json!({"path": "/nonexistent/file/path/abc123.txt"})).await;
+        let result = tool
+            .execute(json!({"path": "/nonexistent/file/path/abc123.txt"}))
+            .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
     }
 

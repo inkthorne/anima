@@ -73,13 +73,16 @@ impl Tool for DaemonListAgentsTool {
         let summary = if agents.is_empty() {
             "No other agents available.".to_string()
         } else {
-            let lines: Vec<String> = agents.iter().map(|a| {
-                let name = a["name"].as_str().unwrap_or("");
-                match a["description"].as_str() {
-                    Some(desc) => format!("- {}: {}", name, desc),
-                    None => format!("- {}", name),
-                }
-            }).collect();
+            let lines: Vec<String> = agents
+                .iter()
+                .map(|a| {
+                    let name = a["name"].as_str().unwrap_or("");
+                    match a["description"].as_str() {
+                        Some(desc) => format!("- {}: {}", name, desc),
+                        None => format!("- {}", name),
+                    }
+                })
+                .collect();
             format!("Available agents:\n{}", lines.join("\n"))
         };
 
