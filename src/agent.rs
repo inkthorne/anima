@@ -189,6 +189,9 @@ pub struct ToolExecution {
     pub call: crate::llm::ToolCall,
     /// The result of executing the tool
     pub result: String,
+    /// Assistant content (narration) that accompanied the tool call, if any.
+    /// When the LLM returns both content AND tool_calls, this captures that content.
+    pub content: Option<String>,
 }
 
 /// Result from a think operation, including tool usage information.
@@ -1015,8 +1018,11 @@ impl Agent {
             self.history.push(assistant_message.clone());
             messages.push(assistant_message);
 
+            // Capture content that accompanied the tool calls (for display alongside tool execution)
+            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
+
             // Execute each tool and add results
-            for tool_call in &response.tool_calls {
+            for (i, tool_call) in response.tool_calls.iter().enumerate() {
                 // Track tool name
                 tool_names_used.push(tool_call.name.clone());
 
@@ -1025,10 +1031,12 @@ impl Agent {
                     .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
 
-                // Record tool execution for persistence
+                // Record tool execution for persistence.
+                // Only attach content to the first tool call to avoid duplication.
                 tool_trace.push(ToolExecution {
                     call: tool_call.clone(),
                     result: result.clone(),
+                    content: if i == 0 { assistant_content.clone() } else { None },
                 });
 
                 let tool_message = ChatMessage {

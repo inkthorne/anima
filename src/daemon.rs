@@ -1826,11 +1826,12 @@ async fn process_message_work(
                 for exec in &tool_trace {
                     // Store the tool call (as an assistant message with tool_calls)
                     let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-                    // The content for intermediate tool-calling messages is typically empty or minimal
+                    // Use the content that accompanied the tool call (narration/status)
+                    let content = exec.content.as_deref().unwrap_or("");
                     if let Err(e) = store.add_message_with_tool_calls(
                         cname,
                         agent_name,
-                        "",
+                        content,
                         &[],
                         None,
                         tool_calls_json.as_deref(),
