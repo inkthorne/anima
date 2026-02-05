@@ -98,6 +98,10 @@ fn default_recall_limit() -> usize {
     10
 }
 
+fn default_history_limit() -> usize {
+    20
+}
+
 fn default_min_importance() -> f64 {
     0.1
 }
@@ -134,6 +138,9 @@ pub struct SemanticMemorySection {
     /// Maximum number of memories to inject per turn
     #[serde(default = "default_recall_limit")]
     pub recall_limit: usize,
+    /// Maximum number of conversation messages to include in context
+    #[serde(default = "default_history_limit")]
+    pub history_limit: usize,
     /// Minimum importance score to include (0.0-1.0)
     #[serde(default = "default_min_importance")]
     pub min_importance: f64,
@@ -148,6 +155,7 @@ impl Default for SemanticMemorySection {
             enabled: false,
             path: default_semantic_memory_path(),
             recall_limit: default_recall_limit(),
+            history_limit: default_history_limit(),
             min_importance: default_min_importance(),
             embedding: None,
         }

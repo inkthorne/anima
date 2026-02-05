@@ -1128,6 +1128,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             use_native_tools,
                             &logger,
                             config.semantic_memory.recall_limit,
+                            config.semantic_memory.history_limit,
                             &task_store,
                             config.num_ctx,
                             config.max_iterations,
@@ -1208,6 +1209,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_tool_registry = tool_registry.clone();
         let worker_logger = logger.clone();
         let worker_recall_limit = config.semantic_memory.recall_limit;
+        let worker_history_limit = config.semantic_memory.history_limit;
         let worker_task_store = task_store.clone();
         let worker_heartbeat_config = config.heartbeat.clone();
 
@@ -1228,6 +1230,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 use_native_tools,
                 worker_logger,
                 worker_recall_limit,
+                worker_history_limit,
                 worker_task_store,
                 worker_heartbeat_config,
                 worker_num_ctx,
@@ -1366,6 +1369,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_work_tx = work_tx.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
+                        let history_limit = config.semantic_memory.history_limit;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
                             if let Err(e) = handle_connection(
@@ -1383,6 +1387,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 shutdown_clone,
                                 conn_logger,
                                 recall_limit,
+                                history_limit,
                                 conn_heartbeat_config,
                                 conn_task_store,
                                 conn_work_tx,
@@ -1550,6 +1555,7 @@ async fn agent_worker(
     use_native_tools: bool,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
+    history_limit: usize,
     task_store: Option<Arc<Mutex<TaskStore>>>,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
@@ -1589,6 +1595,7 @@ async fn agent_worker(
                     use_native_tools,
                     &logger,
                     recall_limit,
+                    history_limit,
                     &task_store,
                 )
                 .await;
@@ -1619,6 +1626,7 @@ async fn agent_worker(
                     use_native_tools,
                     &logger,
                     recall_limit,
+                    history_limit,
                     &task_store,
                     num_ctx,
                     max_iterations,
@@ -1642,6 +1650,7 @@ async fn agent_worker(
                         use_native_tools,
                         &logger,
                         recall_limit,
+                        history_limit,
                     )
                     .await;
                 } else {
@@ -1673,6 +1682,7 @@ async fn process_message_work(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
+    _history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
 ) -> MessageWorkResult {
     let start_time = std::time::Instant::now();
@@ -2158,6 +2168,7 @@ async fn handle_notify(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
+    history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
@@ -2186,7 +2197,7 @@ async fn handle_notify(
     };
 
     // Fetch recent messages from conversation for context
-    let context_messages = match store.get_messages(conv_id, Some(recall_limit)) {
+    let context_messages = match store.get_messages(conv_id, Some(history_limit)) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -2452,7 +2463,7 @@ async fn handle_notify(
                             // internal history (which we cleared at the start of handle_notify).
                             // IMPORTANT: Also update current_message from refreshed_final to avoid passing
                             // the tool result twice (once in history, once as the task).
-                            if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
+                            if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
                                 let (refreshed_history, refreshed_final) =
                                     format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
@@ -2472,7 +2483,7 @@ async fn handle_notify(
                             // Refresh conversation_history from DB (same as success case)
                             // IMPORTANT: Also update current_message from refreshed_final to avoid passing
                             // the tool result twice (once in history, once as the task).
-                            if let Ok(msgs) = store.get_messages(conv_id, Some(recall_limit)) {
+                            if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
                                 let (refreshed_history, refreshed_final) =
                                     format_conversation_history(&msgs, agent_name);
                                 conversation_history = refreshed_history;
@@ -2724,6 +2735,7 @@ async fn run_heartbeat(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
+    history_limit: usize,
 ) {
     // Set current conversation for debug file naming
     {
@@ -2775,7 +2787,7 @@ async fn run_heartbeat(
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = store
-        .get_messages(&conv_name, Some(recall_limit))
+        .get_messages(&conv_name, Some(history_limit))
         .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
@@ -3165,6 +3177,7 @@ async fn handle_connection(
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
+    _history_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
