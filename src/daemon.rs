@@ -668,6 +668,8 @@ pub struct DaemonConfig {
     pub semantic_memory: SemanticMemorySection,
     /// Allowlist of tool names. If set, only these tools are available.
     pub allowed_tools: Option<Vec<String>>,
+    /// Context window size (num_ctx) for token tracking
+    pub num_ctx: Option<u32>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -757,6 +759,7 @@ impl DaemonConfig {
             model_always,
             semantic_memory: agent_dir.config.semantic_memory.clone(),
             allowed_tools,
+            num_ctx: llm_config.num_ctx,
         })
     }
 }
@@ -1037,6 +1040,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &logger,
                             config.semantic_memory.recall_limit,
                             &task_store,
+                            config.num_ctx,
                         ).await;
 
                         match response {
@@ -1113,6 +1117,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_task_store = task_store.clone();
         let worker_heartbeat_config = config.heartbeat.clone();
 
+        let worker_num_ctx = config.num_ctx;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1130,6 +1135,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_recall_limit,
                 worker_task_store,
                 worker_heartbeat_config,
+                worker_num_ctx,
             ).await
         })
     };
@@ -1453,6 +1459,7 @@ async fn agent_worker(
     recall_limit: usize,
     task_store: Option<Arc<Mutex<TaskStore>>>,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
+    num_ctx: Option<u32>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -1506,6 +1513,7 @@ async fn agent_worker(
                     &logger,
                     recall_limit,
                     &task_store,
+                    num_ctx,
                 ).await;
             }
             AgentWork::Heartbeat => {
@@ -1953,6 +1961,7 @@ async fn handle_notify(
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
+    num_ctx: Option<u32>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2070,6 +2079,9 @@ async fn handle_notify(
     let mut final_response: Option<String> = None;
     // Track last tool_calls for native tool mode persistence
     let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
+    // Track total token usage across all iterations
+    let mut total_tokens_in: u32 = 0;
+    let mut total_tokens_out: u32 = 0;
 
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
@@ -2104,7 +2116,15 @@ async fn handle_notify(
                 if think_result.last_tool_calls.is_some() {
                     last_tool_calls = think_result.last_tool_calls.clone();
                 }
-                
+
+                // Accumulate token usage
+                if let Some(tokens) = think_result.tokens_in {
+                    total_tokens_in += tokens;
+                }
+                if let Some(tokens) = think_result.tokens_out {
+                    total_tokens_out += tokens;
+                }
+
                 // Strip thinking tags and extract [REMEMBER: ...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
@@ -2217,12 +2237,16 @@ async fn handle_notify(
         }
     }
 
-    // Store final response in conversation with duration and tool_calls
+    // Store final response in conversation with duration, tool_calls, and token usage
     let cleaned_response = final_response.unwrap_or_default();
     let duration_ms = start_time.elapsed().as_millis() as i64;
     // Serialize tool_calls to JSON for persistence
     let tool_calls_json = last_tool_calls.as_ref().and_then(|tc| serde_json::to_string(tc).ok());
-    match store.add_message_with_tool_calls(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms), tool_calls_json.as_deref()) {
+    // Token tracking: only include if we have any token data
+    let tokens_in = if total_tokens_in > 0 { Some(total_tokens_in as i64) } else { None };
+    let tokens_out = if total_tokens_out > 0 { Some(total_tokens_out as i64) } else { None };
+    let num_ctx_i64 = num_ctx.map(|n| n as i64);
+    match store.add_message_with_tokens(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms), tool_calls_json.as_deref(), tokens_in, tokens_out, num_ctx_i64) {
         Ok(response_msg_id) => {
             logger.log(&format!("[notify] Stored response as msg_id={} ({}ms)", response_msg_id, duration_ms));
 
@@ -3423,6 +3447,9 @@ api_key = "sk-test"
             expires_at: i64::MAX,
             duration_ms: None,
             tool_calls: None,
+            tokens_in: None,
+            tokens_out: None,
+            num_ctx: None,
         }
     }
 

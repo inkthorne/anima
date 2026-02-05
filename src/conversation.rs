@@ -58,6 +58,12 @@ pub struct ConversationMessage {
     pub duration_ms: Option<i64>,
     /// Native tool calls JSON (for native tool mode persistence)
     pub tool_calls: Option<String>,
+    /// Input tokens used for this response
+    pub tokens_in: Option<i64>,
+    /// Output tokens used for this response
+    pub tokens_out: Option<i64>,
+    /// Context window size at generation time
+    pub num_ctx: Option<i64>,
 }
 
 /// A pending notification for an offline agent.
@@ -193,6 +199,9 @@ impl ConversationStore {
         // Migrate: add tool_calls column to messages if it doesn't exist
         self.migrate_add_tool_calls_column()?;
 
+        // Migrate: add token tracking columns to messages if they don't exist
+        self.migrate_add_token_columns()?;
+
         Ok(())
     }
 
@@ -265,6 +274,38 @@ impl ConversationStore {
         if !has_column {
             self.conn.execute(
                 "ALTER TABLE messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add the token tracking columns to messages if they don't exist.
+    fn migrate_add_token_columns(&self) -> Result<(), ConversationError> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
+        let columns: Vec<String> = stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            Ok(col_name)
+        })?.filter_map(|r| r.ok()).collect();
+
+        if !columns.contains(&"tokens_in".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN tokens_in INTEGER DEFAULT NULL",
+                [],
+            )?;
+        }
+
+        if !columns.contains(&"tokens_out".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN tokens_out INTEGER DEFAULT NULL",
+                [],
+            )?;
+        }
+
+        if !columns.contains(&"num_ctx".to_string()) {
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN num_ctx INTEGER DEFAULT NULL",
                 [],
             )?;
         }
@@ -661,7 +702,7 @@ impl ConversationStore {
         content: &str,
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, None, None)
+        self.add_message_full(conv_name, from_agent, content, mentions, None, None, None, None, None)
     }
 
     /// Add a message to a conversation with optional response duration.
@@ -674,7 +715,7 @@ impl ConversationStore {
         mentions: &[&str],
         duration_ms: Option<i64>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, None)
+        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, None, None, None, None)
     }
 
     /// Add a message to a conversation with optional response duration and tool_calls.
@@ -688,7 +729,24 @@ impl ConversationStore {
         duration_ms: Option<i64>,
         tool_calls: Option<&str>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls)
+        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls, None, None, None)
+    }
+
+    /// Add a message to a conversation with all optional fields including token tracking.
+    /// Returns the message ID.
+    pub fn add_message_with_tokens(
+        &self,
+        conv_name: &str,
+        from_agent: &str,
+        content: &str,
+        mentions: &[&str],
+        duration_ms: Option<i64>,
+        tool_calls: Option<&str>,
+        tokens_in: Option<i64>,
+        tokens_out: Option<i64>,
+        num_ctx: Option<i64>,
+    ) -> Result<i64, ConversationError> {
+        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx)
     }
 
     /// Add a message to a conversation with all optional fields.
@@ -701,6 +759,9 @@ impl ConversationStore {
         mentions: &[&str],
         duration_ms: Option<i64>,
         tool_calls: Option<&str>,
+        tokens_in: Option<i64>,
+        tokens_out: Option<i64>,
+        num_ctx: Option<i64>,
     ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
@@ -712,8 +773,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -738,14 +799,14 @@ impl ConversationStore {
 
         let query = match limit {
             Some(n) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2
                  ORDER BY created_at DESC
                  LIMIT {}",
                 n
             ),
-            None => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
+            None => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
                      FROM messages
                      WHERE conv_name = ?1 AND expires_at > ?2
                      ORDER BY created_at ASC".to_string(),
@@ -767,6 +828,9 @@ impl ConversationStore {
                     expires_at: row.get(6)?,
                     duration_ms: row.get(7)?,
                     tool_calls: row.get(8)?,
+                    tokens_in: row.get(9)?,
+                    tokens_out: row.get(10)?,
+                    num_ctx: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -797,7 +861,7 @@ impl ConversationStore {
         // When using --limit without --since, we want the last N messages
         let query = match (limit, since_id) {
             (Some(n), Some(_)) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                  ORDER BY id ASC
@@ -805,14 +869,14 @@ impl ConversationStore {
                 n
             ),
             (Some(n), None) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                  ORDER BY id DESC
                  LIMIT {}",
                 n
             ),
-            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
+            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
                      FROM messages
                      WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                      ORDER BY id ASC".to_string(),
@@ -834,6 +898,9 @@ impl ConversationStore {
                     expires_at: row.get(6)?,
                     duration_ms: row.get(7)?,
                     tool_calls: row.get(8)?,
+                    tokens_in: row.get(9)?,
+                    tokens_out: row.get(10)?,
+                    num_ctx: row.get(11)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

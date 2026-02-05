@@ -484,15 +484,20 @@ async fn chat_with_conversation(
                 }
                 let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
                 let datetime = format_timestamp_pretty(msg.created_at);
-                // Show duration for agent messages if available
+                // Show duration and context usage for agent messages if available
                 let duration_str = if msg.from_agent != "user" {
                     msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
                 } else {
                     String::new()
                 };
+                let ctx_str = if msg.from_agent != "user" {
+                    format_context_usage(msg)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}",
-                    msg.id, datetime, color, msg.from_agent, duration_str
+                    "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}",
+                    msg.id, datetime, color, msg.from_agent, duration_str, ctx_str
                 );
                 println!("{}", msg.content);
                 println!(); // Blank line between messages
@@ -535,11 +540,12 @@ async fn chat_with_conversation(
                         // Print the agent message on a new line
                         print!("\r\x1b[K"); // Clear current line (in case user was typing)
                         let datetime = format_timestamp_pretty(msg.created_at);
-                        // Show duration if available
+                        // Show duration and context usage if available
                         let duration_str = msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default();
+                        let ctx_str = format_context_usage(&msg);
                         println!(
-                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}",
-                            msg.id, datetime, msg.from_agent, duration_str
+                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}{}",
+                            msg.id, datetime, msg.from_agent, duration_str, ctx_str
                         );
                         println!("{}", msg.content);
                         println!(); // Blank line between messages
@@ -1535,18 +1541,23 @@ async fn handle_chat_command(command: Option<ChatCommands>) -> Result<(), Box<dy
                     // Format timestamp: YYYY-MM-DD HH:MM
                     let datetime = format_timestamp_pretty(msg.created_at);
 
-                    // Show duration for agent messages if available
+                    // Show duration and context usage for agent messages if available
                     let duration_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
                         msg.duration_ms.map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d))).unwrap_or_default()
                     } else {
                         String::new()
                     };
+                    let ctx_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
+                        format_context_usage(msg)
+                    } else {
+                        String::new()
+                    };
 
-                    // [ID] YYYY-MM-DD HH:MM • agent_name • duration
-                    // ID and timestamp in dim gray, agent name in cyan, duration in yellow
+                    // [ID] YYYY-MM-DD HH:MM • agent_name • duration • X% ctx
+                    // ID and timestamp in dim gray, agent name in cyan, duration in yellow, ctx in magenta
                     println!(
-                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}",
-                        msg.id, datetime, msg.from_agent, duration_str
+                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}{}",
+                        msg.id, datetime, msg.from_agent, duration_str, ctx_str
                     );
                     // Content in normal color
                     println!("{}", msg.content);
@@ -2011,6 +2022,31 @@ fn format_duration_ms(ms: i64) -> String {
         } else {
             format!("{}m", mins)
         }
+    }
+}
+
+/// Format context usage from message token data.
+/// Returns formatted string like "ctx 2k/32k (26%)" or empty string if data unavailable.
+fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> String {
+    match (msg.tokens_in, msg.tokens_out, msg.num_ctx) {
+        (Some(tokens_in), Some(tokens_out), Some(num_ctx)) if num_ctx > 0 => {
+            let total_tokens = tokens_in + tokens_out;
+            let percentage = (total_tokens as f64 / num_ctx as f64 * 100.0) as u32;
+            let used_str = format_tokens_short(total_tokens);
+            let ctx_str = format_tokens_short(num_ctx);
+            format!(" \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%)\x1b[0m", used_str, ctx_str, percentage)
+        }
+        _ => String::new(),
+    }
+}
+
+/// Format token count as short string (e.g., 2048 -> "2k", 32768 -> "33k", 500 -> "500")
+fn format_tokens_short(tokens: i64) -> String {
+    if tokens >= 1000 {
+        let k = (tokens + 500) / 1000; // round to nearest k
+        format!("{}k", k)
+    } else {
+        format!("{}", tokens)
     }
 }
 

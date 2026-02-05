@@ -185,6 +185,10 @@ pub struct ThinkResult {
     /// Each entry contains the assistant's tool call and the tool's result.
     /// Used for persisting the full conversation to history.
     pub tool_trace: Vec<ToolExecution>,
+    /// Total input tokens used across all LLM calls in this think operation
+    pub tokens_in: Option<u32>,
+    /// Total output tokens used across all LLM calls in this think operation
+    pub tokens_out: Option<u32>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -790,6 +794,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
         let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
         // Track all tool executions for conversation persistence
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
+        // Track total token usage across all LLM calls in this think operation
+        let mut total_tokens_in: u32 = 0;
+        let mut total_tokens_out: u32 = 0;
+        let mut has_token_data = false;
 
         // Agentic loop
         for _iteration in 0..options.max_iterations {
@@ -843,6 +851,13 @@ pub async fn forget(&mut self, key: &str) -> bool {
                 duration_ms: llm_duration_ms,
             }).await;
 
+            // Accumulate token usage
+            if let Some(ref usage) = response.usage {
+                total_tokens_in += usage.prompt_tokens;
+                total_tokens_out += usage.completion_tokens;
+                has_token_data = true;
+            }
+
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
                 let final_response = response.content.unwrap_or_else(|| "No response".to_string());
@@ -873,6 +888,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         tool_names: tool_names_used,
                         last_tool_calls,
                         tool_trace,
+                        tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
+                        tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
                     });
                 }
 
@@ -882,6 +899,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     tool_names: tool_names_used,
                     last_tool_calls,
                     tool_trace,
+                    tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
+                    tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
                 });
             }
 

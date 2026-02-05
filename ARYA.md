@@ -1,66 +1,40 @@
-# Task: Phase 3 — Auto-Invoke on Notification
+# Task: v3.6.3 — Context Usage Tracking
 
-**Goal:** When a daemon receives a Notify request, it should automatically invoke the agent to generate a response. Currently the notification system works, but agents don't auto-respond.
+**Goal:** Show users how full their context window is with an "X% full" indicator.
 
 **Build:** `cargo build --release && cargo test`
 
-## Context
+## Feature Requirements
 
-From `AUTONOMOUS_CONV_SPEC.md`, the daemon should:
-1. Receive Notify request with conv_name, message_id, depth
-2. Fetch conversation context
-3. Generate response (invoke the agent)
-4. Store response in conversation
-5. Parse @mentions from response
-6. If not paused, notify mentioned agents (daemon-to-daemon)
+1. **Track context usage** — Calculate approximate token count of conversation history
+2. **Display in chat TUI** — Show "Context: X% full" or similar in the status area
+3. **Model awareness** — Use model's context limit (e.g., 200K for Claude, 128K for GPT-4)
 
-## Current State
+## Implementation Ideas
 
-- ✅ `anima chat send <conv> "message"` stores message and sends Notify
-- ✅ Notify requests are delivered to daemons
-- ❓ Daemon receives Notify but may not auto-invoke agent
+### Token Counting
+- Simple approximation: ~4 chars per token (good enough for display)
+- Or use tiktoken-rs crate for accurate counts
 
-## Tasks
+### Where to Display
+- Chat TUI status bar (bottom area with the duration)
+- Show something like: `[Context: 23% | 2.3s]` after responses
 
-1. **Check current Notify handling in `src/daemon.rs`**
-   - What happens when daemon receives a Notify request?
-   - Does it invoke the agent? Store the response?
-
-2. **Implement auto-invoke if missing:**
-   - On Notify: fetch conversation messages for context
-   - Call agent to generate response
-   - Store response in conversation
-   - Parse @mentions, forward notifications if not paused
-
-3. **Test the flow:**
-   ```bash
-   # Start two agent daemons
-   anima spawn gendry
-   anima spawn codey
-   
-   # Create conversation and send message
-   anima chat new test-conv
-   anima chat send test-conv "@gendry what's your status?"
-   
-   # Gendry should auto-respond. Check:
-   anima chat view test-conv
-   ```
+### Model Context Limits
+Could add to config or hardcode sensible defaults:
+- claude-*: 200K
+- gpt-4*: 128K  
+- gemini*: 1M
+- Default: 128K
 
 ## Checklist
 
-- [x] Review current Notify handler in daemon.rs
-- [x] Implement agent auto-invoke on Notify (if missing) — already implemented!
-- [x] Implement conversation context fetching
-- [x] Implement response storage
-- [x] Implement @mention forwarding from responses
-- [x] Test with real agents (gendry, arya)
-- [x] Update CURRENT_WORK.md when complete
+- [ ] Add token counting utility
+- [ ] Track cumulative tokens in conversation
+- [ ] Get model context limit (config or defaults)
+- [ ] Display percentage in chat TUI
+- [ ] Test with different conversation lengths
 
-## Phase 3 Complete ✅
+## Notes
 
-Verified 2026-02-02: Auto-invoke was already fully implemented in `handle_notify()` at `src/daemon.rs:1087`.
-
-**Test results:**
-- Created `test-notify-1770088617` conversation
-- Sent "@gendry what's your status?" — gendry auto-responded
-- Sent "@gendry can you ask @arya for her status too?" — both responded, arya was forwarded via @mention chain
+Keep it simple — approximate counting is fine for a UX indicator. Users just need a rough sense of "am I running out of context?"
