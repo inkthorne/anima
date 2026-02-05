@@ -1199,8 +1199,22 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             return Err(format!("No agents match pattern: {}", agent).into());
         }
 
+        // Filter to only running agents (restart shouldn't start stopped agents)
+        let running_matches: Vec<_> = matches
+            .iter()
+            .filter(|name| {
+                let pid_path = resolve_agent_path(name).join("daemon.pid");
+                PidFile::is_running(&pid_path)
+            })
+            .collect();
+
+        if running_matches.is_empty() {
+            println!("No running agents match pattern: {}", agent);
+            return Ok(());
+        }
+
         let mut restarted = Vec::new();
-        for name in &matches {
+        for name in &running_matches {
             print!("Restarting {}... ", name);
             io::stdout().flush()?;
 
@@ -1229,7 +1243,7 @@ async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     println!("done (pid {})", pid);
-                    restarted.push(name.clone());
+                    restarted.push(name.to_string());
                 }
                 Err(e) => {
                     println!("failed to start: {}", e);
