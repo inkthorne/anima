@@ -212,6 +212,57 @@ pub struct MetricsSnapshot {
     pub tool_time_ms: u64,
 }
 
+/// Observer that logs events using an AgentLogger.
+///
+/// This observer integrates the observability system with the AgentLogger,
+/// providing unified logging with timestamps and agent prefixes.
+pub struct AgentLoggerObserver {
+    logger: std::sync::Arc<crate::daemon::AgentLogger>,
+}
+
+impl AgentLoggerObserver {
+    /// Create a new observer that logs to the given AgentLogger.
+    pub fn new(logger: std::sync::Arc<crate::daemon::AgentLogger>) -> Self {
+        Self { logger }
+    }
+}
+
+#[async_trait]
+impl Observer for AgentLoggerObserver {
+    async fn observe(&self, event: Event) {
+        match &event {
+            Event::AgentStart { agent_id: _, task } => {
+                self.logger.log(&format!("Agent starting: {}", truncate(task, 80)));
+            }
+            Event::AgentComplete { agent_id: _, duration_ms, success } => {
+                let status = if *success { "completed" } else { "failed" };
+                self.logger.log(&format!("Agent {} in {}ms", status, duration_ms));
+            }
+            Event::LlmCall { model, tokens_in, tokens_out, duration_ms } => {
+                let tokens = match (tokens_in, tokens_out) {
+                    (Some(i), Some(o)) => format!(" ({}→{} tokens)", i, o),
+                    _ => String::new(),
+                };
+                self.logger.log(&format!("LLM {} call took {}ms{}", model, duration_ms, tokens));
+            }
+            Event::ToolCall { tool_name, duration_ms, success, error } => {
+                let status = if *success {
+                    "ok".to_string()
+                } else {
+                    format!("error: {}", error.as_deref().unwrap_or("unknown"))
+                };
+                self.logger.tool(&format!("{} {} ({}ms)", tool_name, status, duration_ms));
+            }
+            Event::Retry { operation, attempt, delay_ms } => {
+                self.logger.log(&format!("[retry] {} attempt {} after {}ms", operation, attempt, delay_ms));
+            }
+            Event::Error { context, message } => {
+                self.logger.log(&format!("[error] {}: {}", context, message));
+            }
+        }
+    }
+}
+
 /// Observer that fans out events to multiple observers.
 pub struct MultiObserver {
     observers: Vec<std::sync::Arc<dyn Observer>>,

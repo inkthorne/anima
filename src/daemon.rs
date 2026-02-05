@@ -100,7 +100,7 @@ use crate::embedding::EmbeddingClient;
 use crate::llm::{LLM, OpenAIClient, AnthropicClient, OllamaClient, ToolSpec, ChatMessage, strip_thinking_tags};
 use crate::conversation::ConversationMessage;
 use crate::memory::{Memory, SqliteMemory, InMemoryStore, SemanticMemoryStore, SaveResult, extract_remember_tags, build_memory_injection};
-use crate::observe::ConsoleObserver;
+use crate::observe::AgentLoggerObserver;
 use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
@@ -904,7 +904,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create the agent
-    let (agent, use_native_tools) = create_agent_from_dir(&agent_dir).await?;
+    let (agent, use_native_tools) = create_agent_from_dir(&agent_dir, logger.clone()).await?;
     let agent = Arc::new(Mutex::new(agent));
     logger.log(&format!("  Native tools: {}", use_native_tools));
 
@@ -1311,7 +1311,10 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Create an agent from an AgentDir configuration.
 /// Returns (Agent, use_native_tools) where use_native_tools indicates hybrid tool calling mode.
-async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<(Agent, bool), Box<dyn std::error::Error>> {
+async fn create_agent_from_dir(
+    agent_dir: &AgentDir,
+    logger: Arc<AgentLogger>,
+) -> Result<(Agent, bool), Box<dyn std::error::Error>> {
     let agent_name = agent_dir.config.agent.name.clone();
 
     // Resolve LLM config (loads model file if specified, applies overrides)
@@ -1360,8 +1363,8 @@ async fn create_agent_from_dir(agent_dir: &AgentDir) -> Result<(Agent, bool), Bo
     agent = agent.with_memory(memory);
     agent = agent.with_agent_dir(agent_dir.path.clone());
 
-    // Add observer (verbose for daemon since there's no REPL)
-    let observer = Arc::new(ConsoleObserver::new(true));
+    // Add observer that logs to agent.log via AgentLogger
+    let observer = Arc::new(AgentLoggerObserver::new(logger));
     agent = agent.with_observer(observer);
 
     Ok((agent, use_native_tools))
