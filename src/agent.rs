@@ -32,6 +32,46 @@ pub fn strip_thinking(content: &str) -> String {
     stray_tags.replace_all(&result, "").trim().to_string()
 }
 
+/// Generate a brief summary of a tool result for logging.
+/// Extracts key metadata based on tool type.
+fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) -> Option<String> {
+    match tool_name {
+        "write_file" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = params.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            Some(format!("path={} bytes={}", path, bytes))
+        }
+        "read_file" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let bytes = result.and_then(|r| r.get("content")).and_then(|v| v.as_str()).map(|s| s.len());
+            match bytes {
+                Some(b) => Some(format!("path={} bytes={}", path, b)),
+                None => Some(format!("path={}", path)),
+            }
+        }
+        "shell" | "safe_shell" => {
+            let cmd = params.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+            let cmd_short = if cmd.len() > 40 { &cmd[..40] } else { cmd };
+            let exit_code = result.and_then(|r| r.get("exit_code")).and_then(|v| v.as_i64());
+            match exit_code {
+                Some(code) => Some(format!("cmd='{}' exit={}", cmd_short, code)),
+                None => Some(format!("cmd='{}'", cmd_short)),
+            }
+        }
+        "http" => {
+            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            Some(format!("{} {}", method.to_uppercase(), url))
+        }
+        "remember" => {
+            let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let preview = if content.len() > 50 { &content[..50] } else { content };
+            Some(format!("'{}'", preview))
+        }
+        _ => None, // No special summary for other tools
+    }
+}
+
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
     /// Maximum iterations before giving up (default: 10)
@@ -121,6 +161,15 @@ pub struct ReflectionResult {
     pub feedback: Option<String>,
 }
 
+/// A single tool execution: the call and its result.
+#[derive(Debug, Clone)]
+pub struct ToolExecution {
+    /// The tool call (id, name, arguments)
+    pub call: crate::llm::ToolCall,
+    /// The result of executing the tool
+    pub result: String,
+}
+
 /// Result from a think operation, including tool usage information.
 #[derive(Debug, Clone)]
 pub struct ThinkResult {
@@ -130,6 +179,12 @@ pub struct ThinkResult {
     pub tools_used: bool,
     /// Names of tools that were called (for logging/debugging)
     pub tool_names: Vec<String>,
+    /// The last set of tool_calls made before the final response (for conversation persistence)
+    pub last_tool_calls: Option<Vec<crate::llm::ToolCall>>,
+    /// Complete trace of all tool executions during this think operation.
+    /// Each entry contains the assistant's tool call and the tool's result.
+    /// Used for persisting the full conversation to history.
+    pub tool_trace: Vec<ToolExecution>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -215,16 +270,19 @@ impl Agent {
                     err
                 })?;
 
-            let result = (*tool).execute(input_value).await;
+            let result = (*tool).execute(input_value.clone()).await;
             let duration_ms = start.elapsed().as_millis() as u64;
 
             match &result {
                 Ok(val) => {
+                    let summary = tool_result_summary(name, &input_value, Some(val));
                     self.emit(Event::ToolCall {
                         tool_name: name.to_string(),
                         duration_ms,
                         success: true,
                         error: None,
+                        params: Some(input_value),
+                        result_summary: summary,
                     }).await;
                     Ok(val.to_string())
                 }
@@ -234,6 +292,8 @@ impl Agent {
                         duration_ms,
                         success: false,
                         error: Some(e.to_string()),
+                        params: Some(input_value),
+                        result_summary: None,
                     }).await;
                     result.map(|v| v.to_string())
                 }
@@ -245,6 +305,8 @@ impl Agent {
                 duration_ms: 0,
                 success: false,
                 error: Some(err.to_string()),
+                params: None,
+                result_summary: None,
             }).await;
             Err(err)
         }
@@ -724,6 +786,10 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
         // Track tool usage across the agentic loop
         let mut tool_names_used: Vec<String> = Vec::new();
+        // Track the last tool_calls made before final response (for conversation persistence)
+        let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
+        // Track all tool executions for conversation persistence
+        let mut tool_trace: Vec<ToolExecution> = Vec::new();
 
         // Agentic loop
         for _iteration in 0..options.max_iterations {
@@ -805,6 +871,8 @@ pub async fn forget(&mut self, key: &str) -> bool {
                         response: reflected_response,
                         tools_used: !tool_names_used.is_empty(),
                         tool_names: tool_names_used,
+                        last_tool_calls,
+                        tool_trace,
                     });
                 }
 
@@ -812,8 +880,13 @@ pub async fn forget(&mut self, key: &str) -> bool {
                     response: final_response,
                     tools_used: !tool_names_used.is_empty(),
                     tool_names: tool_names_used,
+                    last_tool_calls,
+                    tool_trace,
                 });
             }
+
+            // Track the tool_calls for conversation persistence
+            last_tool_calls = Some(response.tool_calls.clone());
 
             // Create assistant message with tool calls (strip thinking tags for storage)
             let assistant_message = ChatMessage {
@@ -834,6 +907,12 @@ pub async fn forget(&mut self, key: &str) -> bool {
 
                 let result = self.call_tool(&tool_call.name, &tool_call.arguments.to_string()).await
                     .unwrap_or_else(|e| format!("Error: {}", e));
+
+                // Record tool execution for persistence
+                tool_trace.push(ToolExecution {
+                    call: tool_call.clone(),
+                    result: result.clone(),
+                });
 
                 let tool_message = ChatMessage {
                     role: "tool".to_string(),

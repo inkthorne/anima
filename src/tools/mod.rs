@@ -18,7 +18,7 @@ pub use echo::EchoTool;
 pub use http::HttpTool;
 pub use list_agents::DaemonListAgentsTool;
 pub use read_file::ReadFileTool;
-pub use remember::RememberTool;
+pub use remember::{RememberTool, DaemonRememberTool};
 pub use safe_shell::SafeShellTool;
 pub use send_message::{SendMessageTool, ListAgentsTool, DaemonSendMessageTool};
 pub use shell::ShellTool;

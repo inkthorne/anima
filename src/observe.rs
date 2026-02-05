@@ -33,6 +33,10 @@ pub enum Event {
         duration_ms: u64,
         success: bool,
         error: Option<String>,
+        /// Tool input parameters for logging context
+        params: Option<serde_json::Value>,
+        /// Brief summary of result (e.g., "path=/foo/bar.txt bytes=1234")
+        result_summary: Option<String>,
     },
     /// Retry attempt for an operation
     Retry {
@@ -94,14 +98,15 @@ impl Observer for ConsoleObserver {
                     eprintln!("[LLM] {} call took {}ms{}", model, duration_ms, tokens);
                 }
             }
-            Event::ToolCall { tool_name, duration_ms, success, error } => {
+            Event::ToolCall { tool_name, duration_ms, success, error, result_summary, .. } => {
                 if self.verbose || !success {
                     let status = if *success {
                         "ok".to_string()
                     } else {
                         format!("error: {}", error.as_deref().unwrap_or("unknown"))
                     };
-                    eprintln!("[TOOL] {} {} ({}ms)", tool_name, status, duration_ms);
+                    let summary = result_summary.as_deref().map(|s| format!(" {}", s)).unwrap_or_default();
+                    eprintln!("[TOOL] {} {}{} ({}ms)", tool_name, status, summary, duration_ms);
                 }
             }
             Event::Retry { operation, attempt, delay_ms } => {
@@ -245,13 +250,14 @@ impl Observer for AgentLoggerObserver {
                 };
                 self.logger.log(&format!("LLM {} call took {}ms{}", model, duration_ms, tokens));
             }
-            Event::ToolCall { tool_name, duration_ms, success, error } => {
+            Event::ToolCall { tool_name, duration_ms, success, error, result_summary, .. } => {
                 let status = if *success {
                     "ok".to_string()
                 } else {
                     format!("error: {}", error.as_deref().unwrap_or("unknown"))
                 };
-                self.logger.tool(&format!("{} {} ({}ms)", tool_name, status, duration_ms));
+                let summary = result_summary.as_deref().map(|s| format!(" {}", s)).unwrap_or_default();
+                self.logger.tool(&format!("{} {}{} ({}ms)", tool_name, status, summary, duration_ms));
             }
             Event::Retry { operation, attempt, delay_ms } => {
                 self.logger.log(&format!("[retry] {} attempt {} after {}ms", operation, attempt, delay_ms));
@@ -332,6 +338,8 @@ mod tests {
                 duration_ms: 10,
                 success: true,
                 error: None,
+                params: None,
+                result_summary: None,
             },
             Event::Retry {
                 operation: "llm_call".to_string(),
@@ -376,6 +384,8 @@ mod tests {
             duration_ms: 10,
             success: true,
             error: None,
+            params: None,
+            result_summary: None,
         }).await;
 
         collector.observe(Event::ToolCall {
@@ -383,6 +393,8 @@ mod tests {
             duration_ms: 5,
             success: false,
             error: Some("failed".to_string()),
+            params: None,
+            result_summary: None,
         }).await;
 
         collector.observe(Event::Retry {

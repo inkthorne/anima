@@ -56,6 +56,8 @@ pub struct ConversationMessage {
     pub expires_at: i64,
     /// Response duration in milliseconds (for agent responses)
     pub duration_ms: Option<i64>,
+    /// Native tool calls JSON (for native tool mode persistence)
+    pub tool_calls: Option<String>,
 }
 
 /// A pending notification for an offline agent.
@@ -188,6 +190,9 @@ impl ConversationStore {
         // Migrate: add duration_ms column to messages if it doesn't exist
         self.migrate_add_duration_ms_column()?;
 
+        // Migrate: add tool_calls column to messages if it doesn't exist
+        self.migrate_add_tool_calls_column()?;
+
         Ok(())
     }
 
@@ -241,6 +246,25 @@ impl ConversationStore {
         if !has_column {
             self.conn.execute(
                 "ALTER TABLE messages ADD COLUMN duration_ms INTEGER DEFAULT NULL",
+                [],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Migrate existing databases to add the tool_calls column to messages if it doesn't exist.
+    fn migrate_add_tool_calls_column(&self) -> Result<(), ConversationError> {
+        // Check if messages table has tool_calls column
+        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
+        let has_column = stmt.query_map([], |row| {
+            let col_name: String = row.get(1)?;
+            Ok(col_name)
+        })?.any(|r| r.map(|n| n == "tool_calls").unwrap_or(false));
+
+        if !has_column {
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
                 [],
             )?;
         }
@@ -637,7 +661,7 @@ impl ConversationStore {
         content: &str,
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
-        self.add_message_with_duration(conv_name, from_agent, content, mentions, None)
+        self.add_message_full(conv_name, from_agent, content, mentions, None, None)
     }
 
     /// Add a message to a conversation with optional response duration.
@@ -650,6 +674,34 @@ impl ConversationStore {
         mentions: &[&str],
         duration_ms: Option<i64>,
     ) -> Result<i64, ConversationError> {
+        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, None)
+    }
+
+    /// Add a message to a conversation with optional response duration and tool_calls.
+    /// Returns the message ID.
+    pub fn add_message_with_tool_calls(
+        &self,
+        conv_name: &str,
+        from_agent: &str,
+        content: &str,
+        mentions: &[&str],
+        duration_ms: Option<i64>,
+        tool_calls: Option<&str>,
+    ) -> Result<i64, ConversationError> {
+        self.add_message_full(conv_name, from_agent, content, mentions, duration_ms, tool_calls)
+    }
+
+    /// Add a message to a conversation with all optional fields.
+    /// Returns the message ID.
+    fn add_message_full(
+        &self,
+        conv_name: &str,
+        from_agent: &str,
+        content: &str,
+        mentions: &[&str],
+        duration_ms: Option<i64>,
+        tool_calls: Option<&str>,
+    ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
             return Err(ConversationError::NotFound(conv_name.to_string()));
@@ -660,8 +712,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -686,14 +738,14 @@ impl ConversationStore {
 
         let query = match limit {
             Some(n) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2
                  ORDER BY created_at DESC
                  LIMIT {}",
                 n
             ),
-            None => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms
+            None => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
                      FROM messages
                      WHERE conv_name = ?1 AND expires_at > ?2
                      ORDER BY created_at ASC".to_string(),
@@ -714,6 +766,7 @@ impl ConversationStore {
                     created_at: row.get(5)?,
                     expires_at: row.get(6)?,
                     duration_ms: row.get(7)?,
+                    tool_calls: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -744,7 +797,7 @@ impl ConversationStore {
         // When using --limit without --since, we want the last N messages
         let query = match (limit, since_id) {
             (Some(n), Some(_)) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                  ORDER BY id ASC
@@ -752,14 +805,14 @@ impl ConversationStore {
                 n
             ),
             (Some(n), None) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms
+                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
                  FROM messages
                  WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                  ORDER BY id DESC
                  LIMIT {}",
                 n
             ),
-            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms
+            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls
                      FROM messages
                      WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
                      ORDER BY id ASC".to_string(),
@@ -780,6 +833,7 @@ impl ConversationStore {
                     created_at: row.get(5)?,
                     expires_at: row.get(6)?,
                     duration_ms: row.get(7)?,
+                    tool_calls: row.get(8)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

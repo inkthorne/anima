@@ -105,7 +105,7 @@ use crate::runtime::Runtime;
 use crate::socket_api::{SocketApi, Request, Response};
 use crate::tool::Tool;
 use crate::tool_registry::{ToolRegistry, ToolDefinition};
-use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SafeShellTool};
+use crate::tools::{AddTool, EchoTool, ReadFileTool, WriteFileTool, HttpTool, ShellTool, SafeShellTool, DaemonRememberTool};
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStore, TaskStatus, is_process_running};
@@ -135,6 +135,13 @@ pub enum AgentWork {
 pub struct MessageWorkResult {
     pub response: String,
     pub error: Option<String>,
+}
+
+/// Result from processing in native tool mode, includes tool_calls and trace for persistence
+struct NativeToolModeResult {
+    response: String,
+    tool_calls: Option<Vec<crate::llm::ToolCall>>,
+    tool_trace: Vec<crate::agent::ToolExecution>,
 }
 
 /// Expand injection directives in always.md content.
@@ -297,11 +304,16 @@ fn format_conversation_history(
             // First, flush any pending user messages
             flush_user_batch(&mut pending_user_batch, &mut history);
 
+            // Deserialize tool_calls if present (for native tool mode persistence)
+            let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg.tool_calls
+                .as_ref()
+                .and_then(|json| serde_json::from_str(json).ok());
+
             history.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(msg.content.clone()),
                 tool_call_id: None,
-                tool_calls: None,
+                tool_calls,
             });
         } else if msg.from_agent == "tool" {
             // Tool results/errors should NOT be batched with user messages.
@@ -960,6 +972,20 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    // Register DaemonRememberTool if semantic memory is enabled and native tools are supported
+    if use_native_tools {
+        if let Some(ref mem_store) = semantic_memory_store {
+            let remember_tool = DaemonRememberTool::new(
+                Arc::clone(mem_store),
+                embedding_client.clone(),
+            );
+            agent.lock().await.register_tool(Arc::new(remember_tool));
+            logger.log("  Registered DaemonRememberTool");
+        } else {
+            logger.log("  Skipped DaemonRememberTool (no semantic memory)");
+        }
+    }
+
     // Load tool registry (if available)
     let tool_registry: Option<Arc<ToolRegistry>> = match ToolRegistry::load_global() {
         Ok(registry) => {
@@ -1353,6 +1379,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(HttpTool::new()));
         agent.register_tool(Arc::new(ShellTool::new()));
         agent.register_tool(Arc::new(SafeShellTool::new()));
+        // Note: DaemonRememberTool is registered later after semantic memory is created
 
         // Register daemon-aware messaging tools
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
@@ -1624,9 +1651,9 @@ async fn process_message_work(
     let effective_always = build_effective_always(&tools_injection, &memory_injection, always, model_always);
 
     // Process with or without streaming
-    let final_response = if use_native_tools {
+    let (final_response, _tool_calls, tool_trace) = if use_native_tools {
         // Native tool mode with optional streaming
-        process_native_tool_mode(
+        let result = process_native_tool_mode(
             content,
             &effective_always,
             external_tools,
@@ -1636,10 +1663,11 @@ async fn process_message_work(
             semantic_memory,
             embedding_client,
             logger,
-        ).await
+        ).await;
+        (result.response, result.tool_calls, result.tool_trace)
     } else {
-        // JSON-block mode with optional streaming
-        process_json_block_mode(
+        // JSON-block mode with optional streaming (no native tool_calls)
+        let response = process_json_block_mode(
             content,
             &effective_always,
             &relevant_tools,
@@ -1651,7 +1679,8 @@ async fn process_message_work(
             tool_registry,
             logger,
             &tool_context,
-        ).await
+        ).await;
+        (response, None, Vec::new())
     };
 
     // Store response in conversation if conv_name was provided
@@ -1659,7 +1688,23 @@ async fn process_message_work(
         let duration_ms = start_time.elapsed().as_millis() as i64;
         match ConversationStore::init() {
             Ok(store) => {
-                if let Err(e) = store.add_message_with_duration(cname, agent_name, &final_response, &[], Some(duration_ms)) {
+                // For native tool mode, persist each tool execution before the final response.
+                // This ensures the conversation history includes the full tool call trace.
+                for exec in &tool_trace {
+                    // Store the tool call (as an assistant message with tool_calls)
+                    let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
+                    // The content for intermediate tool-calling messages is typically empty or minimal
+                    if let Err(e) = store.add_message_with_tool_calls(cname, agent_name, "", &[], None, tool_calls_json.as_deref()) {
+                        logger.log(&format!("[worker] Failed to store tool call: {}", e));
+                    }
+                    // Store the tool result
+                    let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+                    if let Err(e) = store.add_message(cname, "tool", &tool_result_msg, &[]) {
+                        logger.log(&format!("[worker] Failed to store tool result: {}", e));
+                    }
+                }
+                // Store the final response (no tool_calls since this is the terminal response)
+                if let Err(e) = store.add_message_with_tool_calls(cname, agent_name, &final_response, &[], Some(duration_ms), None) {
                     logger.log(&format!("[worker] Failed to store response in conversation: {}", e));
                 }
             }
@@ -1686,7 +1731,7 @@ async fn process_native_tool_mode(
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
     logger: &Arc<AgentLogger>,
-) -> String {
+) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
         always_prompt: effective_always.clone(),
@@ -1694,8 +1739,8 @@ async fn process_native_tool_mode(
         ..Default::default()
     };
 
-    let result = if let Some(tx) = token_tx {
-        // Streaming mode
+    let (result, tool_calls, tool_trace) = if let Some(tx) = token_tx {
+        // Streaming mode - no tool_calls available from streaming API
         let agent_clone = agent.clone();
         let content_clone = content.to_string();
 
@@ -1705,16 +1750,16 @@ async fn process_native_tool_mode(
         });
 
         match handle.await {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => format!("Error: {}", e),
-            Err(e) => format!("Error: task panicked: {}", e),
+            Ok(Ok(response)) => (response, None, Vec::new()),
+            Ok(Err(e)) => (format!("Error: {}", e), None, Vec::new()),
+            Err(e) => (format!("Error: task panicked: {}", e), None, Vec::new()),
         }
     } else {
-        // Non-streaming mode
+        // Non-streaming mode - can capture tool_calls and trace
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => result.response,
-            Err(e) => format!("Error: {}", e),
+            Ok(result) => (result.response, result.last_tool_calls, result.tool_trace),
+            Err(e) => (format!("Error: {}", e), None, Vec::new()),
         }
     };
 
@@ -1741,7 +1786,11 @@ async fn process_native_tool_mode(
         }
     }
 
-    after_remember
+    NativeToolModeResult {
+        response: after_remember,
+        tool_calls,
+        tool_trace,
+    }
 }
 
 /// Process message in JSON-block tool mode (tools = false in model config)
@@ -2019,6 +2068,8 @@ async fn handle_notify(
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
+    // Track last tool_calls for native tool mode persistence
+    let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
 
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
@@ -2049,6 +2100,11 @@ async fn handle_notify(
 
         match result {
             Ok(think_result) => {
+                // Capture tool_calls from native tool mode for persistence
+                if think_result.last_tool_calls.is_some() {
+                    last_tool_calls = think_result.last_tool_calls.clone();
+                }
+                
                 // Strip thinking tags and extract [REMEMBER: ...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
@@ -2161,10 +2217,12 @@ async fn handle_notify(
         }
     }
 
-    // Store final response in conversation with duration
+    // Store final response in conversation with duration and tool_calls
     let cleaned_response = final_response.unwrap_or_default();
     let duration_ms = start_time.elapsed().as_millis() as i64;
-    match store.add_message_with_duration(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms)) {
+    // Serialize tool_calls to JSON for persistence
+    let tool_calls_json = last_tool_calls.as_ref().and_then(|tc| serde_json::to_string(tc).ok());
+    match store.add_message_with_tool_calls(conv_id, agent_name, &cleaned_response, &[], Some(duration_ms), tool_calls_json.as_deref()) {
         Ok(response_msg_id) => {
             logger.log(&format!("[notify] Stored response as msg_id={} ({}ms)", response_msg_id, duration_ms));
 
@@ -3364,6 +3422,7 @@ api_key = "sk-test"
             created_at: 0,
             expires_at: i64::MAX,
             duration_ms: None,
+            tool_calls: None,
         }
     }
 

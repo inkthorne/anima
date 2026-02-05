@@ -22,7 +22,7 @@ pub mod tool_registry;
 pub mod tools;
 
 // Re-export main types for convenience
-pub use agent::{Agent, ThinkOptions, ThinkResult, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
+pub use agent::{Agent, ThinkOptions, ThinkResult, ToolExecution, ReflectionConfig, ReflectionResult, AutoMemoryConfig};
 pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
 pub use error::{AgentError, ToolError, ErrorContext};
 pub use memory::{Memory, MemoryEntry, MemoryError, InMemoryStore, SqliteMemory, SemanticMemoryStore, SemanticMemoryEntry, SaveResult, extract_remember_tags, build_memory_injection, format_age};
