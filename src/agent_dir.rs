@@ -55,9 +55,9 @@ pub struct LlmSection {
     /// Context window size (num_ctx) for Ollama models
     #[serde(default)]
     pub num_ctx: Option<u32>,
-    /// Model-specific always text appended to agent always prompt
+    /// Model-specific recall text appended to agent recall prompt
     #[serde(default)]
-    pub always: Option<String>,
+    pub recall: Option<String>,
     /// Allowlist of tool names. If set, only these tools are available.
     /// If None, all tools are allowed.
     #[serde(default)]
@@ -75,8 +75,8 @@ pub struct ResolvedLlmConfig {
     pub thinking: Option<bool>,
     pub tools: bool,
     pub num_ctx: Option<u32>,
-    /// Model-specific always text appended to agent always prompt
-    pub always: Option<String>,
+    /// Model-specific recall text appended to agent recall prompt
+    pub recall: Option<String>,
     /// Allowlist of tool names. If set, only these tools are available.
     /// If None, all tools are allowed.
     pub allowed_tools: Option<Vec<String>>,
@@ -165,7 +165,7 @@ pub struct AgentSection {
     pub name: String,
     pub description: Option<String>,
     pub system_file: Option<PathBuf>,
-    pub always_file: Option<PathBuf>,
+    pub recall_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,36 +236,36 @@ impl AgentDir {
         }
     }
 
-    /// Load always content from the configured always file.
-    /// Returns Ok(None) if no always file exists.
+    /// Load recall content from the configured recall file.
+    /// Returns Ok(None) if no recall file exists.
     /// Expands {{include:filename}} directives recursively.
     ///
-    /// Load agent's always.md file if it exists.
-    /// Returns Ok(None) if no always.md exists in the agent directory.
+    /// Load agent's recall.md file if it exists.
+    /// Returns Ok(None) if no recall.md exists in the agent directory.
     ///
-    /// Global always.md files are available via `<!-- @include:path -->` directives
+    /// Global recall.md files are available via `<!-- @include:path -->` directives
     /// if agents want to share common content.
-    pub fn load_always(&self) -> Result<Option<String>, AgentDirError> {
-        // Try agent-specific always file first
-        let agent_always_path = match &self.config.agent.always_file {
-            Some(always_path) => self.path.join(always_path),
-            None => self.path.join("always.md"),
+    pub fn load_recall(&self) -> Result<Option<String>, AgentDirError> {
+        // Try agent-specific recall file first
+        let agent_recall_path = match &self.config.agent.recall_file {
+            Some(recall_path) => self.path.join(recall_path),
+            None => self.path.join("recall.md"),
         };
 
-        if agent_always_path.exists() {
-            let content = std::fs::read_to_string(&agent_always_path)?;
+        if agent_recall_path.exists() {
+            let content = std::fs::read_to_string(&agent_recall_path)?;
             let mut seen = HashSet::new();
             seen.insert(
-                agent_always_path
+                agent_recall_path
                     .canonicalize()
-                    .unwrap_or(agent_always_path),
+                    .unwrap_or(agent_recall_path),
             );
             let expanded = self.expand_includes(&content, &mut seen)?;
             return Ok(Some(expanded));
         }
 
-        // No agent-specific always.md — return None
-        // (Global always.md is available via includes if agents want it)
+        // No agent-specific recall.md — return None
+        // (Global recall.md is available via includes if agents want it)
         Ok(None)
     }
 
@@ -439,7 +439,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
         .or(base_config.base_url.clone());
     let thinking = llm_section.thinking.or(base_config.thinking);
     let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
-    let always = llm_section.always.clone().or(base_config.always.clone());
+    let recall = llm_section.recall.clone().or(base_config.recall.clone());
     let allowed_tools = llm_section
         .allowed_tools
         .clone()
@@ -456,12 +456,12 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
         thinking,
         tools,
         num_ctx,
-        always,
+        recall,
         allowed_tools,
     })
 }
 
-/// Scaffold a new agent directory with config.toml, system.md, and always.md templates.
+/// Scaffold a new agent directory with config.toml, system.md, and recall.md templates.
 ///
 /// Creates the directory at the specified path, or defaults to ~/.anima/agents/<name>/.
 /// Returns an error if the directory already exists.
@@ -484,7 +484,7 @@ pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirErr
         r#"[agent]
 name = "{name}"
 system_file = "system.md"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "anthropic"
@@ -530,8 +530,8 @@ You have access to tools for:
     );
     std::fs::write(agent_path.join("system.md"), system_content)?;
 
-    // Write always.md template
-    let always_content = r#"# Always
+    // Write recall.md template
+    let recall_content = r#"# Recall
 
 ## How Conversations Work
 
@@ -559,7 +559,7 @@ Only @mentions actually reach the other agent.
 - If you @mention someone, include your message to them
 - Dont repeat what others just said — add your own perspective
 "#;
-    std::fs::write(agent_path.join("always.md"), always_content)?;
+    std::fs::write(agent_path.join("recall.md"), recall_content)?;
 
     println!(
         "\x1b[32m✓ Created agent '{}' at {}\x1b[0m",
@@ -570,12 +570,12 @@ Only @mentions actually reach the other agent.
     println!("  Files created:");
     println!("    \x1b[36mconfig.toml\x1b[0m  — agent configuration");
     println!("    \x1b[36msystem.md\x1b[0m    — system prompt / personality");
-    println!("    \x1b[36malways.md\x1b[0m    — persistent reminders (recency bias)");
+    println!("    \x1b[36mrecall.md\x1b[0m    — recall content (injected each turn)");
     println!();
     println!("  Next steps:");
     println!("    1. Edit config.toml to configure your LLM");
     println!("    2. Edit system.md to define your agent's personality");
-    println!("    3. Edit always.md to add persistent reminders");
+    println!("    3. Edit recall.md to add recall content");
     println!("    4. Run with: \x1b[36manima run {}\x1b[0m", name);
 
     Ok(())
@@ -967,13 +967,13 @@ model = "gpt-4"
     }
 
     #[test]
-    fn test_load_always() {
+    fn test_load_recall() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
 system_file = "system.md"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "openai"
@@ -981,21 +981,21 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(dir.path().join("system.md"), "I am a helpful assistant.").unwrap();
-        fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
+        fs::write(dir.path().join("recall.md"), "Always be concise.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
-        assert_eq!(always, Some("Always be concise.".to_string()));
+        let recall = agent_dir.load_recall().unwrap();
+        assert_eq!(recall, Some("Always be concise.".to_string()));
     }
 
     #[test]
     #[serial]
-    fn test_load_always_none() {
-        // Create fake home directory WITHOUT global always.md
+    fn test_load_recall_none() {
+        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
-        // NO always.md in global directory
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
+        // NO recall.md in global directory
 
         let dir = tempdir().unwrap();
         let config_content = r#"
@@ -1008,12 +1008,12 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
 
-        // Override HOME temporarily to avoid picking up real global always.md
+        // Override HOME temporarily to avoid picking up real global recall.md
         let original_home = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Restore HOME
         match original_home {
@@ -1021,38 +1021,38 @@ model = "gpt-4"
             None => unsafe { std::env::remove_var("HOME") },
         }
 
-        assert_eq!(always, None);
+        assert_eq!(recall, None);
     }
 
     #[test]
     #[serial]
-    fn test_load_always_file_missing() {
-        // Create fake home directory WITHOUT global always.md
+    fn test_load_recall_file_missing() {
+        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
-        // NO always.md in global directory
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
+        // NO recall.md in global directory
 
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        // Note: always.md file is NOT created
+        // Note: recall.md file is NOT created
 
-        // Override HOME temporarily to avoid picking up real global always.md
+        // Override HOME temporarily to avoid picking up real global recall.md
         let original_home = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         // Should return None when file is missing (backward compatible)
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Restore HOME
         match original_home {
@@ -1060,16 +1060,16 @@ model = "gpt-4"
             None => unsafe { std::env::remove_var("HOME") },
         }
 
-        assert_eq!(always, None);
+        assert_eq!(recall, None);
     }
 
     #[test]
-    fn test_load_always_with_include() {
+    fn test_load_recall_with_include() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "openai"
@@ -1077,29 +1077,29 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(
-            dir.path().join("always.md"),
+            dir.path().join("recall.md"),
             "Header\n{{include:RULES.md}}\nFooter",
         )
         .unwrap();
         fs::write(dir.path().join("RULES.md"), "Be helpful.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let always = agent_dir.load_always().unwrap().unwrap();
-        assert_eq!(always, "Header\nBe helpful.\nFooter");
+        let recall = agent_dir.load_recall().unwrap().unwrap();
+        assert_eq!(recall, "Header\nBe helpful.\nFooter");
     }
 
     // =========================================================================
-    // Global fallback tests for always.md
+    // Global fallback tests for recall.md
     // =========================================================================
 
-    /// Test: Agent-specific always.md is used when present (explicit config)
+    /// Test: Agent-specific recall.md is used when present (explicit config)
     #[test]
-    fn test_load_always_agent_specific_explicit() {
+    fn test_load_recall_agent_specific_explicit() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-always_file = "my_always.md"
+recall_file = "my_recall.md"
 
 [llm]
 provider = "openai"
@@ -1107,19 +1107,19 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(
-            dir.path().join("my_always.md"),
-            "Agent-specific always content",
+            dir.path().join("my_recall.md"),
+            "Agent-specific recall content",
         )
         .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
-        assert_eq!(always, Some("Agent-specific always content".to_string()));
+        let recall = agent_dir.load_recall().unwrap();
+        assert_eq!(recall, Some("Agent-specific recall content".to_string()));
     }
 
-    /// Test: Default always.md in agent directory is used when no always_file configured
+    /// Test: Default recall.md in agent directory is used when no recall_file configured
     #[test]
-    fn test_load_always_agent_specific_default() {
+    fn test_load_recall_agent_specific_default() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1130,25 +1130,25 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        // Create always.md in agent directory (not configured explicitly)
-        fs::write(dir.path().join("always.md"), "Default agent always content").unwrap();
+        // Create recall.md in agent directory (not configured explicitly)
+        fs::write(dir.path().join("recall.md"), "Default agent recall content").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
-        assert_eq!(always, Some("Default agent always content".to_string()));
+        let recall = agent_dir.load_recall().unwrap();
+        assert_eq!(recall, Some("Default agent recall content".to_string()));
     }
 
-    /// Test: Agent-specific always.md overrides global (no merge)
-    /// Note: This test creates a mock global always.md in a temp dir and temporarily
+    /// Test: Agent-specific recall.md overrides global (no merge)
+    /// Note: This test creates a mock global recall.md in a temp dir and temporarily
     /// overrides HOME. Since dirs::home_dir() uses the HOME env var on Unix, we can test this.
     #[test]
     #[serial]
-    fn test_load_always_agent_overrides_global() {
+    fn test_load_recall_agent_overrides_global() {
         // Create fake home directory
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
-        fs::write(global_always_dir.join("always.md"), "Global always content").unwrap();
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
+        fs::write(global_recall_dir.join("recall.md"), "Global recall content").unwrap();
 
         // Create agent directory
         let agent_dir_path = tempdir().unwrap();
@@ -1161,10 +1161,10 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // Agent-specific always.md
+        // Agent-specific recall.md
         fs::write(
-            agent_dir_path.path().join("always.md"),
-            "Agent-specific always",
+            agent_dir_path.path().join("recall.md"),
+            "Agent-specific recall",
         )
         .unwrap();
 
@@ -1173,7 +1173,7 @@ model = "gpt-4"
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Restore HOME
         match original_home {
@@ -1182,20 +1182,20 @@ model = "gpt-4"
         }
 
         // Agent-specific should be used, NOT global
-        assert_eq!(always, Some("Agent-specific always".to_string()));
+        assert_eq!(recall, Some("Agent-specific recall".to_string()));
     }
 
     /// Test: Returns None when agent-specific doesn't exist (no global fallback)
     #[test]
     #[serial]
-    fn test_load_always_no_global_fallback() {
-        // Create fake home directory with global always.md
+    fn test_load_recall_no_global_fallback() {
+        // Create fake home directory with global recall.md
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
-        fs::write(global_always_dir.join("always.md"), "Global always content").unwrap();
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
+        fs::write(global_recall_dir.join("recall.md"), "Global recall content").unwrap();
 
-        // Create agent directory WITHOUT always.md
+        // Create agent directory WITHOUT recall.md
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1206,14 +1206,14 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // NO always.md in agent directory
+        // NO recall.md in agent directory
 
         // Override HOME temporarily
         let original_home = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Restore HOME
         match original_home {
@@ -1222,20 +1222,20 @@ model = "gpt-4"
         }
 
         // Should return None — no global fallback
-        assert_eq!(always, None);
+        assert_eq!(recall, None);
     }
 
     /// Test: Returns None when neither agent-specific nor global exists
     #[test]
     #[serial]
-    fn test_load_always_neither_exists() {
-        // Create fake home directory WITHOUT global always.md
+    fn test_load_recall_neither_exists() {
+        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
-        // NO always.md in global directory
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
+        // NO recall.md in global directory
 
-        // Create agent directory WITHOUT always.md
+        // Create agent directory WITHOUT recall.md
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1246,14 +1246,14 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // NO always.md in agent directory
+        // NO recall.md in agent directory
 
         // Override HOME temporarily
         let original_home = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", fake_home.path()) };
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Restore HOME
         match original_home {
@@ -1262,25 +1262,25 @@ model = "gpt-4"
         }
 
         // Should return None when neither exists
-        assert_eq!(always, None);
+        assert_eq!(recall, None);
     }
 
-    /// Test: Agent always.md can include shared files from global agents directory
+    /// Test: Agent recall.md can include shared files from global agents directory
     #[test]
     #[serial]
-    fn test_load_always_agent_includes_global_shared() {
+    fn test_load_recall_agent_includes_global_shared() {
         // Create fake home directory with shared files
         let fake_home = tempdir().unwrap();
-        let global_always_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_always_dir).unwrap();
+        let global_recall_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_recall_dir).unwrap();
         // Shared file that agents can include
         fs::write(
-            global_always_dir.join("shared-tools.md"),
+            global_recall_dir.join("shared-tools.md"),
             "Tool instructions here",
         )
         .unwrap();
 
-        // Create agent directory with always.md that includes the shared file
+        // Create agent directory with recall.md that includes the shared file
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1291,10 +1291,10 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // Agent always.md includes the global shared file
-        let global_path = global_always_dir.join("shared-tools.md");
+        // Agent recall.md includes the global shared file
+        let global_path = global_recall_dir.join("shared-tools.md");
         fs::write(
-            agent_dir_path.path().join("always.md"),
+            agent_dir_path.path().join("recall.md"),
             format!(
                 "Agent header\n{{{{include:{}}}}}\nAgent footer",
                 global_path.display()
@@ -1303,11 +1303,11 @@ model = "gpt-4"
         .unwrap();
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let always = agent_dir.load_always().unwrap();
+        let recall = agent_dir.load_recall().unwrap();
 
         // Includes should be expanded
         assert_eq!(
-            always,
+            recall,
             Some("Agent header\nTool instructions here\nAgent footer".to_string())
         );
     }
@@ -1679,25 +1679,25 @@ tools = true
         // Check files were created
         assert!(agent_path.join("config.toml").exists());
         assert!(agent_path.join("system.md").exists());
-        assert!(agent_path.join("always.md").exists());
+        assert!(agent_path.join("recall.md").exists());
 
         // Check config.toml content
         let config_content = fs::read_to_string(agent_path.join("config.toml")).unwrap();
         assert!(config_content.contains("name = \"test-agent\""));
         assert!(config_content.contains("[llm]"));
         assert!(config_content.contains("[memory]"));
-        assert!(config_content.contains("always_file = \"always.md\""));
+        assert!(config_content.contains("recall_file = \"recall.md\""));
 
         // Check system.md content
         let system_content = fs::read_to_string(agent_path.join("system.md")).unwrap();
         assert!(system_content.contains("# test-agent"));
         assert!(system_content.contains("You are test-agent"));
 
-        // Check always.md content
-        let always_content = fs::read_to_string(agent_path.join("always.md")).unwrap();
-        assert!(always_content.contains("# Always"));
-        assert!(always_content.contains("How Conversations Work"));
-        assert!(always_content.contains("Never @mention yourself"));
+        // Check recall.md content
+        let recall_content = fs::read_to_string(agent_path.join("recall.md")).unwrap();
+        assert!(recall_content.contains("# Recall"));
+        assert!(recall_content.contains("How Conversations Work"));
+        assert!(recall_content.contains("Never @mention yourself"));
     }
 
     #[test]

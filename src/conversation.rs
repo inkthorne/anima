@@ -1052,6 +1052,16 @@ impl ConversationStore {
         Ok(notifications)
     }
 
+    /// Clear all pending notifications for a specific conversation.
+    /// Used by stop command to abandon queued work without processing.
+    pub fn clear_pending_notifications_for_conversation(&self, conv_name: &str) -> Result<usize, ConversationError> {
+        let deleted = self.conn.execute(
+            "DELETE FROM pending_notifications WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+        Ok(deleted)
+    }
+
     /// Delete a single pending notification by ID.
     pub fn delete_pending_notification(
         &self,

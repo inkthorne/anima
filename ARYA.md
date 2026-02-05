@@ -1,40 +1,26 @@
-# Task: v3.6.3 — Context Usage Tracking
+# Anima — Next Task
 
-**Goal:** Show users how full their context window is with an "X% full" indicator.
+**Status:** Idle — pick from pending work below
 
 **Build:** `cargo build --release && cargo test`
 
-## Feature Requirements
+## Pending Work Queue
 
-1. **Track context usage** — Calculate approximate token count of conversation history
-2. **Display in chat TUI** — Show "Context: X% full" or similar in the status area
-3. **Model awareness** — Use model's context limit (e.g., 200K for Claude, 128K for GPT-4)
+1. **`anima tasks` CLI commands** — List/add/complete task management
+2. **Fix: `resume` not forwarding queued messages** — Messages sent while agent paused don't deliver on resume
+3. **BUG: claude_code fails silently if workdir doesn't exist** — Should error gracefully
+4. **Empty tool results UX** — Show "(no output)" or exit code instead of blank
 
-## Implementation Ideas
+## Recently Completed
 
-### Token Counting
-- Simple approximation: ~4 chars per token (good enough for display)
-- Or use tiktoken-rs crate for accurate counts
-
-### Where to Display
-- Chat TUI status bar (bottom area with the duration)
-- Show something like: `[Context: 23% | 2.3s]` after responses
-
-### Model Context Limits
-Could add to config or hardcode sensible defaults:
-- claude-*: 200K
-- gpt-4*: 128K  
-- gemini*: 1M
-- Default: 128K
-
-## Checklist
-
-- [ ] Add token counting utility
-- [ ] Track cumulative tokens in conversation
-- [ ] Get model context limit (config or defaults)
-- [ ] Display percentage in chat TUI
-- [ ] Test with different conversation lengths
+- v3.7: Native `remember` tool with daemon persistence
+- v3.6.5: Per-agent max_iterations config  
+- v3.6.4: restart only affects running agents with glob patterns
+- v3.6.3: Context usage tracking "X% full" display
+- TUI: display assistant narration alongside tool calls
+- Clippy warnings cleanup
+- Stop: prompt before SIGKILL on timeout
 
 ## Notes
 
-Keep it simple — approximate counting is fine for a UX indicator. Users just need a rough sense of "am I running out of context?"
+Pick the highest priority item, or ask Chris which to tackle next.

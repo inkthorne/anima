@@ -212,35 +212,35 @@ fn expand_inject_directives(
     Some(result)
 }
 
-/// Build the effective always prompt by combining tools, memory, base always, and model always.
+/// Build the recall content by combining tools, memory, base recall, and model recall.
 ///
 /// Injection behavior:
-/// - If base_always contains directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
+/// - If base_recall contains directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
 ///   tools and memories are expanded in-place at those positions.
-/// - If base_always exists but has no directives, it's used as-is (user opted out of injection).
-/// - If base_always is None, tools and memories are injected as sensible defaults.
-fn build_effective_always(
+/// - If base_recall exists but has no directives, it's used as-is (user opted out of injection).
+/// - If base_recall is None, tools and memories are injected as sensible defaults.
+fn build_recall_content(
     tools_injection: &str,
     memory_injection: &str,
-    base_always: &Option<String>,
-    model_always: &Option<String>,
+    base_recall: &Option<String>,
+    model_recall: &Option<String>,
 ) -> Option<String> {
     let mut parts = Vec::new();
 
     // Try directive expansion first
-    let expanded_base = base_always
+    let expanded_base = base_recall
         .as_ref()
         .and_then(|base| expand_inject_directives(base, tools_injection, memory_injection));
 
     if let Some(expanded) = expanded_base {
         // Directives were found and expanded — use the expanded content
         parts.push(expanded);
-    } else if let Some(base) = base_always {
-        // always.md exists but has no directives — user opted out of auto-injection
-        // Just use the always.md content as-is
+    } else if let Some(base) = base_recall {
+        // recall.md exists but has no directives — user opted out of auto-injection
+        // Just use the recall.md content as-is
         parts.push(base.clone());
     } else {
-        // No always.md at all — inject tools/memories as sensible defaults
+        // No recall.md at all — inject tools/memories as sensible defaults
         if !tools_injection.is_empty() {
             parts.push(tools_injection.to_string());
         }
@@ -249,8 +249,8 @@ fn build_effective_always(
         }
     }
 
-    // Model-specific always is always appended after agent always
-    if let Some(model) = model_always {
+    // Model-specific recall is always appended after agent recall
+    if let Some(model) = model_recall {
         parts.push(model.clone());
     }
 
@@ -282,7 +282,7 @@ fn build_effective_always(
 ///
 /// Returns `(history: Vec<ChatMessage>, final_user_content: String)` where:
 /// - `history` contains all but the last user turn, properly formatted
-/// - `final_user_content` is the last user turn's content (for always_prompt prepending)
+/// - `final_user_content` is the last user turn's content
 fn format_conversation_history(
     messages: &[ConversationMessage],
     current_agent: &str,
@@ -309,12 +309,14 @@ fn format_conversation_history(
 
     // Process all messages
     for msg in messages {
-        if msg.from_agent == current_agent {
-            // Current agent's message → assistant role, raw text
+        if msg.from_agent == current_agent || msg.from_agent == "recall" {
+            // Current agent's message or recall → assistant role, raw text
+            // Recall messages were stored by the daemon and should become standalone assistant messages
             // First, flush any pending user messages
             flush_user_batch(&mut pending_user_batch, &mut history);
 
             // Deserialize tool_calls if present (for native tool mode persistence)
+            // (recall messages won't have tool_calls, but this is harmless)
             let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg
                 .tool_calls
                 .as_ref()
@@ -351,7 +353,6 @@ fn format_conversation_history(
     }
 
     // After processing all messages, we need to extract the final user content
-    // The final user turn is what gets the always_prompt prepended
     if !pending_user_batch.is_empty() {
         // Last turn is from non-self (user/other agent) - this is the current query
         let final_content = pending_user_batch.join("\n");
@@ -708,10 +709,10 @@ pub struct DaemonConfig {
     pub heartbeat: Option<HeartbeatDaemonConfig>,
     /// System prompt
     pub system_prompt: Option<String>,
-    /// Always content (injected before user messages for recency bias)
-    pub always: Option<String>,
-    /// Model-specific always text (appended to agent always)
-    pub model_always: Option<String>,
+    /// Recall content (injected as assistant message before user messages)
+    pub recall: Option<String>,
+    /// Model-specific recall text (appended to agent recall)
+    pub model_recall: Option<String>,
     /// Semantic memory configuration
     pub semantic_memory: SemanticMemorySection,
     /// Allowlist of tool names. If set, only these tools are available.
@@ -786,12 +787,12 @@ impl DaemonConfig {
         // Load system prompt
         let system_prompt = agent_dir.load_system()?;
 
-        // Load always content
-        let always = agent_dir.load_always()?;
+        // Load recall content
+        let recall = agent_dir.load_recall()?;
 
         // Load model-specific config from resolved LLM config
         let llm_config = agent_dir.resolve_llm_config()?;
-        let model_always = llm_config.always;
+        let model_recall = llm_config.recall;
         let allowed_tools = llm_config.allowed_tools;
 
         // Build runtime context and append to system prompt
@@ -812,8 +813,8 @@ impl DaemonConfig {
             timer,
             heartbeat,
             system_prompt,
-            always,
-            model_always,
+            recall,
+            model_recall,
             semantic_memory: agent_dir.config.semantic_memory.clone(),
             allowed_tools,
             num_ctx: llm_config.num_ctx,
@@ -1118,8 +1119,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &agent,
                             &config.name,
                             &config.system_prompt,
-                            &config.always,
-                            &config.model_always,
+                            &config.recall,
+                            &config.model_recall,
                             &config.allowed_tools,
                             &semantic_memory_store,
                             &embedding_client,
@@ -1199,8 +1200,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_agent = agent.clone();
         let worker_name = config.name.clone();
         let worker_system_prompt = config.system_prompt.clone();
-        let worker_always = config.always.clone();
-        let worker_model_always = config.model_always.clone();
+        let worker_recall = config.recall.clone();
+        let worker_model_recall = config.model_recall.clone();
         let worker_allowed_tools = config.allowed_tools.clone();
         let worker_semantic_memory = semantic_memory_store.clone();
         let worker_embedding_client = embedding_client.clone();
@@ -1218,8 +1219,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_agent,
                 worker_name,
                 worker_system_prompt,
-                worker_always,
-                worker_model_always,
+                worker_recall,
+                worker_model_recall,
                 worker_allowed_tools,
                 worker_semantic_memory,
                 worker_embedding_client,
@@ -1352,8 +1353,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let agent_clone = agent.clone();
                         let agent_name = config.name.clone();
                         let system_prompt = config.system_prompt.clone();
-                        let always = config.always.clone();
-                        let model_always = config.model_always.clone();
+                        let always = config.recall.clone();
+                        let model_always = config.model_recall.clone();
                         let allowed_tools = config.allowed_tools.clone();
                         let shutdown_clone = shutdown.clone();
                         let semantic_memory = semantic_memory_store.clone();
@@ -1540,8 +1541,8 @@ async fn agent_worker(
     agent: Arc<Mutex<Agent>>,
     agent_name: String,
     system_prompt: Option<String>,
-    always: Option<String>,
-    model_always: Option<String>,
+    recall: Option<String>,
+    model_recall: Option<String>,
     allowed_tools: Option<Vec<String>>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: Option<Arc<EmbeddingClient>>,
@@ -1579,8 +1580,8 @@ async fn agent_worker(
                     &agent,
                     &agent_name,
                     &system_prompt,
-                    &always,
-                    &model_always,
+                    &recall,
+                    &model_recall,
                     &allowed_tools,
                     &semantic_memory,
                     &embedding_client,
@@ -1609,8 +1610,8 @@ async fn agent_worker(
                     &agent,
                     &agent_name,
                     &system_prompt,
-                    &always,
-                    &model_always,
+                    &recall,
+                    &model_recall,
                     &allowed_tools,
                     &semantic_memory,
                     &embedding_client,
@@ -1632,8 +1633,8 @@ async fn agent_worker(
                         &agent,
                         &agent_name,
                         &system_prompt,
-                        &always,
-                        &model_always,
+                        &recall,
+                        &model_recall,
                         &allowed_tools,
                         &semantic_memory,
                         &embedding_client,
@@ -1663,8 +1664,8 @@ async fn process_message_work(
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
     system_prompt: &Option<String>,
-    always: &Option<String>,
-    model_always: &Option<String>,
+    recall: &Option<String>,
+    model_recall: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
@@ -1778,15 +1779,39 @@ async fn process_message_work(
         String::new()
     };
 
-    let effective_always =
-        build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    let recall_content =
+        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+
+    // Store recall content in conversation DB before processing
+    // This persists the recall (tools, memories, recall.md) that was injected for this turn
+    if let Some(cname) = conv_name {
+        if let Some(ref recall_text) = recall_content {
+            if !recall_text.is_empty() {
+                match ConversationStore::init() {
+                    Ok(store) => {
+                        if let Err(e) = store.add_message(cname, "recall", recall_text, &[]) {
+                            logger.log(&format!(
+                                "[worker] Failed to store recall in conversation: {}",
+                                e
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        logger.log(&format!(
+                            "[worker] Failed to init conversation store for recall: {}",
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     // Process with or without streaming
     let (final_response, _tool_calls, tool_trace) = if use_native_tools {
         // Native tool mode with optional streaming
         let result = process_native_tool_mode(
             content,
-            &effective_always,
             external_tools,
             token_tx,
             agent,
@@ -1801,7 +1826,6 @@ async fn process_message_work(
         // JSON-block mode with optional streaming (no native tool_calls)
         let response = process_json_block_mode(
             content,
-            &effective_always,
             &relevant_tools,
             token_tx,
             agent,
@@ -1879,7 +1903,6 @@ async fn process_message_work(
 #[allow(clippy::too_many_arguments)]
 async fn process_native_tool_mode(
     content: &str,
-    effective_always: &Option<String>,
     external_tools: Option<Vec<ToolSpec>>,
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
@@ -1888,9 +1911,11 @@ async fn process_native_tool_mode(
     embedding_client: &Option<Arc<EmbeddingClient>>,
     logger: &Arc<AgentLogger>,
 ) -> NativeToolModeResult {
+    // No conversation history injection - recall is already stored in DB and
+    // included when conversation history is fetched
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
-        always_prompt: effective_always.clone(),
+        conversation_history: None,
         external_tools,
         ..Default::default()
     };
@@ -1960,7 +1985,6 @@ async fn process_native_tool_mode(
 #[allow(clippy::too_many_arguments)]
 async fn process_json_block_mode(
     content: &str,
-    effective_always: &Option<String>,
     _relevant_tools: &[&ToolDefinition],
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
@@ -1975,10 +1999,12 @@ async fn process_json_block_mode(
     let max_tool_calls = 10;
     let mut tool_call_count = 0;
 
+    // No conversation history injection - recall is already stored in DB and
+    // included when conversation history is fetched
     loop {
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
-            always_prompt: effective_always.clone(),
+            conversation_history: None,
             external_tools: None,
             ..Default::default()
         };
@@ -2123,8 +2149,8 @@ async fn handle_notify(
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
     system_prompt: &Option<String>,
-    always: &Option<String>,
-    model_always: &Option<String>,
+    recall: &Option<String>,
+    model_recall: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
@@ -2253,11 +2279,21 @@ async fn handle_notify(
         String::new()
     };
 
-    let effective_always =
-        build_effective_always(&tools_injection, &memory_injection, always, model_always);
-    // Version without memories for tool continuation turns - still has tools + always.md
-    let effective_always_no_memory =
-        build_effective_always(&tools_injection, "", always, model_always);
+    let recall_content =
+        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+
+    // Store recall content in conversation DB before processing
+    // This persists the recall (tools, memories, recall.md) that was injected for this turn
+    if let Some(ref recall_text) = recall_content {
+        if !recall_text.is_empty() {
+            if let Err(e) = store.add_message(conv_id, "recall", recall_text, &[]) {
+                logger.log(&format!(
+                    "[notify] Failed to store recall in conversation: {}",
+                    e
+                ));
+            }
+        }
+    }
 
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
@@ -2284,10 +2320,6 @@ async fn handle_notify(
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
 
-    // First iteration gets full always (tools + memories + always.md).
-    // Subsequent iterations get tools + always.md but NO memories (memories are query-specific).
-    let mut is_first_iteration = true;
-
     loop {
         // Clear agent's internal history EACH iteration to avoid duplication.
         // think_with_options adds to self.history, and agent.rs injects self.history
@@ -2295,14 +2327,15 @@ async fn handle_notify(
         // iteration, the growing internal history appears before DB-backed history.
         agent.lock().await.clear_history();
 
+        // No fresh recall injection - recall is already stored in DB and included
+        // in conversation_history when fetched. This enables KV cache reuse.
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
-            always_prompt: if is_first_iteration {
-                effective_always.clone()
+            conversation_history: if conversation_history.is_empty() {
+                None
             } else {
-                effective_always_no_memory.clone()
+                Some(conversation_history.clone())
             },
-            conversation_history: Some(conversation_history.clone()),
             external_tools: external_tools.clone(),
             max_iterations: max_iterations.unwrap_or(10),
             ..Default::default()
@@ -2425,8 +2458,6 @@ async fn handle_notify(
                                 conversation_history = refreshed_history;
                                 current_message = refreshed_final;
                             }
-                            // Subsequent iterations are tool continuations - no need to re-inject always
-                            is_first_iteration = false;
                             // Continue to next iteration
                         }
                         Err(e) => {
@@ -2447,8 +2478,6 @@ async fn handle_notify(
                                 conversation_history = refreshed_history;
                                 current_message = refreshed_final;
                             }
-                            // Subsequent iterations are tool continuations - no need to re-inject always
-                            is_first_iteration = false;
                             // Continue to next iteration to let LLM handle the error
                         }
                     }
@@ -2686,8 +2715,8 @@ async fn run_heartbeat(
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
     system_prompt: &Option<String>,
-    always: &Option<String>,
-    model_always: &Option<String>,
+    recall: &Option<String>,
+    model_recall: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
@@ -2813,18 +2842,35 @@ async fn run_heartbeat(
         String::new()
     };
 
-    let effective_always =
-        build_effective_always(&tools_injection, &memory_injection, always, model_always);
+    let recall_content =
+        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
 
-    // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
+    // Store recall content in conversation DB before processing
+    // This persists the recall (tools, memories, recall.md) that was injected for this turn
+    if let Some(ref recall_text) = recall_content {
+        if !recall_text.is_empty() {
+            if let Err(e) = store.add_message(&conv_name, "recall", recall_text, &[]) {
+                logger.log(&format!(
+                    "[heartbeat] Failed to store recall in conversation: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    // 5. Build conversation history - no fresh recall injection
+    // Recall is already stored in DB above and included in conversation_history when fetched.
+    // This enables KV cache reuse since history doesn't change per-query.
+    let full_history = if conversation_history.is_empty() {
+        None
+    } else {
+        Some(conversation_history)
+    };
+
+    // 6. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
-        always_prompt: effective_always,
-        conversation_history: if conversation_history.is_empty() {
-            None
-        } else {
-            Some(conversation_history)
-        },
+        conversation_history: full_history,
         external_tools,
         ..Default::default()
     };
@@ -3109,8 +3155,8 @@ async fn handle_connection(
     agent: Arc<Mutex<Agent>>,
     agent_name: String,
     system_prompt: Option<String>,
-    always: Option<String>,
-    model_always: Option<String>,
+    recall: Option<String>,
+    model_recall: Option<String>,
     allowed_tools: Option<Vec<String>>,
     semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: Option<Arc<EmbeddingClient>>,
@@ -3309,17 +3355,14 @@ async fn handle_connection(
                     String::new()
                 };
 
-                // Combine tools, memory injection, and always prompt
-                let effective_always = build_effective_always(
-                    &tools_injection,
-                    &memory_injection,
-                    &always,
-                    &model_always,
-                );
+                // No fresh recall injection for streaming - recall should be stored
+                // in DB by the caller and included in conversation history when fetched.
+                // This enables KV cache reuse.
+                let _ = (&tools_injection, &memory_injection, &recall, &model_recall); // suppress unused warnings
 
                 let options = ThinkOptions {
                     system_prompt: system_prompt.clone(),
-                    always_prompt: effective_always,
+                    conversation_history: None,
                     external_tools,
                     ..Default::default()
                 };
@@ -3702,13 +3745,13 @@ interval = "5m"
 
     #[test]
     #[serial]
-    fn test_daemon_config_with_always() {
+    fn test_daemon_config_with_recall() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test-agent"
 system_file = "system.md"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "openai"
@@ -3717,7 +3760,7 @@ api_key = "sk-test"
 "#;
         std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
         std::fs::write(dir.path().join("system.md"), "Test system prompt").unwrap();
-        std::fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
+        std::fs::write(dir.path().join("recall.md"), "Always be concise.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
@@ -3726,13 +3769,13 @@ api_key = "sk-test"
         let system_prompt = daemon_config.system_prompt.unwrap();
         assert!(system_prompt.starts_with("Test system prompt"));
         assert!(system_prompt.contains("You are running inside Anima, a multi-agent runtime."));
-        assert_eq!(daemon_config.always, Some("Always be concise.".to_string()));
+        assert_eq!(daemon_config.recall, Some("Always be concise.".to_string()));
     }
 
     #[test]
     #[serial]
-    fn test_daemon_config_always_file_missing() {
-        // Use a fake HOME so the global ~/.anima/agents/always.md fallback doesn't interfere
+    fn test_daemon_config_recall_file_missing() {
+        // Use a fake HOME so the global ~/.anima/agents/recall.md fallback doesn't interfere
         let fake_home = tempdir().unwrap();
         let original_home = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", fake_home.path()) };
@@ -3741,7 +3784,7 @@ api_key = "sk-test"
         let config_content = r#"
 [agent]
 name = "test-agent"
-always_file = "always.md"
+recall_file = "recall.md"
 
 [llm]
 provider = "openai"
@@ -3749,7 +3792,7 @@ model = "gpt-4"
 api_key = "sk-test"
 "#;
         std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        // Note: always.md file is NOT created
+        // Note: recall.md file is NOT created
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
@@ -3761,7 +3804,7 @@ api_key = "sk-test"
         }
 
         // Should be None when file is missing (backward compatible)
-        assert!(daemon_config.always.is_none());
+        assert!(daemon_config.recall.is_none());
     }
 
     #[test]
@@ -4035,6 +4078,44 @@ api_key = "sk-test"
         assert!(final_content.contains("msg3"));
     }
 
+    #[test]
+    fn test_format_conversation_history_recall_becomes_assistant() {
+        // Recall messages should become standalone assistant messages, NOT JSON-wrapped user content
+        // Pattern: user₁, recall, assistant₁, user₂
+        // Should map: [user₁-JSON], [assistant: recall], [assistant: assistant₁], final = [user₂-JSON]
+        let msgs = vec![
+            make_conv_msg("user", "hello"),
+            make_conv_msg("recall", "[Relevant memories]\n- Memory 1\n- Memory 2"),
+            make_conv_msg("arya", "Hi! How can I help?"),
+            make_conv_msg("user", "what's up?"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // Should have 3 messages in history: user, assistant (recall), assistant (arya)
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "user");
+        assert!(
+            history[0]
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("\"from\": \"user\"")
+        );
+        // Recall should be assistant role with raw content (not JSON-wrapped)
+        assert_eq!(history[1].role, "assistant");
+        assert!(history[1].content.as_ref().unwrap().contains("[Relevant memories]"));
+        assert!(!history[1].content.as_ref().unwrap().contains("\"from\": \"recall\""));
+        // Arya's response should also be assistant role
+        assert_eq!(history[2].role, "assistant");
+        assert_eq!(history[2].content.as_ref().unwrap(), "Hi! How can I help?");
+
+        // Final content should be the last user message
+        assert!(final_content.contains("\"from\": \"user\""));
+        assert!(final_content.contains("what's up?"));
+        // Final content should NOT contain recall (would indicate double injection bug)
+        assert!(!final_content.contains("Relevant memories"));
+    }
+
     // Tests for expand_inject_directives
 
     #[test]
@@ -4126,10 +4207,10 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_effective_always_with_directives() {
+    fn test_build_recall_content_with_directives() {
         let base =
             Some("Header\n<!-- @inject:tools -->\n<!-- @inject:memories -->\nFooter".to_string());
-        let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Tools and memories should be in their directive positions
@@ -4141,10 +4222,10 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_effective_always_without_directives_no_injection() {
+    fn test_build_recall_content_without_directives_no_injection() {
         // If always.md exists but has no directives, user opted out of injection
         let base = Some("Just content, no directives".to_string());
-        let result = build_effective_always("TOOLS", "MEMORIES", &base, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Should NOT contain tools or memories - user opted out
@@ -4154,9 +4235,9 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_effective_always_no_base_injects_defaults() {
+    fn test_build_recall_content_no_base_injects_defaults() {
         // If no always.md at all, inject tools/memories as sensible defaults
-        let result = build_effective_always("TOOLS", "MEMORIES", &None, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", &None, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         assert!(effective.contains("TOOLS"));
@@ -4164,10 +4245,10 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_effective_always_model_always_appended() {
+    fn test_build_recall_content_model_always_appended() {
         let base = Some("Base\n<!-- @inject:tools -->".to_string());
         let model = Some("Model always".to_string());
-        let result = build_effective_always("TOOLS", "", &base, &model);
+        let result = build_recall_content("TOOLS", "", &base, &model);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Model always should be at the end

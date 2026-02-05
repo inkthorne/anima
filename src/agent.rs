@@ -107,9 +107,6 @@ pub struct ThinkOptions {
     pub retry_policy: Option<RetryPolicy>,
     /// Optional conversation history to inject before the user task
     pub conversation_history: Option<Vec<ChatMessage>>,
-    /// Optional "always" prompt injected as system message just before the user message.
-    /// This exploits recency bias to keep critical instructions salient in long conversations.
-    pub always_prompt: Option<String>,
     /// Optional external tools to pass to the LLM. When set, these override the agent's
     /// registered tools for this call. Used for hybrid tool calling where tools are
     /// dynamically selected via keyword recall.
@@ -126,7 +123,6 @@ impl Default for ThinkOptions {
             stream: false,
             retry_policy: Some(RetryPolicy::default()),
             conversation_history: None,
-            always_prompt: None,
             external_tools: None,
         }
     }
@@ -829,41 +825,21 @@ impl Agent {
             messages.extend(extra_history.clone());
         }
 
-        // Build user message content, optionally prepending always_prompt (tools, memories, always.md)
-        //
-        // WHY we prepend to user message instead of using a separate system message:
-        // 1. The always_prompt contains query-specific context (tools, memories, always.md) —
-        //    retrieved based on what the user just typed
-        // 2. Placing it immediately before the user's actual message keeps it 'hot' for
-        //    the model's attention (recency bias)
-        // 3. Mid-conversation system messages are non-standard and can confuse some models
-        // 4. By prepending to user content, we maintain clean message structure:
-        //    system → user/assistant alternation
-        // 5. The always_prompt is NOT stored in history — it's injected fresh each turn,
-        //    so old context doesn't accumulate
-        let user_content = if let Some(always) = &options.always_prompt {
-            format!("{}\n\n{}", always, effective_task)
-        } else {
-            effective_task.clone()
-        };
-
-        // Create user message with always_prompt prepended (if present)
+        // Create and add user message
+        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
+        // message by the daemon BEFORE the user message, not prepended to user content.
+        // This improves KV caching since user messages stay unchanged.
         let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(user_content.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-        };
-
-        // Add user message to internal history (WITHOUT always_prompt — store only user's actual message)
-        self.history.push(ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
-        });
+        };
 
-        // Add user message (with always_prompt prepended) to LLM messages
+        // Add user message to internal history
+        self.history.push(user_message.clone());
+
+        // Add user message to LLM messages
         messages.push(user_message);
 
         // Track tool usage across the agentic loop
@@ -1187,41 +1163,21 @@ impl Agent {
             messages.extend(extra_history.clone());
         }
 
-        // Build user message content, optionally prepending always_prompt (tools, memories, always.md)
-        //
-        // WHY we prepend to user message instead of using a separate system message:
-        // 1. The always_prompt contains query-specific context (tools, memories, always.md) —
-        //    retrieved based on what the user just typed
-        // 2. Placing it immediately before the user's actual message keeps it 'hot' for
-        //    the model's attention (recency bias)
-        // 3. Mid-conversation system messages are non-standard and can confuse some models
-        // 4. By prepending to user content, we maintain clean message structure:
-        //    system → user/assistant alternation
-        // 5. The always_prompt is NOT stored in history — it's injected fresh each turn,
-        //    so old context doesn't accumulate
-        let user_content = if let Some(always) = &options.always_prompt {
-            format!("{}\n\n{}", always, effective_task)
-        } else {
-            effective_task.clone()
-        };
-
-        // Create user message with always_prompt prepended (if present)
+        // Create and add user message
+        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
+        // message by the daemon BEFORE the user message, not prepended to user content.
+        // This improves KV caching since user messages stay unchanged.
         let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(user_content.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-        };
-
-        // Add user message to internal history (WITHOUT always_prompt — store only user's actual message)
-        self.history.push(ChatMessage {
             role: "user".to_string(),
             content: Some(effective_task.clone()),
             tool_call_id: None,
             tool_calls: None,
-        });
+        };
 
-        // Add user message (with always_prompt prepended) to LLM messages
+        // Add user message to internal history
+        self.history.push(user_message.clone());
+
+        // Add user message to LLM messages
         messages.push(user_message);
 
         // Agentic loop with streaming
@@ -1422,7 +1378,6 @@ impl Agent {
             let revision_options = ThinkOptions {
                 max_iterations: options.max_iterations,
                 system_prompt: options.system_prompt.clone(),
-                always_prompt: options.always_prompt.clone(),
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
                 stream: false, // Reflection doesn't use streaming
@@ -1485,14 +1440,11 @@ impl Agent {
             });
         }
 
-        // Inject always prompt as system message just before user message (recency bias)
-        if let Some(always) = &options.always_prompt {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(always.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
+        // message by the daemon BEFORE the user message via conversation_history, not here.
+        // Inject conversation history if present (may include recall as first message)
+        if let Some(history) = &options.conversation_history {
+            messages.extend(history.clone());
         }
 
         messages.push(ChatMessage {
@@ -1890,7 +1842,6 @@ mod tests {
         let opts = ThinkOptions {
             max_iterations: 5,
             system_prompt: Some("Be helpful".to_string()),
-            always_prompt: None,
             reflection: None,
             auto_memory: Some(AutoMemoryConfig::default()),
             stream: false,
@@ -2346,19 +2297,20 @@ mod tests {
     }
 
     // =========================================================================
-    // always_prompt (always.md) tests
+    // recall (recall.md) injection tests
     // =========================================================================
 
     /// Helper function to build initial messages array for testing.
     /// This mirrors the message building logic in think_with_options_inner.
     ///
-    /// The always_prompt (tools, memories, always.md) is prepended to the user message content
-    /// rather than being a separate system message. This keeps query-specific context 'hot'
-    /// for the model's attention and maintains clean system → user/assistant alternation.
+    /// Recall content (tools, memories, recall.md) is now injected as an assistant message
+    /// BEFORE the user message in the conversation history. This improves KV caching because
+    /// user messages remain unchanged across requests.
+    ///
+    /// Pattern: [system] → [assistant: recall] → [user] → [assistant]
     fn build_test_messages(
         system_prompt: Option<&str>,
         conversation_history: Option<Vec<ChatMessage>>,
-        always_prompt: Option<&str>,
         user_task: &str,
     ) -> Vec<ChatMessage> {
         use crate::llm::ChatMessage;
@@ -2376,25 +2328,16 @@ mod tests {
         }
 
         // Inject conversation history if present
+        // Note: Recall content is now injected by the daemon as an assistant message
+        // at the start of conversation_history, not prepended to user message
         if let Some(history) = conversation_history {
             messages.extend(history);
         }
 
-        // Build user message content with always_prompt prepended (if present)
-        // WHY prepend to user message instead of separate system message:
-        // 1. Query-specific context stays 'hot' for model attention (recency bias)
-        // 2. Mid-conversation system messages are non-standard and can confuse models
-        // 3. Maintains clean message structure: system → user/assistant alternation
-        let user_content = if let Some(always) = always_prompt {
-            format!("{}\n\n{}", always, user_task)
-        } else {
-            user_task.to_string()
-        };
-
-        // User message with always_prompt prepended
+        // User message - clean, no prepended content
         messages.push(ChatMessage {
             role: "user".to_string(),
-            content: Some(user_content),
+            content: Some(user_task.to_string()),
             tool_call_id: None,
             tool_calls: None,
         });
@@ -2402,33 +2345,30 @@ mod tests {
         messages
     }
 
-    /// Test 1: Verify always.md content is prepended to the user message content.
-    /// Expected order: [system: system_prompt] ... [user: always.md + task]
-    /// This maintains clean system → user/assistant alternation.
+    /// Test 1: Verify recall content is injected as an assistant message BEFORE the user message.
+    /// Expected order: [system] → [assistant: recall] → [user]
+    /// This improves KV caching since user messages remain unchanged.
     #[test]
-    fn test_always_prompt_injection_position() {
+    fn test_recall_injection_as_assistant_message() {
+        // Simulate recall being injected as assistant message in conversation_history
+        let recall_content = "Always be concise and helpful.";
+        let history_with_recall = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(recall_content.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
         let messages = build_test_messages(
             Some("You are a helpful assistant."),
-            Some(vec![
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: Some("Previous question".to_string()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some("Previous answer".to_string()),
-                    tool_call_id: None,
-                    tool_calls: None,
-                },
-            ]),
-            Some("Always be concise and helpful."),
+            Some(history_with_recall),
             "Current question",
         );
 
-        // Verify message count: system + 2 history + user = 4 (always_prompt is IN user message)
-        assert_eq!(messages.len(), 4);
+        // Verify message count: system + recall (assistant) + user = 3
+        assert_eq!(messages.len(), 3);
 
         // Verify order: system prompt at index 0
         assert_eq!(messages[0].role, "system");
@@ -2437,41 +2377,30 @@ mod tests {
             "You are a helpful assistant."
         );
 
-        // History at indices 1 and 2
-        assert_eq!(messages[1].role, "user");
-        assert_eq!(messages[1].content.as_ref().unwrap(), "Previous question");
-        assert_eq!(messages[2].role, "assistant");
-        assert_eq!(messages[2].content.as_ref().unwrap(), "Previous answer");
-
-        // User message at last position with always.md prepended
-        assert_eq!(messages[3].role, "user");
-        let user_content = messages[3].content.as_ref().unwrap();
-        assert!(user_content.starts_with("Always be concise and helpful."));
-        assert!(user_content.ends_with("Current question"));
-        assert!(user_content.contains("\n\n")); // Separated by double newline
-    }
-
-    /// Test 2: Verify always.md is NOT stored in conversation history.
-    /// It should be dynamically injected (prepended to user message) each time, not repeated.
-    #[test]
-    fn test_always_prompt_not_in_history() {
-        let always_content = "Always be concise.";
-
-        // Simulate building messages for first request
-        let _messages_turn_1 = build_test_messages(
-            Some("System prompt"),
-            None, // No history on first turn
-            Some(always_content),
-            "First question",
+        // Recall as assistant message at index 1
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(
+            messages[1].content.as_ref().unwrap(),
+            recall_content
         );
 
+        // User message at last position - clean, no prepended content
+        assert_eq!(messages[2].role, "user");
+        assert_eq!(messages[2].content.as_ref().unwrap(), "Current question");
+    }
+
+    /// Test 2: Verify recall is NOT stored in persisted conversation history.
+    /// It should be dynamically injected each turn, not repeated from previous turns.
+    #[test]
+    fn test_recall_not_in_persisted_history() {
+        let recall_content = "Always be concise.";
+
         // After the first turn, history would contain user message + assistant response.
-        // Importantly, the always_prompt should NOT be stored in history.
-        // The history should only contain the user/assistant conversation turns (without always_prompt).
-        let simulated_history = vec![
+        // The recall content should NOT be persisted in history.
+        let simulated_persisted_history = vec![
             ChatMessage {
                 role: "user".to_string(),
-                content: Some("First question".to_string()), // Note: NOT prepended with always_content
+                content: Some("First question".to_string()),
                 tool_call_id: None,
                 tool_calls: None,
             },
@@ -2483,62 +2412,68 @@ mod tests {
             },
         ];
 
-        // Verify history does not contain always.md content
-        for msg in &simulated_history {
+        // Verify persisted history does not contain recall content
+        for msg in &simulated_persisted_history {
             assert!(
-                !msg.content.as_ref().unwrap().contains(always_content),
-                "always.md content should not be stored in conversation history"
+                !msg.content.as_ref().unwrap().contains(recall_content),
+                "recall content should not be stored in persisted conversation history"
             );
         }
 
-        // Build messages for second request - always.md should be injected fresh (prepended to user msg)
-        let messages_turn_2 = build_test_messages(
+        // Build messages for second turn - daemon prepends recall as assistant message
+        let mut history_with_recall = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(recall_content.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        history_with_recall.extend(simulated_persisted_history);
+
+        let messages = build_test_messages(
             Some("System prompt"),
-            Some(simulated_history),
-            Some(always_content),
+            Some(history_with_recall),
             "Second question",
         );
 
-        // Count how many messages contain always_content
-        let always_count = messages_turn_2
+        // Count how many messages contain recall_content
+        let recall_count = messages
             .iter()
             .filter(|m| {
                 m.content
                     .as_ref()
-                    .map(|c| c.contains(always_content))
+                    .map(|c| c.contains(recall_content))
                     .unwrap_or(false)
             })
             .count();
 
-        // Should appear exactly once (prepended to the current user message only)
+        // Should appear exactly once (injected by daemon before current turn)
         assert_eq!(
-            always_count, 1,
-            "always.md should appear exactly once per request, not duplicated"
+            recall_count, 1,
+            "recall should appear exactly once per request, not duplicated"
         );
 
-        // Verify the always prompt is prepended to the last user message
-        let last_msg = &messages_turn_2[messages_turn_2.len() - 1];
+        // Verify the recall is in the first assistant message (after system)
+        assert_eq!(messages[1].role, "assistant");
+        assert!(
+            messages[1]
+                .content
+                .as_ref()
+                .unwrap()
+                .contains(recall_content)
+        );
+
+        // Verify user message is clean
+        let last_msg = &messages[messages.len() - 1];
         assert_eq!(last_msg.role, "user");
-        assert!(
-            last_msg
-                .content
-                .as_ref()
-                .unwrap()
-                .starts_with(always_content)
-        );
-        assert!(
-            last_msg
-                .content
-                .as_ref()
-                .unwrap()
-                .ends_with("Second question")
-        );
+        assert_eq!(last_msg.content.as_ref().unwrap(), "Second question");
     }
 
-    /// Test 3: Verify backward compatibility when always.md is not configured or missing.
+    /// Test 3: Verify behavior when recall is not configured or missing.
     #[test]
-    fn test_always_prompt_optional_missing() {
-        // Test with always_prompt = None
+    fn test_no_recall_configured() {
+        // Test with no recall in conversation_history
         let messages = build_test_messages(
             Some("You are a helpful assistant."),
             Some(vec![
@@ -2555,14 +2490,13 @@ mod tests {
                     tool_calls: None,
                 },
             ]),
-            None, // No always.md configured
             "Current question",
         );
 
-        // Should have system + 2 history + user = 4 messages (no always.md to prepend)
+        // Should have system + 2 history + user = 4 messages
         assert_eq!(messages.len(), 4);
 
-        // Verify last message is user with just the task (no prepended always_prompt)
+        // Verify last message is user with just the task
         let last = &messages[messages.len() - 1];
         assert_eq!(last.role, "user");
         assert_eq!(last.content.as_ref().unwrap(), "Current question");
@@ -2573,28 +2507,40 @@ mod tests {
         assert_eq!(second_to_last.content.as_ref().unwrap(), "Previous answer");
     }
 
-    /// Test that ThinkOptions default has always_prompt as None
+    /// Test that ThinkOptions default has conversation_history as None
     #[test]
-    fn test_think_options_default_has_no_always_prompt() {
+    fn test_think_options_default_has_no_conversation_history() {
         let opts = ThinkOptions::default();
-        assert!(opts.always_prompt.is_none());
+        assert!(opts.conversation_history.is_none());
     }
 
-    /// Test ThinkOptions with always_prompt set
+    /// Test ThinkOptions with conversation_history containing recall
     #[test]
-    fn test_think_options_with_always_prompt() {
+    fn test_think_options_with_conversation_history() {
         let opts = ThinkOptions {
             max_iterations: 5,
             system_prompt: Some("Be helpful".to_string()),
-            always_prompt: Some("Always be concise.".to_string()),
             reflection: None,
             auto_memory: None,
             stream: false,
             retry_policy: None,
-            conversation_history: None,
+            conversation_history: Some(vec![
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("Recall content here.".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ]),
             external_tools: None,
         };
-        assert!(opts.always_prompt.is_some());
-        assert_eq!(opts.always_prompt.as_ref().unwrap(), "Always be concise.");
+        assert!(opts.conversation_history.is_some());
+        let history = opts.conversation_history.as_ref().unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(
+            history[0].content.as_ref().unwrap(),
+            "Recall content here."
+        );
     }
 }

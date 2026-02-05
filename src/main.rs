@@ -2588,12 +2588,11 @@ async fn run_agent_task(
     let options = ThinkOptions {
         max_iterations: config.think.max_iterations,
         system_prompt: config.agent.system_prompt,
-        always_prompt: None, // Not supported in task mode yet
         auto_memory,
         reflection,
         stream,
         retry_policy: Some(config.retry.to_policy()),
-        conversation_history: None,
+        conversation_history: None, // Recall content is injected by daemon via conversation_history
         external_tools: None, // One-shot mode uses registered tools
     };
 
@@ -2675,25 +2674,25 @@ mod tests {
         // Check files were created
         assert!(agent_path.join("config.toml").exists());
         assert!(agent_path.join("system.md").exists());
-        assert!(agent_path.join("always.md").exists());
+        assert!(agent_path.join("recall.md").exists());
 
         // Check config.toml content
         let config_content = std::fs::read_to_string(agent_path.join("config.toml")).unwrap();
         assert!(config_content.contains("name = \"test-agent\""));
         assert!(config_content.contains("[llm]"));
         assert!(config_content.contains("[memory]"));
-        assert!(config_content.contains("always_file = \"always.md\""));
+        assert!(config_content.contains("recall_file = \"recall.md\""));
 
         // Check system.md content
         let system_content = std::fs::read_to_string(agent_path.join("system.md")).unwrap();
         assert!(system_content.contains("# test-agent"));
         assert!(system_content.contains("You are test-agent"));
 
-        // Check always.md content
-        let always_content = std::fs::read_to_string(agent_path.join("always.md")).unwrap();
-        assert!(always_content.contains("# Always"));
-        assert!(always_content.contains("How Conversations Work"));
-        assert!(always_content.contains("Never @mention yourself"));
+        // Check recall.md content
+        let recall_content = std::fs::read_to_string(agent_path.join("recall.md")).unwrap();
+        assert!(recall_content.contains("# Recall"));
+        assert!(recall_content.contains("How Conversations Work"));
+        assert!(recall_content.contains("Never @mention yourself"));
     }
 
     #[test]
