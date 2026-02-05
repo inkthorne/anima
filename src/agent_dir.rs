@@ -155,6 +155,12 @@ impl Default for SemanticMemorySection {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct ThinkSection {
+    /// Maximum iterations for tool call loops (default: 10)
+    pub max_iterations: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentSection {
     pub name: String,
@@ -173,6 +179,8 @@ pub struct AgentDirConfig {
     pub semantic_memory: SemanticMemorySection,
     #[serde(default)]
     pub heartbeat: crate::config::HeartbeatConfig,
+    #[serde(default)]
+    pub think: ThinkSection,
 }
 
 #[derive(Debug)]

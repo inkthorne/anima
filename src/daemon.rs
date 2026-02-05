@@ -670,6 +670,8 @@ pub struct DaemonConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// Context window size (num_ctx) for token tracking
     pub num_ctx: Option<u32>,
+    /// Maximum tool call iterations per turn
+    pub max_iterations: Option<usize>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -760,6 +762,7 @@ impl DaemonConfig {
             semantic_memory: agent_dir.config.semantic_memory.clone(),
             allowed_tools,
             num_ctx: llm_config.num_ctx,
+            max_iterations: agent_dir.config.think.max_iterations,
         })
     }
 }
@@ -1041,6 +1044,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.semantic_memory.recall_limit,
                             &task_store,
                             config.num_ctx,
+                            config.max_iterations,
                         ).await;
 
                         match response {
@@ -1118,6 +1122,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_heartbeat_config = config.heartbeat.clone();
 
         let worker_num_ctx = config.num_ctx;
+        let worker_max_iterations = config.max_iterations;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1136,6 +1141,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_task_store,
                 worker_heartbeat_config,
                 worker_num_ctx,
+                worker_max_iterations,
             ).await
         })
     };
@@ -1460,6 +1466,7 @@ async fn agent_worker(
     task_store: Option<Arc<Mutex<TaskStore>>>,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
+    max_iterations: Option<usize>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -1514,6 +1521,7 @@ async fn agent_worker(
                     recall_limit,
                     &task_store,
                     num_ctx,
+                    max_iterations,
                 ).await;
             }
             AgentWork::Heartbeat => {
@@ -1962,6 +1970,7 @@ async fn handle_notify(
     recall_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
+    max_iterations: Option<usize>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2102,6 +2111,7 @@ async fn handle_notify(
             always_prompt: if is_first_iteration { effective_always.clone() } else { effective_always_no_memory.clone() },
             conversation_history: Some(conversation_history.clone()),
             external_tools: external_tools.clone(),
+            max_iterations: max_iterations.unwrap_or(10),
             ..Default::default()
         };
 
