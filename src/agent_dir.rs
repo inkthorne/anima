@@ -159,7 +159,7 @@ impl Default for SemanticMemorySection {
 pub struct AgentSection {
     pub name: String,
     pub description: Option<String>,
-    pub persona_file: Option<PathBuf>,
+    pub system_file: Option<PathBuf>,
     pub always_file: Option<PathBuf>,
 }
 
@@ -212,13 +212,13 @@ impl AgentDir {
         Ok(result)
     }
 
-    /// Load persona content from the configured persona file.
-    /// Returns Ok(None) if no persona file is configured.
+    /// Load system prompt content from the configured system file.
+    /// Returns Ok(None) if no system file is configured.
     /// Expands {{include:filename}} directives recursively.
-    pub fn load_persona(&self) -> Result<Option<String>, AgentDirError> {
-        match &self.config.agent.persona_file {
-            Some(persona_path) => {
-                let full_path = self.path.join(persona_path);
+    pub fn load_system(&self) -> Result<Option<String>, AgentDirError> {
+        match &self.config.agent.system_file {
+            Some(system_path) => {
+                let full_path = self.path.join(system_path);
                 let content = std::fs::read_to_string(&full_path)?;
                 let mut seen = HashSet::new();
                 seen.insert(full_path.canonicalize().unwrap_or(full_path));
@@ -437,7 +437,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
     })
 }
 
-/// Scaffold a new agent directory with config.toml, persona.md, and always.md templates.
+/// Scaffold a new agent directory with config.toml, system.md, and always.md templates.
 ///
 /// Creates the directory at the specified path, or defaults to ~/.anima/agents/<name>/.
 /// Returns an error if the directory already exists.
@@ -458,7 +458,7 @@ pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirErr
     // Write config.toml template
     let config_content = format!(r#"[agent]
 name = "{name}"
-persona_file = "persona.md"
+system_file = "system.md"
 always_file = "always.md"
 
 [llm]
@@ -477,8 +477,8 @@ path = "memory.db"
 "#);
     std::fs::write(agent_path.join("config.toml"), config_content)?;
 
-    // Write persona.md template
-    let persona_content = format!(r#"# {name}
+    // Write system.md template
+    let system_content = format!(r#"# {name}
 
 You are {name}, an AI agent running in the Anima runtime.
 
@@ -500,7 +500,7 @@ You have access to tools for:
 - Use tools when needed to accomplish tasks
 - Be proactive about using your memory to track important information
 "#);
-    std::fs::write(agent_path.join("persona.md"), persona_content)?;
+    std::fs::write(agent_path.join("system.md"), system_content)?;
 
     // Write always.md template
     let always_content = r#"# Always
@@ -537,12 +537,12 @@ Only @mentions actually reach the other agent.
     println!();
     println!("  Files created:");
     println!("    \x1b[36mconfig.toml\x1b[0m  — agent configuration");
-    println!("    \x1b[36mpersona.md\x1b[0m   — system prompt / personality");
+    println!("    \x1b[36msystem.md\x1b[0m    — system prompt / personality");
     println!("    \x1b[36malways.md\x1b[0m    — persistent reminders (recency bias)");
     println!();
     println!("  Next steps:");
     println!("    1. Edit config.toml to configure your LLM");
-    println!("    2. Edit persona.md to define your agent's personality");
+    println!("    2. Edit system.md to define your agent's personality");
     println!("    3. Edit always.md to add persistent reminders");
     println!("    4. Run with: \x1b[36manima run {}\x1b[0m", name);
 
@@ -562,7 +562,7 @@ mod tests {
         let config_content = r#"
 [agent]
 name = "test-agent"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
@@ -583,8 +583,8 @@ message = "heartbeat"
 
         assert_eq!(agent_dir.config.agent.name, "test-agent");
         assert_eq!(
-            agent_dir.config.agent.persona_file,
-            Some(PathBuf::from("persona.md"))
+            agent_dir.config.agent.system_file,
+            Some(PathBuf::from("system.md"))
         );
         assert_eq!(agent_dir.config.llm.provider, Some("openai".to_string()));
         assert_eq!(agent_dir.config.llm.model, Some("gpt-4".to_string()));
@@ -635,27 +635,27 @@ message = "heartbeat"
     }
 
     #[test]
-    fn test_load_persona() {
+    fn test_load_system() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "I am a helpful assistant.").unwrap();
+        fs::write(dir.path().join("system.md"), "I am a helpful assistant.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap();
-        assert_eq!(persona, Some("I am a helpful assistant.".to_string()));
+        let system_prompt = agent_dir.load_system().unwrap();
+        assert_eq!(system_prompt, Some("I am a helpful assistant.".to_string()));
     }
 
     #[test]
-    fn test_load_persona_none() {
+    fn test_load_system_none() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -668,8 +668,8 @@ model = "gpt-4"
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap();
-        assert_eq!(persona, None);
+        let system_prompt = agent_dir.load_system().unwrap();
+        assert_eq!(system_prompt, None);
     }
 
     #[test]
@@ -751,12 +751,12 @@ api_key = "${TEST_API_KEY}"
     }
 
     #[test]
-    fn test_load_persona_with_include() {
+    fn test_load_system_with_include() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
@@ -764,24 +764,24 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(
-            dir.path().join("persona.md"),
+            dir.path().join("system.md"),
             "Header\n{{include:SOUL.md}}\nFooter",
         )
         .unwrap();
         fs::write(dir.path().join("SOUL.md"), "I am the soul.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap().unwrap();
-        assert_eq!(persona, "Header\nI am the soul.\nFooter");
+        let system_prompt = agent_dir.load_system().unwrap().unwrap();
+        assert_eq!(system_prompt, "Header\nI am the soul.\nFooter");
     }
 
     #[test]
-    fn test_load_persona_with_multiple_includes() {
+    fn test_load_system_with_multiple_includes() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
@@ -789,7 +789,7 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(
-            dir.path().join("persona.md"),
+            dir.path().join("system.md"),
             "{{include:IDENTITY.md}}\n---\n{{include:USER.md}}",
         )
         .unwrap();
@@ -797,24 +797,24 @@ model = "gpt-4"
         fs::write(dir.path().join("USER.md"), "My user is Alice.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap().unwrap();
-        assert_eq!(persona, "I am Arya.\n---\nMy user is Alice.");
+        let system_prompt = agent_dir.load_system().unwrap().unwrap();
+        assert_eq!(system_prompt, "I am Arya.\n---\nMy user is Alice.");
     }
 
     #[test]
-    fn test_load_persona_with_nested_includes() {
+    fn test_load_system_with_nested_includes() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "{{include:outer.md}}").unwrap();
+        fs::write(dir.path().join("system.md"), "{{include:outer.md}}").unwrap();
         fs::write(
             dir.path().join("outer.md"),
             "Outer[{{include:inner.md}}]Outer",
@@ -823,17 +823,17 @@ model = "gpt-4"
         fs::write(dir.path().join("inner.md"), "INNER").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap().unwrap();
-        assert_eq!(persona, "Outer[INNER]Outer");
+        let system_prompt = agent_dir.load_system().unwrap().unwrap();
+        assert_eq!(system_prompt, "Outer[INNER]Outer");
     }
 
     #[test]
-    fn test_load_persona_include_not_found() {
+    fn test_load_system_include_not_found() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
@@ -841,97 +841,97 @@ model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
         fs::write(
-            dir.path().join("persona.md"),
+            dir.path().join("system.md"),
             "{{include:nonexistent.md}}",
         )
         .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_persona();
+        let result = agent_dir.load_system();
         assert!(matches!(result, Err(AgentDirError::IncludeNotFound(_))));
     }
 
     #[test]
-    fn test_load_persona_include_cycle_self() {
+    fn test_load_system_include_cycle_self() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "{{include:persona.md}}").unwrap();
+        fs::write(dir.path().join("system.md"), "{{include:system.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_persona();
+        let result = agent_dir.load_system();
         assert!(matches!(result, Err(AgentDirError::IncludeCycle(_))));
     }
 
     #[test]
-    fn test_load_persona_include_cycle_indirect() {
+    fn test_load_system_include_cycle_indirect() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "{{include:a.md}}").unwrap();
+        fs::write(dir.path().join("system.md"), "{{include:a.md}}").unwrap();
         fs::write(dir.path().join("a.md"), "{{include:b.md}}").unwrap();
-        fs::write(dir.path().join("b.md"), "{{include:persona.md}}").unwrap();
+        fs::write(dir.path().join("b.md"), "{{include:system.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_persona();
+        let result = agent_dir.load_system();
         assert!(matches!(result, Err(AgentDirError::IncludeCycle(_))));
     }
 
     #[test]
-    fn test_load_persona_no_includes() {
+    fn test_load_system_no_includes() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "Plain content with no includes.").unwrap();
+        fs::write(dir.path().join("system.md"), "Plain content with no includes.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap().unwrap();
-        assert_eq!(persona, "Plain content with no includes.");
+        let system_prompt = agent_dir.load_system().unwrap().unwrap();
+        assert_eq!(system_prompt, "Plain content with no includes.");
     }
 
     #[test]
-    fn test_load_persona_include_with_whitespace() {
+    fn test_load_system_include_with_whitespace() {
         let dir = tempdir().unwrap();
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "{{include: SOUL.md }}").unwrap();
+        fs::write(dir.path().join("system.md"), "{{include: SOUL.md }}").unwrap();
         fs::write(dir.path().join("SOUL.md"), "Soul content").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let persona = agent_dir.load_persona().unwrap().unwrap();
-        assert_eq!(persona, "Soul content");
+        let system_prompt = agent_dir.load_system().unwrap().unwrap();
+        assert_eq!(system_prompt, "Soul content");
     }
 
     #[test]
@@ -940,7 +940,7 @@ model = "gpt-4"
         let config_content = r#"
 [agent]
 name = "test"
-persona_file = "persona.md"
+system_file = "system.md"
 always_file = "always.md"
 
 [llm]
@@ -948,7 +948,7 @@ provider = "openai"
 model = "gpt-4"
 "#;
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        fs::write(dir.path().join("persona.md"), "I am a helpful assistant.").unwrap();
+        fs::write(dir.path().join("system.md"), "I am a helpful assistant.").unwrap();
         fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
@@ -1622,7 +1622,7 @@ tools = true
 
         // Check files were created
         assert!(agent_path.join("config.toml").exists());
-        assert!(agent_path.join("persona.md").exists());
+        assert!(agent_path.join("system.md").exists());
         assert!(agent_path.join("always.md").exists());
 
         // Check config.toml content
@@ -1632,10 +1632,10 @@ tools = true
         assert!(config_content.contains("[memory]"));
         assert!(config_content.contains("always_file = \"always.md\""));
 
-        // Check persona.md content
-        let persona_content = fs::read_to_string(agent_path.join("persona.md")).unwrap();
-        assert!(persona_content.contains("# test-agent"));
-        assert!(persona_content.contains("You are test-agent"));
+        // Check system.md content
+        let system_content = fs::read_to_string(agent_path.join("system.md")).unwrap();
+        assert!(system_content.contains("# test-agent"));
+        assert!(system_content.contains("You are test-agent"));
 
         // Check always.md content
         let always_content = fs::read_to_string(agent_path.join("always.md")).unwrap();

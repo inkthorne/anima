@@ -46,7 +46,7 @@ pub enum Request {
     Clear,
     /// List all agents visible to this daemon.
     ListAgents,
-    /// Get the system prompt (persona) for this agent.
+    /// Get the system prompt for this agent.
     System,
     /// Manually trigger a heartbeat.
     Heartbeat,
@@ -71,7 +71,7 @@ pub enum Response {
     },
     /// Response to a system prompt request.
     System {
-        persona: String,
+        system_prompt: String,
     },
     /// Generic OK response.
     Ok,
@@ -445,16 +445,16 @@ mod tests {
     #[test]
     fn test_response_system_serialization() {
         let response = Response::System {
-            persona: "You are a helpful assistant.".to_string(),
+            system_prompt: "You are a helpful assistant.".to_string(),
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"type\":\"system\""));
-        assert!(json.contains("\"persona\":\"You are a helpful assistant.\""));
+        assert!(json.contains("\"system_prompt\":\"You are a helpful assistant.\""));
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         match parsed {
-            Response::System { persona } => {
-                assert_eq!(persona, "You are a helpful assistant.");
+            Response::System { system_prompt } => {
+                assert_eq!(system_prompt, "You are a helpful assistant.");
             }
             _ => panic!("Wrong variant"),
         }

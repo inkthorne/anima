@@ -1354,8 +1354,8 @@ async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error
 
     // Read the response
     match api.read_response().await.map_err(|e| format!("Failed to read response: {}", e))? {
-        Some(Response::System { persona }) => {
-            println!("{}", persona);
+        Some(Response::System { system_prompt }) => {
+            println!("{}", system_prompt);
         }
         Some(Response::Error { message }) => {
             return Err(format!("Error from agent: {}", message).into());
@@ -2292,7 +2292,7 @@ mod tests {
 
         // Check files were created
         assert!(agent_path.join("config.toml").exists());
-        assert!(agent_path.join("persona.md").exists());
+        assert!(agent_path.join("system.md").exists());
         assert!(agent_path.join("always.md").exists());
 
         // Check config.toml content
@@ -2302,10 +2302,10 @@ mod tests {
         assert!(config_content.contains("[memory]"));
         assert!(config_content.contains("always_file = \"always.md\""));
 
-        // Check persona.md content
-        let persona_content = std::fs::read_to_string(agent_path.join("persona.md")).unwrap();
-        assert!(persona_content.contains("# test-agent"));
-        assert!(persona_content.contains("You are test-agent"));
+        // Check system.md content
+        let system_content = std::fs::read_to_string(agent_path.join("system.md")).unwrap();
+        assert!(system_content.contains("# test-agent"));
+        assert!(system_content.contains("You are test-agent"));
 
         // Check always.md content
         let always_content = std::fs::read_to_string(agent_path.join("always.md")).unwrap();

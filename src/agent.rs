@@ -2122,7 +2122,7 @@ mod tests {
     }
 
     /// Test 1: Verify always.md content is prepended to the user message content.
-    /// Expected order: [system: persona] ... [user: always.md + task]
+    /// Expected order: [system: system_prompt] ... [user: always.md + task]
     /// This maintains clean system → user/assistant alternation.
     #[test]
     fn test_always_prompt_injection_position() {
@@ -2149,7 +2149,7 @@ mod tests {
         // Verify message count: system + 2 history + user = 4 (always_prompt is IN user message)
         assert_eq!(messages.len(), 4);
 
-        // Verify order: persona at index 0
+        // Verify order: system prompt at index 0
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[0].content.as_ref().unwrap(), "You are a helpful assistant.");
 

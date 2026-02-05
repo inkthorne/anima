@@ -646,8 +646,8 @@ pub struct DaemonConfig {
     pub timer: Option<TimerConfig>,
     /// Heartbeat configuration (if enabled)
     pub heartbeat: Option<HeartbeatDaemonConfig>,
-    /// Persona (system prompt)
-    pub persona: Option<String>,
+    /// System prompt
+    pub system_prompt: Option<String>,
     /// Always content (injected before user messages for recency bias)
     pub always: Option<String>,
     /// Model-specific always text (appended to agent always)
@@ -711,8 +711,8 @@ impl DaemonConfig {
             None
         };
 
-        // Load persona
-        let persona = agent_dir.load_persona()?;
+        // Load system prompt
+        let system_prompt = agent_dir.load_system()?;
 
         // Load always content
         let always = agent_dir.load_always()?;
@@ -722,13 +722,13 @@ impl DaemonConfig {
         let model_always = llm_config.always;
         let allowed_tools = llm_config.allowed_tools;
 
-        // Build runtime context and append to persona
+        // Build runtime context and append to system prompt
         let host = gethostname::gethostname()
             .to_string_lossy()
             .to_string();
         let runtime_context = build_runtime_context(&name, &llm_config.model, &host, llm_config.tools);
 
-        let persona = match persona {
+        let system_prompt = match system_prompt {
             Some(p) => Some(format!("{}\n\n{}", p, runtime_context)),
             None => Some(runtime_context),
         };
@@ -740,7 +740,7 @@ impl DaemonConfig {
             pid_path,
             timer,
             heartbeat,
-            persona,
+            system_prompt,
             always,
             model_always,
             semantic_memory: agent_dir.config.semantic_memory.clone(),
@@ -749,7 +749,7 @@ impl DaemonConfig {
     }
 }
 
-/// Build the runtime context string that is appended to the persona.
+/// Build the runtime context string that is appended to the system prompt.
 /// This gives agents self-awareness about their environment.
 fn build_runtime_context(agent: &str, model: &str, host: &str, tools_native: bool) -> String {
     let tools_mode = if tools_native { "native" } else { "json-block" };
@@ -1000,7 +1000,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             0, // Start at depth 0 for pending notifications
                             &agent,
                             &config.name,
-                            &config.persona,
+                            &config.system_prompt,
                             &config.always,
                             &config.model_always,
                             &config.allowed_tools,
@@ -1075,7 +1075,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     let worker_handle = {
         let worker_agent = agent.clone();
         let worker_name = config.name.clone();
-        let worker_persona = config.persona.clone();
+        let worker_system_prompt = config.system_prompt.clone();
         let worker_always = config.always.clone();
         let worker_model_always = config.model_always.clone();
         let worker_allowed_tools = config.allowed_tools.clone();
@@ -1092,7 +1092,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 work_rx,
                 worker_agent,
                 worker_name,
-                worker_persona,
+                worker_system_prompt,
                 worker_always,
                 worker_model_always,
                 worker_allowed_tools,
@@ -1228,7 +1228,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                     Ok((stream, _)) => {
                         let agent_clone = agent.clone();
                         let agent_name = config.name.clone();
-                        let persona = config.persona.clone();
+                        let system_prompt = config.system_prompt.clone();
                         let always = config.always.clone();
                         let model_always = config.model_always.clone();
                         let allowed_tools = config.allowed_tools.clone();
@@ -1248,7 +1248,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 api,
                                 agent_clone,
                                 agent_name,
-                                persona,
+                                system_prompt,
                                 always,
                                 model_always,
                                 allowed_tools,
@@ -1413,7 +1413,7 @@ async fn agent_worker(
     mut work_rx: mpsc::UnboundedReceiver<AgentWork>,
     agent: Arc<Mutex<Agent>>,
     agent_name: String,
-    persona: Option<String>,
+    system_prompt: Option<String>,
     always: Option<String>,
     model_always: Option<String>,
     allowed_tools: Option<Vec<String>>,
@@ -1445,7 +1445,7 @@ async fn agent_worker(
                     token_tx,
                     &agent,
                     &agent_name,
-                    &persona,
+                    &system_prompt,
                     &always,
                     &model_always,
                     &allowed_tools,
@@ -1467,7 +1467,7 @@ async fn agent_worker(
                     depth,
                     &agent,
                     &agent_name,
-                    &persona,
+                    &system_prompt,
                     &always,
                     &model_always,
                     &allowed_tools,
@@ -1487,7 +1487,7 @@ async fn agent_worker(
                         hb_config,
                         &agent,
                         &agent_name,
-                        &persona,
+                        &system_prompt,
                         &always,
                         &model_always,
                         &allowed_tools,
@@ -1516,7 +1516,7 @@ async fn process_message_work(
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
-    persona: &Option<String>,
+    system_prompt: &Option<String>,
     always: &Option<String>,
     model_always: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
@@ -1631,7 +1631,7 @@ async fn process_message_work(
             external_tools,
             token_tx,
             agent,
-            persona,
+            system_prompt,
             semantic_memory,
             embedding_client,
             logger,
@@ -1644,7 +1644,7 @@ async fn process_message_work(
             &relevant_tools,
             token_tx,
             agent,
-            persona,
+            system_prompt,
             semantic_memory,
             embedding_client,
             tool_registry,
@@ -1681,13 +1681,13 @@ async fn process_native_tool_mode(
     external_tools: Option<Vec<ToolSpec>>,
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
-    persona: &Option<String>,
+    system_prompt: &Option<String>,
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
     logger: &Arc<AgentLogger>,
 ) -> String {
     let options = ThinkOptions {
-        system_prompt: persona.clone(),
+        system_prompt: system_prompt.clone(),
         always_prompt: effective_always.clone(),
         external_tools,
         ..Default::default()
@@ -1750,7 +1750,7 @@ async fn process_json_block_mode(
     _relevant_tools: &[&ToolDefinition],
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
-    persona: &Option<String>,
+    system_prompt: &Option<String>,
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
     tool_registry: &Option<Arc<ToolRegistry>>,
@@ -1763,7 +1763,7 @@ async fn process_json_block_mode(
 
     loop {
         let options = ThinkOptions {
-            system_prompt: persona.clone(),
+            system_prompt: system_prompt.clone(),
             always_prompt: effective_always.clone(),
             external_tools: None,
             ..Default::default()
@@ -1892,7 +1892,7 @@ async fn handle_notify(
     depth: u32,
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
-    persona: &Option<String>,
+    system_prompt: &Option<String>,
     always: &Option<String>,
     model_always: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
@@ -2034,7 +2034,7 @@ async fn handle_notify(
         agent.lock().await.clear_history();
 
         let options = ThinkOptions {
-            system_prompt: persona.clone(),
+            system_prompt: system_prompt.clone(),
             always_prompt: if is_first_iteration { effective_always.clone() } else { effective_always_no_memory.clone() },
             conversation_history: Some(conversation_history.clone()),
             external_tools: external_tools.clone(),
@@ -2308,7 +2308,7 @@ async fn run_heartbeat(
     config: &HeartbeatDaemonConfig,
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
-    persona: &Option<String>,
+    system_prompt: &Option<String>,
     always: &Option<String>,
     model_always: &Option<String>,
     allowed_tools: &Option<Vec<String>>,
@@ -2422,7 +2422,7 @@ async fn run_heartbeat(
 
     // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
     let options = ThinkOptions {
-        system_prompt: persona.clone(),
+        system_prompt: system_prompt.clone(),
         always_prompt: effective_always,
         conversation_history: if conversation_history.is_empty() { None } else { Some(conversation_history) },
         external_tools,
@@ -2676,7 +2676,7 @@ async fn handle_connection(
     mut api: SocketApi,
     agent: Arc<Mutex<Agent>>,
     agent_name: String,
-    persona: Option<String>,
+    system_prompt: Option<String>,
     always: Option<String>,
     model_always: Option<String>,
     allowed_tools: Option<Vec<String>>,
@@ -2850,7 +2850,7 @@ async fn handle_connection(
                 let effective_always = build_effective_always(&tools_injection, &memory_injection, &always, &model_always);
 
                 let options = ThinkOptions {
-                    system_prompt: persona.clone(),
+                    system_prompt: system_prompt.clone(),
                     always_prompt: effective_always,
                     external_tools,
                     ..Default::default()
@@ -2952,8 +2952,8 @@ async fn handle_connection(
 
             Request::System => {
                 logger.log("[socket] System prompt requested");
-                let persona_content = persona.clone().unwrap_or_else(|| "(no persona configured)".to_string());
-                Response::System { persona: persona_content }
+                let system_content = system_prompt.clone().unwrap_or_else(|| "(no system prompt configured)".to_string());
+                Response::System { system_prompt: system_content }
             }
 
             Request::Heartbeat => {
@@ -3094,7 +3094,7 @@ mod tests {
         let config_content = r#"
 [agent]
 name = "test-agent"
-persona_file = "persona.md"
+system_file = "system.md"
 
 [llm]
 provider = "openai"
@@ -3110,7 +3110,7 @@ interval = "5m"
 message = "heartbeat"
 "#;
         std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        std::fs::write(dir.path().join("persona.md"), "Test persona").unwrap();
+        std::fs::write(dir.path().join("system.md"), "Test system prompt").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
@@ -3125,12 +3125,12 @@ message = "heartbeat"
         assert_eq!(timer.message, "heartbeat");
 
         // Persona should start with original content and include runtime context
-        let persona = daemon_config.persona.unwrap();
-        assert!(persona.starts_with("Test persona"));
-        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
-        assert!(persona.contains("agent=test-agent"));
-        assert!(persona.contains("model=gpt-4"));
-        assert!(persona.contains("tools=native"));
+        let system_prompt = daemon_config.system_prompt.unwrap();
+        assert!(system_prompt.starts_with("Test system prompt"));
+        assert!(system_prompt.contains("You are running inside Anima, a multi-agent runtime."));
+        assert!(system_prompt.contains("agent=test-agent"));
+        assert!(system_prompt.contains("model=gpt-4"));
+        assert!(system_prompt.contains("tools=native"));
     }
 
     #[test]
@@ -3152,10 +3152,10 @@ api_key = "sk-test"
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
 
         assert!(daemon_config.timer.is_none());
-        // Even without a persona file, runtime context is injected
-        let persona = daemon_config.persona.unwrap();
-        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
-        assert!(persona.contains("agent=test-agent"));
+        // Even without a system file, runtime context is injected
+        let system_prompt = daemon_config.system_prompt.unwrap();
+        assert!(system_prompt.contains("You are running inside Anima, a multi-agent runtime."));
+        assert!(system_prompt.contains("agent=test-agent"));
     }
 
     #[test]
@@ -3190,7 +3190,7 @@ interval = "5m"
         let config_content = r#"
 [agent]
 name = "test-agent"
-persona_file = "persona.md"
+system_file = "system.md"
 always_file = "always.md"
 
 [llm]
@@ -3199,16 +3199,16 @@ model = "gpt-4"
 api_key = "sk-test"
 "#;
         std::fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        std::fs::write(dir.path().join("persona.md"), "Test persona").unwrap();
+        std::fs::write(dir.path().join("system.md"), "Test system prompt").unwrap();
         std::fs::write(dir.path().join("always.md"), "Always be concise.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         let daemon_config = DaemonConfig::from_agent_dir(&agent_dir).unwrap();
 
         // Persona should start with original content and include runtime context
-        let persona = daemon_config.persona.unwrap();
-        assert!(persona.starts_with("Test persona"));
-        assert!(persona.contains("You are running inside Anima, a multi-agent runtime."));
+        let system_prompt = daemon_config.system_prompt.unwrap();
+        assert!(system_prompt.starts_with("Test system prompt"));
+        assert!(system_prompt.contains("You are running inside Anima, a multi-agent runtime."));
         assert_eq!(daemon_config.always, Some("Always be concise.".to_string()));
     }
 
