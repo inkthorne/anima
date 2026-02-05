@@ -377,6 +377,173 @@ pub struct ToolExecutionContext {
     pub allowed_tools: Option<Vec<String>>,
 }
 
+/// Result of building recall content (tools + memories).
+struct RecallResult {
+    /// Combined recall content (tools injection + memory injection + recall.md + model recall)
+    recall_content: Option<String>,
+    /// Tool specs for native tool mode (None in JSON-block mode)
+    external_tools: Option<Vec<ToolSpec>>,
+    /// Relevant tool definitions for JSON-block mode (empty in native mode)
+    relevant_tools: Vec<ToolDefinition>,
+}
+
+/// Build tools and memory injection for a query.
+///
+/// This shared helper handles:
+/// - Tool recall (native mode: all allowed tools, JSON-block mode: keyword-matched tools)
+/// - Memory recall (semantic search with embeddings)
+/// - Combining with recall.md and model-specific recall
+#[allow(clippy::too_many_arguments)]
+async fn build_recall_for_query(
+    query: &str,
+    allowed_tools: &Option<Vec<String>>,
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    use_native_tools: bool,
+    recall: &Option<String>,
+    model_recall: &Option<String>,
+    recall_limit: usize,
+    logger: &Arc<AgentLogger>,
+) -> RecallResult {
+    // Build tools injection or tool specs
+    let (tools_injection, external_tools, relevant_tools) = if use_native_tools {
+        // Native tool calling: pass ALL allowed tools from registry
+        let all_tools = if let Some(registry) = tool_registry {
+            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+            filter_by_allowlist(all, allowed_tools)
+        } else {
+            Vec::new()
+        };
+        if !all_tools.is_empty() {
+            logger.tool(&format!("Native tools: {} allowed", all_tools.len()));
+        }
+        let specs = if !all_tools.is_empty() {
+            Some(tool_definitions_to_specs(&all_tools))
+        } else {
+            None
+        };
+        (String::new(), specs, Vec::new())
+    } else {
+        // JSON-block mode: keyword-match relevant tools
+        let relevant_tools = if let Some(registry) = tool_registry {
+            let relevant = registry.find_relevant(query, recall_limit);
+            let relevant = filter_by_allowlist(relevant, allowed_tools);
+            if !relevant.is_empty() {
+                logger.tool(&format!("Recall: {} tools for query", relevant.len()));
+                for t in &relevant {
+                    logger.tool(&format!("  - {}", t.name));
+                }
+            }
+            relevant
+        } else {
+            Vec::new()
+        };
+        let injection = ToolRegistry::format_for_prompt(&relevant_tools);
+        // Clone tool definitions since we need to return owned values
+        let owned_tools: Vec<ToolDefinition> = relevant_tools.iter().map(|t| (*t).clone()).collect();
+        (injection, None, owned_tools)
+    };
+
+    // Inject relevant memories
+    let memory_injection = if let Some(mem_store) = semantic_memory {
+        let query_embedding = if let Some(emb_client) = embedding_client {
+            match emb_client.embed(query).await {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    logger.log(&format!("Failed to generate query embedding: {}", e));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let store = mem_store.lock().await;
+        match store.recall_with_embedding(query, recall_limit, query_embedding.as_deref()) {
+            Ok(memories) => {
+                if !memories.is_empty() {
+                    logger.memory(&format!("Recall: {} memories for query", memories.len()));
+                    for (m, score) in &memories {
+                        logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
+                    }
+                }
+                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
+                build_memory_injection(&entries)
+            }
+            Err(e) => {
+                logger.log(&format!("Memory recall error: {}", e));
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let recall_content =
+        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+
+    RecallResult {
+        recall_content,
+        external_tools,
+        relevant_tools,
+    }
+}
+
+/// Store recall content in conversation DB.
+fn store_recall_in_db(
+    conv_name: &str,
+    recall_content: &Option<String>,
+    logger: &Arc<AgentLogger>,
+) {
+    if let Some(recall_text) = recall_content
+        && !recall_text.is_empty()
+    {
+        match ConversationStore::init() {
+            Ok(store) => {
+                if let Err(e) = store.add_message(conv_name, "recall", recall_text, &[]) {
+                    logger.log(&format!("Failed to store recall in conversation: {}", e));
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("Failed to init conversation store for recall: {}", e));
+            }
+        }
+    }
+}
+
+/// Save extracted [REMEMBER: ...] tags to semantic memory.
+async fn save_memories(
+    memories_to_save: &[String],
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    logger: &Arc<AgentLogger>,
+) {
+    if memories_to_save.is_empty() {
+        return;
+    }
+    if let Some(mem_store) = semantic_memory {
+        let store = mem_store.lock().await;
+        for memory in memories_to_save {
+            let embedding = if let Some(emb_client) = embedding_client {
+                emb_client.embed(memory).await.ok()
+            } else {
+                None
+            };
+            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+                Ok(SaveResult::New(id)) => {
+                    logger.memory(&format!("Save #{}: \"{}\"", id, memory))
+                }
+                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
+                    "Reinforce #{}: \"{}\" ({:.2} → {:.2})",
+                    id, memory, old, new
+                )),
+                Err(e) => logger.log(&format!("Failed to save memory: {}", e)),
+            }
+        }
+    }
+}
+
 /// Execute a tool call and return the result as a string.
 /// If a tool_def is provided, command validation is performed for shell tools.
 async fn execute_tool_call(
@@ -1682,7 +1849,7 @@ async fn process_message_work(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
-    _history_limit: usize,
+    history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
 ) -> MessageWorkResult {
     let start_time = std::time::Instant::now();
@@ -1692,6 +1859,37 @@ async fn process_message_work(
         let mut agent_guard = agent.lock().await;
         agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
     }
+
+    // Load conversation history if conv_name is provided
+    let conversation_history: Vec<ChatMessage> = if let Some(cname) = conv_name {
+        match ConversationStore::init() {
+            Ok(store) => match store.get_messages(cname, Some(history_limit)) {
+                Ok(msgs) if !msgs.is_empty() => {
+                    let (history, _) = format_conversation_history(&msgs, agent_name);
+                    logger.log(&format!(
+                        "[worker] Loaded {} history messages for conversation {}",
+                        history.len(),
+                        cname
+                    ));
+                    history
+                }
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    logger.log(&format!("[worker] Failed to load conversation history: {}", e));
+                    Vec::new()
+                }
+            },
+            Err(e) => {
+                logger.log(&format!(
+                    "[worker] Failed to init conversation store for history: {}",
+                    e
+                ));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // Create tool execution context
     let tool_context = ToolExecutionContext {
@@ -1703,118 +1901,24 @@ async fn process_message_work(
         allowed_tools: allowed_tools.clone(),
     };
 
-    // Build tools injection or tool specs
-    // Native mode: pass ALL allowed tools (model can only call tools in the array)
-    // JSON-block mode: keyword-match relevant tools (injected into prompt)
-    let (tools_injection, external_tools, relevant_tools) = if use_native_tools {
-        // Native tool calling: pass ALL allowed tools from registry
-        let all_tools = if let Some(registry) = tool_registry {
-            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
-            filter_by_allowlist(all, allowed_tools)
-        } else {
-            Vec::new()
-        };
-        if !all_tools.is_empty() {
-            logger.tool(&format!(
-                "[worker] Native tools: {} allowed",
-                all_tools.len()
-            ));
-        }
-        let specs = if !all_tools.is_empty() {
-            Some(tool_definitions_to_specs(&all_tools))
-        } else {
-            None
-        };
-        (String::new(), specs, Vec::new())
-    } else {
-        // JSON-block mode: keyword-match relevant tools
-        let relevant_tools = if let Some(registry) = tool_registry {
-            let relevant = registry.find_relevant(content, recall_limit);
-            let relevant = filter_by_allowlist(relevant, allowed_tools);
-            if !relevant.is_empty() {
-                logger.tool(&format!(
-                    "[worker] Recall: {} tools for query",
-                    relevant.len()
-                ));
-                for t in &relevant {
-                    logger.tool(&format!("  - {}", t.name));
-                }
-            }
-            relevant
-        } else {
-            Vec::new()
-        };
-        let injection = ToolRegistry::format_for_prompt(&relevant_tools);
-        (injection, None, relevant_tools)
-    };
-
-    // Inject relevant memories
-    let memory_injection = if let Some(mem_store) = semantic_memory {
-        let query_embedding = if let Some(emb_client) = embedding_client {
-            match emb_client.embed(content).await {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    logger.log(&format!(
-                        "[worker] Failed to generate query embedding: {}",
-                        e
-                    ));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let store = mem_store.lock().await;
-        match store.recall_with_embedding(content, recall_limit, query_embedding.as_deref()) {
-            Ok(memories) => {
-                if !memories.is_empty() {
-                    logger.memory(&format!(
-                        "[worker] Recall: {} memories for query",
-                        memories.len()
-                    ));
-                    for (m, score) in &memories {
-                        logger.memory(&format!("  ({:.3}) \"{}\" [#{}]", score, m.content, m.id));
-                    }
-                }
-                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                build_memory_injection(&entries)
-            }
-            Err(e) => {
-                logger.log(&format!("[worker] Memory recall error: {}", e));
-                String::new()
-            }
-        }
-    } else {
-        String::new()
-    };
-
-    let recall_content =
-        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+    // Build recall (tools + memories)
+    let recall_result = build_recall_for_query(
+        content,
+        allowed_tools,
+        semantic_memory,
+        embedding_client,
+        tool_registry,
+        use_native_tools,
+        recall,
+        model_recall,
+        recall_limit,
+        logger,
+    )
+    .await;
 
     // Store recall content in conversation DB before processing
-    // This persists the recall (tools, memories, recall.md) that was injected for this turn
     if let Some(cname) = conv_name {
-        if let Some(ref recall_text) = recall_content {
-            if !recall_text.is_empty() {
-                match ConversationStore::init() {
-                    Ok(store) => {
-                        if let Err(e) = store.add_message(cname, "recall", recall_text, &[]) {
-                            logger.log(&format!(
-                                "[worker] Failed to store recall in conversation: {}",
-                                e
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        logger.log(&format!(
-                            "[worker] Failed to init conversation store for recall: {}",
-                            e
-                        ));
-                    }
-                }
-            }
-        }
+        store_recall_in_db(cname, &recall_result.recall_content, logger);
     }
 
     // Process with or without streaming
@@ -1822,13 +1926,14 @@ async fn process_message_work(
         // Native tool mode with optional streaming
         let result = process_native_tool_mode(
             content,
-            external_tools,
+            recall_result.external_tools,
             token_tx,
             agent,
             system_prompt,
             semantic_memory,
             embedding_client,
             logger,
+            conversation_history,
         )
         .await;
         (result.response, result.tool_calls, result.tool_trace)
@@ -1836,7 +1941,7 @@ async fn process_message_work(
         // JSON-block mode with optional streaming (no native tool_calls)
         let response = process_json_block_mode(
             content,
-            &relevant_tools,
+            &recall_result.relevant_tools,
             token_tx,
             agent,
             system_prompt,
@@ -1845,6 +1950,7 @@ async fn process_message_work(
             tool_registry,
             logger,
             &tool_context,
+            conversation_history,
         )
         .await;
         (response, None, Vec::new())
@@ -1920,12 +2026,15 @@ async fn process_native_tool_mode(
     semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
     embedding_client: &Option<Arc<EmbeddingClient>>,
     logger: &Arc<AgentLogger>,
+    conversation_history: Vec<ChatMessage>,
 ) -> NativeToolModeResult {
-    // No conversation history injection - recall is already stored in DB and
-    // included when conversation history is fetched
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
-        conversation_history: None,
+        conversation_history: if conversation_history.is_empty() {
+            None
+        } else {
+            Some(conversation_history)
+        },
         external_tools,
         ..Default::default()
     };
@@ -1961,28 +2070,7 @@ async fn process_native_tool_mode(
     let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
     // Save memories
-    if !memories_to_save.is_empty()
-        && let Some(mem_store) = semantic_memory
-    {
-        let store = mem_store.lock().await;
-        for memory in &memories_to_save {
-            let embedding = if let Some(emb_client) = embedding_client {
-                emb_client.embed(memory).await.ok()
-            } else {
-                None
-            };
-            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                Ok(SaveResult::New(id)) => {
-                    logger.memory(&format!("[worker] Save #{}: \"{}\"", id, memory))
-                }
-                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
-                    "[worker] Reinforce #{}: \"{}\" ({:.2} → {:.2})",
-                    id, memory, old, new
-                )),
-                Err(e) => logger.log(&format!("[worker] Failed to save memory: {}", e)),
-            }
-        }
-    }
+    save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
     NativeToolModeResult {
         response: after_remember,
@@ -1995,7 +2083,7 @@ async fn process_native_tool_mode(
 #[allow(clippy::too_many_arguments)]
 async fn process_json_block_mode(
     content: &str,
-    _relevant_tools: &[&ToolDefinition],
+    _relevant_tools: &[ToolDefinition],
     token_tx: Option<mpsc::Sender<String>>,
     agent: &Arc<Mutex<Agent>>,
     system_prompt: &Option<String>,
@@ -2004,17 +2092,20 @@ async fn process_json_block_mode(
     tool_registry: &Option<Arc<ToolRegistry>>,
     logger: &Arc<AgentLogger>,
     tool_context: &ToolExecutionContext,
+    conversation_history: Vec<ChatMessage>,
 ) -> String {
     let mut current_message = content.to_string();
     let max_tool_calls = 10;
     let mut tool_call_count = 0;
 
-    // No conversation history injection - recall is already stored in DB and
-    // included when conversation history is fetched
     loop {
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
-            conversation_history: None,
+            conversation_history: if conversation_history.is_empty() {
+                None
+            } else {
+                Some(conversation_history.clone())
+            },
             external_tools: None,
             ..Default::default()
         };
@@ -2097,19 +2188,7 @@ async fn process_json_block_mode(
         let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
         // Save memories
-        if !memories_to_save.is_empty()
-            && let Some(mem_store) = semantic_memory
-        {
-            let store = mem_store.lock().await;
-            for memory in &memories_to_save {
-                let embedding = if let Some(emb_client) = embedding_client {
-                    emb_client.embed(memory).await.ok()
-                } else {
-                    None
-                };
-                let _ = store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref());
-            }
-        }
+        save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
         // Check for tool calls
         let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
@@ -2225,85 +2304,30 @@ async fn handle_notify(
         conversation_history.len()
     ));
 
-    // Build tools injection or tool specs
-    // Native mode: pass ALL allowed tools (model can only call tools in the array)
-    // JSON-block mode: keyword-match relevant tools (injected into prompt)
-    let (tools_injection, external_tools) = if use_native_tools {
-        // Native tool calling: pass ALL allowed tools from registry
-        let all_tools = if let Some(registry) = tool_registry {
-            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
-            filter_by_allowlist(all, allowed_tools)
-        } else {
-            Vec::new()
-        };
-        if !all_tools.is_empty() {
-            logger.tool(&format!(
-                "[notify] Native tools: {} allowed",
-                all_tools.len()
-            ));
-        }
-        let specs = if !all_tools.is_empty() {
-            Some(tool_definitions_to_specs(&all_tools))
-        } else {
-            None
-        };
-        (String::new(), specs)
-    } else {
-        // JSON-block mode: keyword-match relevant tools
-        let relevant_tools = if let Some(registry) = tool_registry {
-            let relevant = registry.find_relevant(&final_user_content, recall_limit);
-            let relevant = filter_by_allowlist(relevant, allowed_tools);
-            if !relevant.is_empty() {
-                logger.tool(&format!(
-                    "[notify] Recall: {} tools for query",
-                    relevant.len()
-                ));
-            }
-            relevant
-        } else {
-            Vec::new()
-        };
-        (ToolRegistry::format_for_prompt(&relevant_tools), None)
-    };
-
-    // Get memory injection (based on final user content)
-    let memory_injection = if let Some(mem_store) = semantic_memory {
-        let query_embedding = if let Some(emb_client) = embedding_client {
-            emb_client.embed(&final_user_content).await.ok()
-        } else {
-            None
-        };
-
-        let store_guard = mem_store.lock().await;
-        match store_guard.recall_with_embedding(
-            &final_user_content,
-            recall_limit,
-            query_embedding.as_deref(),
-        ) {
-            Ok(memories) => {
-                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                build_memory_injection(&entries)
-            }
-            Err(_) => String::new(),
-        }
-    } else {
-        String::new()
-    };
-
-    let recall_content =
-        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+    // Build recall (tools + memories)
+    let recall_result = build_recall_for_query(
+        &final_user_content,
+        allowed_tools,
+        semantic_memory,
+        embedding_client,
+        tool_registry,
+        use_native_tools,
+        recall,
+        model_recall,
+        recall_limit,
+        logger,
+    )
+    .await;
 
     // Store recall content in conversation DB before processing
-    // This persists the recall (tools, memories, recall.md) that was injected for this turn
-    if let Some(ref recall_text) = recall_content {
-        if !recall_text.is_empty() {
-            if let Err(e) = store.add_message(conv_id, "recall", recall_text, &[]) {
-                logger.log(&format!(
-                    "[notify] Failed to store recall in conversation: {}",
-                    e
-                ));
-            }
-        }
+    if let Some(ref recall_text) = recall_result.recall_content
+        && !recall_text.is_empty()
+        && let Err(e) = store.add_message(conv_id, "recall", recall_text, &[])
+    {
+        logger.log(&format!(
+            "[notify] Failed to store recall in conversation: {}",
+            e
+        ));
     }
 
     // Create tool execution context for tools that need daemon state
@@ -2315,6 +2339,9 @@ async fn handle_notify(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
     };
+
+    // Extract external_tools for use in the loop
+    let external_tools = recall_result.external_tools;
 
     // Tool execution loop - similar to Request::Message handler
     let max_tool_calls = 10;
@@ -2379,24 +2406,7 @@ async fn handle_notify(
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
                 // Save memories
-                if !memories_to_save.is_empty()
-                    && let Some(mem_store) = semantic_memory
-                {
-                    let store_guard = mem_store.lock().await;
-                    for memory in &memories_to_save {
-                        let embedding = if let Some(emb_client) = embedding_client {
-                            emb_client.embed(memory).await.ok()
-                        } else {
-                            None
-                        };
-                        let _ = store_guard.save_with_embedding(
-                            memory,
-                            0.9,
-                            "explicit",
-                            embedding.as_deref(),
-                        );
-                    }
-                }
+                save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
                 // Check for tool calls (JSON-block parsing)
                 let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
@@ -2859,15 +2869,14 @@ async fn run_heartbeat(
 
     // Store recall content in conversation DB before processing
     // This persists the recall (tools, memories, recall.md) that was injected for this turn
-    if let Some(ref recall_text) = recall_content {
-        if !recall_text.is_empty() {
-            if let Err(e) = store.add_message(&conv_name, "recall", recall_text, &[]) {
-                logger.log(&format!(
-                    "[heartbeat] Failed to store recall in conversation: {}",
-                    e
-                ));
-            }
-        }
+    if let Some(ref recall_text) = recall_content
+        && !recall_text.is_empty()
+        && let Err(e) = store.add_message(&conv_name, "recall", recall_text, &[])
+    {
+        logger.log(&format!(
+            "[heartbeat] Failed to store recall in conversation: {}",
+            e
+        ));
     }
 
     // 5. Build conversation history - no fresh recall injection
