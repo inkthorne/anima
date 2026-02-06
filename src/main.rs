@@ -470,7 +470,7 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
     };
 
     format!(
-        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}\n{}\n",
+        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}\n{}\n\n",
         msg.id, datetime, color, msg.from_agent, duration_str, ctx_str, msg.content
     )
 }
@@ -764,7 +764,7 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
             if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id))
             {
                 for msg in msgs {
-                    if msg.from_agent != "user" && msg.from_agent != "tool" {
+                    if msg.from_agent != "user" && msg.from_agent != "tool" && msg.from_agent != "recall" {
                         print!("\r\x1b[K");
                         print!("{}", format_message_display(&msg));
                         print!("\x1b[36m#{}\x1b[90m›\x1b[0m ", poll_conv_name);
