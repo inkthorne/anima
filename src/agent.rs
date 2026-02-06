@@ -111,6 +111,10 @@ pub struct ThinkOptions {
     /// registered tools for this call. Used for hybrid tool calling where tools are
     /// dynamically selected via keyword recall.
     pub external_tools: Option<Vec<ToolSpec>>,
+    /// Optional channel to stream tool executions incrementally as they complete.
+    /// When set, each ToolExecution is sent through the channel immediately after the tool
+    /// finishes, enabling real-time persistence to the conversation DB.
+    pub tool_trace_tx: Option<tokio::sync::mpsc::Sender<ToolExecution>>,
 }
 
 impl Default for ThinkOptions {
@@ -124,6 +128,7 @@ impl Default for ThinkOptions {
             retry_policy: Some(RetryPolicy::default()),
             conversation_history: None,
             external_tools: None,
+            tool_trace_tx: None,
         }
     }
 }
@@ -1020,6 +1025,11 @@ impl Agent {
                     content: if i == 0 { assistant_content.clone() } else { None },
                 });
 
+                // Stream tool execution to caller if channel provided
+                if let Some(ref tx) = options.tool_trace_tx {
+                    let _ = tx.send(tool_trace.last().unwrap().clone()).await;
+                }
+
                 let tool_message = ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
@@ -1334,6 +1344,11 @@ impl Agent {
                     content: if i == 0 { assistant_content.clone() } else { None },
                 });
 
+                // Stream tool execution to caller if channel provided
+                if let Some(ref tx) = options.tool_trace_tx {
+                    let _ = tx.send(tool_trace.last().unwrap().clone()).await;
+                }
+
                 let tool_message = ChatMessage {
                     role: "tool".to_string(),
                     content: Some(result),
@@ -1440,6 +1455,7 @@ impl Agent {
                 retry_policy: options.retry_policy.clone(),
                 conversation_history: options.conversation_history.clone(),
                 external_tools: options.external_tools.clone(),
+                tool_trace_tx: None,
             };
 
             current_response = self
@@ -1904,6 +1920,7 @@ mod tests {
             retry_policy: None,
             conversation_history: None,
             external_tools: None,
+            tool_trace_tx: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2589,6 +2606,7 @@ mod tests {
                 },
             ]),
             external_tools: None,
+            tool_trace_tx: None,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();

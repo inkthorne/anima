@@ -2594,6 +2594,7 @@ async fn run_agent_task(
         retry_policy: Some(config.retry.to_policy()),
         conversation_history: None, // Recall content is injected by daemon via conversation_history
         external_tools: None, // One-shot mode uses registered tools
+        tool_trace_tx: None,
     };
 
     // 6. Run agent with streaming or non-streaming based on flag

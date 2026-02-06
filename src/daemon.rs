@@ -147,11 +147,10 @@ pub struct MessageWorkResult {
     pub error: Option<String>,
 }
 
-/// Result from processing in native tool mode, includes tool_calls and trace for persistence
+/// Result from processing in native tool mode, includes tool_calls for persistence
 struct NativeToolModeResult {
     response: String,
     tool_calls: Option<Vec<crate::llm::ToolCall>>,
-    tool_trace: Vec<crate::agent::ToolExecution>,
 }
 
 /// Expand injection directives in always.md content.
@@ -1918,8 +1917,46 @@ async fn process_message_work(
         allowed_tools: allowed_tools.clone(),
     };
 
+    // Create channel for incremental tool trace persistence
+    let (trace_tx, mut trace_rx) =
+        tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
+    let trace_conv_name = conv_name.map(|s| s.to_string());
+    let trace_agent_name = agent_name.to_string();
+    let trace_logger = logger.clone();
+
+    let trace_handle = tokio::spawn(async move {
+        if trace_conv_name.is_none() {
+            // No conversation to persist to — just drain
+            while trace_rx.recv().await.is_some() {}
+            return;
+        }
+        let cname = trace_conv_name.as_ref().unwrap();
+        let store = match ConversationStore::init() {
+            Ok(s) => s,
+            Err(e) => {
+                trace_logger.log(&format!("[worker] Failed to init trace store: {}", e));
+                while trace_rx.recv().await.is_some() {} // drain
+                return;
+            }
+        };
+        while let Some(exec) = trace_rx.recv().await {
+            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
+            let content = exec.content.as_deref().unwrap_or("");
+            if let Err(e) = store.add_message_with_tool_calls(
+                cname, &trace_agent_name, content, &[], None,
+                tool_calls_json.as_deref(),
+            ) {
+                trace_logger.log(&format!("[worker] Failed to store tool call: {}", e));
+            }
+            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+            if let Err(e) = store.add_message(cname, "tool", &tool_result_msg, &[]) {
+                trace_logger.log(&format!("[worker] Failed to store tool result: {}", e));
+            }
+        }
+    });
+
     // Process with or without streaming
-    let (final_response, _tool_calls, tool_trace) = if use_native_tools {
+    let (final_response, _tool_calls) = if use_native_tools {
         // Native tool mode with optional streaming
         let result = process_native_tool_mode(
             &final_user_content,
@@ -1931,9 +1968,10 @@ async fn process_message_work(
             embedding_client,
             logger,
             conversation_history,
+            Some(trace_tx.clone()),
         )
         .await;
-        (result.response, result.tool_calls, result.tool_trace)
+        (result.response, result.tool_calls)
     } else {
         // JSON-block mode with optional streaming (no native tool_calls)
         let response = process_json_block_mode(
@@ -1950,38 +1988,18 @@ async fn process_message_work(
             conversation_history,
         )
         .await;
-        (response, None, Vec::new())
+        (response, None)
     };
+
+    // Wait for incremental tool trace storage to complete
+    drop(trace_tx);
+    let _ = trace_handle.await;
 
     // Store response in conversation if conv_name was provided
     if let Some(cname) = conv_name {
         let duration_ms = start_time.elapsed().as_millis() as i64;
         match ConversationStore::init() {
             Ok(store) => {
-                // For native tool mode, persist each tool execution before the final response.
-                // This ensures the conversation history includes the full tool call trace.
-                for exec in &tool_trace {
-                    // Store the tool call (as an assistant message with tool_calls)
-                    let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-                    // Use the content that accompanied the tool call (narration/status)
-                    let content = exec.content.as_deref().unwrap_or("");
-                    if let Err(e) = store.add_message_with_tool_calls(
-                        cname,
-                        agent_name,
-                        content,
-                        &[],
-                        None,
-                        tool_calls_json.as_deref(),
-                    ) {
-                        logger.log(&format!("[worker] Failed to store tool call: {}", e));
-                    }
-                    // Store the tool result
-                    let tool_result_msg =
-                        format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-                    if let Err(e) = store.add_message(cname, "tool", &tool_result_msg, &[]) {
-                        logger.log(&format!("[worker] Failed to store tool result: {}", e));
-                    }
-                }
                 // Store recall AFTER response for persistence (but recall was already injected in memory)
                 // This positions recall in DB right before the response, preserving context for future turns
                 if let Some(ref recall_text) = recall_content_for_storage {
@@ -2036,6 +2054,7 @@ async fn process_native_tool_mode(
     embedding_client: &Option<Arc<EmbeddingClient>>,
     logger: &Arc<AgentLogger>,
     conversation_history: Vec<ChatMessage>,
+    tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
 ) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
@@ -2045,11 +2064,12 @@ async fn process_native_tool_mode(
             Some(conversation_history)
         },
         external_tools,
+        tool_trace_tx,
         ..Default::default()
     };
 
-    let (result, tool_calls, tool_trace) = if let Some(tx) = token_tx {
-        // Streaming mode - now returns ThinkResult with tool_calls and trace
+    let (result, tool_calls) = if let Some(tx) = token_tx {
+        // Streaming mode - now returns ThinkResult with tool_calls
         let agent_clone = agent.clone();
         let content_clone = content.to_string();
 
@@ -2061,16 +2081,16 @@ async fn process_native_tool_mode(
         });
 
         match handle.await {
-            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.tool_trace),
-            Ok(Err(e)) => (format!("Error: {}", e), None, Vec::new()),
-            Err(e) => (format!("Error: task panicked: {}", e), None, Vec::new()),
+            Ok(Ok(result)) => (result.response, result.last_tool_calls),
+            Ok(Err(e)) => (format!("Error: {}", e), None),
+            Err(e) => (format!("Error: task panicked: {}", e), None),
         }
     } else {
-        // Non-streaming mode - can capture tool_calls and trace
+        // Non-streaming mode - can capture tool_calls
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.last_tool_calls, result.tool_trace),
-            Err(e) => (format!("Error: {}", e), None, Vec::new()),
+            Ok(result) => (result.response, result.last_tool_calls),
+            Err(e) => (format!("Error: {}", e), None),
         }
     };
 
@@ -2084,7 +2104,6 @@ async fn process_native_tool_mode(
     NativeToolModeResult {
         response: after_remember,
         tool_calls,
-        tool_trace,
     }
 }
 
@@ -2366,8 +2385,37 @@ async fn handle_notify(
     // Track total token usage across all iterations
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
-    // Track tool execution trace for native tool mode persistence
-    let mut tool_trace: Vec<crate::agent::ToolExecution> = Vec::new();
+    // Channel for incremental tool trace persistence (native tool mode)
+    let (tool_trace_tx, mut tool_trace_rx) =
+        tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
+    let trace_store = ConversationStore::init();
+    let trace_conv_id = conv_id.to_string();
+    let trace_agent_name = agent_name.to_string();
+    let trace_logger = logger.clone();
+
+    let trace_handle = tokio::spawn(async move {
+        let store = match trace_store {
+            Ok(s) => s,
+            Err(e) => {
+                trace_logger.log(&format!("[notify] Failed to init trace store: {}", e));
+                return;
+            }
+        };
+        while let Some(exec) = tool_trace_rx.recv().await {
+            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
+            let content = exec.content.as_deref().unwrap_or("");
+            if let Err(e) = store.add_message_with_tool_calls(
+                &trace_conv_id, &trace_agent_name, content, &[], None,
+                tool_calls_json.as_deref(),
+            ) {
+                trace_logger.log(&format!("[notify] Failed to store tool call: {}", e));
+            }
+            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+            if let Err(e) = store.add_message(&trace_conv_id, "tool", &tool_result_msg, &[]) {
+                trace_logger.log(&format!("[notify] Failed to store tool result: {}", e));
+            }
+        }
+    });
 
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
@@ -2391,6 +2439,7 @@ async fn handle_notify(
             },
             external_tools: external_tools.clone(),
             max_iterations: max_iterations.unwrap_or(10),
+            tool_trace_tx: Some(tool_trace_tx.clone()),
             ..Default::default()
         };
 
@@ -2423,9 +2472,6 @@ async fn handle_notify(
                 if let Some(tokens) = think_result.tokens_out {
                     total_tokens_out += tokens;
                 }
-
-                // Accumulate tool trace for native tool mode
-                tool_trace.extend(think_result.tool_trace);
 
                 // Strip thinking tags and extract [REMEMBER: ...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
@@ -2562,29 +2608,10 @@ async fn handle_notify(
         None
     };
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
-    // For native tool mode, persist each tool execution before the final response.
-    // This ensures the conversation history includes the full tool call trace.
-    for exec in &tool_trace {
-        // Store the tool call (as an assistant message with tool_calls)
-        let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-        // Use the content that accompanied the tool call (narration/status)
-        let content = exec.content.as_deref().unwrap_or("");
-        if let Err(e) = store.add_message_with_tool_calls(
-            conv_id,
-            agent_name,
-            content,
-            &[],
-            None,
-            tool_calls_json.as_deref(),
-        ) {
-            logger.log(&format!("[notify] Failed to store tool call: {}", e));
-        }
-        // Store the tool result
-        let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-        if let Err(e) = store.add_message(conv_id, "tool", &tool_result_msg, &[]) {
-            logger.log(&format!("[notify] Failed to store tool result: {}", e));
-        }
-    }
+
+    // Flush tool trace channel — drop sender so consumer finishes
+    drop(tool_trace_tx);
+    let _ = trace_handle.await;
 
     // Store recall AFTER response for persistence (but recall was already injected in memory)
     // This positions recall in DB right before the response, preserving context for future turns
