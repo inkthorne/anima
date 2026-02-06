@@ -586,9 +586,14 @@ impl LLM for OpenAIClient {
 // Anthropic client
 // ---------------------------------------------------------------------------
 
+pub enum AnthropicAuth {
+    ApiKey(String),
+    Bearer(String),
+}
+
 pub struct AnthropicClient {
     client: Client,
-    api_key: String,
+    auth: AnthropicAuth,
     base_url: String,
     model: String,
 }
@@ -597,7 +602,16 @@ impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: Client::new(),
-            api_key: api_key.into(),
+            auth: AnthropicAuth::ApiKey(api_key.into()),
+            base_url: "https://api.anthropic.com".to_string(),
+            model: "claude-sonnet-4-20250514".to_string(),
+        }
+    }
+
+    pub fn with_bearer(token: impl Into<String>) -> Self {
+        Self {
+            client: Client::new(),
+            auth: AnthropicAuth::Bearer(token.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
         }
@@ -611,6 +625,15 @@ impl AnthropicClient {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.auth {
+            AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
+            AnthropicAuth::Bearer(tok) => {
+                req.header("Authorization", format!("Bearer {}", tok))
+            }
+        }
     }
 }
 
@@ -643,13 +666,14 @@ impl LLM for AnthropicClient {
                 serde_json::to_value(format_tools_anthropic(&tool_list)).unwrap();
         }
 
-        let response = self
+        let req = self
             .client
             .post(&url)
-            .header("x-api-key", self.api_key.clone())
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
+            .json(&request_body);
+        let response = self
+            .apply_auth(req)
             .send()
             .await
             .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
@@ -733,13 +757,14 @@ impl LLM for AnthropicClient {
                 serde_json::to_value(format_tools_anthropic(&tool_list)).unwrap();
         }
 
-        let response = self
+        let req = self
             .client
             .post(&url)
-            .header("x-api-key", self.api_key.clone())
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
-            .json(&request_body)
+            .json(&request_body);
+        let response = self
+            .apply_auth(req)
             .send()
             .await
             .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
@@ -1300,7 +1325,16 @@ mod tests {
 
         assert_eq!(client.model, "claude-opus-4-20250514");
         assert_eq!(client.base_url, "https://custom.api.com");
-        assert_eq!(client.api_key, "test-key");
+        assert!(matches!(client.auth, AnthropicAuth::ApiKey(ref k) if k == "test-key"));
+    }
+
+    #[test]
+    fn test_anthropic_client_bearer() {
+        let client = AnthropicClient::with_bearer("my-token")
+            .with_model("claude-sonnet-4-20250514");
+
+        assert_eq!(client.model, "claude-sonnet-4-20250514");
+        assert!(matches!(client.auth, AnthropicAuth::Bearer(ref t) if t == "my-token"));
     }
 
     #[test]

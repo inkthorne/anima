@@ -101,8 +101,10 @@ use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
+use crate::auth;
 use crate::llm::{
-    AnthropicClient, ChatMessage, LLM, OllamaClient, OpenAIClient, ToolSpec, strip_thinking_tags,
+    AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient, OpenAIClient, ToolSpec,
+    strip_thinking_tags,
 };
 use crate::memory::{
     InMemoryStore, Memory, SaveResult, SemanticMemoryStore, SqliteMemory, build_memory_injection,
@@ -1673,7 +1675,7 @@ async fn create_agent_from_dir(
     let api_key = AgentDir::api_key_for_config(&llm_config)?;
 
     // Create LLM from resolved config
-    let llm: Arc<dyn LLM> = create_llm_from_config(&llm_config, api_key)?;
+    let llm: Arc<dyn LLM> = create_llm_from_config(&llm_config, api_key).await?;
 
     // Create memory from config
     let memory: Box<dyn Memory> = if let Some(mem_path) = agent_dir.memory_path() {
@@ -1720,8 +1722,91 @@ async fn create_agent_from_dir(
     Ok((agent, use_native_tools))
 }
 
+// ---------------------------------------------------------------------------
+// Refreshing Anthropic client (auto-refreshes OAuth tokens for daemons)
+// ---------------------------------------------------------------------------
+
+/// An LLM wrapper that auto-refreshes OAuth Bearer tokens before expiry.
+/// For API key auth, this is a transparent passthrough.
+struct RefreshingAnthropicClient {
+    inner: tokio::sync::RwLock<AnthropicClient>,
+    refresh_token: String,
+    expires_at: std::sync::atomic::AtomicI64,
+    model: String,
+    base_url: Option<String>,
+}
+
+impl RefreshingAnthropicClient {
+    fn new(tokens: auth::StoredTokens, model: String, base_url: Option<String>) -> Self {
+        let mut client = AnthropicClient::with_bearer(&tokens.access_token).with_model(&model);
+        if let Some(ref url) = base_url {
+            client = client.with_base_url(url);
+        }
+        Self {
+            inner: tokio::sync::RwLock::new(client),
+            refresh_token: tokens.refresh_token,
+            expires_at: std::sync::atomic::AtomicI64::new(tokens.expires_at),
+            model,
+            base_url,
+        }
+    }
+
+    async fn ensure_fresh(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let exp = self.expires_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now < exp - 300 {
+            return; // still valid
+        }
+
+        // Try to refresh — extract what we need before the write lock
+        let refreshed = auth::refresh_tokens(&self.refresh_token).await;
+        if let Ok(new_tokens) = refreshed {
+            let _ = auth::save_tokens(&new_tokens);
+            self.expires_at
+                .store(new_tokens.expires_at, std::sync::atomic::Ordering::Relaxed);
+
+            let mut client =
+                AnthropicClient::with_bearer(&new_tokens.access_token).with_model(&self.model);
+            if let Some(ref url) = self.base_url {
+                client = client.with_base_url(url);
+            }
+            *self.inner.write().await = client;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LLM for RefreshingAnthropicClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        self.ensure_fresh().await;
+        self.inner.read().await.chat_complete(messages, tools).await
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        self.ensure_fresh().await;
+        self.inner
+            .read()
+            .await
+            .chat_complete_stream(messages, tools, tx)
+            .await
+    }
+}
+
 /// Create an LLM client from resolved configuration.
-fn create_llm_from_config(
+async fn create_llm_from_config(
     config: &ResolvedLlmConfig,
     api_key: Option<String>,
 ) -> Result<Arc<dyn LLM>, Box<dyn std::error::Error>> {
@@ -1735,12 +1820,22 @@ fn create_llm_from_config(
             Arc::new(client)
         }
         "anthropic" => {
-            let key = api_key.ok_or("Anthropic API key not configured")?;
-            let mut client = AnthropicClient::new(key).with_model(&config.model);
-            if let Some(ref base_url) = config.base_url {
-                client = client.with_base_url(base_url);
+            if let Some(key) = api_key {
+                let mut client = AnthropicClient::new(key).with_model(&config.model);
+                if let Some(ref base_url) = config.base_url {
+                    client = client.with_base_url(base_url);
+                }
+                Arc::new(client)
+            } else if let Some(tokens) = auth::load_tokens() {
+                // Use RefreshingAnthropicClient for daemon longevity
+                Arc::new(RefreshingAnthropicClient::new(
+                    tokens,
+                    config.model.clone(),
+                    config.base_url.clone(),
+                ))
+            } else {
+                return Err("No Anthropic API key or subscription login found. Run `anima login` or set ANTHROPIC_API_KEY.".into());
             }
-            Arc::new(client)
         }
         "ollama" => {
             let mut client = OllamaClient::new()

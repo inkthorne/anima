@@ -133,6 +133,12 @@ enum Commands {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
+    /// Log in with your Anthropic subscription (OAuth)
+    Login,
+    /// Log out (remove stored subscription tokens)
+    Logout,
+    /// Show current authentication status
+    Whoami,
     /// Manage agent memories
     Memory {
         #[command(subcommand)]
@@ -385,6 +391,19 @@ async fn main() {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+        }
+        Commands::Login => {
+            if let Err(e) = handle_login().await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Commands::Logout => {
+            anima::auth::clear_tokens();
+            println!("Logged out — stored subscription tokens removed.");
+        }
+        Commands::Whoami => {
+            handle_whoami();
         }
         Commands::Memory { command } => {
             if let Err(e) = handle_memory_command(command).await {
@@ -1623,6 +1642,91 @@ async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>
 }
 
 // ---------------------------------------------------------------------------
+// Auth commands
+// ---------------------------------------------------------------------------
+
+async fn handle_login() -> Result<(), Box<dyn std::error::Error>> {
+    let (url, verifier, expected_state) = anima::auth::build_auth_url();
+
+    println!("Open this URL in your browser to log in:\n");
+    println!("  {}\n", url);
+
+    // Try to open the browser automatically
+    if let Err(_) = Command::new("xdg-open")
+        .arg(&url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        // Also try macOS open
+        let _ = Command::new("open")
+            .arg(&url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+
+    print!("Paste the code from your browser: ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    // The callback returns code#state
+    let (code, state) = if let Some(pos) = input.rfind('#') {
+        (&input[..pos], &input[pos + 1..])
+    } else {
+        (input, expected_state.as_str())
+    };
+
+    let tokens = anima::auth::exchange_code(code, state, &expected_state, &verifier)
+        .await
+        .map_err(|e| e.to_string())?;
+    anima::auth::save_tokens(&tokens).map_err(|e| e.to_string())?;
+
+    let expires = chrono::DateTime::from_timestamp(tokens.expires_at, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    println!("Logged in successfully! Token expires: {}", expires);
+    Ok(())
+}
+
+fn handle_whoami() {
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        let masked = if key.len() > 8 {
+            format!("{}...{}", &key[..4], &key[key.len() - 4..])
+        } else {
+            "****".to_string()
+        };
+        println!("Anthropic API key configured ({})", masked);
+    }
+
+    match anima::auth::load_tokens() {
+        Some(tokens) => {
+            let expires = chrono::DateTime::from_timestamp(tokens.expires_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let now = chrono::Utc::now().timestamp();
+            let status = if now < tokens.expires_at {
+                "active"
+            } else {
+                "expired (will refresh on next use)"
+            };
+            println!(
+                "Anthropic subscription: {} (expires: {})",
+                status, expires
+            );
+        }
+        None => {
+            if std::env::var("ANTHROPIC_API_KEY").is_err() {
+                println!("Not logged in. Run `anima login` or set ANTHROPIC_API_KEY.");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chat subcommands
 // ---------------------------------------------------------------------------
 
@@ -2219,9 +2323,14 @@ async fn run_agent_task(
             Arc::new(client)
         }
         "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| "ANTHROPIC_API_KEY environment variable not set")?;
-            let mut client = AnthropicClient::new(api_key).with_model(&config.llm.model);
+            let mut client = if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+                AnthropicClient::new(api_key)
+            } else if let Some(token) = anima::auth::get_valid_token().await.map_err(|e| e.to_string())? {
+                AnthropicClient::with_bearer(token)
+            } else {
+                return Err("No Anthropic API key or subscription login found. Run `anima login` or set ANTHROPIC_API_KEY.".into());
+            };
+            client = client.with_model(&config.llm.model);
             if let Some(base_url) = &config.llm.base_url {
                 client = client.with_base_url(base_url);
             }

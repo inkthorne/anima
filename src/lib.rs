@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_dir;
+pub mod auth;
 pub mod config;
 pub mod conversation;
 pub mod daemon;
@@ -35,8 +36,8 @@ pub use conversation::{
 pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
 pub use error::{AgentError, ErrorContext, ToolError};
 pub use llm::{
-    AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient, OpenAIClient, ToolCall,
-    ToolSpec, UsageInfo, strip_thinking_tags,
+    AnthropicAuth, AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient,
+    OpenAIClient, ToolCall, ToolSpec, UsageInfo, strip_thinking_tags,
 };
 pub use memory::{
     InMemoryStore, Memory, MemoryEntry, MemoryError, SaveResult, SemanticMemoryEntry,
