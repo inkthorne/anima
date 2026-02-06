@@ -1345,6 +1345,9 @@ impl Agent {
                 self.history.push(tool_message.clone());
                 messages.push(tool_message);
             }
+
+            // Send newline to separate messages in streaming output
+            let _ = token_tx.send("\n".to_string()).await;
         }
 
         // Trim history even on error path
