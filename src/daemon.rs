@@ -7,6 +7,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::Local;
@@ -326,6 +327,12 @@ fn format_conversation_history(
                 tool_calls,
             });
         } else if msg.from_agent == "tool" {
+            // Skip tool results triggered by other agents — they're irrelevant noise.
+            // Unattributed (triggered_by = None) are included for backward compatibility.
+            match &msg.triggered_by {
+                Some(owner) if owner != current_agent => continue,
+                _ => {}
+            }
             // Tool results/errors should NOT be batched with user messages.
             // Flush any pending user messages first, then add tool message as its own user message.
             flush_user_batch(&mut pending_user_batch, &mut history);
@@ -570,7 +577,7 @@ fn spawn_tool_trace_persister(
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
             let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            if let Err(e) = store.add_message(&cname, "tool", &tool_result_msg, &[]) {
+            if let Err(e) = store.add_tool_result(&cname, &tool_result_msg, &agent_name) {
                 logger.log(&format!("[trace] Failed to store tool result: {}", e));
             }
         }
@@ -2392,6 +2399,24 @@ async fn handle_notify(
         trace_rx,
     );
 
+    // Cancellation flag for native tool mode — checked by agent.rs at each iteration boundary
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+
+    // Spawn a watcher that polls is_paused every 500ms and sets the cancel flag
+    let cancel_for_watcher = cancel_flag.clone();
+    let conv_id_for_watcher = conv_id.to_string();
+    let pause_watcher = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Ok(store) = ConversationStore::init() {
+                if store.is_paused(&conv_id_for_watcher).unwrap_or(false) {
+                    cancel_for_watcher.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    });
+
     loop {
         // Clear agent's internal history EACH iteration to avoid duplication.
         // think_with_options adds to self.history, and agent.rs injects self.history
@@ -2412,6 +2437,7 @@ async fn handle_notify(
             external_tools: external_tools.clone(),
             max_iterations: max_iterations.unwrap_or(10),
             tool_trace_tx: Some(tool_trace_tx.clone()),
+            cancel: Some(cancel_flag.clone()),
             ..Default::default()
         };
 
@@ -2513,8 +2539,8 @@ async fn handle_notify(
                         }
                     };
 
-                    // Store tool result/error in conversation
-                    if let Err(e) = store.add_message(conv_id, "tool", &tool_message, &[]) {
+                    // Store tool result/error in conversation (attributed to this agent)
+                    if let Err(e) = store.add_tool_result(conv_id, &tool_message, agent_name) {
                         logger.log(&format!("[notify] Failed to store tool message: {}", e));
                     }
 
@@ -2536,14 +2562,23 @@ async fn handle_notify(
                     break;
                 }
             }
+            Err(crate::error::AgentError::Cancelled) => {
+                logger.log("[notify] Agent cancelled (conversation paused)");
+                final_response = Some("[Paused]".to_string());
+                break;
+            }
             Err(e) => {
                 logger.log(&format!("[notify] Agent error: {}", e));
+                pause_watcher.abort();
                 return Response::Error {
                     message: e.to_string(),
                 };
             }
         }
     }
+
+    // Clean up pause watcher
+    pause_watcher.abort();
 
     // Store final response in conversation with duration, tool_calls, and token usage
     let cleaned_response = final_response.unwrap_or_default();
@@ -3803,6 +3838,25 @@ api_key = "sk-test"
             tokens_in: None,
             tokens_out: None,
             num_ctx: None,
+            triggered_by: None,
+        }
+    }
+
+    fn make_tool_msg(content: &str, triggered_by: Option<&str>) -> ConversationMessage {
+        ConversationMessage {
+            id: 1,
+            conv_name: "test".to_string(),
+            from_agent: "tool".to_string(),
+            content: content.to_string(),
+            mentions: vec![],
+            created_at: 0,
+            expires_at: i64::MAX,
+            duration_ms: None,
+            tool_calls: None,
+            tokens_in: None,
+            tokens_out: None,
+            num_ctx: None,
+            triggered_by: triggered_by.map(|s| s.to_string()),
         }
     }
 
@@ -3985,6 +4039,68 @@ api_key = "sk-test"
         assert!(final_content.contains("what's up?"));
         // Final content should NOT contain recall (would indicate double injection bug)
         assert!(!final_content.contains("Relevant memories"));
+    }
+
+    // =========================================================================
+    // Tool result filtering tests (triggered_by)
+    // =========================================================================
+
+    #[test]
+    fn test_format_conversation_history_own_tool_results_included() {
+        // Tool results triggered by the current agent should be included
+        let msgs = vec![
+            make_conv_msg("user", "read my file"),
+            make_conv_msg("arya", "Sure, let me read it."),
+            make_tool_msg("[Tool Result for read_file]\nfile contents here", Some("arya")),
+            make_conv_msg("user", "thanks"),
+        ];
+        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+
+        // History should include: user, assistant, tool result (3 messages)
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[0].role, "user");
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[2].role, "user"); // tool results become user role
+        assert!(history[2].content.as_ref().unwrap().contains("file contents here"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_other_agent_tool_results_filtered() {
+        // Tool results triggered by a different agent should be filtered out
+        let msgs = vec![
+            make_conv_msg("user", "hello @arya @gendry"),
+            make_conv_msg("gendry", "Let me check something."),
+            make_tool_msg("[Tool Result for shell]\nsome output", Some("gendry")),
+            make_conv_msg("user", "what do you think @arya?"),
+        ];
+        let (history, final_content) = format_conversation_history(&msgs, "arya");
+
+        // Gendry's tool result should be filtered out.
+        // History: user batch (user + gendry), no tool result
+        // Final: user asking arya
+        assert!(history.len() <= 2); // user batch + possibly gendry's message
+        for msg in &history {
+            if let Some(content) = &msg.content {
+                assert!(!content.contains("some output"), "Should not contain gendry's tool result");
+            }
+        }
+        assert!(final_content.contains("what do you think"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_unattributed_tool_results_included() {
+        // Old tool results (triggered_by = None) should be included for all agents
+        let msgs = vec![
+            make_conv_msg("user", "do something"),
+            make_conv_msg("arya", "Ok."),
+            make_tool_msg("[Tool Result for read_file]\nold data", None), // unattributed
+            make_conv_msg("user", "next"),
+        ];
+        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+
+        // Unattributed tool result should be included
+        assert_eq!(history.len(), 3);
+        assert!(history[2].content.as_ref().unwrap().contains("old data"));
     }
 
     // Tests for expand_inject_directives

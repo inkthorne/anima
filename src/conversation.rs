@@ -64,6 +64,8 @@ pub struct ConversationMessage {
     pub tokens_out: Option<i64>,
     /// Context window size at generation time
     pub num_ctx: Option<i64>,
+    /// Which agent triggered this message (for tool results: the agent that invoked the tool)
+    pub triggered_by: Option<String>,
 }
 
 /// A pending notification for an offline agent.
@@ -231,6 +233,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "tokens_in", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tokens_out", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "num_ctx", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "triggered_by", "TEXT DEFAULT NULL")?;
         Ok(())
     }
 
@@ -649,6 +652,41 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
     ) -> Result<i64, ConversationError> {
+        self.add_message_full(
+            conv_name, from_agent, content, mentions,
+            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None,
+        )
+    }
+
+    /// Add a tool result message attributed to the agent that triggered it.
+    /// This allows `format_conversation_history` to filter out other agents' tool results.
+    pub fn add_tool_result(
+        &self,
+        conv_name: &str,
+        content: &str,
+        triggered_by: &str,
+    ) -> Result<i64, ConversationError> {
+        self.add_message_full(
+            conv_name, "tool", content, &[],
+            None, None, None, None, None, Some(triggered_by),
+        )
+    }
+
+    /// Internal: add a message with all fields including triggered_by.
+    #[allow(clippy::too_many_arguments)]
+    fn add_message_full(
+        &self,
+        conv_name: &str,
+        from_agent: &str,
+        content: &str,
+        mentions: &[&str],
+        duration_ms: Option<i64>,
+        tool_calls: Option<&str>,
+        tokens_in: Option<i64>,
+        tokens_out: Option<i64>,
+        num_ctx: Option<i64>,
+        triggered_by: Option<&str>,
+    ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
             return Err(ConversationError::NotFound(conv_name.to_string()));
@@ -659,8 +697,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -1016,7 +1054,7 @@ fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
 
 /// Map a database row to a ConversationMessage struct.
 /// Expects columns: id, conv_name, from_agent, content, mentions, created_at,
-/// expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx.
+/// expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by.
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> {
     let mentions_json: String = row.get(4)?;
     let mentions: Vec<String> = serde_json::from_str(&mentions_json).unwrap_or_default();
@@ -1033,11 +1071,12 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> 
         tokens_in: row.get(9)?,
         tokens_out: row.get(10)?,
         num_ctx: row.get(11)?,
+        triggered_by: row.get(12)?,
     })
 }
 
 /// SQL column list for message queries.
-const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx";
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
@@ -2333,5 +2372,43 @@ mod tests {
             .get_messages_filtered(&conv_name, None, Some(msg2))
             .unwrap();
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn test_add_tool_result() {
+        let store = test_store();
+
+        let conv_name = store
+            .create_conversation(Some("tool-test"), &["arya", "gendry"])
+            .unwrap();
+
+        // Add a tool result attributed to arya
+        let msg_id = store
+            .add_tool_result(&conv_name, "[Tool Result for read_file]\ncontents", "arya")
+            .unwrap();
+        assert!(msg_id > 0);
+
+        // Retrieve and verify
+        let messages = store.get_messages(&conv_name, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].from_agent, "tool");
+        assert_eq!(messages[0].triggered_by.as_deref(), Some("arya"));
+        assert!(messages[0].content.contains("read_file"));
+    }
+
+    #[test]
+    fn test_add_message_has_no_triggered_by() {
+        let store = test_store();
+
+        let conv_name = store
+            .create_conversation(Some("no-trigger-test"), &["arya"])
+            .unwrap();
+
+        // Regular messages should have triggered_by = None
+        store.add_message(&conv_name, "arya", "hello", &[]).unwrap();
+
+        let messages = store.get_messages(&conv_name, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].triggered_by.is_none());
     }
 }

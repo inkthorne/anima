@@ -2284,6 +2284,7 @@ async fn run_agent_task(
         conversation_history: None,
         external_tools: None,
         tool_trace_tx: None,
+        cancel: None,
     };
 
     if stream {

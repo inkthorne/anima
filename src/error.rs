@@ -47,6 +47,7 @@ pub enum AgentError {
     ChannelClosed,
     LlmError(String),
     MaxIterationsExceeded(usize),
+    Cancelled,
 }
 
 impl fmt::Display for AgentError {
@@ -57,6 +58,7 @@ impl fmt::Display for AgentError {
             AgentError::ChannelClosed => write!(f, "Channel closed"),
             AgentError::LlmError(e) => write!(f, "LLM error: {}", e),
             AgentError::MaxIterationsExceeded(n) => write!(f, "Max iterations exceeded: {}", n),
+            AgentError::Cancelled => write!(f, "Agent cancelled"),
         }
     }
 }

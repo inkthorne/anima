@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use regex::Regex;
@@ -115,6 +116,9 @@ pub struct ThinkOptions {
     /// When set, each ToolExecution is sent through the channel immediately after the tool
     /// finishes, enabling real-time persistence to the conversation DB.
     pub tool_trace_tx: Option<tokio::sync::mpsc::Sender<ToolExecution>>,
+    /// Optional cancellation flag. When set to true, the agent stops the tool loop
+    /// at the next iteration boundary and returns a Cancelled error.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Default for ThinkOptions {
@@ -129,6 +133,7 @@ impl Default for ThinkOptions {
             conversation_history: None,
             external_tools: None,
             tool_trace_tx: None,
+            cancel: None,
         }
     }
 }
@@ -1024,6 +1029,14 @@ impl Agent {
         let mut has_token_data = false;
 
         for _iteration in 0..options.max_iterations {
+            // Check cancellation before each LLM call
+            if let Some(ref cancel) = options.cancel {
+                if cancel.load(Ordering::Relaxed) {
+                    self.trim_history();
+                    return Err(crate::error::AgentError::Cancelled);
+                }
+            }
+
             self.dump_context(&tools, &messages);
 
             let llm_start = Instant::now();
@@ -1193,6 +1206,14 @@ impl Agent {
         let mut has_token_data = false;
 
         for _iteration in 0..options.max_iterations {
+            // Check cancellation before each LLM call
+            if let Some(ref cancel) = options.cancel {
+                if cancel.load(Ordering::Relaxed) {
+                    self.trim_history();
+                    return Err(crate::error::AgentError::Cancelled);
+                }
+            }
+
             self.dump_context(&tools, &messages);
 
             let llm_start = Instant::now();
@@ -1332,6 +1353,7 @@ impl Agent {
                 conversation_history: options.conversation_history.clone(),
                 external_tools: options.external_tools.clone(),
                 tool_trace_tx: None,
+                cancel: options.cancel.clone(),
             };
 
             current_response = self
@@ -1735,6 +1757,7 @@ mod tests {
             conversation_history: None,
             external_tools: None,
             tool_trace_tx: None,
+            cancel: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2421,6 +2444,7 @@ mod tests {
             ]),
             external_tools: None,
             tool_trace_tx: None,
+            cancel: None,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();
