@@ -596,6 +596,7 @@ pub struct AnthropicClient {
     auth: AnthropicAuth,
     base_url: String,
     model: String,
+    max_tokens: u32,
 }
 
 impl AnthropicClient {
@@ -605,6 +606,7 @@ impl AnthropicClient {
             auth: AnthropicAuth::ApiKey(api_key.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 16384,
         }
     }
 
@@ -614,6 +616,7 @@ impl AnthropicClient {
             auth: AnthropicAuth::Bearer(token.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
+            max_tokens: 16384,
         }
     }
 
@@ -627,12 +630,17 @@ impl AnthropicClient {
         self
     }
 
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.auth {
             AnthropicAuth::ApiKey(key) => req.header("x-api-key", key),
-            AnthropicAuth::Bearer(tok) => {
-                req.header("Authorization", format!("Bearer {}", tok))
-            }
+            AnthropicAuth::Bearer(tok) => req
+                .header("Authorization", format!("Bearer {}", tok))
+                .header("anthropic-beta", "oauth-2025-04-20"),
         }
     }
 }
@@ -654,6 +662,7 @@ impl LLM for AnthropicClient {
 
         let mut request_body = serde_json::json!({
             "model": self.model,
+            "max_tokens": self.max_tokens,
             "messages": filtered_messages,
         });
 
@@ -744,6 +753,7 @@ impl LLM for AnthropicClient {
 
         let mut request_body = serde_json::json!({
             "model": self.model,
+            "max_tokens": self.max_tokens,
             "messages": filtered_messages,
             "stream": true
         });

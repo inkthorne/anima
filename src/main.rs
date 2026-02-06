@@ -2334,6 +2334,9 @@ async fn run_agent_task(
             if let Some(base_url) = &config.llm.base_url {
                 client = client.with_base_url(base_url);
             }
+            if let Some(mt) = config.llm.max_tokens {
+                client = client.with_max_tokens(mt);
+            }
             Arc::new(client)
         }
         other => return Err(format!("Unknown LLM provider: {}", other).into()),

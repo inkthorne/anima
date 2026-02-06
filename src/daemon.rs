@@ -1734,13 +1734,22 @@ struct RefreshingAnthropicClient {
     expires_at: std::sync::atomic::AtomicI64,
     model: String,
     base_url: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 impl RefreshingAnthropicClient {
-    fn new(tokens: auth::StoredTokens, model: String, base_url: Option<String>) -> Self {
+    fn new(
+        tokens: auth::StoredTokens,
+        model: String,
+        base_url: Option<String>,
+        max_tokens: Option<u32>,
+    ) -> Self {
         let mut client = AnthropicClient::with_bearer(&tokens.access_token).with_model(&model);
         if let Some(ref url) = base_url {
             client = client.with_base_url(url);
+        }
+        if let Some(mt) = max_tokens {
+            client = client.with_max_tokens(mt);
         }
         Self {
             inner: tokio::sync::RwLock::new(client),
@@ -1748,6 +1757,7 @@ impl RefreshingAnthropicClient {
             expires_at: std::sync::atomic::AtomicI64::new(tokens.expires_at),
             model,
             base_url,
+            max_tokens,
         }
     }
 
@@ -1769,6 +1779,9 @@ impl RefreshingAnthropicClient {
                 AnthropicClient::with_bearer(&new_tokens.access_token).with_model(&self.model);
             if let Some(ref url) = self.base_url {
                 client = client.with_base_url(url);
+            }
+            if let Some(mt) = self.max_tokens {
+                client = client.with_max_tokens(mt);
             }
             *self.inner.write().await = client;
         }
@@ -1825,6 +1838,9 @@ async fn create_llm_from_config(
                 if let Some(ref base_url) = config.base_url {
                     client = client.with_base_url(base_url);
                 }
+                if let Some(mt) = config.max_tokens {
+                    client = client.with_max_tokens(mt);
+                }
                 Arc::new(client)
             } else if let Some(tokens) = auth::load_tokens() {
                 // Use RefreshingAnthropicClient for daemon longevity
@@ -1832,6 +1848,7 @@ async fn create_llm_from_config(
                     tokens,
                     config.model.clone(),
                     config.base_url.clone(),
+                    config.max_tokens,
                 ))
             } else {
                 return Err("No Anthropic API key or subscription login found. Run `anima login` or set ANTHROPIC_API_KEY.".into());

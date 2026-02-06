@@ -84,6 +84,9 @@ pub struct LlmSection {
     /// Enable tool support (default: true). Set to false for models that don't support tools.
     #[serde(default = "default_tools_enabled")]
     pub tools: bool,
+    /// Maximum tokens for Anthropic API responses
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     // API key from env: OPENAI_API_KEY or ANTHROPIC_API_KEY
 }
 

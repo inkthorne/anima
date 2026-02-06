@@ -62,6 +62,9 @@ pub struct LlmSection {
     /// If None, all tools are allowed.
     #[serde(default)]
     pub allowed_tools: Option<Vec<String>>,
+    /// Maximum tokens for Anthropic API responses
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -80,6 +83,8 @@ pub struct ResolvedLlmConfig {
     /// Allowlist of tool names. If set, only these tools are available.
     /// If None, all tools are allowed.
     pub allowed_tools: Option<Vec<String>>,
+    /// Maximum tokens for Anthropic API responses
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -430,6 +435,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
             .allowed_tools
             .clone()
             .or(base.allowed_tools.clone()),
+        max_tokens: llm_section.max_tokens.or(base.max_tokens),
     })
 }
 
