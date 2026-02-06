@@ -552,6 +552,247 @@ impl Agent {
             .collect()
     }
 
+    /// Resolve which tools to send to the LLM. Uses external_tools when provided (hybrid mode),
+    /// otherwise falls back to registered tools. Returns None for empty lists since some
+    /// models don't support empty tool arrays.
+    fn resolve_tools(&self, external_tools: &Option<Vec<ToolSpec>>) -> Option<Vec<ToolSpec>> {
+        let tools_list = external_tools
+            .clone()
+            .unwrap_or_else(|| self.list_tools_for_llm());
+        if tools_list.is_empty() {
+            None
+        } else {
+            Some(tools_list)
+        }
+    }
+
+    /// Combine memory context and system prompt into a single effective system prompt.
+    fn combine_prompts(
+        memory_context: &Option<String>,
+        system_prompt: &Option<String>,
+    ) -> Option<String> {
+        match (memory_context, system_prompt) {
+            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
+            (Some(mem), None) => Some(mem.clone()),
+            (None, Some(sys)) => Some(sys.clone()),
+            (None, None) => None,
+        }
+    }
+
+    /// Build the task string, prepending any pending inbox messages.
+    fn build_effective_task(&mut self, task: &str) -> String {
+        let pending_messages = self.drain_inbox();
+        if pending_messages.is_empty() {
+            return task.to_string();
+        }
+        let inbox_text = pending_messages
+            .iter()
+            .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}",
+            inbox_text, task
+        )
+    }
+
+    /// Build the initial message list for an LLM call: system prompt, internal history,
+    /// conversation history from options, and (optionally) the user message.
+    fn build_messages(
+        &self,
+        effective_system_prompt: &Option<String>,
+        conversation_history: &Option<Vec<ChatMessage>>,
+        user_content: Option<&str>,
+    ) -> Vec<ChatMessage> {
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        if let Some(system) = effective_system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        messages.extend(self.history.clone());
+        if let Some(extra_history) = conversation_history {
+            messages.extend(extra_history.clone());
+        }
+        if let Some(content) = user_content {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(content.to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        messages
+    }
+
+    /// Call the LLM with optional retry policy.
+    async fn call_llm(
+        &self,
+        llm: &Arc<dyn LLM>,
+        messages: &[ChatMessage],
+        tools: &Option<Vec<ToolSpec>>,
+        retry_policy: &Option<RetryPolicy>,
+    ) -> Result<crate::llm::LLMResponse, crate::error::AgentError> {
+        if let Some(policy) = retry_policy {
+            let llm_ref = llm.clone();
+            let msgs = messages.to_vec();
+            let tls = tools.clone();
+            let observer = self.observer.clone();
+            let result = with_retry(
+                policy,
+                || {
+                    let llm = llm_ref.clone();
+                    let m = msgs.clone();
+                    let t = tls.clone();
+                    async move { llm.chat_complete(m, t).await }
+                },
+                |e: &LLMError| e.is_retryable,
+            )
+            .await;
+            self.emit_retry_events(&observer, policy, result.attempts)
+                .await;
+            result
+                .result
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+        } else {
+            llm.chat_complete(messages.to_vec(), tools.clone())
+                .await
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+        }
+    }
+
+    /// Call the LLM with streaming and optional retry policy.
+    async fn call_llm_stream(
+        &self,
+        llm: &Arc<dyn LLM>,
+        messages: &[ChatMessage],
+        tools: &Option<Vec<ToolSpec>>,
+        retry_policy: &Option<RetryPolicy>,
+        token_tx: &mpsc::Sender<String>,
+    ) -> Result<crate::llm::LLMResponse, crate::error::AgentError> {
+        if let Some(policy) = retry_policy {
+            let llm_ref = llm.clone();
+            let msgs = messages.to_vec();
+            let tls = tools.clone();
+            let tx = token_tx.clone();
+            let observer = self.observer.clone();
+            let result = with_retry(
+                policy,
+                || {
+                    let llm = llm_ref.clone();
+                    let m = msgs.clone();
+                    let t = tls.clone();
+                    let tx_clone = tx.clone();
+                    async move { llm.chat_complete_stream(m, t, tx_clone).await }
+                },
+                |e: &LLMError| e.is_retryable,
+            )
+            .await;
+            self.emit_retry_events(&observer, policy, result.attempts)
+                .await;
+            result
+                .result
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+        } else {
+            llm.chat_complete_stream(messages.to_vec(), tools.clone(), token_tx.clone())
+                .await
+                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+        }
+    }
+
+    /// Emit retry events when an LLM call required more than one attempt.
+    async fn emit_retry_events(
+        &self,
+        observer: &Option<Arc<dyn Observer>>,
+        policy: &RetryPolicy,
+        attempts: usize,
+    ) {
+        if attempts > 1 {
+            if let Some(obs) = observer {
+                for attempt in 1..attempts {
+                    let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
+                    obs.observe(Event::Retry {
+                        operation: "llm_call".to_string(),
+                        attempt,
+                        delay_ms,
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+
+    /// Execute tool calls from an LLM response, recording results in the tool trace
+    /// and appending messages to both the LLM message list and internal history.
+    async fn execute_tool_calls(
+        &mut self,
+        tool_calls: &[crate::llm::ToolCall],
+        assistant_content: &Option<String>,
+        tool_names_used: &mut Vec<String>,
+        tool_trace: &mut Vec<ToolExecution>,
+        tool_trace_tx: &Option<mpsc::Sender<ToolExecution>>,
+        messages: &mut Vec<ChatMessage>,
+    ) {
+        for (i, tool_call) in tool_calls.iter().enumerate() {
+            tool_names_used.push(tool_call.name.clone());
+
+            let result = self
+                .call_tool(&tool_call.name, &tool_call.arguments.to_string())
+                .await
+                .unwrap_or_else(|e| format!("Error: {}", e));
+
+            // Only attach assistant content to the first tool call to avoid duplication
+            let execution = ToolExecution {
+                call: tool_call.clone(),
+                result: result.clone(),
+                content: if i == 0 {
+                    assistant_content.clone()
+                } else {
+                    None
+                },
+            };
+            tool_trace.push(execution.clone());
+
+            if let Some(tx) = tool_trace_tx {
+                let _ = tx.send(execution).await;
+            }
+
+            let tool_message = ChatMessage {
+                role: "tool".to_string(),
+                content: Some(result),
+                tool_call_id: Some(tool_call.id.clone()),
+                tool_calls: None,
+            };
+            self.history.push(tool_message.clone());
+            messages.push(tool_message);
+        }
+    }
+
+    /// Emit AgentComplete and (on failure) Error events after a think operation.
+    async fn emit_completion(
+        &self,
+        start: Instant,
+        result: &Result<ThinkResult, crate::error::AgentError>,
+    ) {
+        let duration_ms = start.elapsed().as_millis() as u64;
+        self.emit(Event::AgentComplete {
+            agent_id: self.id.clone(),
+            duration_ms,
+            success: result.is_ok(),
+        })
+        .await;
+        if let Err(e) = result {
+            self.emit(Event::Error {
+                context: format!("agent:{}", self.id),
+                message: e.to_string(),
+            })
+            .await;
+        }
+    }
+
     /// Build memory context string for auto-injection into thinking
     async fn build_memory_context(&self, config: &Option<AutoMemoryConfig>) -> Option<String> {
         let config = config.as_ref()?;
@@ -612,8 +853,6 @@ impl Agent {
     /// This is called before each LLM request to provide the exact JSON for debugging/reproduction.
     fn dump_context(
         &self,
-        _system_prompt: &Option<String>,
-        _memory_context: &Option<String>,
         tools: &Option<Vec<ToolSpec>>,
         messages: &[ChatMessage],
     ) {
@@ -728,9 +967,7 @@ impl Agent {
         task: &str,
         options: ThinkOptions,
     ) -> Result<ThinkResult, crate::error::AgentError> {
-        let agent_start = Instant::now();
-
-        // Emit agent start event
+        let start = Instant::now();
         self.emit(Event::AgentStart {
             agent_id: self.id.clone(),
             task: task.to_string(),
@@ -739,23 +976,7 @@ impl Agent {
 
         let result = self.think_with_options_inner(task, options).await;
 
-        // Emit agent complete event
-        let duration_ms = agent_start.elapsed().as_millis() as u64;
-        self.emit(Event::AgentComplete {
-            agent_id: self.id.clone(),
-            duration_ms,
-            success: result.is_ok(),
-        })
-        .await;
-
-        if let Err(ref e) = result {
-            self.emit(Event::Error {
-                context: format!("agent:{}", self.id),
-                message: e.to_string(),
-            })
-            .await;
-        }
-
+        self.emit_completion(start, &result).await;
         result
     }
 
@@ -765,153 +986,51 @@ impl Agent {
         task: &str,
         options: ThinkOptions,
     ) -> Result<ThinkResult, crate::error::AgentError> {
-        // Drain any pending messages from inbox (must happen before borrowing llm)
-        let pending_messages = self.drain_inbox();
-        let effective_task = if pending_messages.is_empty() {
-            task.to_string()
-        } else {
-            let inbox_text = pending_messages
-                .iter()
-                .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}",
-                inbox_text, task
-            )
-        };
-
+        let effective_task = self.build_effective_task(task);
         let llm = self
             .llm
-            .as_ref()
-            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-
-        // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options
-            .external_tools
             .clone()
-            .unwrap_or_else(|| self.list_tools_for_llm());
-        // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let tools = self.resolve_tools(&options.external_tools);
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+        let effective_system_prompt = Self::combine_prompts(&memory_context, &options.system_prompt);
+
+        // Build initial messages: system prompt, internal history, conversation history,
+        // and the user message (skipped when empty -- already in conversation_history).
+        let user_content = if effective_task.is_empty() {
             None
         } else {
-            Some(tools_list)
+            Some(effective_task.as_str())
         };
-
-        // Build auto-memory context if configured
-        let memory_context = self.build_memory_context(&options.auto_memory).await;
-
-        // Combine memory context with system prompt
-        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
-            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
-            (Some(mem), None) => Some(mem.clone()),
-            (None, Some(sys)) => Some(sys.clone()),
-            (None, None) => None,
-        };
-
-        // Build initial messages for LLM call
-        let mut messages: Vec<ChatMessage> = Vec::new();
-
-        // Optional system prompt (with memory context prepended)
-        if let Some(system) = &effective_system_prompt {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(system.clone()),
+        let mut messages = self.build_messages(
+            &effective_system_prompt,
+            &options.conversation_history,
+            user_content,
+        );
+        if let Some(content) = user_content {
+            self.history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(content.to_string()),
                 tool_call_id: None,
                 tool_calls: None,
             });
         }
 
-        // Inject internal conversation history
-        messages.extend(self.history.clone());
-
-        // Also inject any additional context from options (additive, not replacement)
-        if let Some(extra_history) = &options.conversation_history {
-            messages.extend(extra_history.clone());
-        }
-
-        // Create and add user message (unless empty with existing history)
-        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
-        // message by the daemon BEFORE the user message, not prepended to user content.
-        // This improves KV caching since user messages stay unchanged.
-        //
-        // When final_user_content is empty (after storing recall and re-fetching history),
-        // the user message is already in conversation_history. Skip adding an empty user message.
-        if !effective_task.is_empty() {
-            let user_message = ChatMessage {
-                role: "user".to_string(),
-                content: Some(effective_task.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            };
-
-            // Add user message to internal history
-            self.history.push(user_message.clone());
-
-            // Add user message to LLM messages
-            messages.push(user_message);
-        }
-
-        // Track tool usage across the agentic loop
         let mut tool_names_used: Vec<String> = Vec::new();
-        // Track the last tool_calls made before final response (for conversation persistence)
         let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
-        // Track all tool executions for conversation persistence
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
-        // Track total token usage across all LLM calls in this think operation
         let mut total_tokens_in: u32 = 0;
         let mut total_tokens_out: u32 = 0;
         let mut has_token_data = false;
 
-        // Agentic loop
         for _iteration in 0..options.max_iterations {
-            // Dump context before each LLM call
-            self.dump_context(&effective_system_prompt, &memory_context, &tools, &messages);
+            self.dump_context(&tools, &messages);
 
-            // Call LLM with retry if policy is configured
             let llm_start = Instant::now();
-            let response = if let Some(ref policy) = options.retry_policy {
-                let llm_ref = llm.clone();
-                let msgs = messages.clone();
-                let tls = tools.clone();
-                let observer = self.observer.clone();
-                let result = with_retry(
-                    policy,
-                    || {
-                        let llm = llm_ref.clone();
-                        let m = msgs.clone();
-                        let t = tls.clone();
-                        async move { llm.chat_complete(m, t).await }
-                    },
-                    |e: &LLMError| e.is_retryable,
-                )
-                .await;
+            let response = self
+                .call_llm(&llm, &messages, &tools, &options.retry_policy)
+                .await?;
 
-                // Emit retry events if attempts > 1
-                if result.attempts > 1
-                    && let Some(obs) = &observer
-                {
-                    for attempt in 1..result.attempts {
-                        let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
-                        obs.observe(Event::Retry {
-                            operation: "llm_call".to_string(),
-                            attempt,
-                            delay_ms,
-                        })
-                        .await;
-                    }
-                }
-
-                result
-                    .result
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            } else {
-                llm.chat_complete(messages.clone(), tools.clone())
-                    .await
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            };
-
-            // Emit LLM call event
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.emit(Event::LlmCall {
                 model: llm.model_name().to_string(),
@@ -921,20 +1040,18 @@ impl Agent {
             })
             .await;
 
-            // Accumulate token usage
             if let Some(ref usage) = response.usage {
                 total_tokens_in += usage.prompt_tokens;
                 total_tokens_out += usage.completion_tokens;
                 has_token_data = true;
             }
 
-            // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
                 let final_response = response
                     .content
                     .unwrap_or_else(|| "No response".to_string());
 
-                // Add final assistant response to internal history (strip thinking tags)
+                // Store stripped version in history (thinking tags removed)
                 let stripped_response = strip_thinking(&final_response);
                 self.history.push(ChatMessage {
                     role: "assistant".to_string(),
@@ -943,109 +1060,52 @@ impl Agent {
                     tool_calls: None,
                 });
 
-                // Trim history to stay within limit
                 self.trim_history();
 
-                // Apply reflection if configured
-                if let Some(ref config) = options.reflection {
-                    let reflected_response = self
-                        .reflect_and_revise(task, &final_response, config, &options)
-                        .await?;
-                    return Ok(ThinkResult {
-                        response: reflected_response,
-                        tools_used: !tool_names_used.is_empty(),
-                        tool_names: tool_names_used,
-                        last_tool_calls,
-                        tool_trace,
-                        tokens_in: if has_token_data {
-                            Some(total_tokens_in)
-                        } else {
-                            None
-                        },
-                        tokens_out: if has_token_data {
-                            Some(total_tokens_out)
-                        } else {
-                            None
-                        },
-                    });
-                }
+                let response_text = if let Some(ref config) = options.reflection {
+                    self.reflect_and_revise(task, &final_response, config, &options)
+                        .await?
+                } else {
+                    final_response
+                };
 
+                let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
+                let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
                 return Ok(ThinkResult {
-                    response: final_response,
+                    response: response_text,
                     tools_used: !tool_names_used.is_empty(),
                     tool_names: tool_names_used,
                     last_tool_calls,
                     tool_trace,
-                    tokens_in: if has_token_data {
-                        Some(total_tokens_in)
-                    } else {
-                        None
-                    },
-                    tokens_out: if has_token_data {
-                        Some(total_tokens_out)
-                    } else {
-                        None
-                    },
+                    tokens_in,
+                    tokens_out,
                 });
             }
 
-            // Track the tool_calls for conversation persistence
             last_tool_calls = Some(response.tool_calls.clone());
 
-            // Create assistant message with tool calls (strip thinking tags for storage)
+            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
             let assistant_message = ChatMessage {
                 role: "assistant".to_string(),
-                content: response.content.as_ref().map(|c| strip_thinking(c)),
+                content: assistant_content.clone(),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             };
-
-            // Add to both internal history and LLM messages
             self.history.push(assistant_message.clone());
             messages.push(assistant_message);
 
-            // Capture content that accompanied the tool calls (for display alongside tool execution)
-            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
-
-            // Execute each tool and add results
-            for (i, tool_call) in response.tool_calls.iter().enumerate() {
-                // Track tool name
-                tool_names_used.push(tool_call.name.clone());
-
-                let result = self
-                    .call_tool(&tool_call.name, &tool_call.arguments.to_string())
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {}", e));
-
-                // Record tool execution for persistence.
-                // Only attach content to the first tool call to avoid duplication.
-                tool_trace.push(ToolExecution {
-                    call: tool_call.clone(),
-                    result: result.clone(),
-                    content: if i == 0 { assistant_content.clone() } else { None },
-                });
-
-                // Stream tool execution to caller if channel provided
-                if let Some(ref tx) = options.tool_trace_tx {
-                    let _ = tx.send(tool_trace.last().unwrap().clone()).await;
-                }
-
-                let tool_message = ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(result),
-                    tool_call_id: Some(tool_call.id.clone()),
-                    tool_calls: None,
-                };
-
-                // Add to both internal history and LLM messages
-                self.history.push(tool_message.clone());
-                messages.push(tool_message);
-            }
+            self.execute_tool_calls(
+                &response.tool_calls,
+                &assistant_content,
+                &mut tool_names_used,
+                &mut tool_trace,
+                &options.tool_trace_tx,
+                &mut messages,
+            )
+            .await;
         }
 
-        // Trim history even on error path
         self.trim_history();
-
         Err(crate::error::AgentError::MaxIterationsExceeded(
             options.max_iterations,
         ))
@@ -1074,9 +1134,7 @@ impl Agent {
         options: ThinkOptions,
         token_tx: mpsc::Sender<String>,
     ) -> Result<ThinkResult, crate::error::AgentError> {
-        let agent_start = Instant::now();
-
-        // Emit agent start event
+        let start = Instant::now();
         self.emit(Event::AgentStart {
             agent_id: self.id.clone(),
             task: task.to_string(),
@@ -1087,23 +1145,7 @@ impl Agent {
             .think_streaming_with_options_inner(task, options, token_tx)
             .await;
 
-        // Emit agent complete event
-        let duration_ms = agent_start.elapsed().as_millis() as u64;
-        self.emit(Event::AgentComplete {
-            agent_id: self.id.clone(),
-            duration_ms,
-            success: result.is_ok(),
-        })
-        .await;
-
-        if let Err(ref e) = result {
-            self.emit(Event::Error {
-                context: format!("agent:{}", self.id),
-                message: e.to_string(),
-            })
-            .await;
-        }
-
+        self.emit_completion(start, &result).await;
         result
     }
 
@@ -1114,88 +1156,35 @@ impl Agent {
         options: ThinkOptions,
         token_tx: mpsc::Sender<String>,
     ) -> Result<ThinkResult, crate::error::AgentError> {
-        // Drain any pending messages from inbox (must happen before borrowing llm)
-        let pending_messages = self.drain_inbox();
-        let effective_task = if pending_messages.is_empty() {
-            task.to_string()
-        } else {
-            let inbox_text = pending_messages
-                .iter()
-                .map(|msg| format!("[from: {}] {}", msg.from, msg.content))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!(
-                "You have messages from other agents:\n{}\n\nTo reply, use the send_message tool with the sender's name.\n\nCurrent task: {}",
-                inbox_text, task
-            )
-        };
-
+        let effective_task = self.build_effective_task(task);
         let llm = self
             .llm
-            .as_ref()
-            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-
-        // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options
-            .external_tools
             .clone()
-            .unwrap_or_else(|| self.list_tools_for_llm());
-        // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let tools = self.resolve_tools(&options.external_tools);
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+        let effective_system_prompt =
+            Self::combine_prompts(&memory_context, &options.system_prompt);
+
+        let user_content = if effective_task.is_empty() {
             None
         } else {
-            Some(tools_list)
+            Some(effective_task.as_str())
         };
-
-        // Build auto-memory context if configured
-        let memory_context = self.build_memory_context(&options.auto_memory).await;
-
-        // Combine memory context with system prompt
-        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
-            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
-            (Some(mem), None) => Some(mem.clone()),
-            (None, Some(sys)) => Some(sys.clone()),
-            (None, None) => None,
-        };
-
-        // Build initial messages for LLM call
-        let mut messages: Vec<ChatMessage> = Vec::new();
-
-        if let Some(system) = &effective_system_prompt {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(system.clone()),
+        let mut messages = self.build_messages(
+            &effective_system_prompt,
+            &options.conversation_history,
+            user_content,
+        );
+        if let Some(content) = user_content {
+            self.history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(content.to_string()),
                 tool_call_id: None,
                 tool_calls: None,
             });
         }
 
-        // Inject internal conversation history
-        messages.extend(self.history.clone());
-
-        // Also inject any additional context from options (additive, not replacement)
-        if let Some(extra_history) = &options.conversation_history {
-            messages.extend(extra_history.clone());
-        }
-
-        // Create and add user message
-        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
-        // message by the daemon BEFORE the user message, not prepended to user content.
-        // This improves KV caching since user messages stay unchanged.
-        let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(effective_task.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-        };
-
-        // Add user message to internal history
-        self.history.push(user_message.clone());
-
-        // Add user message to LLM messages
-        messages.push(user_message);
-
-        // Track tool usage across the agentic loop (same as non-streaming)
         let mut tool_names_used: Vec<String> = Vec::new();
         let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
@@ -1203,58 +1192,14 @@ impl Agent {
         let mut total_tokens_out: u32 = 0;
         let mut has_token_data = false;
 
-        // Agentic loop with streaming
         for _iteration in 0..options.max_iterations {
-            // Dump context before each LLM call
-            self.dump_context(&effective_system_prompt, &memory_context, &tools, &messages);
+            self.dump_context(&tools, &messages);
 
-            // Call LLM with retry if policy is configured
-            // Note: streaming with retry will restart the entire stream on failure
             let llm_start = Instant::now();
-            let response = if let Some(ref policy) = options.retry_policy {
-                let llm_ref = llm.clone();
-                let msgs = messages.clone();
-                let tls = tools.clone();
-                let tx = token_tx.clone();
-                let observer = self.observer.clone();
-                let result = with_retry(
-                    policy,
-                    || {
-                        let llm = llm_ref.clone();
-                        let m = msgs.clone();
-                        let t = tls.clone();
-                        let tx_clone = tx.clone();
-                        async move { llm.chat_complete_stream(m, t, tx_clone).await }
-                    },
-                    |e: &LLMError| e.is_retryable,
-                )
-                .await;
+            let response = self
+                .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
+                .await?;
 
-                // Emit retry events if attempts > 1
-                if result.attempts > 1
-                    && let Some(obs) = &observer
-                {
-                    for attempt in 1..result.attempts {
-                        let delay_ms = policy.delay_for_attempt(attempt).as_millis() as u64;
-                        obs.observe(Event::Retry {
-                            operation: "llm_call_stream".to_string(),
-                            attempt,
-                            delay_ms,
-                        })
-                        .await;
-                    }
-                }
-
-                result
-                    .result
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            } else {
-                llm.chat_complete_stream(messages.clone(), tools.clone(), token_tx.clone())
-                    .await
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            };
-
-            // Emit LLM call event
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.emit(Event::LlmCall {
                 model: llm.model_name().to_string(),
@@ -1264,20 +1209,17 @@ impl Agent {
             })
             .await;
 
-            // Track token usage
             if let Some(ref usage) = response.usage {
                 total_tokens_in += usage.prompt_tokens;
                 total_tokens_out += usage.completion_tokens;
                 has_token_data = true;
             }
 
-            // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
                 let final_response = response
                     .content
                     .unwrap_or_else(|| "No response".to_string());
 
-                // Add final assistant response to internal history (strip thinking tags)
                 let stripped_response = strip_thinking(&final_response);
                 self.history.push(ChatMessage {
                     role: "assistant".to_string(),
@@ -1286,7 +1228,6 @@ impl Agent {
                     tool_calls: None,
                 });
 
-                // Trim history to stay within limit
                 self.trim_history();
 
                 return Ok(ThinkResult {
@@ -1295,77 +1236,36 @@ impl Agent {
                     tool_names: tool_names_used,
                     last_tool_calls,
                     tool_trace,
-                    tokens_in: if has_token_data {
-                        Some(total_tokens_in)
-                    } else {
-                        None
-                    },
-                    tokens_out: if has_token_data {
-                        Some(total_tokens_out)
-                    } else {
-                        None
-                    },
+                    tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
+                    tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
                 });
             }
 
-            // Track the tool_calls for conversation persistence
             last_tool_calls = Some(response.tool_calls.clone());
 
-            // Create assistant message with tool calls (strip thinking tags for storage)
+            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
             let assistant_message = ChatMessage {
                 role: "assistant".to_string(),
-                content: response.content.as_ref().map(|c| strip_thinking(c)),
+                content: assistant_content.clone(),
                 tool_call_id: None,
                 tool_calls: Some(response.tool_calls.clone()),
             };
-
-            // Add to both internal history and LLM messages
             self.history.push(assistant_message.clone());
             messages.push(assistant_message);
 
-            // Capture content that accompanied the tool calls (for display alongside tool execution)
-            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
+            self.execute_tool_calls(
+                &response.tool_calls,
+                &assistant_content,
+                &mut tool_names_used,
+                &mut tool_trace,
+                &options.tool_trace_tx,
+                &mut messages,
+            )
+            .await;
 
-            // Execute each tool and add results
-            for (i, tool_call) in response.tool_calls.iter().enumerate() {
-                // Track tool name
-                tool_names_used.push(tool_call.name.clone());
-
-                let result = self
-                    .call_tool(&tool_call.name, &tool_call.arguments.to_string())
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {}", e));
-
-                // Record tool execution for persistence.
-                // Only attach content to the first tool call to avoid duplication.
-                tool_trace.push(ToolExecution {
-                    call: tool_call.clone(),
-                    result: result.clone(),
-                    content: if i == 0 { assistant_content.clone() } else { None },
-                });
-
-                // Stream tool execution to caller if channel provided
-                if let Some(ref tx) = options.tool_trace_tx {
-                    let _ = tx.send(tool_trace.last().unwrap().clone()).await;
-                }
-
-                let tool_message = ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(result),
-                    tool_call_id: Some(tool_call.id.clone()),
-                    tool_calls: None,
-                };
-
-                // Add to both internal history and LLM messages
-                self.history.push(tool_message.clone());
-                messages.push(tool_message);
-            }
-
-            // Send newline to separate messages in streaming output
             let _ = token_tx.send("\n".to_string()).await;
         }
 
-        // Trim history even on error path
         self.trim_history();
 
         Err(crate::error::AgentError::MaxIterationsExceeded(
@@ -1384,13 +1284,11 @@ impl Agent {
         let mut current_response = response.to_string();
 
         for _revision in 0..config.max_revisions {
-            // Clone LLM for this scope to avoid borrow issues
             let llm = self
                 .llm
                 .clone()
                 .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
 
-            // Ask LLM to reflect on the response
             let reflection_prompt = format!(
                 "{}\n\nOriginal task: {}\n\nResponse to evaluate:\n{}\n\nRespond with either:\n- ACCEPTED: if the response is complete and correct\n- REVISE: <feedback> if changes are needed",
                 config.prompt, original_task, current_response
@@ -1403,44 +1301,22 @@ impl Agent {
                 tool_calls: None,
             }];
 
-            // Call with retry if policy configured
-            let reflection = if let Some(ref policy) = options.retry_policy {
-                let llm_ref = llm.clone();
-                let msgs = reflection_messages.clone();
-                let result = with_retry(
-                    policy,
-                    || {
-                        let llm = llm_ref.clone();
-                        let m = msgs.clone();
-                        async move { llm.chat_complete(m, None).await }
-                    },
-                    |e: &LLMError| e.is_retryable,
-                )
-                .await;
-                result
-                    .result
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            } else {
-                llm.chat_complete(reflection_messages, None)
-                    .await
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            };
+            let reflection = self
+                .call_llm(&llm, &reflection_messages, &None, &options.retry_policy)
+                .await?;
 
             let reflection_text = reflection.content.unwrap_or_default();
 
-            // Parse reflection result
             if reflection_text.to_uppercase().starts_with("ACCEPTED") {
                 return Ok(current_response);
             }
 
-            // Extract feedback and revise
             let feedback = if reflection_text.to_uppercase().starts_with("REVISE:") {
                 reflection_text[7..].trim().to_string()
             } else {
                 reflection_text.clone()
             };
 
-            // Generate revised response
             let revision_prompt = format!(
                 "Original task: {}\n\nYour previous response:\n{}\n\nFeedback:\n{}\n\nPlease provide an improved response.",
                 original_task, current_response, feedback
@@ -1451,7 +1327,7 @@ impl Agent {
                 system_prompt: options.system_prompt.clone(),
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
-                stream: false, // Reflection doesn't use streaming
+                stream: false,
                 retry_policy: options.retry_policy.clone(),
                 conversation_history: options.conversation_history.clone(),
                 external_tools: options.external_tools.clone(),
@@ -1463,11 +1339,11 @@ impl Agent {
                 .await?;
         }
 
-        // Return final response after max revisions
         Ok(current_response)
     }
 
-    /// Core agentic loop extracted for reuse
+    /// Core agentic loop extracted for reuse (used by reflect_and_revise).
+    /// Unlike think_with_options_inner, this does not manage internal history or emit events.
     async fn run_agentic_loop(
         &mut self,
         task: &str,
@@ -1475,82 +1351,20 @@ impl Agent {
     ) -> Result<String, crate::error::AgentError> {
         let llm = self
             .llm
-            .as_ref()
-            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
-
-        // Use external_tools if provided (hybrid mode), otherwise use registered tools
-        let tools_list = options
-            .external_tools
             .clone()
-            .unwrap_or_else(|| self.list_tools_for_llm());
-        // Send None instead of Some(empty_vec) for models that don't support tools
-        let tools: Option<Vec<ToolSpec>> = if tools_list.is_empty() {
-            None
-        } else {
-            Some(tools_list)
-        };
-
-        // Build auto-memory context if configured
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let tools = self.resolve_tools(&options.external_tools);
         let memory_context = self.build_memory_context(&options.auto_memory).await;
+        let effective_system_prompt =
+            Self::combine_prompts(&memory_context, &options.system_prompt);
 
-        // Combine memory context with system prompt
-        let effective_system_prompt = match (&memory_context, &options.system_prompt) {
-            (Some(mem), Some(sys)) => Some(format!("{}\n\n{}", mem, sys)),
-            (Some(mem), None) => Some(mem.clone()),
-            (None, Some(sys)) => Some(sys.clone()),
-            (None, None) => None,
-        };
-
-        let mut messages: Vec<ChatMessage> = Vec::new();
-
-        if let Some(system) = &effective_system_prompt {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(system.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-
-        // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
-        // message by the daemon BEFORE the user message via conversation_history, not here.
-        // Inject conversation history if present (may include recall as first message)
-        if let Some(history) = &options.conversation_history {
-            messages.extend(history.clone());
-        }
-
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: Some(task.to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        });
+        let mut messages =
+            self.build_messages(&effective_system_prompt, &options.conversation_history, Some(task));
 
         for _iteration in 0..options.max_iterations {
-            // Call LLM with retry if policy is configured
-            let response = if let Some(ref policy) = options.retry_policy {
-                let llm_ref = llm.clone();
-                let msgs = messages.clone();
-                let tls = tools.clone();
-                let result = with_retry(
-                    policy,
-                    || {
-                        let llm = llm_ref.clone();
-                        let m = msgs.clone();
-                        let t = tls.clone();
-                        async move { llm.chat_complete(m, t).await }
-                    },
-                    |e: &LLMError| e.is_retryable,
-                )
-                .await;
-                result
-                    .result
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            } else {
-                llm.chat_complete(messages.clone(), tools.clone())
-                    .await
-                    .map_err(|e| crate::error::AgentError::LlmError(e.message))?
-            };
+            let response = self
+                .call_llm(&llm, &messages, &tools, &options.retry_policy)
+                .await?;
 
             if response.tool_calls.is_empty() {
                 return Ok(response

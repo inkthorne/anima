@@ -189,165 +189,60 @@ impl ConversationStore {
             )?;
         }
 
-        // Migrate: add paused column if it doesn't exist (for existing DBs)
-        self.migrate_add_paused_column()?;
-
-        // Migrate: add paused_at_msg_id column if it doesn't exist
-        self.migrate_add_paused_at_msg_id_column()?;
-
-        // Migrate: add duration_ms column to messages if it doesn't exist
-        self.migrate_add_duration_ms_column()?;
-
-        // Migrate: add tool_calls column to messages if it doesn't exist
-        self.migrate_add_tool_calls_column()?;
-
-        // Migrate: add token tracking columns to messages if they don't exist
-        self.migrate_add_token_columns()?;
+        self.run_column_migrations()?;
 
         Ok(())
     }
 
-    /// Migrate existing databases to add the paused column if it doesn't exist.
-    fn migrate_add_paused_column(&self) -> Result<(), ConversationError> {
-        // Check if conversations table has paused column
-        let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_paused = stmt
+    /// Check if a table has a specific column.
+    fn has_column(&self, table: &str, column: &str) -> Result<bool, ConversationError> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({})", table))?;
+        let found = stmt
             .query_map([], |row| {
                 let col_name: String = row.get(1)?;
                 Ok(col_name)
             })?
-            .any(|r| r.map(|n| n == "paused").unwrap_or(false));
+            .any(|r| r.map(|n| n == column).unwrap_or(false));
+        Ok(found)
+    }
 
-        if !has_paused {
+    /// Add a column to a table if it doesn't already exist.
+    fn add_column_if_missing(
+        &self,
+        table: &str,
+        column: &str,
+        definition: &str,
+    ) -> Result<(), ConversationError> {
+        if !self.has_column(table, column)? {
             self.conn.execute(
-                "ALTER TABLE conversations ADD COLUMN paused INTEGER DEFAULT 0",
+                &format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, definition),
                 [],
             )?;
         }
-
         Ok(())
     }
 
-    /// Migrate existing databases to add the paused_at_msg_id column if it doesn't exist.
-    fn migrate_add_paused_at_msg_id_column(&self) -> Result<(), ConversationError> {
-        // Check if conversations table has paused_at_msg_id column
-        let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_column = stmt
-            .query_map([], |row| {
-                let col_name: String = row.get(1)?;
-                Ok(col_name)
-            })?
-            .any(|r| r.map(|n| n == "paused_at_msg_id").unwrap_or(false));
-
-        if !has_column {
-            self.conn.execute(
-                "ALTER TABLE conversations ADD COLUMN paused_at_msg_id INTEGER DEFAULT NULL",
-                [],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Migrate existing databases to add the duration_ms column to messages if it doesn't exist.
-    fn migrate_add_duration_ms_column(&self) -> Result<(), ConversationError> {
-        // Check if messages table has duration_ms column
-        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let has_column = stmt
-            .query_map([], |row| {
-                let col_name: String = row.get(1)?;
-                Ok(col_name)
-            })?
-            .any(|r| r.map(|n| n == "duration_ms").unwrap_or(false));
-
-        if !has_column {
-            self.conn.execute(
-                "ALTER TABLE messages ADD COLUMN duration_ms INTEGER DEFAULT NULL",
-                [],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Migrate existing databases to add the tool_calls column to messages if it doesn't exist.
-    fn migrate_add_tool_calls_column(&self) -> Result<(), ConversationError> {
-        // Check if messages table has tool_calls column
-        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let has_column = stmt
-            .query_map([], |row| {
-                let col_name: String = row.get(1)?;
-                Ok(col_name)
-            })?
-            .any(|r| r.map(|n| n == "tool_calls").unwrap_or(false));
-
-        if !has_column {
-            self.conn.execute(
-                "ALTER TABLE messages ADD COLUMN tool_calls TEXT DEFAULT NULL",
-                [],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    /// Migrate existing databases to add the token tracking columns to messages if they don't exist.
-    fn migrate_add_token_columns(&self) -> Result<(), ConversationError> {
-        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
-        let columns: Vec<String> = stmt
-            .query_map([], |row| {
-                let col_name: String = row.get(1)?;
-                Ok(col_name)
-            })?
-            .filter_map(|r| r.ok())
-            .collect();
-
-        if !columns.contains(&"tokens_in".to_string()) {
-            self.conn.execute(
-                "ALTER TABLE messages ADD COLUMN tokens_in INTEGER DEFAULT NULL",
-                [],
-            )?;
-        }
-
-        if !columns.contains(&"tokens_out".to_string()) {
-            self.conn.execute(
-                "ALTER TABLE messages ADD COLUMN tokens_out INTEGER DEFAULT NULL",
-                [],
-            )?;
-        }
-
-        if !columns.contains(&"num_ctx".to_string()) {
-            self.conn.execute(
-                "ALTER TABLE messages ADD COLUMN num_ctx INTEGER DEFAULT NULL",
-                [],
-            )?;
-        }
-
+    /// Run all column migrations for existing databases.
+    fn run_column_migrations(&self) -> Result<(), ConversationError> {
+        self.add_column_if_missing("conversations", "paused", "INTEGER DEFAULT 0")?;
+        self.add_column_if_missing("conversations", "paused_at_msg_id", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "duration_ms", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "tool_calls", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "tokens_in", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "tokens_out", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "num_ctx", "INTEGER DEFAULT NULL")?;
         Ok(())
     }
 
     /// Check if the database needs migration from the old schema.
     fn needs_migration(&self) -> Result<bool, ConversationError> {
-        // Check if conversations table exists with old schema (has 'id' column)
         let mut stmt = self.conn.prepare(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='conversations'",
         )?;
-        let exists = stmt.exists([])?;
-
-        if !exists {
+        if !stmt.exists([])? {
             return Ok(false);
         }
-
-        // Check if it has the old 'id' column
-        let mut stmt = self.conn.prepare("PRAGMA table_info(conversations)")?;
-        let has_id = stmt
-            .query_map([], |row| {
-                let col_name: String = row.get(1)?;
-                Ok(col_name)
-            })?
-            .any(|r| r.map(|n| n == "id").unwrap_or(false));
-
-        Ok(has_id)
+        self.has_column("conversations", "id")
     }
 
     /// Migrate from old schema (id + name) to new schema (name as primary key).
@@ -510,15 +405,7 @@ impl ConversationStore {
         )?;
 
         let conversations = stmt
-            .query_map([], |row| {
-                Ok(Conversation {
-                    name: row.get(0)?,
-                    created_at: row.get(1)?,
-                    updated_at: row.get(2)?,
-                    paused: row.get::<_, i64>(3)? != 0,
-                    paused_at_msg_id: row.get(4)?,
-                })
-            })?
+            .query_map([], row_to_conversation)?
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(conversations)
@@ -563,16 +450,9 @@ impl ConversationStore {
         )?;
 
         let mut rows = stmt.query(params![name])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(Conversation {
-                name: row.get(0)?,
-                created_at: row.get(1)?,
-                updated_at: row.get(2)?,
-                paused: row.get::<_, i64>(3)? != 0,
-                paused_at_msg_id: row.get(4)?,
-            }))
-        } else {
-            Ok(None)
+        match rows.next()? {
+            Some(row) => Ok(Some(row_to_conversation(row)?)),
+            None => Ok(None),
         }
     }
 
@@ -725,31 +605,8 @@ impl ConversationStore {
         content: &str,
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(
+        self.add_message_with_tokens(
             conv_name, from_agent, content, mentions, None, None, None, None, None,
-        )
-    }
-
-    /// Add a message to a conversation with optional response duration.
-    /// Returns the message ID.
-    pub fn add_message_with_duration(
-        &self,
-        conv_name: &str,
-        from_agent: &str,
-        content: &str,
-        mentions: &[&str],
-        duration_ms: Option<i64>,
-    ) -> Result<i64, ConversationError> {
-        self.add_message_full(
-            conv_name,
-            from_agent,
-            content,
-            mentions,
-            duration_ms,
-            None,
-            None,
-            None,
-            None,
         )
     }
 
@@ -764,7 +621,7 @@ impl ConversationStore {
         duration_ms: Option<i64>,
         tool_calls: Option<&str>,
     ) -> Result<i64, ConversationError> {
-        self.add_message_full(
+        self.add_message_with_tokens(
             conv_name,
             from_agent,
             content,
@@ -781,34 +638,6 @@ impl ConversationStore {
     /// Returns the message ID.
     #[allow(clippy::too_many_arguments)]
     pub fn add_message_with_tokens(
-        &self,
-        conv_name: &str,
-        from_agent: &str,
-        content: &str,
-        mentions: &[&str],
-        duration_ms: Option<i64>,
-        tool_calls: Option<&str>,
-        tokens_in: Option<i64>,
-        tokens_out: Option<i64>,
-        num_ctx: Option<i64>,
-    ) -> Result<i64, ConversationError> {
-        self.add_message_full(
-            conv_name,
-            from_agent,
-            content,
-            mentions,
-            duration_ms,
-            tool_calls,
-            tokens_in,
-            tokens_out,
-            num_ctx,
-        )
-    }
-
-    /// Add a message to a conversation with all optional fields.
-    /// Returns the message ID.
-    #[allow(clippy::too_many_arguments)]
-    fn add_message_full(
         &self,
         conv_name: &str,
         from_agent: &str,
@@ -856,40 +685,18 @@ impl ConversationStore {
 
         let query = match limit {
             Some(n) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
-                 FROM messages
-                 WHERE conv_name = ?1 AND expires_at > ?2
-                 ORDER BY created_at DESC
-                 LIMIT {}",
-                n
+                "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 ORDER BY created_at DESC LIMIT {}",
+                MESSAGE_COLUMNS, n
             ),
-            None => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
-                     FROM messages
-                     WHERE conv_name = ?1 AND expires_at > ?2
-                     ORDER BY created_at ASC".to_string(),
+            None => format!(
+                "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 ORDER BY created_at ASC",
+                MESSAGE_COLUMNS
+            ),
         };
 
         let mut stmt = self.conn.prepare(&query)?;
         let mut messages: Vec<ConversationMessage> = stmt
-            .query_map(params![conv_name, now], |row| {
-                let mentions_json: String = row.get(4)?;
-                let mentions: Vec<String> =
-                    serde_json::from_str(&mentions_json).unwrap_or_default();
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    conv_name: row.get(1)?,
-                    from_agent: row.get(2)?,
-                    content: row.get(3)?,
-                    mentions,
-                    created_at: row.get(5)?,
-                    expires_at: row.get(6)?,
-                    duration_ms: row.get(7)?,
-                    tool_calls: row.get(8)?,
-                    tokens_in: row.get(9)?,
-                    tokens_out: row.get(10)?,
-                    num_ctx: row.get(11)?,
-                })
-            })?
+            .query_map(params![conv_name, now], row_to_message)?
             .collect::<Result<Vec<_>, _>>()?;
 
         // If we used LIMIT with DESC, reverse to get chronological order
@@ -915,53 +722,21 @@ impl ConversationStore {
         let now = current_timestamp();
         let since = since_id.unwrap_or(0);
 
-        // Build query based on options
-        // When using --since, we want messages after that ID in chronological order
-        // When using --limit without --since, we want the last N messages
+        // When using --since, we want messages after that ID in chronological order.
+        // When using --limit without --since, we want the last N messages.
+        let base = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3",
+            MESSAGE_COLUMNS
+        );
         let query = match (limit, since_id) {
-            (Some(n), Some(_)) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
-                 FROM messages
-                 WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
-                 ORDER BY id ASC
-                 LIMIT {}",
-                n
-            ),
-            (Some(n), None) => format!(
-                "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
-                 FROM messages
-                 WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
-                 ORDER BY id DESC
-                 LIMIT {}",
-                n
-            ),
-            (None, _) => "SELECT id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx
-                     FROM messages
-                     WHERE conv_name = ?1 AND expires_at > ?2 AND id > ?3
-                     ORDER BY id ASC".to_string(),
+            (Some(n), Some(_)) => format!("{} ORDER BY id ASC LIMIT {}", base, n),
+            (Some(n), None) => format!("{} ORDER BY id DESC LIMIT {}", base, n),
+            (None, _) => format!("{} ORDER BY id ASC", base),
         };
 
         let mut stmt = self.conn.prepare(&query)?;
         let mut messages: Vec<ConversationMessage> = stmt
-            .query_map(params![conv_name, now, since], |row| {
-                let mentions_json: String = row.get(4)?;
-                let mentions: Vec<String> =
-                    serde_json::from_str(&mentions_json).unwrap_or_default();
-                Ok(ConversationMessage {
-                    id: row.get(0)?,
-                    conv_name: row.get(1)?,
-                    from_agent: row.get(2)?,
-                    content: row.get(3)?,
-                    mentions,
-                    created_at: row.get(5)?,
-                    expires_at: row.get(6)?,
-                    duration_ms: row.get(7)?,
-                    tool_calls: row.get(8)?,
-                    tokens_in: row.get(9)?,
-                    tokens_out: row.get(10)?,
-                    num_ctx: row.get(11)?,
-                })
-            })?
+            .query_map(params![conv_name, now, since], row_to_message)?
             .collect::<Result<Vec<_>, _>>()?;
 
         // If we used LIMIT with DESC (no since_id), reverse to get chronological order
@@ -1104,7 +879,6 @@ impl ConversationStore {
         Ok((messages_deleted, convs_deleted))
     }
 
-    /// Delete a conversation and all its messages.
     /// Clear all messages from a conversation (keeps the conversation and participants).
     pub fn clear_messages(&self, conv_name: &str) -> Result<usize, ConversationError> {
         // Check conversation exists
@@ -1126,8 +900,8 @@ impl ConversationStore {
         Ok(deleted)
     }
 
+    /// Delete a conversation and all its related data.
     pub fn delete_conversation(&self, conv_name: &str) -> Result<(), ConversationError> {
-        // Delete in order: pending_notifications, messages, participants, conversation
         self.conn.execute(
             "DELETE FROM pending_notifications WHERE conv_name = ?1",
             params![conv_name],
@@ -1227,6 +1001,43 @@ impl ConversationStore {
         })
     }
 }
+
+/// Map a database row to a Conversation struct.
+/// Expects columns: name, created_at, updated_at, paused, paused_at_msg_id.
+fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
+    Ok(Conversation {
+        name: row.get(0)?,
+        created_at: row.get(1)?,
+        updated_at: row.get(2)?,
+        paused: row.get::<_, i64>(3)? != 0,
+        paused_at_msg_id: row.get(4)?,
+    })
+}
+
+/// Map a database row to a ConversationMessage struct.
+/// Expects columns: id, conv_name, from_agent, content, mentions, created_at,
+/// expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx.
+fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> {
+    let mentions_json: String = row.get(4)?;
+    let mentions: Vec<String> = serde_json::from_str(&mentions_json).unwrap_or_default();
+    Ok(ConversationMessage {
+        id: row.get(0)?,
+        conv_name: row.get(1)?,
+        from_agent: row.get(2)?,
+        content: row.get(3)?,
+        mentions,
+        created_at: row.get(5)?,
+        expires_at: row.get(6)?,
+        duration_ms: row.get(7)?,
+        tool_calls: row.get(8)?,
+        tokens_in: row.get(9)?,
+        tokens_out: row.get(10)?,
+        num_ctx: row.get(11)?,
+    })
+}
+
+/// SQL column list for message queries.
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
@@ -1392,6 +1203,46 @@ pub enum NotifyResult {
     Failed { reason: String },
 }
 
+/// Queue a notification for an offline agent, or return UnknownAgent if the agent doesn't exist.
+fn queue_notification(
+    store: &ConversationStore,
+    agent_name: &str,
+    conv_id: &str,
+    message_id: i64,
+) -> NotifyResult {
+    if !crate::discovery::agent_exists(agent_name) {
+        return NotifyResult::UnknownAgent;
+    }
+    match store.add_pending_notification(agent_name, conv_id, message_id) {
+        Ok(notification_id) => NotifyResult::Queued { notification_id },
+        Err(e) => NotifyResult::Failed {
+            reason: format!("Failed to queue notification: {}", e),
+        },
+    }
+}
+
+/// Map a socket response to a NotifyResult.
+fn response_to_notify_result(response: Result<Option<crate::socket_api::Response>, crate::socket_api::SocketApiError>) -> NotifyResult {
+    use crate::socket_api::Response;
+
+    match response {
+        Ok(Some(Response::NotifyReceived)) => NotifyResult::Acknowledged,
+        Ok(Some(Response::Notified { response_message_id })) => {
+            NotifyResult::Notified { response_message_id }
+        }
+        Ok(Some(Response::Error { message })) => NotifyResult::Failed { reason: message },
+        Ok(Some(_)) => NotifyResult::Failed {
+            reason: "Unexpected response type".to_string(),
+        },
+        Ok(None) => NotifyResult::Failed {
+            reason: "Connection closed".to_string(),
+        },
+        Err(e) => NotifyResult::Failed {
+            reason: format!("Failed to read response: {}", e),
+        },
+    }
+}
+
 /// Attempt to notify agents mentioned in a message.
 /// For running agents: sends Notify request via socket.
 /// For offline agents: queues notification in pending_notifications table.
@@ -1404,125 +1255,49 @@ pub async fn notify_mentioned_agents(
     mentions: &[String],
 ) -> std::collections::HashMap<String, NotifyResult> {
     use crate::discovery;
-    use crate::socket_api::{Request, Response, SocketApi};
+    use crate::socket_api::{Request, SocketApi};
     use tokio::net::UnixStream;
 
     let mut results = std::collections::HashMap::new();
 
     for agent_name in mentions {
-        // Check if agent is running
-        if let Some(running_agent) = discovery::get_running_agent(agent_name) {
-            // Try to connect and send Notify request
-            match UnixStream::connect(&running_agent.socket_path).await {
-                Ok(stream) => {
-                    let mut api = SocketApi::new(stream);
-
-                    // Send Notify request (depth 0 for initial notifications from CLI)
-                    let request = Request::Notify {
-                        conv_id: conv_id.to_string(),
-                        message_id,
-                        depth: 0,
-                    };
-
-                    if let Err(e) = api.write_request(&request).await {
-                        results.insert(
-                            agent_name.clone(),
-                            NotifyResult::Failed {
-                                reason: format!("Failed to send request: {}", e),
-                            },
-                        );
-                        continue;
-                    }
-
-                    // Read response
-                    match api.read_response().await {
-                        Ok(Some(Response::Notified {
-                            response_message_id,
-                        })) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Notified {
-                                    response_message_id,
-                                },
-                            );
-                        }
-                        Ok(Some(Response::Error { message })) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Failed { reason: message },
-                            );
-                        }
-                        Ok(Some(_)) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Failed {
-                                    reason: "Unexpected response type".to_string(),
-                                },
-                            );
-                        }
-                        Ok(None) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Failed {
-                                    reason: "Connection closed".to_string(),
-                                },
-                            );
-                        }
-                        Err(e) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Failed {
-                                    reason: format!("Failed to read response: {}", e),
-                                },
-                            );
-                        }
-                    }
-                }
-                Err(_e) => {
-                    // Socket connection failed - agent may have just stopped
-                    // Only queue if agent exists
-                    if !discovery::agent_exists(agent_name) {
-                        results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
-                        continue;
-                    }
-                    match store.add_pending_notification(agent_name, conv_id, message_id) {
-                        Ok(notification_id) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Queued { notification_id },
-                            );
-                        }
-                        Err(e) => {
-                            results.insert(
-                                agent_name.clone(),
-                                NotifyResult::Failed {
-                                    reason: format!("Failed to queue notification: {}", e),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        } else {
-            // Agent is not running - only queue if agent exists
-            if !discovery::agent_exists(agent_name) {
-                results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
+        let running_agent = match discovery::get_running_agent(agent_name) {
+            Some(agent) => agent,
+            None => {
+                let result = queue_notification(store, agent_name, conv_id, message_id);
+                results.insert(agent_name.clone(), result);
                 continue;
             }
-            match store.add_pending_notification(agent_name, conv_id, message_id) {
-                Ok(notification_id) => {
-                    results.insert(agent_name.clone(), NotifyResult::Queued { notification_id });
-                }
-                Err(e) => {
-                    results.insert(
-                        agent_name.clone(),
-                        NotifyResult::Failed {
-                            reason: format!("Failed to queue notification: {}", e),
-                        },
-                    );
-                }
+        };
+
+        let stream = match UnixStream::connect(&running_agent.socket_path).await {
+            Ok(s) => s,
+            Err(_) => {
+                let result = queue_notification(store, agent_name, conv_id, message_id);
+                results.insert(agent_name.clone(), result);
+                continue;
             }
+        };
+
+        let mut api = SocketApi::new(stream);
+        let request = Request::Notify {
+            conv_id: conv_id.to_string(),
+            message_id,
+            depth: 0,
+        };
+
+        if let Err(e) = api.write_request(&request).await {
+            results.insert(
+                agent_name.clone(),
+                NotifyResult::Failed {
+                    reason: format!("Failed to send request: {}", e),
+                },
+            );
+            continue;
         }
+
+        let result = response_to_notify_result(api.read_response().await);
+        results.insert(agent_name.clone(), result);
     }
 
     results
@@ -1536,93 +1311,51 @@ async fn notify_single_agent(
     message_id: i64,
 ) -> (String, NotifyResult) {
     use crate::discovery;
-    use crate::socket_api::{Request, Response, SocketApi};
+    use crate::socket_api::{Request, SocketApi};
     use tokio::net::UnixStream;
 
-    // Check if agent is running
-    if let Some(running_agent) = discovery::get_running_agent(&agent_name) {
-        // Try to connect and send Notify request
-        match UnixStream::connect(&running_agent.socket_path).await {
-            Ok(stream) => {
-                let mut api = SocketApi::new(stream);
-
-                // Send Notify request (depth 0 for initial notifications from CLI)
-                let request = Request::Notify {
-                    conv_id: conv_id.clone(),
-                    message_id,
-                    depth: 0,
-                };
-
-                if let Err(e) = api.write_request(&request).await {
-                    return (
-                        agent_name,
-                        NotifyResult::Failed {
-                            reason: format!("Failed to send request: {}", e),
-                        },
-                    );
-                }
-
-                // Read response
-                match api.read_response().await {
-                    Ok(Some(Response::NotifyReceived)) => {
-                        // Fire-and-forget: daemon acknowledged, will process async
-                        (agent_name, NotifyResult::Acknowledged)
-                    }
-                    Ok(Some(Response::Notified {
-                        response_message_id,
-                    })) => {
-                        // Synchronous response (backwards compat)
-                        (
-                            agent_name,
-                            NotifyResult::Notified {
-                                response_message_id,
-                            },
-                        )
-                    }
-                    Ok(Some(Response::Error { message })) => {
-                        (agent_name, NotifyResult::Failed { reason: message })
-                    }
-                    Ok(Some(_)) => (
-                        agent_name,
-                        NotifyResult::Failed {
-                            reason: "Unexpected response type".to_string(),
-                        },
-                    ),
-                    Ok(None) => (
-                        agent_name,
-                        NotifyResult::Failed {
-                            reason: "Connection closed".to_string(),
-                        },
-                    ),
-                    Err(e) => (
-                        agent_name,
-                        NotifyResult::Failed {
-                            reason: format!("Failed to read response: {}", e),
-                        },
-                    ),
-                }
-            }
-            Err(_e) => {
-                // Socket connection failed - agent may have just stopped
-                // For parallel mode, we can't queue (no store reference)
-                // Return failed status - caller can decide to queue
-                (
-                    agent_name,
-                    NotifyResult::Failed {
-                        reason: "Agent not reachable (socket connection failed)".to_string(),
-                    },
-                )
-            }
+    let running_agent = match discovery::get_running_agent(&agent_name) {
+        Some(agent) => agent,
+        None => {
+            return (
+                agent_name,
+                NotifyResult::Failed {
+                    reason: "Agent not running".to_string(),
+                },
+            );
         }
-    } else {
-        // Agent is not running
-        (
+    };
+
+    let stream = match UnixStream::connect(&running_agent.socket_path).await {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                agent_name,
+                NotifyResult::Failed {
+                    reason: "Agent not reachable (socket connection failed)".to_string(),
+                },
+            );
+        }
+    };
+
+    let mut api = SocketApi::new(stream);
+    let request = Request::Notify {
+        conv_id,
+        message_id,
+        depth: 0,
+    };
+
+    if let Err(e) = api.write_request(&request).await {
+        return (
             agent_name,
             NotifyResult::Failed {
-                reason: "Agent not running".to_string(),
+                reason: format!("Failed to send request: {}", e),
             },
-        )
+        );
     }
+
+    let result = response_to_notify_result(api.read_response().await);
+    (agent_name, result)
 }
 
 /// Notify multiple agents in parallel.
@@ -1659,34 +1392,21 @@ pub async fn notify_mentioned_agents_parallel_owned(
         return results;
     }
 
-    // Check if conversation is paused - if so, queue all notifications instead of sending
-    let is_paused = match ConversationStore::init() {
-        Ok(store) => store.is_paused(&conv_id).unwrap_or(false),
-        Err(_) => false, // If we can't check, proceed normally
-    };
+    // Check if conversation is paused -- if so, queue all notifications instead of sending.
+    let is_paused = ConversationStore::init()
+        .ok()
+        .and_then(|store| store.is_paused(&conv_id).ok())
+        .unwrap_or(false);
 
     if is_paused {
-        // Conversation is paused - queue all notifications instead of sending
         match ConversationStore::init() {
             Ok(store) => {
                 for agent_name in &mentions {
-                    // Only queue if agent exists
-                    if !crate::discovery::agent_exists(agent_name) {
-                        results.insert(agent_name.clone(), NotifyResult::UnknownAgent);
-                        continue;
-                    }
-                    let queued_result =
-                        match store.add_pending_notification(agent_name, &conv_id, message_id) {
-                            Ok(notification_id) => NotifyResult::Queued { notification_id },
-                            Err(e) => NotifyResult::Failed {
-                                reason: format!("Failed to queue notification: {}", e),
-                            },
-                        };
-                    results.insert(agent_name.clone(), queued_result);
+                    let result = queue_notification(&store, agent_name, &conv_id, message_id);
+                    results.insert(agent_name.clone(), result);
                 }
             }
             Err(e) => {
-                // Can't queue - mark all as failed
                 for agent_name in &mentions {
                     results.insert(
                         agent_name.clone(),
@@ -1706,32 +1426,26 @@ pub async fn notify_mentioned_agents_parallel_owned(
         .map(|agent_name| {
             let agent = agent_name.clone();
             let cid = conv_id.clone();
-            let mid = message_id;
-            tokio::spawn(async move { notify_single_agent(agent, cid, mid).await })
+            tokio::spawn(async move { notify_single_agent(agent, cid, message_id).await })
         })
         .collect();
 
-    // Wait for all notifications to complete
     let outcomes = join_all(futures).await;
 
-    // Collect agents that need queuing
+    // Collect agents that need queuing (not running or not reachable)
     let mut agents_to_queue: Vec<String> = Vec::new();
 
-    // Process results
     for outcome in outcomes {
         match outcome {
             Ok((agent_name, result)) => {
-                // If agent wasn't reachable or not running, mark for queuing
                 let final_result = match &result {
                     NotifyResult::Failed { reason }
                         if reason.contains("not running") || reason.contains("not reachable") =>
                     {
-                        // Only queue if agent actually exists
                         if !crate::discovery::agent_exists(&agent_name) {
                             NotifyResult::UnknownAgent
                         } else {
                             agents_to_queue.push(agent_name.clone());
-                            // Placeholder - will be updated below
                             NotifyResult::Failed {
                                 reason: "pending_queue".to_string(),
                             }
@@ -1742,29 +1456,21 @@ pub async fn notify_mentioned_agents_parallel_owned(
                 results.insert(agent_name, final_result);
             }
             Err(e) => {
-                // Task panicked - shouldn't happen but handle gracefully
                 eprintln!("Notification task panicked: {}", e);
             }
         }
     }
 
-    // Queue notifications for offline agents (creates its own store)
+    // Queue notifications for offline agents
     if !agents_to_queue.is_empty() {
         match ConversationStore::init() {
             Ok(store) => {
                 for agent in agents_to_queue {
-                    let queued_result =
-                        match store.add_pending_notification(&agent, &conv_id, message_id) {
-                            Ok(notification_id) => NotifyResult::Queued { notification_id },
-                            Err(e) => NotifyResult::Failed {
-                                reason: format!("Failed to queue notification: {}", e),
-                            },
-                        };
-                    results.insert(agent, queued_result);
+                    let result = queue_notification(&store, &agent, &conv_id, message_id);
+                    results.insert(agent, result);
                 }
             }
             Err(e) => {
-                // Update all queued agents to failed
                 for agent in agents_to_queue {
                     results.insert(
                         agent,
@@ -1795,17 +1501,14 @@ pub fn notify_mentioned_agents_fire_and_forget(
     message_id: i64,
     mentions: &[String],
 ) {
-    // Check if conversation is paused - if so, queue all notifications instead of sending
-    let is_paused = match ConversationStore::init() {
-        Ok(store) => store.is_paused(conv_id).unwrap_or(false),
-        Err(_) => false, // If we can't check, proceed normally
-    };
+    let is_paused = ConversationStore::init()
+        .ok()
+        .and_then(|store| store.is_paused(conv_id).ok())
+        .unwrap_or(false);
 
     if is_paused {
-        // Conversation is paused - queue all notifications instead of sending
         if let Ok(store) = ConversationStore::init() {
             for agent_name in mentions {
-                // Only queue if agent exists
                 if crate::discovery::agent_exists(agent_name) {
                     let _ = store.add_pending_notification(agent_name, conv_id, message_id);
                 }
@@ -1817,11 +1520,8 @@ pub fn notify_mentioned_agents_fire_and_forget(
     for agent_name in mentions {
         let agent = agent_name.clone();
         let cid = conv_id.to_string();
-        let mid = message_id;
-
-        // Spawn notification task - don't await, let it run in background
         tokio::spawn(async move {
-            let _ = notify_single_agent(agent, cid, mid).await;
+            let _ = notify_single_agent(agent, cid, message_id).await;
         });
     }
 }

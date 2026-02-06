@@ -21,15 +21,12 @@ use tokio::net::UnixStream;
 
 /// Format tool params for display in a brief, readable way.
 fn format_tool_params(params: &serde_json::Value) -> String {
-    // For shell commands, show the command
     if let Some(cmd) = params.get("command").and_then(|c| c.as_str()) {
         return cmd.to_string();
     }
-    // For file operations, show the path
     if let Some(path) = params.get("path").and_then(|p| p.as_str()) {
         return path.to_string();
     }
-    // For HTTP requests, show method and URL
     if let Some(url) = params.get("url").and_then(|u| u.as_str()) {
         let method = params
             .get("method")
@@ -37,7 +34,6 @@ fn format_tool_params(params: &serde_json::Value) -> String {
             .unwrap_or("GET");
         return format!("{} {}", method, url);
     }
-    // Fallback: compact JSON, truncated
     let json = serde_json::to_string(params).unwrap_or_default();
     if json.len() > 60 {
         format!("{}...", &json[..57])
@@ -399,6 +395,10 @@ async fn main() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Path helpers
+// ---------------------------------------------------------------------------
+
 /// Get the agents directory path (~/.anima/agents/)
 fn agents_dir() -> PathBuf {
     dirs::home_dir()
@@ -443,1886 +443,36 @@ async fn connect_to_agent(agent: &str) -> Result<SocketApi, Box<dyn std::error::
     Ok(SocketApi::new(stream))
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers (format, display, directory listing, memory, catchup)
+// ---------------------------------------------------------------------------
+
 /// Default number of context messages to load from conversation history.
 const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 
-/// Start an interactive chat session with a conversation by name.
-///
-/// Messages are sent to @mentioned agents. When a user @mentions an agent
-/// for the first time, they are automatically added as a participant.
-///
-/// Note: The daemon now handles @mention forwarding autonomously. The CLI only
-/// sends initial notifications and displays results - follow-up chains continue
-/// in the background via daemon-to-daemon communication.
-///
-/// A background polling task displays incoming agent messages in real-time.
-async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize conversation store
-    let store = ConversationStore::init()?;
+/// Format a conversation message header and content for pretty display.
+fn format_message_display(msg: &anima::conversation::ConversationMessage) -> String {
+    let color = if msg.from_agent == "user" { "33" } else { "36" };
+    let datetime = format_timestamp_pretty(msg.created_at);
 
-    // Load current participants
-    let parts = store.get_participants(conv_name)?;
-    let mut participants: Vec<String> = parts
-        .iter()
-        .filter(|p| p.agent != "user")
-        .map(|p| p.agent.clone())
-        .collect();
-
-    // Track the last message ID we've displayed
-    let last_seen_id = Arc::new(AtomicI64::new(0));
-
-    // Get current last message ID so we don't display old messages
-    if let Ok(msgs) = store.get_messages(conv_name, Some(1))
-        && let Some(last) = msgs.last()
-    {
-        last_seen_id.store(last.id, Ordering::SeqCst);
-    }
-
-    // Print connection info
-    println!("\x1b[32m✓ Joined conversation '{}'\x1b[0m", conv_name);
-    if participants.is_empty() {
-        println!("\x1b[90mNo agents yet - use @mentions to invite them\x1b[0m");
+    let is_agent = msg.from_agent != "user" && msg.from_agent != "tool";
+    let duration_str = if is_agent {
+        msg.duration_ms
+            .map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d)))
+            .unwrap_or_default()
     } else {
-        println!("\x1b[90mParticipants: {}\x1b[0m", participants.join(", "));
-    }
-
-    // Display recent message history for context
-    if let Ok(recent_msgs) = store.get_messages(conv_name, Some(25))
-        && !recent_msgs.is_empty()
-    {
-        println!("\x1b[90m--- Recent messages ---\x1b[0m");
-        for msg in &recent_msgs {
-            // Skip tool messages
-            if msg.from_agent == "tool" {
-                continue;
-            }
-            let color = if msg.from_agent == "user" { "33" } else { "36" }; // yellow for user, cyan for agents
-            let datetime = format_timestamp_pretty(msg.created_at);
-            // Show duration and context usage for agent messages if available
-            let duration_str = if msg.from_agent != "user" {
-                msg.duration_ms
-                    .map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d)))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let ctx_str = if msg.from_agent != "user" {
-                format_context_usage(msg)
-            } else {
-                String::new()
-            };
-            println!(
-                "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}",
-                msg.id, datetime, color, msg.from_agent, duration_str, ctx_str
-            );
-            println!("{}", msg.content);
-            println!(); // Blank line between messages
-        }
-
-        // Update last_seen_id to the most recent message
-        if let Some(last) = recent_msgs.last() {
-            last_seen_id.store(last.id, Ordering::SeqCst);
-        }
-    }
-
-    println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
-
-    // Spawn background message polling task
-    let poll_conv_name = conv_name.to_string();
-    let poll_last_seen = last_seen_id.clone();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let poll_shutdown = shutdown.clone();
-
-    let poll_handle = tokio::spawn(async move {
-        // Create a separate store connection for the polling task
-        let poll_store = match ConversationStore::init() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        loop {
-            if poll_shutdown.load(Ordering::SeqCst) {
-                break;
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let last_id = poll_last_seen.load(Ordering::SeqCst);
-            if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id))
-            {
-                for msg in msgs {
-                    // Only display messages from agents (not from "user" or "tool")
-                    if msg.from_agent != "user" && msg.from_agent != "tool" {
-                        // Print the agent message on a new line
-                        print!("\r\x1b[K"); // Clear current line (in case user was typing)
-                        let datetime = format_timestamp_pretty(msg.created_at);
-                        // Show duration and context usage if available
-                        let duration_str = msg
-                            .duration_ms
-                            .map(|d| {
-                                format!(
-                                    " \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m",
-                                    format_duration_ms(d)
-                                )
-                            })
-                            .unwrap_or_default();
-                        let ctx_str = format_context_usage(&msg);
-                        println!(
-                            "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}{}",
-                            msg.id, datetime, msg.from_agent, duration_str, ctx_str
-                        );
-                        println!("{}", msg.content);
-                        println!(); // Blank line between messages
-                        print!("\x1b[36m#{}\x1b[90m›\x1b[0m ", poll_conv_name); // Re-print prompt
-                        let _ = io::stdout().flush();
-                    }
-                    // Update last seen ID regardless of sender
-                    poll_last_seen.store(msg.id, Ordering::SeqCst);
-                }
-            }
-        }
-    });
-
-    // Use rustyline for interactive input
-    let mut rl = rustyline::DefaultEditor::new()?;
-    let prompt = format!("\x1b[36m#{}\x1b[90m›\x1b[0m ", conv_name);
-
-    loop {
-        match rl.readline(&prompt) {
-            Ok(line) => {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-
-                // Add to history
-                let _ = rl.add_history_entry(line);
-
-                // Handle slash commands
-                if line.starts_with('/') {
-                    match line {
-                        "/clear" => {
-                            store.clear_messages(conv_name)?;
-                            println!("\x1b[90mConversation cleared.\x1b[0m");
-                            continue;
-                        }
-                        "/quit" | "/exit" => {
-                            println!("\x1b[33mGoodbye!\x1b[0m");
-                            break;
-                        }
-                        "/pause" => {
-                            match store.set_paused(conv_name, true) {
-                                Ok(_) => println!(
-                                    "\x1b[90mConversation paused. Notifications will be queued.\x1b[0m"
-                                ),
-                                Err(e) => eprintln!("\x1b[31mFailed to pause: {}\x1b[0m", e),
-                            }
-                            continue;
-                        }
-                        "/resume" => {
-                            match store.set_paused(conv_name, false) {
-                                Ok(paused_at_msg_id) => {
-                                    let mut catchup_count = 0;
-
-                                    // Process catchup items (tool calls and mentions skipped during pause)
-                                    if let Some(paused_at) = paused_at_msg_id
-                                        && let Ok(catchup_msgs) =
-                                            store.get_catchup_messages(conv_name, paused_at)
-                                    {
-                                        let catchup_items =
-                                            ConversationStore::build_catchup_items(&catchup_msgs);
-                                        for item in &catchup_items {
-                                            // Process @mentions
-                                            if !item.mentions.is_empty() {
-                                                let _ = notify_mentioned_agents_parallel(
-                                                    &store,
-                                                    conv_name,
-                                                    item.message.id,
-                                                    &item.mentions,
-                                                )
-                                                .await;
-                                                catchup_count += item.mentions.len();
-                                            }
-                                            // Note: Tool calls in catchup items will be handled
-                                            // by the agent when it processes the follow-up notification
-                                        }
-                                    }
-
-                                    // Also check for pending notifications (for agents that weren't running)
-                                    if let Ok(pending) =
-                                        store.get_pending_notifications_for_conversation(conv_name)
-                                    {
-                                        let pending_count = pending.len();
-                                        if pending_count > 0 {
-                                            for notification in &pending {
-                                                let mentions = vec![notification.agent.clone()];
-                                                let _ = notify_mentioned_agents_parallel(
-                                                    &store,
-                                                    conv_name,
-                                                    notification.message_id,
-                                                    &mentions,
-                                                )
-                                                .await;
-                                                let _ = store
-                                                    .delete_pending_notification(notification.id);
-                                            }
-                                            catchup_count += pending_count;
-                                        }
-                                    }
-
-                                    if catchup_count > 0 {
-                                        println!(
-                                            "\x1b[90mConversation resumed. {} pending item(s) processed.\x1b[0m",
-                                            catchup_count
-                                        );
-                                    } else {
-                                        println!("\x1b[90mConversation resumed.\x1b[0m");
-                                    }
-                                }
-                                Err(e) => eprintln!("\x1b[31mFailed to resume: {}\x1b[0m", e),
-                            }
-                            continue;
-                        }
-                        "/help" => {
-                            println!(
-                                "\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m"
-                            );
-                            continue;
-                        }
-                        _ => {
-                            eprintln!(
-                                "\x1b[33mUnknown command. Type /help for available commands.\x1b[0m"
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                // Parse @mentions from user message
-                let mentions = parse_mentions(line);
-
-                // Require @mentions to send messages
-                if mentions.is_empty() {
-                    eprintln!(
-                        "\x1b[33m⚠ Use @mentions to notify agents (e.g., @arya what do you think?)\x1b[0m"
-                    );
-                    continue;
-                }
-
-                // @mention-as-invite: Add new mentions as participants
-                for agent_name in &mentions {
-                    if agent_name != "all" && !participants.contains(agent_name) {
-                        // Only add if agent actually exists
-                        if anima::discovery::agent_exists(agent_name) {
-                            if let Err(e) = store.add_participant(conv_name, agent_name) {
-                                eprintln!(
-                                    "\x1b[33mWarning: Could not add {} as participant: {}\x1b[0m",
-                                    agent_name, e
-                                );
-                            } else {
-                                participants.push(agent_name.clone());
-                                println!(
-                                    "\x1b[90m[@{} joined the conversation]\x1b[0m",
-                                    agent_name
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Expand @all to all participants (excluding "user")
-                let expanded_mentions = expand_all_mention(&mentions, &participants);
-
-                let mention_refs: Vec<&str> =
-                    expanded_mentions.iter().map(|s| s.as_str()).collect();
-
-                // Store user message in conversation with mentions
-                let user_msg_id = store.add_message(conv_name, "user", line, &mention_refs)?;
-
-                // Update last_seen_id to the user's message to avoid re-displaying it
-                last_seen_id.store(user_msg_id, Ordering::SeqCst);
-
-                // Blank line before agent response
-                println!();
-
-                // Notify mentioned agents (initial notifications only)
-                // The daemon now handles all follow-up @mention chains autonomously
-                if !expanded_mentions.is_empty() {
-                    let notify_results = notify_mentioned_agents_parallel(
-                        &store,
-                        conv_name,
-                        user_msg_id,
-                        &expanded_mentions,
-                    )
-                    .await;
-
-                    // Display results for each initially notified agent
-                    for (agent, result) in &notify_results {
-                        match result {
-                            NotifyResult::Acknowledged => {
-                                // Fire-and-forget: agent received notification, processing async
-                                // The background poller will display the response when it arrives
-                                // (no message needed - "joined the conversation" already shown)
-                            }
-                            NotifyResult::Notified {
-                                response_message_id,
-                            } => {
-                                // Synchronous response (backwards compat)
-                                // Update last_seen_id so poller doesn't re-display
-                                last_seen_id.store(*response_message_id, Ordering::SeqCst);
-                                if let Ok(msgs) =
-                                    store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES))
-                                    && let Some(response_msg) =
-                                        msgs.iter().find(|m| m.id == *response_message_id)
-                                {
-                                    println!(
-                                        "\n\x1b[36m[{}]:\x1b[0m {}\n",
-                                        agent, response_msg.content
-                                    );
-                                }
-                            }
-                            NotifyResult::Queued { notification_id: _ } => {
-                                eprintln!(
-                                    "\x1b[90m[@{} offline, notification queued]\x1b[0m",
-                                    agent
-                                );
-                            }
-                            NotifyResult::UnknownAgent => {
-                                eprintln!(
-                                    "\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m",
-                                    agent
-                                );
-                            }
-                            NotifyResult::Failed { reason } => {
-                                eprintln!(
-                                    "\x1b[33m[@{} notification failed: {}]\x1b[0m",
-                                    agent, reason
-                                );
-                            }
-                        }
-                    }
-
-                    // Note: Any @mentions in agent responses are now forwarded autonomously
-                    // by the daemon. The CLI no longer tracks or displays follow-up chains.
-                    // The background poller will display new messages as they arrive.
-                }
-            }
-            Err(rustyline::error::ReadlineError::Interrupted) => {
-                println!("\n\x1b[33mInterrupted. Goodbye!\x1b[0m");
-                break;
-            }
-            Err(rustyline::error::ReadlineError::Eof) => {
-                println!("\n\x1b[33mGoodbye!\x1b[0m");
-                break;
-            }
-            Err(e) => {
-                eprintln!("\x1b[31mInput error: {}\x1b[0m", e);
-                break;
-            }
-        }
-    }
-
-    // Signal shutdown and wait for the polling task to finish
-    shutdown.store(true, Ordering::SeqCst);
-    let _ = poll_handle.await;
-
-    Ok(())
-}
-
-/// Show status of all agents (running/stopped).
-fn show_status() {
-    let agents_path = agents_dir();
-
-    if !agents_path.exists() {
-        println!(
-            "\x1b[33mNo agents directory found at {}\x1b[0m",
-            agents_path.display()
-        );
-        println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
-        return;
-    }
-
-    let entries: Vec<_> = match std::fs::read_dir(&agents_path) {
-        Ok(dir) => dir
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_dir())
-            .filter(|e| e.path().join("config.toml").exists())
-            .collect(),
-        Err(e) => {
-            eprintln!("\x1b[31mCould not read agents directory: {}\x1b[0m", e);
-            return;
-        }
+        String::new()
+    };
+    let ctx_str = if is_agent {
+        format_context_usage(msg)
+    } else {
+        String::new()
     };
 
-    if entries.is_empty() {
-        println!(
-            "\x1b[33mNo agents found in {}\x1b[0m",
-            agents_path.display()
-        );
-        println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
-        return;
-    }
-
-    // Print header
-    println!(
-        "\x1b[1m{:<20} {:<10} {:<10}\x1b[0m",
-        "AGENT", "STATUS", "PID"
-    );
-    println!("{}", "-".repeat(42));
-
-    for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let agent_path = entry.path();
-        let pid_path = agent_path.join("daemon.pid");
-
-        let (status, pid) = if PidFile::is_running(&pid_path) {
-            let pid = PidFile::read(&pid_path).unwrap_or(0);
-            ("\x1b[32mrunning\x1b[0m", pid.to_string())
-        } else {
-            ("\x1b[90mstopped\x1b[0m", "-".to_string())
-        };
-
-        println!("{:<20} {:<19} {:<10}", name, status, pid);
-    }
-}
-
-/// Query an agent with conversation persistence.
-/// Starts daemon if not running, creates/uses conversation named after agent,
-/// stores user message, streams response, and daemon stores agent response.
-async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery;
-    use std::process::Command;
-
-    let agent_path = resolve_agent_path(agent);
-
-    // Verify agent exists
-    if !agent_path.exists() {
-        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
-    }
-
-    // Load agent directory to get canonical name
-    let agent_dir = AgentDir::load(&agent_path)
-        .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
-    let agent_name = agent_dir.config.agent.name.clone();
-
-    // Start daemon if not running
-    if !discovery::is_agent_running(&agent_name) {
-        eprintln!("\x1b[33mStarting daemon for '{}'...\x1b[0m", agent_name);
-
-        let exe =
-            std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
-
-        Command::new(&exe)
-            .args(["start", &agent_name])
-            .spawn()
-            .map_err(|e| format!("Failed to start daemon: {}", e))?;
-
-        // Wait for daemon to start (up to 2 seconds)
-        for _ in 0..20 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if discovery::is_agent_running(&agent_name) {
-                break;
-            }
-        }
-
-        if !discovery::is_agent_running(&agent_name) {
-            return Err(format!("Daemon for '{}' failed to start", agent_name).into());
-        }
-    }
-
-    // Initialize conversation store and create/get conversation named after agent
-    let store = ConversationStore::init()?;
-    let conv_name = agent_name.clone();
-
-    // Create conversation if it doesn't exist
-    if store.find_by_name(&conv_name)?.is_none() {
-        store.create_conversation(Some(&conv_name), &["user", &agent_name])?;
-    }
-
-    // Store user message in conversation
-    store.add_message(&conv_name, "user", message, &[])?;
-
-    // Connect to daemon
-    let mut api = connect_to_agent(&agent_name).await?;
-
-    // Send message with conversation name for persistence
-    api.write_request(&Request::Message {
-        content: message.to_string(),
-        conv_name: Some(conv_name),
-    })
-    .await
-    .map_err(|e| format!("Failed to send message: {}", e))?;
-
-    // Read responses (streaming)
-    loop {
-        match api
-            .read_response()
-            .await
-            .map_err(|e| format!("Failed to read response: {}", e))?
-        {
-            Some(Response::Chunk { text }) => {
-                // Streaming: print tokens as they arrive
-                print!("{}", text);
-                io::stdout().flush()?;
-            }
-            Some(Response::ToolCall { tool, params }) => {
-                // Show tool call
-                let param_summary = format_tool_params(&params);
-                eprintln!(" - [tool] {}: {}", tool, param_summary);
-            }
-            Some(Response::Done) => {
-                // Streaming complete
-                println!(); // Final newline
-                break;
-            }
-            Some(Response::Message { content }) => {
-                // Fallback for non-streaming responses
-                println!("{}", content);
-                break;
-            }
-            Some(Response::Error { message }) => {
-                eprintln!("Error from agent: {}", message);
-                std::process::exit(1);
-            }
-            None => {
-                eprintln!("Connection closed unexpectedly");
-                std::process::exit(1);
-            }
-            _ => {
-                // Ignore other response types
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Start an agent daemon in the background.
-/// If `quiet` is true, suppresses output (used by restart_all_agents).
-fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let agent_path = resolve_agent_path(agent);
-    let pid_path = agent_path.join("daemon.pid");
-
-    // Check if agent directory exists
-    if !agent_path.exists() {
-        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
-    }
-
-    // Check if already running
-    if PidFile::is_running(&pid_path) {
-        let pid = PidFile::read(&pid_path).unwrap_or(0);
-        return Err(format!("Agent '{}' is already running (pid {})", agent, pid).into());
-    }
-
-    // Get path to current executable
-    let exe =
-        std::env::current_exe().map_err(|e| format!("Failed to get current executable: {}", e))?;
-
-    // Open log file for stdout/stderr redirection
-    let log_path = agent_path.join("agent.log");
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .map_err(|e| format!("Failed to open log file: {}", e))?;
-    let log_file_err = log_file
-        .try_clone()
-        .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
-
-    // Spawn daemon process in background
-    // Use `run --daemon` for the actual daemon logic
-    let child = Command::new(&exe)
-        .arg("run")
-        .arg(agent)
-        .arg("--daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_file_err))
-        .spawn()
-        .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
-
-    let pid = child.id();
-    if !quiet {
-        println!("Started {} (pid {})", agent, pid);
-    }
-
-    Ok(())
-}
-
-/// Start an agent daemon in the background.
-/// Supports glob patterns (*, ?) for matching multiple agents.
-fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::match_agents;
-
-    // Handle "all" case - start all stopped agents
-    if agent == "all" {
-        return start_all_agents();
-    }
-
-    // Check for glob pattern
-    if has_wildcards(agent) {
-        let matches = match_agents(agent);
-
-        if matches.is_empty() {
-            return Err(format!("No agents match pattern: {}", agent).into());
-        }
-
-        let mut started = Vec::new();
-        for name in &matches {
-            match start_agent_impl(name, true) {
-                Ok(()) => started.push(name.clone()),
-                Err(e) => eprintln!("Failed to start {}: {}", name, e),
-            }
-        }
-
-        if !started.is_empty() {
-            println!("Started {} agent(s): {}", started.len(), started.join(", "));
-        }
-
-        return Ok(());
-    }
-
-    start_agent_impl(agent, false)
-}
-
-/// Start all configured agents that are not currently running.
-fn start_all_agents() -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::{is_agent_running, list_saved_agents};
-
-    let all_agents = list_saved_agents();
-
-    if all_agents.is_empty() {
-        println!("No configured agents found");
-        return Ok(());
-    }
-
-    // Filter to only stopped agents
-    let stopped_agents: Vec<_> = all_agents
-        .into_iter()
-        .filter(|name| !is_agent_running(name))
-        .collect();
-
-    if stopped_agents.is_empty() {
-        println!("All agents already running");
-        return Ok(());
-    }
-
-    let mut started = Vec::new();
-
-    for agent in &stopped_agents {
-        match start_agent_impl(agent, true) {
-            Ok(()) => started.push(agent.clone()),
-            Err(e) => eprintln!("Failed to start {}: {}", agent, e),
-        }
-    }
-
-    if !started.is_empty() {
-        println!("Started {} agent(s): {}", started.len(), started.join(", "));
-    }
-
-    Ok(())
-}
-
-/// Stop a running agent daemon.
-/// - `quiet`: suppress output (used by restart_all_agents)
-/// - `force`: if true, SIGKILL without prompting on timeout; if false, prompt user
-async fn stop_agent_impl(
-    agent: &str,
-    quiet: bool,
-    force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let agent_path = resolve_agent_path(agent);
-    let pid_path = agent_path.join("daemon.pid");
-
-    // Check if running
-    if !PidFile::is_running(&pid_path) {
-        if !quiet {
-            println!("Agent '{}' is not running", agent);
-        }
-        return Ok(());
-    }
-
-    let pid = PidFile::read(&pid_path).unwrap_or(0);
-
-    // Try to send shutdown via socket first (graceful shutdown)
-    match connect_to_agent(agent).await {
-        Ok(mut api) => {
-            // Send shutdown request
-            if let Err(e) = api.write_request(&Request::Shutdown).await {
-                if !quiet {
-                    eprintln!("Warning: Failed to send shutdown request: {}", e);
-                }
-            } else {
-                // Wait briefly for graceful shutdown
-                for _ in 0..10 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    if !PidFile::is_running(&pid_path) {
-                        if !quiet {
-                            println!("Stopped {}", agent);
-                        }
-                        return Ok(());
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if !quiet {
-                eprintln!("Warning: Could not connect to agent socket: {}", e);
-            }
-        }
-    }
-
-    // If socket shutdown didn't work, send SIGTERM
-    unsafe {
-        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
-            // Wait for process to terminate (3 seconds)
-            for _ in 0..30 {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if !PidFile::is_running(&pid_path) {
-                    if !quiet {
-                        println!("Stopped {}", agent);
-                    }
-                    return Ok(());
-                }
-            }
-
-            // Still running - try SIGKILL
-            if !quiet {
-                eprintln!("Warning: Agent did not stop within timeout");
-            }
-
-            // Determine if we should SIGKILL
-            let should_kill = if force {
-                true
-            } else if quiet {
-                false // Don't auto-kill in quiet mode without force
-            } else {
-                // Prompt user
-                use std::io::{self, Write};
-                print!("Stop timed out, do you want to kill {}? (y/N) ", agent);
-                io::stdout().flush().ok();
-                let mut input = String::new();
-                if io::stdin().read_line(&mut input).is_ok() {
-                    input.trim().eq_ignore_ascii_case("y")
-                        || input.trim().eq_ignore_ascii_case("yes")
-                } else {
-                    false
-                }
-            };
-
-            if should_kill {
-                if libc::kill(pid as i32, libc::SIGKILL) == 0 {
-                    // Wait briefly for cleanup
-                    for _ in 0..10 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        if !PidFile::is_running(&pid_path) {
-                            break;
-                        }
-                    }
-                    // Clean up stale pid file if process is gone
-                    if !PidFile::is_running(&pid_path) {
-                        let _ = std::fs::remove_file(&pid_path);
-                    }
-                    if !quiet {
-                        println!("Killed {}", agent);
-                    }
-                } else if !quiet {
-                    eprintln!("Warning: Failed to send SIGKILL to pid {}", pid);
-                }
-                return Ok(());
-            } else {
-                if !quiet {
-                    println!("Agent {} still running (pid {})", agent, pid);
-                }
-                return Ok(());
-            }
-        } else if !quiet {
-            eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
-        }
-    }
-
-    if !quiet {
-        println!("Stopped {}", agent);
-    }
-    Ok(())
-}
-
-/// Stop a running agent daemon.
-/// Supports glob patterns (*, ?) for matching multiple agents.
-async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::match_agents;
-
-    // Handle "all" case - stop all running agents
-    if agent == "all" {
-        return stop_all_agents().await;
-    }
-
-    // Check for glob pattern
-    if has_wildcards(agent) {
-        let matches = match_agents(agent);
-
-        if matches.is_empty() {
-            return Err(format!("No agents match pattern: {}", agent).into());
-        }
-
-        let mut stopped = Vec::new();
-        for name in &matches {
-            match stop_agent_impl(name, true, true).await {
-                // force=true for batch
-                Ok(()) => stopped.push(name.clone()),
-                Err(e) => eprintln!("Failed to stop {}: {}", name, e),
-            }
-        }
-
-        if !stopped.is_empty() {
-            println!("Stopped {} agent(s): {}", stopped.len(), stopped.join(", "));
-        }
-
-        return Ok(());
-    }
-
-    stop_agent_impl(agent, false, false).await // Interactive: prompt before kill
-}
-
-/// Stop all running agent daemons.
-async fn stop_all_agents() -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::discover_running_agents;
-
-    let running_agents = discover_running_agents();
-
-    if running_agents.is_empty() {
-        println!("No running agents to stop");
-        return Ok(());
-    }
-
-    let mut stopped_count = 0;
-
-    for agent in &running_agents {
-        print!("Stopping {}... ", agent.name);
-        io::stdout().flush()?;
-
-        match stop_agent_impl(&agent.name, true, true).await {
-            // force=true for batch
-            Ok(()) => {
-                println!("stopped");
-                stopped_count += 1;
-            }
-            Err(e) => {
-                println!("failed: {}", e);
-            }
-        }
-    }
-
-    println!("\nStopped {} agent(s)", stopped_count);
-    Ok(())
-}
-
-/// Restart a running agent daemon (stop then start).
-/// Supports glob patterns (*, ?) for matching multiple agents.
-/// If agent is "all", restarts all currently running agents.
-async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::match_agents;
-
-    // Handle "all" case - restart all running agents
-    if agent == "all" {
-        return restart_all_agents().await;
-    }
-
-    // Check for glob pattern
-    if has_wildcards(agent) {
-        let matches = match_agents(agent);
-
-        if matches.is_empty() {
-            return Err(format!("No agents match pattern: {}", agent).into());
-        }
-
-        // Filter to only running agents (restart shouldn't start stopped agents)
-        let running_matches: Vec<_> = matches
-            .iter()
-            .filter(|name| {
-                let pid_path = resolve_agent_path(name).join("daemon.pid");
-                PidFile::is_running(&pid_path)
-            })
-            .collect();
-
-        if running_matches.is_empty() {
-            println!("No running agents match pattern: {}", agent);
-            return Ok(());
-        }
-
-        let mut restarted = Vec::new();
-        for name in &running_matches {
-            print!("Restarting {}... ", name);
-            io::stdout().flush()?;
-
-            // Stop the agent (quiet mode, force kill if needed)
-            if let Err(e) = stop_agent_impl(name, true, true).await {
-                println!("failed to stop: {}", e);
-                continue;
-            }
-
-            // Brief wait to ensure clean shutdown
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-            // Start the agent (quiet mode)
-            match start_agent_impl(name, true) {
-                Ok(()) => {
-                    // Wait for daemon.pid to be written by the daemon process
-                    let pid_path = resolve_agent_path(name).join("daemon.pid");
-                    let mut pid = 0u32;
-                    for _ in 0..20 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        if let Ok(p) = PidFile::read(&pid_path)
-                            && p > 0
-                        {
-                            pid = p;
-                            break;
-                        }
-                    }
-                    println!("done (pid {})", pid);
-                    restarted.push(name.to_string());
-                }
-                Err(e) => {
-                    println!("failed to start: {}", e);
-                }
-            }
-        }
-
-        println!(
-            "Restarted {} agent{}",
-            restarted.len(),
-            if restarted.len() == 1 { "" } else { "s" }
-        );
-
-        return Ok(());
-    }
-
-    // Single agent (no wildcards)
-    let agent_path = resolve_agent_path(agent);
-    let pid_path = agent_path.join("daemon.pid");
-
-    // Check if agent directory exists
-    if !agent_path.exists() {
-        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
-    }
-
-    // Check if currently running
-    let was_running = PidFile::is_running(&pid_path);
-
-    if was_running {
-        println!("Stopping {}...", agent);
-        stop_agent(agent).await?;
-        // Brief wait to ensure clean shutdown
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    println!("Starting {}...", agent);
-    start_agent(agent)?;
-
-    Ok(())
-}
-
-/// Restart all currently running agent daemons.
-async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
-    use anima::discovery::discover_running_agents;
-
-    // Get all running agents
-    let running_agents = discover_running_agents();
-
-    if running_agents.is_empty() {
-        println!("No running agents to restart");
-        return Ok(());
-    }
-
-    let mut restarted_count = 0;
-
-    for agent in &running_agents {
-        print!("Restarting {}... ", agent.name);
-        io::stdout().flush()?;
-
-        // Stop the agent (quiet mode, force kill if needed)
-        if let Err(e) = stop_agent_impl(&agent.name, true, true).await {
-            println!("failed to stop: {}", e);
-            continue;
-        }
-
-        // Brief wait to ensure clean shutdown
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // Start the agent (quiet mode - no output)
-        match start_agent_impl(&agent.name, true) {
-            Ok(()) => {
-                // Wait for daemon.pid to be written by the daemon process
-                let pid_path = resolve_agent_path(&agent.name).join("daemon.pid");
-                let mut pid = 0u32;
-                for _ in 0..20 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    if let Ok(p) = PidFile::read(&pid_path)
-                        && p > 0
-                    {
-                        pid = p;
-                        break;
-                    }
-                }
-                println!("done (pid {})", pid);
-                restarted_count += 1;
-            }
-            Err(e) => {
-                println!("failed to start: {}", e);
-            }
-        }
-    }
-
-    println!(
-        "Restarted {} agent{}",
-        restarted_count,
-        if restarted_count == 1 { "" } else { "s" }
-    );
-
-    Ok(())
-}
-
-/// Clear conversation history for a running agent daemon.
-async fn clear_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut api = connect_to_agent(agent).await?;
-
-    // Send clear request
-    api.write_request(&Request::Clear)
-        .await
-        .map_err(|e| format!("Failed to send clear request: {}", e))?;
-
-    // Read the response
-    match api
-        .read_response()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?
-    {
-        Some(Response::Ok) => {
-            println!("Cleared conversation for {}", agent);
-        }
-        Some(Response::Error { message }) => {
-            return Err(format!("Error from agent: {}", message).into());
-        }
-        Some(other) => {
-            return Err(format!("Unexpected response: {:?}", other).into());
-        }
-        None => {
-            return Err("Connection closed unexpectedly".into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Show the system prompt for a running agent daemon.
-async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut api = connect_to_agent(agent).await?;
-
-    // Send system request
-    api.write_request(&Request::System)
-        .await
-        .map_err(|e| format!("Failed to send system request: {}", e))?;
-
-    // Read the response
-    match api
-        .read_response()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?
-    {
-        Some(Response::System { system_prompt }) => {
-            println!("{}", system_prompt);
-        }
-        Some(Response::Error { message }) => {
-            return Err(format!("Error from agent: {}", message).into());
-        }
-        Some(other) => {
-            return Err(format!("Unexpected response: {:?}", other).into());
-        }
-        None => {
-            return Err("Connection closed unexpectedly".into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Trigger a heartbeat for a running agent daemon.
-async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut api = connect_to_agent(agent).await?;
-
-    // Send heartbeat request
-    api.write_request(&Request::Heartbeat)
-        .await
-        .map_err(|e| format!("Failed to send heartbeat request: {}", e))?;
-
-    // Read the response
-    match api
-        .read_response()
-        .await
-        .map_err(|e| format!("Failed to read response: {}", e))?
-    {
-        Some(Response::HeartbeatTriggered) => {
-            println!("Heartbeat triggered for {}", agent);
-        }
-        Some(Response::HeartbeatNotConfigured) => {
-            println!(
-                "Heartbeat not configured for {} (add [heartbeat] section to config.toml)",
-                agent
-            );
-        }
-        Some(Response::Error { message }) => {
-            return Err(format!("Error from agent: {}", message).into());
-        }
-        Some(other) => {
-            return Err(format!("Unexpected response: {:?}", other).into());
-        }
-        None => {
-            return Err("Connection closed unexpectedly".into());
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle chat subcommands.
-async fn handle_chat_command(
-    command: Option<ChatCommands>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let store = ConversationStore::init()?;
-
-    match command {
-        // `anima chat new` or `anima chat new <name>` - create new chat and enter it
-        Some(ChatCommands::New { name }) => {
-            // Create conversation with "user" as participant (agents join via @mention)
-            let conv_name = store.create_conversation(name.as_deref(), &["user"])?;
-            println!("Created conversation '\x1b[36m{}\x1b[0m'\n", conv_name);
-
-            // Enter the new chat
-            chat_with_conversation(&conv_name).await?;
-        }
-
-        // `anima chat create` or `anima chat create <name>` - create conversation without entering interactive mode
-        Some(ChatCommands::Create { name }) => {
-            // Create conversation with "user" as participant (agents join via @mention)
-            let conv_name = store.create_conversation(name.as_deref(), &["user"])?;
-            println!("Created conversation: {}", conv_name);
-        }
-
-        // `anima chat join <name>` (or `anima chat open <name>`) - join existing chat by name
-        Some(ChatCommands::Join { name }) => {
-            // Check if conversation exists
-            if store.find_by_name(&name)?.is_none() {
-                return Err(format!(
-                    "Conversation '{}' not found. Use 'anima chat create {}' to create it.",
-                    name, name
-                )
-                .into());
-            }
-
-            chat_with_conversation(&name).await?;
-        }
-
-        // `anima chat send <conv> "message"` - fire-and-forget message injection
-        Some(ChatCommands::Send { conv, message }) => {
-            // Check if conversation exists
-            if store.find_by_name(&conv)?.is_none() {
-                return Err(format!("Conversation '{}' not found", conv).into());
-            }
-
-            // Parse @mentions from message
-            let mentions = parse_mentions(&message);
-
-            // Get current participants
-            let parts = store.get_participants(&conv)?;
-            let participants: Vec<String> = parts
-                .iter()
-                .filter(|p| p.agent != "user")
-                .map(|p| p.agent.clone())
-                .collect();
-
-            // Add mentioned agents as participants if they exist and not already in
-            for agent_name in &mentions {
-                if agent_name != "all"
-                    && !participants.contains(agent_name)
-                    && anima::discovery::agent_exists(agent_name)
-                    && let Err(e) = store.add_participant(&conv, agent_name)
-                {
-                    eprintln!(
-                        "Warning: Could not add {} as participant: {}",
-                        agent_name, e
-                    );
-                }
-            }
-
-            // Expand @all to all participants
-            let updated_parts = store.get_participants(&conv)?;
-            let updated_participants: Vec<String> = updated_parts
-                .iter()
-                .filter(|p| p.agent != "user")
-                .map(|p| p.agent.clone())
-                .collect();
-            let expanded_mentions = expand_all_mention(&mentions, &updated_participants);
-
-            let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
-
-            // Store user message in conversation
-            let user_msg_id = store.add_message(&conv, "user", &message, &mention_refs)?;
-
-            // Notify mentioned agents - wait for acknowledgments but not responses
-            // The daemon processes notifications asynchronously after acknowledging
-            if !expanded_mentions.is_empty() {
-                let results = notify_mentioned_agents_parallel(
-                    &store,
-                    &conv,
-                    user_msg_id,
-                    &expanded_mentions,
-                )
-                .await;
-
-                // Report results
-                let mut notified = Vec::new();
-                let mut queued = Vec::new();
-                let mut failed = Vec::new();
-
-                for (agent, result) in results {
-                    match result {
-                        NotifyResult::Acknowledged | NotifyResult::Notified { .. } => {
-                            notified.push(agent)
-                        }
-                        NotifyResult::Queued { .. } => queued.push(agent),
-                        NotifyResult::UnknownAgent => failed.push(format!("{} (unknown)", agent)),
-                        NotifyResult::Failed { reason } => {
-                            failed.push(format!("{} ({})", agent, reason))
-                        }
-                    }
-                }
-
-                if !notified.is_empty() {
-                    println!(
-                        "Sent message to '{}', notified: {}",
-                        conv,
-                        notified.join(", ")
-                    );
-                }
-                if !queued.is_empty() {
-                    println!("Queued for offline agents: {}", queued.join(", "));
-                }
-                if !failed.is_empty() {
-                    eprintln!("Failed to notify: {}", failed.join(", "));
-                }
-            } else {
-                println!("Sent message to '{}' (no @mentions)", conv);
-            }
-        }
-
-        // `anima chat view <conv>` - view messages (pretty by default, --raw for scripts)
-        Some(ChatCommands::View {
-            conv,
-            limit,
-            since,
-            raw,
-        }) => {
-            // Check if conversation exists
-            if store.find_by_name(&conv)?.is_none() {
-                return Err(format!("Conversation '{}' not found", conv).into());
-            }
-
-            // Get messages with filtering
-            let messages = store.get_messages_filtered(&conv, limit, since)?;
-
-            // Filter out tool messages from display (they clutter the chat)
-            let messages: Vec<_> = messages
-                .into_iter()
-                .filter(|m| m.from_agent != "tool")
-                .collect();
-
-            if raw {
-                // Raw format: ID|TIMESTAMP|FROM|CONTENT (one line per message, escaped)
-                for msg in messages {
-                    let escaped_content = msg
-                        .content
-                        .replace('\\', "\\\\")
-                        .replace('\n', "\\n")
-                        .replace('|', "\\|");
-                    println!(
-                        "{}|{}|{}|{}",
-                        msg.id, msg.created_at, msg.from_agent, escaped_content
-                    );
-                }
-            } else {
-                // Pretty format (human-readable)
-                for msg in &messages {
-                    // Format timestamp: YYYY-MM-DD HH:MM
-                    let datetime = format_timestamp_pretty(msg.created_at);
-
-                    // Show duration and context usage for agent messages if available
-                    let duration_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
-                        msg.duration_ms
-                            .map(|d| {
-                                format!(
-                                    " \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m",
-                                    format_duration_ms(d)
-                                )
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let ctx_str = if msg.from_agent != "user" && msg.from_agent != "tool" {
-                        format_context_usage(msg)
-                    } else {
-                        String::new()
-                    };
-
-                    // [ID] YYYY-MM-DD HH:MM • agent_name • duration • X% ctx
-                    // ID and timestamp in dim gray, agent name in cyan, duration in yellow, ctx in magenta
-                    println!(
-                        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[36m{}\x1b[0m{}{}",
-                        msg.id, datetime, msg.from_agent, duration_str, ctx_str
-                    );
-                    // Content in normal color
-                    println!("{}", msg.content);
-                    println!(); // Blank line between messages
-                }
-            }
-        }
-
-        // `anima chat pause <conv>` - pause notifications for a conversation (supports glob patterns)
-        Some(ChatCommands::Pause { conv, force }) => {
-            let matches = store.match_conversations(&conv)?;
-
-            if matches.is_empty() {
-                return Err(format!("No conversations match pattern: {}", conv).into());
-            }
-
-            // Ask for confirmation if multiple matches or using wildcards
-            if !force
-                && (matches.len() > 1 || has_wildcards(&conv))
-                && !confirm_action("pause", &matches)?
-            {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            for conv_name in &matches {
-                let _ = store.set_paused(conv_name, true)?;
-                println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv_name);
-            }
-        }
-
-        // `anima chat stop <conv>` - stop a paused conversation without processing catchup (supports glob patterns)
-        Some(ChatCommands::Stop { conv, force }) => {
-            let matches = store.match_conversations(&conv)?;
-
-            if matches.is_empty() {
-                return Err(format!("No conversations match pattern: {}", conv).into());
-            }
-
-            // Ask for confirmation if multiple matches or using wildcards
-            if !force
-                && (matches.len() > 1 || has_wildcards(&conv))
-                && !confirm_action("stop", &matches)?
-            {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            for conv_name in &matches {
-                // Resume without processing catchup (just clears paused state)
-                let _ = store.set_paused(conv_name, false)?;
-                // Clear any catchup items by not processing them
-                println!(
-                    "Stopped conversation '\x1b[36m{}\x1b[0m' (catchup discarded)",
-                    conv_name
-                );
-            }
-        }
-
-        // `anima chat resume <conv>` - resume a paused conversation (supports glob patterns)
-        Some(ChatCommands::Resume { conv, force }) => {
-            let matches = store.match_conversations(&conv)?;
-
-            if matches.is_empty() {
-                return Err(format!("No conversations match pattern: {}", conv).into());
-            }
-
-            // Ask for confirmation if multiple matches or using wildcards
-            if !force
-                && (matches.len() > 1 || has_wildcards(&conv))
-                && !confirm_action("resume", &matches)?
-            {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            for conv_name in &matches {
-                // Resume the conversation and get the paused_at_msg_id
-                let paused_at_msg_id = store.set_paused(conv_name, false)?;
-                let mut catchup_count = 0;
-
-                // Process catchup items (tool calls and mentions skipped during pause)
-                if let Some(paused_at) = paused_at_msg_id
-                    && let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at)
-                {
-                    let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
-                    for item in &catchup_items {
-                        // Process @mentions
-                        if !item.mentions.is_empty() {
-                            let _ = notify_mentioned_agents_parallel(
-                                &store,
-                                conv_name,
-                                item.message.id,
-                                &item.mentions,
-                            )
-                            .await;
-                            catchup_count += item.mentions.len();
-                        }
-                        // Note: Tool calls in catchup items will be handled
-                        // by the agent when it processes the follow-up notification
-                    }
-                }
-
-                // Also check for pending notifications (for agents that weren't running)
-                let pending = store.get_pending_notifications_for_conversation(conv_name)?;
-                let pending_count = pending.len();
-
-                if pending_count > 0 {
-                    // Process pending notifications
-                    for notification in &pending {
-                        let mentions = vec![notification.agent.clone()];
-                        let _ = notify_mentioned_agents_parallel(
-                            &store,
-                            conv_name,
-                            notification.message_id,
-                            &mentions,
-                        )
-                        .await;
-
-                        // Clear this notification after processing
-                        let _ = store.delete_pending_notification(notification.id);
-                    }
-                    catchup_count += pending_count;
-                }
-
-                if catchup_count > 0 {
-                    println!(
-                        "Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)",
-                        conv_name, catchup_count
-                    );
-                } else {
-                    println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv_name);
-                }
-            }
-        }
-
-        // `anima chat delete <name>` - delete a conversation (supports glob patterns)
-        Some(ChatCommands::Delete { name, force }) => {
-            let matches = store.match_conversations(&name)?;
-
-            if matches.is_empty() {
-                return Err(format!("No conversations match pattern: {}", name).into());
-            }
-
-            // Ask for confirmation if multiple matches or using wildcards
-            if !force
-                && (matches.len() > 1 || has_wildcards(&name))
-                && !confirm_action("delete", &matches)?
-            {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            for conv_name in &matches {
-                store.delete_conversation(conv_name)?;
-                println!("Deleted conversation '\x1b[36m{}\x1b[0m'", conv_name);
-            }
-        }
-
-        // `anima chat clear <conv>` - clear all messages from a conversation (supports glob patterns)
-        Some(ChatCommands::Clear { conv, force }) => {
-            let matches = store.match_conversations(&conv)?;
-
-            if matches.is_empty() {
-                return Err(format!("No conversations match pattern: {}", conv).into());
-            }
-
-            // Ask for confirmation if multiple matches or using wildcards
-            if !force
-                && (matches.len() > 1 || has_wildcards(&conv))
-                && !confirm_action("clear", &matches)?
-            {
-                println!("Aborted.");
-                return Ok(());
-            }
-
-            for conv_name in &matches {
-                let deleted = store.clear_messages(conv_name)?;
-                println!(
-                    "Cleared {} messages from '\x1b[36m{}\x1b[0m'",
-                    deleted, conv_name
-                );
-            }
-        }
-
-        // `anima chat cleanup` - run cleanup_expired
-        Some(ChatCommands::Cleanup) => {
-            let (messages_deleted, convs_deleted) = store.cleanup_expired()?;
-            println!("Cleanup complete:");
-            println!("  - {} expired messages deleted", messages_deleted);
-            println!("  - {} empty conversations deleted", convs_deleted);
-        }
-
-        // `anima chat` - list all conversations
-        None => {
-            let conversations = store.list_conversations()?;
-
-            if conversations.is_empty() {
-                println!("\x1b[33mNo conversations found.\x1b[0m");
-                println!("Create one with: \x1b[36manima chat create\x1b[0m");
-                return Ok(());
-            }
-
-            // Column order: NAME, MSGS, UPDATED, PARTICIPANTS (last so it can overflow)
-            println!(
-                "\x1b[1m{:<30} {:>6}   {:<10} PARTICIPANTS\x1b[0m",
-                "NAME", "MSGS", "UPDATED"
-            );
-            println!("{}", "-".repeat(80));
-
-            for conv in conversations {
-                let participants = store.get_participants(&conv.name)?;
-                let agents: Vec<_> = participants.iter().map(|p| p.agent.as_str()).collect();
-
-                // Get message count
-                let msg_count = store.get_message_count(&conv.name)?;
-
-                // Format updated_at as relative time
-                let updated = format_relative_time(conv.updated_at);
-
-                // Show paused indicator
-                let name_display = if conv.paused {
-                    format!("{} \x1b[33m⏸\x1b[0m", conv.name)
-                } else {
-                    conv.name.clone()
-                };
-
-                println!(
-                    "{:<30} {:>6}   {:<10} {}",
-                    name_display,
-                    msg_count,
-                    updated,
-                    agents.join(", ")
-                );
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Handle memory subcommands.
-async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn std::error::Error>> {
-    match command {
-        MemoryCommands::List { agent, limit } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            let memories = store.list_all(Some(limit))?;
-
-            if memories.is_empty() {
-                println!("No memories found for agent '{}'", agent);
-                return Ok(());
-            }
-
-            // Print header
-            println!(
-                "\x1b[1m{:<6} {:<12} {:<10} CONTENT\x1b[0m",
-                "ID", "CREATED", "SOURCE"
-            );
-            println!("{}", "─".repeat(110));
-
-            for m in memories {
-                let age = format_age(m.created_at);
-                // Truncate content to ~80 chars for display
-                let content_display: String = m.content.chars().take(80).collect();
-                let content_display = if m.content.chars().count() > 80 {
-                    format!("{}...", content_display)
-                } else {
-                    content_display
-                };
-                // Replace newlines with spaces for single-line display
-                let content_display = content_display.replace('\n', " ");
-
-                println!(
-                    "{:<6} {:<12} {:<10} {}",
-                    m.id, age, m.source, content_display
-                );
-            }
-        }
-
-        MemoryCommands::Search {
-            agent,
-            query,
-            limit,
-        } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-
-            // For semantic search, we need embeddings. Check if agent has embedding config.
-            // Try to get embedding from Ollama if available
-            let embedding_result = get_query_embedding(&query).await;
-
-            let results = match embedding_result {
-                Ok(embedding) =>
-                {
-                    #[allow(deprecated)]
-                    store.recall_with_embedding(&query, limit, Some(&embedding))?
-                }
-                Err(_) => {
-                    // Fall back to listing all and doing simple text search
-                    eprintln!(
-                        "\x1b[33mWarning: Could not generate embedding, falling back to text search\x1b[0m"
-                    );
-                    let all = store.list_all(None)?;
-                    let query_lower = query.to_lowercase();
-                    all.into_iter()
-                        .filter(|m| m.content.to_lowercase().contains(&query_lower))
-                        .take(limit)
-                        .map(|m| (m, 1.0)) // Dummy score for text matches
-                        .collect()
-                }
-            };
-
-            if results.is_empty() {
-                println!(
-                    "No memories matching '{}' found for agent '{}'",
-                    query, agent
-                );
-                return Ok(());
-            }
-
-            // Print header
-            println!(
-                "\x1b[1m{:<6} {:<8} {:<12} {:<10} CONTENT\x1b[0m",
-                "ID", "SCORE", "CREATED", "SOURCE"
-            );
-            println!("{}", "─".repeat(80));
-
-            for (m, score) in results {
-                let age = format_age(m.created_at);
-                // Truncate content to ~35 chars for display
-                let content_display: String = m.content.chars().take(35).collect();
-                let content_display = if m.content.chars().count() > 35 {
-                    format!("{}...", content_display)
-                } else {
-                    content_display
-                };
-                let content_display = content_display.replace('\n', " ");
-
-                println!(
-                    "{:<6} {:<8.3} {:<12} {:<10} {}",
-                    m.id, score, age, m.source, content_display
-                );
-            }
-        }
-
-        MemoryCommands::Delete { agent, id } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            let deleted = store.delete(id)?;
-
-            if deleted {
-                println!("Deleted memory #{} for agent '{}'", id, agent);
-            } else {
-                println!("Memory #{} not found for agent '{}'", id, agent);
-            }
-        }
-
-        MemoryCommands::Clear { agent, force } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            let count = store.count()?;
-
-            if count == 0 {
-                println!("No memories to clear for agent '{}'", agent);
-                return Ok(());
-            }
-
-            // Confirm unless --force
-            if !force {
-                print!(
-                    "This will delete {} memories for '{}'. Continue? [y/N] ",
-                    count, agent
-                );
-                io::stdout().flush()?;
-
-                let mut input = String::new();
-                io::stdin().read_line(&mut input)?;
-                if !input.trim().eq_ignore_ascii_case("y") {
-                    println!("Aborted.");
-                    return Ok(());
-                }
-            }
-
-            let deleted = store.clear_all()?;
-            println!("Cleared {} memories for agent '{}'", deleted, agent);
-        }
-
-        MemoryCommands::Count { agent } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-            let count = store.count()?;
-
-            println!("Agent '{}' has {} memories", agent, count);
-        }
-
-        MemoryCommands::Show { agent, id } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-
-            match store.get(id)? {
-                Some(entry) => {
-                    let age = format_age(entry.created_at);
-                    println!("\x1b[1mMemory #{}\x1b[0m", entry.id);
-                    println!("─────────────────────────────────────────");
-                    println!("\x1b[90mCreated:\x1b[0m    {}", age);
-                    println!("\x1b[90mSource:\x1b[0m     {}", entry.source);
-                    println!("\x1b[90mImportance:\x1b[0m {:.2}", entry.importance);
-                    println!("\x1b[90mContent:\x1b[0m");
-                    println!("{}", entry.content);
-                }
-                None => {
-                    return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
-                }
-            }
-        }
-
-        MemoryCommands::Add {
-            agent,
-            content,
-            importance,
-        } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            // Create memory.db if it doesn't exist
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-
-            // Clamp importance to valid range
-            let importance = importance.clamp(0.0, 1.0);
-
-            match store.save(&content, importance, "cli")? {
-                anima::memory::SaveResult::New(id) => {
-                    println!("Created memory #{} for agent '{}'", id, agent);
-                }
-                anima::memory::SaveResult::Reinforced(id, old_imp, new_imp) => {
-                    println!(
-                        "Reinforced existing memory #{} (importance: {:.2} → {:.2})",
-                        id, old_imp, new_imp
-                    );
-                }
-            }
-        }
-
-        MemoryCommands::Replace { agent, id, content } => {
-            let agent_path = resolve_agent_path(&agent);
-            let memory_path = agent_path.join("memory.db");
-
-            if !memory_path.exists() {
-                return Err(format!(
-                    "No memory database found for agent '{}' at {}",
-                    agent,
-                    memory_path.display()
-                )
-                .into());
-            }
-
-            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
-
-            if store.update_content(id, &content)? {
-                println!("Updated memory #{} for agent '{}'", id, agent);
-            } else {
-                return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Try to get an embedding for a query string using Ollama.
-async fn get_query_embedding(query: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    use anima::EmbeddingClient;
-
-    // Try to use the default embedding model (nomic-embed-text is common)
-    let client = EmbeddingClient::new("nomic-embed-text", None);
-    let embedding = client.embed(query).await?;
-    Ok(embedding)
+    format!(
+        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}\n{}\n",
+        msg.id, datetime, color, msg.from_agent, duration_str, ctx_str, msg.content
+    )
 }
 
 /// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.
@@ -2357,7 +507,7 @@ fn format_duration_ms(ms: i64) -> String {
 }
 
 /// Format context usage from message token data.
-/// Returns formatted string like "ctx 2k/32k (26%)" or empty string if data unavailable.
+/// Returns formatted string like "2k/32k (26%)" or empty string if data unavailable.
 fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> String {
     match (msg.tokens_in, msg.tokens_out, msg.num_ctx) {
         (Some(tokens_in), Some(tokens_out), Some(num_ctx)) if num_ctx > 0 => {
@@ -2377,7 +527,7 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
 /// Format token count as short string (e.g., 2048 -> "2k", 32768 -> "33k", 500 -> "500")
 fn format_tokens_short(tokens: i64) -> String {
     if tokens >= 1000 {
-        let k = (tokens + 500) / 1000; // round to nearest k
+        let k = (tokens + 500) / 1000;
         format!("{}k", k)
     } else {
         format!("{}", tokens)
@@ -2426,31 +576,9 @@ fn confirm_action(action: &str, items: &[String]) -> Result<bool, Box<dyn std::e
     Ok(input.trim().eq_ignore_ascii_case("y"))
 }
 
-/// Run an agent from a directory and start an interactive REPL
-/// In daemon mode, this starts the daemon (if needed) and connects via REPL.
-async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let agent_path = resolve_agent_path(agent);
-
-    // Load the agent directory to verify it exists
-    let agent_dir = AgentDir::load(&agent_path)?;
-    let agent_name = agent_dir.config.agent.name.clone();
-
-    // Start a REPL connected to this agent (will start daemon if needed)
-    let mut repl = Repl::with_agent(agent_name.clone()).await;
-    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent_name);
-
-    repl.run().await?;
-    Ok(())
-}
-
-/// Scaffold a new agent directory (delegates to shared function in agent_dir)
-fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    anima::agent_dir::create_agent(name, path)?;
-    Ok(())
-}
-
-/// List all agents in ~/.anima/agents/
-fn list_agents() {
+/// List agent directory entries from ~/.anima/agents/ that contain config.toml.
+/// Prints a message and returns None if no agents are found.
+fn list_agent_dirs() -> Option<Vec<std::fs::DirEntry>> {
     let agents_path = agents_dir();
 
     if !agents_path.exists() {
@@ -2459,7 +587,7 @@ fn list_agents() {
             agents_path.display()
         );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
-        return;
+        return None;
     }
 
     let entries: Vec<_> = match std::fs::read_dir(&agents_path) {
@@ -2470,7 +598,7 @@ fn list_agents() {
             .collect(),
         Err(e) => {
             eprintln!("\x1b[31mCould not read agents directory: {}\x1b[0m", e);
-            return;
+            return None;
         }
     };
 
@@ -2480,14 +608,1582 @@ fn list_agents() {
             agents_path.display()
         );
         println!("Create an agent with: \x1b[36manima create <name>\x1b[0m");
-        return;
+        return None;
     }
+
+    Some(entries)
+}
+
+/// Open a SemanticMemoryStore for the given agent, returning an error if memory.db doesn't exist.
+fn open_memory_store(agent: &str) -> Result<SemanticMemoryStore, Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let memory_path = agent_path.join("memory.db");
+
+    if !memory_path.exists() {
+        return Err(format!(
+            "No memory database found for agent '{}' at {}",
+            agent,
+            memory_path.display()
+        )
+        .into());
+    }
+
+    Ok(SemanticMemoryStore::open(&memory_path, agent)?)
+}
+
+/// Process catchup items and pending notifications after resuming a conversation.
+/// Returns the number of items processed.
+async fn process_catchup(
+    store: &ConversationStore,
+    conv_name: &str,
+    paused_at_msg_id: Option<i64>,
+) -> usize {
+    let mut catchup_count = 0;
+
+    if let Some(paused_at) = paused_at_msg_id
+        && let Ok(catchup_msgs) = store.get_catchup_messages(conv_name, paused_at)
+    {
+        let catchup_items = ConversationStore::build_catchup_items(&catchup_msgs);
+        for item in &catchup_items {
+            if !item.mentions.is_empty() {
+                let _ = notify_mentioned_agents_parallel(
+                    store,
+                    conv_name,
+                    item.message.id,
+                    &item.mentions,
+                )
+                .await;
+                catchup_count += item.mentions.len();
+            }
+        }
+    }
+
+    if let Ok(pending) = store.get_pending_notifications_for_conversation(conv_name) {
+        for notification in &pending {
+            let mentions = vec![notification.agent.clone()];
+            let _ = notify_mentioned_agents_parallel(
+                store,
+                conv_name,
+                notification.message_id,
+                &mentions,
+            )
+            .await;
+            let _ = store.delete_pending_notification(notification.id);
+        }
+        catchup_count += pending.len();
+    }
+
+    catchup_count
+}
+
+/// Try to get an embedding for a query string using Ollama.
+async fn get_query_embedding(query: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    use anima::EmbeddingClient;
+
+    let client = EmbeddingClient::new("nomic-embed-text", None);
+    Ok(client.embed(query).await?)
+}
+
+// ---------------------------------------------------------------------------
+// Chat session
+// ---------------------------------------------------------------------------
+
+/// Start an interactive chat session with a conversation by name.
+///
+/// Messages are sent to @mentioned agents. When a user @mentions an agent
+/// for the first time, they are automatically added as a participant.
+///
+/// Note: The daemon now handles @mention forwarding autonomously. The CLI only
+/// sends initial notifications and displays results - follow-up chains continue
+/// in the background via daemon-to-daemon communication.
+///
+/// A background polling task displays incoming agent messages in real-time.
+async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = ConversationStore::init()?;
+
+    let parts = store.get_participants(conv_name)?;
+    let mut participants: Vec<String> = parts
+        .iter()
+        .filter(|p| p.agent != "user")
+        .map(|p| p.agent.clone())
+        .collect();
+
+    let last_seen_id = Arc::new(AtomicI64::new(0));
+
+    if let Ok(msgs) = store.get_messages(conv_name, Some(1))
+        && let Some(last) = msgs.last()
+    {
+        last_seen_id.store(last.id, Ordering::SeqCst);
+    }
+
+    println!("\x1b[32m✓ Joined conversation '{}'\x1b[0m", conv_name);
+    if participants.is_empty() {
+        println!("\x1b[90mNo agents yet - use @mentions to invite them\x1b[0m");
+    } else {
+        println!("\x1b[90mParticipants: {}\x1b[0m", participants.join(", "));
+    }
+
+    if let Ok(recent_msgs) = store.get_messages(conv_name, Some(25))
+        && !recent_msgs.is_empty()
+    {
+        println!("\x1b[90m--- Recent messages ---\x1b[0m");
+        for msg in &recent_msgs {
+            if msg.from_agent == "tool" {
+                continue;
+            }
+            print!("{}", format_message_display(msg));
+        }
+
+        if let Some(last) = recent_msgs.last() {
+            last_seen_id.store(last.id, Ordering::SeqCst);
+        }
+    }
+
+    println!("Type your messages. Press Ctrl+D or Ctrl+C to exit.\n");
+
+    // Spawn background message polling task
+    let poll_conv_name = conv_name.to_string();
+    let poll_last_seen = last_seen_id.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let poll_shutdown = shutdown.clone();
+
+    let poll_handle = tokio::spawn(async move {
+        let poll_store = match ConversationStore::init() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        loop {
+            if poll_shutdown.load(Ordering::SeqCst) {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let last_id = poll_last_seen.load(Ordering::SeqCst);
+            if let Ok(msgs) = poll_store.get_messages_filtered(&poll_conv_name, None, Some(last_id))
+            {
+                for msg in msgs {
+                    if msg.from_agent != "user" && msg.from_agent != "tool" {
+                        print!("\r\x1b[K");
+                        print!("{}", format_message_display(&msg));
+                        print!("\x1b[36m#{}\x1b[90m›\x1b[0m ", poll_conv_name);
+                        let _ = io::stdout().flush();
+                    }
+                    poll_last_seen.store(msg.id, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
+    let mut rl = rustyline::DefaultEditor::new()?;
+    let prompt = format!("\x1b[36m#{}\x1b[90m›\x1b[0m ", conv_name);
+
+    loop {
+        match rl.readline(&prompt) {
+            Ok(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                let _ = rl.add_history_entry(line);
+
+                // Handle slash commands
+                if line.starts_with('/') {
+                    match line {
+                        "/clear" => {
+                            store.clear_messages(conv_name)?;
+                            println!("\x1b[90mConversation cleared.\x1b[0m");
+                            continue;
+                        }
+                        "/quit" | "/exit" => {
+                            println!("\x1b[33mGoodbye!\x1b[0m");
+                            break;
+                        }
+                        "/pause" => {
+                            match store.set_paused(conv_name, true) {
+                                Ok(_) => println!(
+                                    "\x1b[90mConversation paused. Notifications will be queued.\x1b[0m"
+                                ),
+                                Err(e) => eprintln!("\x1b[31mFailed to pause: {}\x1b[0m", e),
+                            }
+                            continue;
+                        }
+                        "/resume" => {
+                            match store.set_paused(conv_name, false) {
+                                Ok(paused_at_msg_id) => {
+                                    let catchup_count =
+                                        process_catchup(&store, conv_name, paused_at_msg_id).await;
+                                    if catchup_count > 0 {
+                                        println!(
+                                            "\x1b[90mConversation resumed. {} pending item(s) processed.\x1b[0m",
+                                            catchup_count
+                                        );
+                                    } else {
+                                        println!("\x1b[90mConversation resumed.\x1b[0m");
+                                    }
+                                }
+                                Err(e) => eprintln!("\x1b[31mFailed to resume: {}\x1b[0m", e),
+                            }
+                            continue;
+                        }
+                        "/help" => {
+                            println!(
+                                "\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m"
+                            );
+                            continue;
+                        }
+                        _ => {
+                            eprintln!(
+                                "\x1b[33mUnknown command. Type /help for available commands.\x1b[0m"
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                let mentions = parse_mentions(line);
+
+                if mentions.is_empty() {
+                    eprintln!(
+                        "\x1b[33m⚠ Use @mentions to notify agents (e.g., @arya what do you think?)\x1b[0m"
+                    );
+                    continue;
+                }
+
+                // @mention-as-invite: Add new mentions as participants
+                for agent_name in &mentions {
+                    if agent_name != "all" && !participants.contains(agent_name) {
+                        if anima::discovery::agent_exists(agent_name) {
+                            if let Err(e) = store.add_participant(conv_name, agent_name) {
+                                eprintln!(
+                                    "\x1b[33mWarning: Could not add {} as participant: {}\x1b[0m",
+                                    agent_name, e
+                                );
+                            } else {
+                                participants.push(agent_name.clone());
+                                println!(
+                                    "\x1b[90m[@{} joined the conversation]\x1b[0m",
+                                    agent_name
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let expanded_mentions = expand_all_mention(&mentions, &participants);
+
+                let mention_refs: Vec<&str> =
+                    expanded_mentions.iter().map(|s| s.as_str()).collect();
+
+                let user_msg_id = store.add_message(conv_name, "user", line, &mention_refs)?;
+
+                last_seen_id.store(user_msg_id, Ordering::SeqCst);
+
+                println!();
+
+                // Notify mentioned agents (initial notifications only)
+                // The daemon handles all follow-up @mention chains autonomously
+                if !expanded_mentions.is_empty() {
+                    let notify_results = notify_mentioned_agents_parallel(
+                        &store,
+                        conv_name,
+                        user_msg_id,
+                        &expanded_mentions,
+                    )
+                    .await;
+
+                    for (agent, result) in &notify_results {
+                        match result {
+                            NotifyResult::Acknowledged => {
+                                // Agent received notification, processing async.
+                                // The background poller will display the response.
+                            }
+                            NotifyResult::Notified {
+                                response_message_id,
+                            } => {
+                                // Synchronous response (backwards compat)
+                                last_seen_id.store(*response_message_id, Ordering::SeqCst);
+                                if let Ok(msgs) =
+                                    store.get_messages(conv_name, Some(DEFAULT_CONTEXT_MESSAGES))
+                                    && let Some(response_msg) =
+                                        msgs.iter().find(|m| m.id == *response_message_id)
+                                {
+                                    println!(
+                                        "\n\x1b[36m[{}]:\x1b[0m {}\n",
+                                        agent, response_msg.content
+                                    );
+                                }
+                            }
+                            NotifyResult::Queued { notification_id: _ } => {
+                                eprintln!(
+                                    "\x1b[90m[@{} offline, notification queued]\x1b[0m",
+                                    agent
+                                );
+                            }
+                            NotifyResult::UnknownAgent => {
+                                eprintln!(
+                                    "\x1b[33m[@{} unknown agent - no such agent exists]\x1b[0m",
+                                    agent
+                                );
+                            }
+                            NotifyResult::Failed { reason } => {
+                                eprintln!(
+                                    "\x1b[33m[@{} notification failed: {}]\x1b[0m",
+                                    agent, reason
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(rustyline::error::ReadlineError::Interrupted) => {
+                println!("\n\x1b[33mInterrupted. Goodbye!\x1b[0m");
+                break;
+            }
+            Err(rustyline::error::ReadlineError::Eof) => {
+                println!("\n\x1b[33mGoodbye!\x1b[0m");
+                break;
+            }
+            Err(e) => {
+                eprintln!("\x1b[31mInput error: {}\x1b[0m", e);
+                break;
+            }
+        }
+    }
+
+    shutdown.store(true, Ordering::SeqCst);
+    let _ = poll_handle.await;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Agent status / listing
+// ---------------------------------------------------------------------------
+
+/// Show status of all agents (running/stopped).
+fn show_status() {
+    let Some(entries) = list_agent_dirs() else {
+        return;
+    };
+
+    println!(
+        "\x1b[1m{:<20} {:<10} {:<10}\x1b[0m",
+        "AGENT", "STATUS", "PID"
+    );
+    println!("{}", "-".repeat(42));
+
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let agent_path = entry.path();
+        let pid_path = agent_path.join("daemon.pid");
+
+        let (status, pid) = if PidFile::is_running(&pid_path) {
+            let pid = PidFile::read(&pid_path).unwrap_or(0);
+            ("\x1b[32mrunning\x1b[0m", pid.to_string())
+        } else {
+            ("\x1b[90mstopped\x1b[0m", "-".to_string())
+        };
+
+        println!("{:<20} {:<19} {:<10}", name, status, pid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ask (one-shot query)
+// ---------------------------------------------------------------------------
+
+/// Query an agent with conversation persistence.
+/// Starts daemon if not running, creates/uses conversation named after agent,
+/// stores user message, streams response, and daemon stores agent response.
+async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery;
+
+    let agent_path = resolve_agent_path(agent);
+
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    let agent_dir = AgentDir::load(&agent_path)
+        .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
+    let agent_name = agent_dir.config.agent.name.clone();
+
+    if !discovery::is_agent_running(&agent_name) {
+        eprintln!("\x1b[33mStarting daemon for '{}'...\x1b[0m", agent_name);
+
+        let exe =
+            std::env::current_exe().map_err(|e| format!("Failed to get executable path: {}", e))?;
+
+        Command::new(&exe)
+            .args(["start", &agent_name])
+            .spawn()
+            .map_err(|e| format!("Failed to start daemon: {}", e))?;
+
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if discovery::is_agent_running(&agent_name) {
+                break;
+            }
+        }
+
+        if !discovery::is_agent_running(&agent_name) {
+            return Err(format!("Daemon for '{}' failed to start", agent_name).into());
+        }
+    }
+
+    let store = ConversationStore::init()?;
+    let conv_name = agent_name.clone();
+
+    if store.find_by_name(&conv_name)?.is_none() {
+        store.create_conversation(Some(&conv_name), &["user", &agent_name])?;
+    }
+
+    store.add_message(&conv_name, "user", message, &[])?;
+
+    let mut api = connect_to_agent(&agent_name).await?;
+
+    api.write_request(&Request::Message {
+        content: message.to_string(),
+        conv_name: Some(conv_name),
+    })
+    .await
+    .map_err(|e| format!("Failed to send message: {}", e))?;
+
+    loop {
+        match api
+            .read_response()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+        {
+            Some(Response::Chunk { text }) => {
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            Some(Response::ToolCall { tool, params }) => {
+                let param_summary = format_tool_params(&params);
+                eprintln!(" - [tool] {}: {}", tool, param_summary);
+            }
+            Some(Response::Done) => {
+                println!();
+                break;
+            }
+            Some(Response::Message { content }) => {
+                println!("{}", content);
+                break;
+            }
+            Some(Response::Error { message }) => {
+                eprintln!("Error from agent: {}", message);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Connection closed unexpectedly");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Daemon lifecycle (start / stop / restart)
+// ---------------------------------------------------------------------------
+
+/// Start an agent daemon in the background.
+/// If `quiet` is true, suppresses output (used by batch operations).
+fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    if PidFile::is_running(&pid_path) {
+        let pid = PidFile::read(&pid_path).unwrap_or(0);
+        return Err(format!("Agent '{}' is already running (pid {})", agent, pid).into());
+    }
+
+    let exe =
+        std::env::current_exe().map_err(|e| format!("Failed to get current executable: {}", e))?;
+
+    let log_path = agent_path.join("agent.log");
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map_err(|e| format!("Failed to open log file: {}", e))?;
+    let log_file_err = log_file
+        .try_clone()
+        .map_err(|e| format!("Failed to clone log file handle: {}", e))?;
+
+    let child = Command::new(&exe)
+        .arg("run")
+        .arg(agent)
+        .arg("--daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_file_err))
+        .spawn()
+        .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
+
+    let pid = child.id();
+    if !quiet {
+        println!("Started {} (pid {})", agent, pid);
+    }
+
+    Ok(())
+}
+
+/// Start an agent daemon in the background.
+/// Supports glob patterns (*, ?) for matching multiple agents.
+fn start_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
+    if agent == "all" {
+        return start_all_agents();
+    }
+
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        let mut started = Vec::new();
+        for name in &matches {
+            match start_agent_impl(name, true) {
+                Ok(()) => started.push(name.clone()),
+                Err(e) => eprintln!("Failed to start {}: {}", name, e),
+            }
+        }
+
+        if !started.is_empty() {
+            println!("Started {} agent(s): {}", started.len(), started.join(", "));
+        }
+
+        return Ok(());
+    }
+
+    start_agent_impl(agent, false)
+}
+
+/// Start all configured agents that are not currently running.
+fn start_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::{is_agent_running, list_saved_agents};
+
+    let all_agents = list_saved_agents();
+
+    if all_agents.is_empty() {
+        println!("No configured agents found");
+        return Ok(());
+    }
+
+    let stopped_agents: Vec<_> = all_agents
+        .into_iter()
+        .filter(|name| !is_agent_running(name))
+        .collect();
+
+    if stopped_agents.is_empty() {
+        println!("All agents already running");
+        return Ok(());
+    }
+
+    let mut started = Vec::new();
+
+    for agent in &stopped_agents {
+        match start_agent_impl(agent, true) {
+            Ok(()) => started.push(agent.clone()),
+            Err(e) => eprintln!("Failed to start {}: {}", agent, e),
+        }
+    }
+
+    if !started.is_empty() {
+        println!("Started {} agent(s): {}", started.len(), started.join(", "));
+    }
+
+    Ok(())
+}
+
+/// Stop a running agent daemon.
+/// - `quiet`: suppress output (used by batch operations)
+/// - `force`: if true, SIGKILL without prompting on timeout; if false, prompt user
+async fn stop_agent_impl(
+    agent: &str,
+    quiet: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    if !PidFile::is_running(&pid_path) {
+        if !quiet {
+            println!("Agent '{}' is not running", agent);
+        }
+        return Ok(());
+    }
+
+    let pid = PidFile::read(&pid_path).unwrap_or(0);
+
+    // Try graceful shutdown via socket first
+    match connect_to_agent(agent).await {
+        Ok(mut api) => {
+            if let Err(e) = api.write_request(&Request::Shutdown).await {
+                if !quiet {
+                    eprintln!("Warning: Failed to send shutdown request: {}", e);
+                }
+            } else {
+                for _ in 0..10 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    if !PidFile::is_running(&pid_path) {
+                        if !quiet {
+                            println!("Stopped {}", agent);
+                        }
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            if !quiet {
+                eprintln!("Warning: Could not connect to agent socket: {}", e);
+            }
+        }
+    }
+
+    // Fall back to SIGTERM
+    unsafe {
+        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
+            for _ in 0..30 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if !PidFile::is_running(&pid_path) {
+                    if !quiet {
+                        println!("Stopped {}", agent);
+                    }
+                    return Ok(());
+                }
+            }
+
+            if !quiet {
+                eprintln!("Warning: Agent did not stop within timeout");
+            }
+
+            let should_kill = if force {
+                true
+            } else if quiet {
+                false
+            } else {
+                use std::io::{self, Write};
+                print!("Stop timed out, do you want to kill {}? (y/N) ", agent);
+                io::stdout().flush().ok();
+                let mut input = String::new();
+                if io::stdin().read_line(&mut input).is_ok() {
+                    input.trim().eq_ignore_ascii_case("y")
+                        || input.trim().eq_ignore_ascii_case("yes")
+                } else {
+                    false
+                }
+            };
+
+            if should_kill {
+                if libc::kill(pid as i32, libc::SIGKILL) == 0 {
+                    for _ in 0..10 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        if !PidFile::is_running(&pid_path) {
+                            break;
+                        }
+                    }
+                    if !PidFile::is_running(&pid_path) {
+                        let _ = std::fs::remove_file(&pid_path);
+                    }
+                    if !quiet {
+                        println!("Killed {}", agent);
+                    }
+                } else if !quiet {
+                    eprintln!("Warning: Failed to send SIGKILL to pid {}", pid);
+                }
+                return Ok(());
+            }
+            if !quiet {
+                println!("Agent {} still running (pid {})", agent, pid);
+            }
+            return Ok(());
+        } else if !quiet {
+            eprintln!("Warning: Failed to send SIGTERM to pid {}", pid);
+        }
+    }
+
+    if !quiet {
+        println!("Stopped {}", agent);
+    }
+    Ok(())
+}
+
+/// Stop a running agent daemon.
+/// Supports glob patterns (*, ?) for matching multiple agents.
+async fn stop_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
+    if agent == "all" {
+        return stop_all_agents().await;
+    }
+
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        let mut stopped = Vec::new();
+        for name in &matches {
+            match stop_agent_impl(name, true, true).await {
+                Ok(()) => stopped.push(name.clone()),
+                Err(e) => eprintln!("Failed to stop {}: {}", name, e),
+            }
+        }
+
+        if !stopped.is_empty() {
+            println!("Stopped {} agent(s): {}", stopped.len(), stopped.join(", "));
+        }
+
+        return Ok(());
+    }
+
+    stop_agent_impl(agent, false, false).await
+}
+
+/// Stop all running agent daemons.
+async fn stop_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::discover_running_agents;
+
+    let running_agents = discover_running_agents();
+
+    if running_agents.is_empty() {
+        println!("No running agents to stop");
+        return Ok(());
+    }
+
+    let mut stopped_count = 0;
+
+    for agent in &running_agents {
+        print!("Stopping {}... ", agent.name);
+        io::stdout().flush()?;
+
+        match stop_agent_impl(&agent.name, true, true).await {
+            Ok(()) => {
+                println!("stopped");
+                stopped_count += 1;
+            }
+            Err(e) => {
+                println!("failed: {}", e);
+            }
+        }
+    }
+
+    println!("\nStopped {} agent(s)", stopped_count);
+    Ok(())
+}
+
+/// Stop and restart a single agent, printing progress. Returns true on success.
+async fn restart_single_agent(name: &str) -> bool {
+    print!("Restarting {}... ", name);
+    let _ = io::stdout().flush();
+
+    if let Err(e) = stop_agent_impl(name, true, true).await {
+        println!("failed to stop: {}", e);
+        return false;
+    }
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    match start_agent_impl(name, true) {
+        Ok(()) => {
+            let pid_path = resolve_agent_path(name).join("daemon.pid");
+            let mut pid = 0u32;
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if let Ok(p) = PidFile::read(&pid_path)
+                    && p > 0
+                {
+                    pid = p;
+                    break;
+                }
+            }
+            println!("done (pid {})", pid);
+            true
+        }
+        Err(e) => {
+            println!("failed to start: {}", e);
+            false
+        }
+    }
+}
+
+/// Restart a running agent daemon (stop then start).
+/// Supports glob patterns (*, ?) for matching multiple agents.
+/// If agent is "all", restarts all currently running agents.
+async fn restart_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::match_agents;
+
+    if agent == "all" {
+        return restart_all_agents().await;
+    }
+
+    if has_wildcards(agent) {
+        let matches = match_agents(agent);
+
+        if matches.is_empty() {
+            return Err(format!("No agents match pattern: {}", agent).into());
+        }
+
+        // Only restart agents that are currently running
+        let running_matches: Vec<_> = matches
+            .iter()
+            .filter(|name| {
+                let pid_path = resolve_agent_path(name).join("daemon.pid");
+                PidFile::is_running(&pid_path)
+            })
+            .collect();
+
+        if running_matches.is_empty() {
+            println!("No running agents match pattern: {}", agent);
+            return Ok(());
+        }
+
+        let mut restarted = Vec::new();
+        for name in &running_matches {
+            if restart_single_agent(name).await {
+                restarted.push(name.to_string());
+            }
+        }
+
+        println!(
+            "Restarted {} agent{}",
+            restarted.len(),
+            if restarted.len() == 1 { "" } else { "s" }
+        );
+
+        return Ok(());
+    }
+
+    // Single agent (no wildcards)
+    let agent_path = resolve_agent_path(agent);
+    let pid_path = agent_path.join("daemon.pid");
+
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    let was_running = PidFile::is_running(&pid_path);
+
+    if was_running {
+        println!("Stopping {}...", agent);
+        stop_agent(agent).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    println!("Starting {}...", agent);
+    start_agent(agent)?;
+
+    Ok(())
+}
+
+/// Restart all currently running agent daemons.
+async fn restart_all_agents() -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery::discover_running_agents;
+
+    let running_agents = discover_running_agents();
+
+    if running_agents.is_empty() {
+        println!("No running agents to restart");
+        return Ok(());
+    }
+
+    let mut restarted_count = 0;
+
+    for agent in &running_agents {
+        if restart_single_agent(&agent.name).await {
+            restarted_count += 1;
+        }
+    }
+
+    println!(
+        "Restarted {} agent{}",
+        restarted_count,
+        if restarted_count == 1 { "" } else { "s" }
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Daemon socket commands (clear, system, heartbeat)
+// ---------------------------------------------------------------------------
+
+/// Clear conversation history for a running agent daemon.
+async fn clear_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    api.write_request(&Request::Clear)
+        .await
+        .map_err(|e| format!("Failed to send clear request: {}", e))?;
+
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
+        Some(Response::Ok) => {
+            println!("Cleared conversation for {}", agent);
+        }
+        Some(Response::Error { message }) => {
+            return Err(format!("Error from agent: {}", message).into());
+        }
+        Some(other) => {
+            return Err(format!("Unexpected response: {:?}", other).into());
+        }
+        None => {
+            return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Show the system prompt for a running agent daemon.
+async fn show_system_prompt(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    api.write_request(&Request::System)
+        .await
+        .map_err(|e| format!("Failed to send system request: {}", e))?;
+
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
+        Some(Response::System { system_prompt }) => {
+            println!("{}", system_prompt);
+        }
+        Some(Response::Error { message }) => {
+            return Err(format!("Error from agent: {}", message).into());
+        }
+        Some(other) => {
+            return Err(format!("Unexpected response: {:?}", other).into());
+        }
+        None => {
+            return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Trigger a heartbeat for a running agent daemon.
+async fn trigger_heartbeat(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut api = connect_to_agent(agent).await?;
+
+    api.write_request(&Request::Heartbeat)
+        .await
+        .map_err(|e| format!("Failed to send heartbeat request: {}", e))?;
+
+    match api
+        .read_response()
+        .await
+        .map_err(|e| format!("Failed to read response: {}", e))?
+    {
+        Some(Response::HeartbeatTriggered) => {
+            println!("Heartbeat triggered for {}", agent);
+        }
+        Some(Response::HeartbeatNotConfigured) => {
+            println!(
+                "Heartbeat not configured for {} (add [heartbeat] section to config.toml)",
+                agent
+            );
+        }
+        Some(Response::Error { message }) => {
+            return Err(format!("Error from agent: {}", message).into());
+        }
+        Some(other) => {
+            return Err(format!("Unexpected response: {:?}", other).into());
+        }
+        None => {
+            return Err("Connection closed unexpectedly".into());
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Chat subcommands
+// ---------------------------------------------------------------------------
+
+/// Handle chat subcommands.
+async fn handle_chat_command(
+    command: Option<ChatCommands>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = ConversationStore::init()?;
+
+    match command {
+        Some(ChatCommands::New { name }) => {
+            let conv_name = store.create_conversation(name.as_deref(), &["user"])?;
+            println!("Created conversation '\x1b[36m{}\x1b[0m'\n", conv_name);
+            chat_with_conversation(&conv_name).await?;
+        }
+
+        Some(ChatCommands::Create { name }) => {
+            let conv_name = store.create_conversation(name.as_deref(), &["user"])?;
+            println!("Created conversation: {}", conv_name);
+        }
+
+        Some(ChatCommands::Join { name }) => {
+            if store.find_by_name(&name)?.is_none() {
+                return Err(format!(
+                    "Conversation '{}' not found. Use 'anima chat create {}' to create it.",
+                    name, name
+                )
+                .into());
+            }
+
+            chat_with_conversation(&name).await?;
+        }
+
+        Some(ChatCommands::Send { conv, message }) => {
+            if store.find_by_name(&conv)?.is_none() {
+                return Err(format!("Conversation '{}' not found", conv).into());
+            }
+
+            let mentions = parse_mentions(&message);
+
+            let parts = store.get_participants(&conv)?;
+            let participants: Vec<String> = parts
+                .iter()
+                .filter(|p| p.agent != "user")
+                .map(|p| p.agent.clone())
+                .collect();
+
+            for agent_name in &mentions {
+                if agent_name != "all"
+                    && !participants.contains(agent_name)
+                    && anima::discovery::agent_exists(agent_name)
+                    && let Err(e) = store.add_participant(&conv, agent_name)
+                {
+                    eprintln!(
+                        "Warning: Could not add {} as participant: {}",
+                        agent_name, e
+                    );
+                }
+            }
+
+            let updated_parts = store.get_participants(&conv)?;
+            let updated_participants: Vec<String> = updated_parts
+                .iter()
+                .filter(|p| p.agent != "user")
+                .map(|p| p.agent.clone())
+                .collect();
+            let expanded_mentions = expand_all_mention(&mentions, &updated_participants);
+
+            let mention_refs: Vec<&str> = expanded_mentions.iter().map(|s| s.as_str()).collect();
+
+            let user_msg_id = store.add_message(&conv, "user", &message, &mention_refs)?;
+
+            if !expanded_mentions.is_empty() {
+                let results = notify_mentioned_agents_parallel(
+                    &store,
+                    &conv,
+                    user_msg_id,
+                    &expanded_mentions,
+                )
+                .await;
+
+                let mut notified = Vec::new();
+                let mut queued = Vec::new();
+                let mut failed = Vec::new();
+
+                for (agent, result) in results {
+                    match result {
+                        NotifyResult::Acknowledged | NotifyResult::Notified { .. } => {
+                            notified.push(agent)
+                        }
+                        NotifyResult::Queued { .. } => queued.push(agent),
+                        NotifyResult::UnknownAgent => failed.push(format!("{} (unknown)", agent)),
+                        NotifyResult::Failed { reason } => {
+                            failed.push(format!("{} ({})", agent, reason))
+                        }
+                    }
+                }
+
+                if !notified.is_empty() {
+                    println!(
+                        "Sent message to '{}', notified: {}",
+                        conv,
+                        notified.join(", ")
+                    );
+                }
+                if !queued.is_empty() {
+                    println!("Queued for offline agents: {}", queued.join(", "));
+                }
+                if !failed.is_empty() {
+                    eprintln!("Failed to notify: {}", failed.join(", "));
+                }
+            } else {
+                println!("Sent message to '{}' (no @mentions)", conv);
+            }
+        }
+
+        Some(ChatCommands::View {
+            conv,
+            limit,
+            since,
+            raw,
+        }) => {
+            if store.find_by_name(&conv)?.is_none() {
+                return Err(format!("Conversation '{}' not found", conv).into());
+            }
+
+            let messages = store.get_messages_filtered(&conv, limit, since)?;
+
+            let messages: Vec<_> = messages
+                .into_iter()
+                .filter(|m| m.from_agent != "tool")
+                .collect();
+
+            if raw {
+                for msg in messages {
+                    let escaped_content = msg
+                        .content
+                        .replace('\\', "\\\\")
+                        .replace('\n', "\\n")
+                        .replace('|', "\\|");
+                    println!(
+                        "{}|{}|{}|{}",
+                        msg.id, msg.created_at, msg.from_agent, escaped_content
+                    );
+                }
+            } else {
+                for msg in &messages {
+                    print!("{}", format_message_display(msg));
+                }
+            }
+        }
+
+        Some(ChatCommands::Pause { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("pause", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                let _ = store.set_paused(conv_name, true)?;
+                println!("Paused conversation '\x1b[36m{}\x1b[0m'", conv_name);
+            }
+        }
+
+        Some(ChatCommands::Stop { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("stop", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                let _ = store.set_paused(conv_name, false)?;
+                println!(
+                    "Stopped conversation '\x1b[36m{}\x1b[0m' (catchup discarded)",
+                    conv_name
+                );
+            }
+        }
+
+        Some(ChatCommands::Resume { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("resume", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                let paused_at_msg_id = store.set_paused(conv_name, false)?;
+                let catchup_count =
+                    process_catchup(&store, conv_name, paused_at_msg_id).await;
+
+                if catchup_count > 0 {
+                    println!(
+                        "Resumed conversation '\x1b[36m{}\x1b[0m' ({} pending item(s) processed)",
+                        conv_name, catchup_count
+                    );
+                } else {
+                    println!("Resumed conversation '\x1b[36m{}\x1b[0m'", conv_name);
+                }
+            }
+        }
+
+        Some(ChatCommands::Delete { name, force }) => {
+            let matches = store.match_conversations(&name)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", name).into());
+            }
+
+            if !force
+                && (matches.len() > 1 || has_wildcards(&name))
+                && !confirm_action("delete", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                store.delete_conversation(conv_name)?;
+                println!("Deleted conversation '\x1b[36m{}\x1b[0m'", conv_name);
+            }
+        }
+
+        Some(ChatCommands::Clear { conv, force }) => {
+            let matches = store.match_conversations(&conv)?;
+
+            if matches.is_empty() {
+                return Err(format!("No conversations match pattern: {}", conv).into());
+            }
+
+            if !force
+                && (matches.len() > 1 || has_wildcards(&conv))
+                && !confirm_action("clear", &matches)?
+            {
+                println!("Aborted.");
+                return Ok(());
+            }
+
+            for conv_name in &matches {
+                let deleted = store.clear_messages(conv_name)?;
+                println!(
+                    "Cleared {} messages from '\x1b[36m{}\x1b[0m'",
+                    deleted, conv_name
+                );
+            }
+        }
+
+        Some(ChatCommands::Cleanup) => {
+            let (messages_deleted, convs_deleted) = store.cleanup_expired()?;
+            println!("Cleanup complete:");
+            println!("  - {} expired messages deleted", messages_deleted);
+            println!("  - {} empty conversations deleted", convs_deleted);
+        }
+
+        None => {
+            let conversations = store.list_conversations()?;
+
+            if conversations.is_empty() {
+                println!("\x1b[33mNo conversations found.\x1b[0m");
+                println!("Create one with: \x1b[36manima chat create\x1b[0m");
+                return Ok(());
+            }
+
+            println!(
+                "\x1b[1m{:<30} {:>6}   {:<10} PARTICIPANTS\x1b[0m",
+                "NAME", "MSGS", "UPDATED"
+            );
+            println!("{}", "-".repeat(80));
+
+            for conv in conversations {
+                let participants = store.get_participants(&conv.name)?;
+                let agents: Vec<_> = participants.iter().map(|p| p.agent.as_str()).collect();
+
+                let msg_count = store.get_message_count(&conv.name)?;
+                let updated = format_relative_time(conv.updated_at);
+
+                let name_display = if conv.paused {
+                    format!("{} \x1b[33m⏸\x1b[0m", conv.name)
+                } else {
+                    conv.name.clone()
+                };
+
+                println!(
+                    "{:<30} {:>6}   {:<10} {}",
+                    name_display,
+                    msg_count,
+                    updated,
+                    agents.join(", ")
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Memory subcommands
+// ---------------------------------------------------------------------------
+
+/// Handle memory subcommands.
+async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        MemoryCommands::List { agent, limit } => {
+            let store = open_memory_store(&agent)?;
+            let memories = store.list_all(Some(limit))?;
+
+            if memories.is_empty() {
+                println!("No memories found for agent '{}'", agent);
+                return Ok(());
+            }
+
+            println!(
+                "\x1b[1m{:<6} {:<12} {:<10} CONTENT\x1b[0m",
+                "ID", "CREATED", "SOURCE"
+            );
+            println!("{}", "─".repeat(110));
+
+            for m in memories {
+                let age = format_age(m.created_at);
+                let content_display: String = m.content.chars().take(80).collect();
+                let content_display = if m.content.chars().count() > 80 {
+                    format!("{}...", content_display)
+                } else {
+                    content_display
+                };
+                let content_display = content_display.replace('\n', " ");
+
+                println!(
+                    "{:<6} {:<12} {:<10} {}",
+                    m.id, age, m.source, content_display
+                );
+            }
+        }
+
+        MemoryCommands::Search {
+            agent,
+            query,
+            limit,
+        } => {
+            let store = open_memory_store(&agent)?;
+
+            let embedding_result = get_query_embedding(&query).await;
+
+            let results = match embedding_result {
+                Ok(embedding) =>
+                {
+                    #[allow(deprecated)]
+                    store.recall_with_embedding(&query, limit, Some(&embedding))?
+                }
+                Err(_) => {
+                    eprintln!(
+                        "\x1b[33mWarning: Could not generate embedding, falling back to text search\x1b[0m"
+                    );
+                    let all = store.list_all(None)?;
+                    let query_lower = query.to_lowercase();
+                    all.into_iter()
+                        .filter(|m| m.content.to_lowercase().contains(&query_lower))
+                        .take(limit)
+                        .map(|m| (m, 1.0))
+                        .collect()
+                }
+            };
+
+            if results.is_empty() {
+                println!(
+                    "No memories matching '{}' found for agent '{}'",
+                    query, agent
+                );
+                return Ok(());
+            }
+
+            println!(
+                "\x1b[1m{:<6} {:<8} {:<12} {:<10} CONTENT\x1b[0m",
+                "ID", "SCORE", "CREATED", "SOURCE"
+            );
+            println!("{}", "─".repeat(80));
+
+            for (m, score) in results {
+                let age = format_age(m.created_at);
+                let content_display: String = m.content.chars().take(35).collect();
+                let content_display = if m.content.chars().count() > 35 {
+                    format!("{}...", content_display)
+                } else {
+                    content_display
+                };
+                let content_display = content_display.replace('\n', " ");
+
+                println!(
+                    "{:<6} {:<8.3} {:<12} {:<10} {}",
+                    m.id, score, age, m.source, content_display
+                );
+            }
+        }
+
+        MemoryCommands::Delete { agent, id } => {
+            let store = open_memory_store(&agent)?;
+            let deleted = store.delete(id)?;
+
+            if deleted {
+                println!("Deleted memory #{} for agent '{}'", id, agent);
+            } else {
+                println!("Memory #{} not found for agent '{}'", id, agent);
+            }
+        }
+
+        MemoryCommands::Clear { agent, force } => {
+            let store = open_memory_store(&agent)?;
+            let count = store.count()?;
+
+            if count == 0 {
+                println!("No memories to clear for agent '{}'", agent);
+                return Ok(());
+            }
+
+            if !force {
+                print!(
+                    "This will delete {} memories for '{}'. Continue? [y/N] ",
+                    count, agent
+                );
+                io::stdout().flush()?;
+
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("Aborted.");
+                    return Ok(());
+                }
+            }
+
+            let deleted = store.clear_all()?;
+            println!("Cleared {} memories for agent '{}'", deleted, agent);
+        }
+
+        MemoryCommands::Count { agent } => {
+            let store = open_memory_store(&agent)?;
+            let count = store.count()?;
+            println!("Agent '{}' has {} memories", agent, count);
+        }
+
+        MemoryCommands::Show { agent, id } => {
+            let store = open_memory_store(&agent)?;
+
+            match store.get(id)? {
+                Some(entry) => {
+                    let age = format_age(entry.created_at);
+                    println!("\x1b[1mMemory #{}\x1b[0m", entry.id);
+                    println!("─────────────────────────────────────────");
+                    println!("\x1b[90mCreated:\x1b[0m    {}", age);
+                    println!("\x1b[90mSource:\x1b[0m     {}", entry.source);
+                    println!("\x1b[90mImportance:\x1b[0m {:.2}", entry.importance);
+                    println!("\x1b[90mContent:\x1b[0m");
+                    println!("{}", entry.content);
+                }
+                None => {
+                    return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
+                }
+            }
+        }
+
+        MemoryCommands::Add {
+            agent,
+            content,
+            importance,
+        } => {
+            let agent_path = resolve_agent_path(&agent);
+            let memory_path = agent_path.join("memory.db");
+
+            // Create memory.db if it doesn't exist (unlike other commands that require it)
+            let store = SemanticMemoryStore::open(&memory_path, &agent)?;
+
+            let importance = importance.clamp(0.0, 1.0);
+
+            match store.save(&content, importance, "cli")? {
+                anima::memory::SaveResult::New(id) => {
+                    println!("Created memory #{} for agent '{}'", id, agent);
+                }
+                anima::memory::SaveResult::Reinforced(id, old_imp, new_imp) => {
+                    println!(
+                        "Reinforced existing memory #{} (importance: {:.2} → {:.2})",
+                        id, old_imp, new_imp
+                    );
+                }
+            }
+        }
+
+        MemoryCommands::Replace { agent, id, content } => {
+            let store = open_memory_store(&agent)?;
+
+            if store.update_content(id, &content)? {
+                println!("Updated memory #{} for agent '{}'", id, agent);
+            } else {
+                return Err(format!("Memory #{} not found for agent '{}'", id, agent).into());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Run / Create / List / Task
+// ---------------------------------------------------------------------------
+
+/// Run an agent from a directory and start an interactive REPL.
+/// In daemon mode, this starts the daemon (if needed) and connects via REPL.
+async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+
+    let agent_dir = AgentDir::load(&agent_path)?;
+    let agent_name = agent_dir.config.agent.name.clone();
+
+    let mut repl = Repl::with_agent(agent_name.clone()).await;
+    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent_name);
+
+    repl.run().await?;
+    Ok(())
+}
+
+/// Scaffold a new agent directory (delegates to shared function in agent_dir).
+fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    anima::agent_dir::create_agent(name, path)?;
+    Ok(())
+}
+
+/// List all agents in ~/.anima/agents/
+fn list_agents() {
+    let Some(entries) = list_agent_dirs() else {
+        return;
+    };
 
     println!("\x1b[1mAgents in ~/.anima/agents/:\x1b[0m");
     for entry in entries {
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Try to load config to get more info
         let info = match AgentDir::load(entry.path()) {
             Ok(agent_dir) => match agent_dir.resolve_llm_config() {
                 Ok(resolved) => format!(" ({}/{})", resolved.provider, resolved.model),
@@ -2500,21 +2196,18 @@ fn list_agents() {
     }
 }
 
-/// Run an agent with a single task (non-interactive, from config file)
+/// Run an agent with a single task (non-interactive, from config file).
 async fn run_agent_task(
     config_path: &str,
     task: &str,
     stream: bool,
     verbose_cli: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Load config
     let config = AgentConfig::from_file(config_path)?;
 
-    // 2. Create observer (CLI flag overrides config)
     let verbose = verbose_cli || config.observe.verbose;
     let observer = Arc::new(ConsoleObserver::new(verbose));
 
-    // 2. Create LLM from config (check env for API key)
     let llm: Arc<dyn LLM> = match config.llm.provider.as_str() {
         "openai" => {
             let api_key = std::env::var("OPENAI_API_KEY")
@@ -2537,7 +2230,6 @@ async fn run_agent_task(
         other => return Err(format!("Unknown LLM provider: {}", other).into()),
     };
 
-    // 3. Create memory from config
     let memory: Box<dyn anima::Memory> = match config.memory.backend.as_str() {
         "sqlite" => {
             let path = config.memory.path.as_deref().unwrap_or("anima.db");
@@ -2547,11 +2239,9 @@ async fn run_agent_task(
         _ => Box::new(InMemoryStore::new()),
     };
 
-    // 4. Create agent, register enabled tools
     let mut runtime = Runtime::new();
     let mut agent = runtime.spawn_agent(config.agent.name.clone()).await;
 
-    // Register enabled tools
     for tool_name in &config.tools.enabled {
         match tool_name.as_str() {
             "add" => agent.register_tool(Arc::new(AddTool)),
@@ -2568,7 +2258,6 @@ async fn run_agent_task(
     agent = agent.with_memory(memory);
     agent = agent.with_observer(observer);
 
-    // 5. Build ThinkOptions from config
     let auto_memory = if config.think.auto_memory {
         Some(AutoMemoryConfig {
             max_entries: config.think.max_memory_entries,
@@ -2592,35 +2281,27 @@ async fn run_agent_task(
         reflection,
         stream,
         retry_policy: Some(config.retry.to_policy()),
-        conversation_history: None, // Recall content is injected by daemon via conversation_history
-        external_tools: None, // One-shot mode uses registered tools
+        conversation_history: None,
+        external_tools: None,
         tool_trace_tx: None,
     };
 
-    // 6. Run agent with streaming or non-streaming based on flag
     if stream {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
 
-        // Spawn a task to print tokens as they arrive
         let print_task = tokio::spawn(async move {
             while let Some(token) = rx.recv().await {
                 print!("{}", token);
-                // Flush stdout to ensure real-time display
                 let _ = io::stdout().flush();
             }
-            println!(); // Final newline after streaming completes
+            println!();
         });
 
-        // Run the streaming agent
-        let result = agent
+        agent
             .think_streaming_with_options(task, options, tx)
             .await?;
 
-        // Wait for print task to complete
         let _ = print_task.await;
-
-        // Note: result contains the full response, already printed via streaming
-        let _ = result;
     } else {
         let result = agent.think_with_options(task, options).await?;
         println!("{}", result.response);
