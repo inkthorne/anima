@@ -180,31 +180,24 @@ fn expand_inject_directives(
 
     let mut result = content.to_string();
 
-    // Replace tools directive
-    if has_tools_directive {
-        if tools_injection.is_empty() {
-            // Remove the directive line cleanly (including trailing newline if present)
-            result = result
-                .lines()
-                .filter(|line| line.trim() != TOOLS_DIRECTIVE)
-                .collect::<Vec<_>>()
-                .join("\n");
-        } else {
-            result = result.replace(TOOLS_DIRECTIVE, tools_injection);
-        }
-    }
+    // Replace or remove each directive based on whether its content is empty
+    let directives: &[(&str, &str)] = &[
+        (TOOLS_DIRECTIVE, tools_injection),
+        (MEMORIES_DIRECTIVE, memory_injection),
+    ];
 
-    // Replace memories directive
-    if has_memories_directive {
-        if memory_injection.is_empty() {
-            // Remove the directive line cleanly (including trailing newline if present)
+    for &(directive, injection) in directives {
+        if !result.contains(directive) {
+            continue;
+        }
+        if injection.is_empty() {
             result = result
                 .lines()
-                .filter(|line| line.trim() != MEMORIES_DIRECTIVE)
+                .filter(|line| line.trim() != directive)
                 .collect::<Vec<_>>()
                 .join("\n");
         } else {
-            result = result.replace(MEMORIES_DIRECTIVE, memory_injection);
+            result = result.replace(directive, injection);
         }
     }
 
@@ -503,26 +496,85 @@ async fn save_memories(
     if memories_to_save.is_empty() {
         return;
     }
-    if let Some(mem_store) = semantic_memory {
-        let store = mem_store.lock().await;
-        for memory in memories_to_save {
-            let embedding = if let Some(emb_client) = embedding_client {
-                emb_client.embed(memory).await.ok()
-            } else {
-                None
-            };
-            match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                Ok(SaveResult::New(id)) => {
-                    logger.memory(&format!("Save #{}: \"{}\"", id, memory))
-                }
-                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
-                    "Reinforce #{}: \"{}\" ({:.2} → {:.2})",
-                    id, memory, old, new
-                )),
-                Err(e) => logger.log(&format!("Failed to save memory: {}", e)),
+    let Some(mem_store) = semantic_memory else {
+        return;
+    };
+    let store = mem_store.lock().await;
+    for memory in memories_to_save {
+        let embedding = if let Some(emb_client) = embedding_client {
+            emb_client.embed(memory).await.ok()
+        } else {
+            None
+        };
+        match store.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
+            Ok(SaveResult::New(id)) => {
+                logger.memory(&format!("Save #{}: \"{}\"", id, memory))
             }
+            Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
+                "Reinforce #{}: \"{}\" ({:.2} → {:.2})",
+                id, memory, old, new
+            )),
+            Err(e) => logger.log(&format!("Failed to save memory: {}", e)),
         }
     }
+}
+
+/// Prepend recall content as an assistant message to conversation history.
+/// Pattern: [history...] [assistant: recall] [user: task]
+fn inject_recall_into_history(
+    recall_content: &Option<String>,
+    conversation_history: &mut Vec<ChatMessage>,
+) {
+    if let Some(recall_text) = recall_content {
+        if !recall_text.is_empty() {
+            conversation_history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(recall_text.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+    }
+}
+
+/// Spawn a background task that persists tool trace executions to the conversation store.
+/// Returns the join handle. The caller should drop `trace_tx` when done to signal completion.
+fn spawn_tool_trace_persister(
+    conv_name: Option<String>,
+    agent_name: String,
+    logger: Arc<AgentLogger>,
+    trace_rx: tokio::sync::mpsc::Receiver<crate::agent::ToolExecution>,
+) -> tokio::task::JoinHandle<()> {
+    let mut trace_rx = trace_rx;
+    tokio::spawn(async move {
+        let Some(cname) = conv_name else {
+            // No conversation to persist to -- just drain
+            while trace_rx.recv().await.is_some() {}
+            return;
+        };
+        let store = match ConversationStore::init() {
+            Ok(s) => s,
+            Err(e) => {
+                logger.log(&format!("[trace] Failed to init trace store: {}", e));
+                while trace_rx.recv().await.is_some() {} // drain
+                return;
+            }
+        };
+        while let Some(exec) = trace_rx.recv().await {
+            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
+            let content = exec.content.as_deref().unwrap_or("");
+            if let Err(e) = store.add_message_with_tool_calls(
+                &cname, &agent_name, content, &[], None,
+                tool_calls_json.as_deref(),
+            ) {
+                logger.log(&format!("[trace] Failed to store tool call: {}", e));
+            }
+            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+            if let Err(e) = store.add_message(&cname, "tool", &tool_result_msg, &[]) {
+                logger.log(&format!("[trace] Failed to store tool result: {}", e));
+            }
+        }
+    })
 }
 
 /// Execute a tool call and return the result as a string.
@@ -1892,20 +1944,8 @@ async fn process_message_work(
     )
     .await;
 
-    // Prepend recall as assistant message to conversation_history (in memory)
-    // This positions it BEFORE the user message (which is passed as task)
-    // Pattern: [history...] [assistant: recall] [user: task]
     let recall_content_for_storage = recall_result.recall_content.clone();
-    if let Some(ref recall_text) = recall_result.recall_content {
-        if !recall_text.is_empty() {
-            conversation_history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(recall_text.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-    }
+    inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
 
     // Create tool execution context
     let tool_context = ToolExecutionContext {
@@ -1918,42 +1958,14 @@ async fn process_message_work(
     };
 
     // Create channel for incremental tool trace persistence
-    let (trace_tx, mut trace_rx) =
+    let (trace_tx, trace_rx) =
         tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
-    let trace_conv_name = conv_name.map(|s| s.to_string());
-    let trace_agent_name = agent_name.to_string();
-    let trace_logger = logger.clone();
-
-    let trace_handle = tokio::spawn(async move {
-        if trace_conv_name.is_none() {
-            // No conversation to persist to — just drain
-            while trace_rx.recv().await.is_some() {}
-            return;
-        }
-        let cname = trace_conv_name.as_ref().unwrap();
-        let store = match ConversationStore::init() {
-            Ok(s) => s,
-            Err(e) => {
-                trace_logger.log(&format!("[worker] Failed to init trace store: {}", e));
-                while trace_rx.recv().await.is_some() {} // drain
-                return;
-            }
-        };
-        while let Some(exec) = trace_rx.recv().await {
-            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-            let content = exec.content.as_deref().unwrap_or("");
-            if let Err(e) = store.add_message_with_tool_calls(
-                cname, &trace_agent_name, content, &[], None,
-                tool_calls_json.as_deref(),
-            ) {
-                trace_logger.log(&format!("[worker] Failed to store tool call: {}", e));
-            }
-            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            if let Err(e) = store.add_message(cname, "tool", &tool_result_msg, &[]) {
-                trace_logger.log(&format!("[worker] Failed to store tool result: {}", e));
-            }
-        }
-    });
+    let trace_handle = spawn_tool_trace_persister(
+        conv_name.map(|s| s.to_string()),
+        agent_name.to_string(),
+        logger.clone(),
+        trace_rx,
+    );
 
     // Process with or without streaming
     let (final_response, _tool_calls) = if use_native_tools {
@@ -2340,20 +2352,8 @@ async fn handle_notify(
     )
     .await;
 
-    // Prepend recall as assistant message to conversation_history (in memory)
-    // This positions it BEFORE the user message (which is passed as task)
-    // Pattern: [history...] [assistant: recall] [user: task]
     let recall_content_for_storage = recall_result.recall_content.clone();
-    if let Some(ref recall_text) = recall_result.recall_content {
-        if !recall_text.is_empty() {
-            conversation_history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(recall_text.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-    }
+    inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
 
     logger.log(&format!(
         "[notify] Context: {} messages → {} history + final user turn",
@@ -2371,54 +2371,26 @@ async fn handle_notify(
         allowed_tools: allowed_tools.clone(),
     };
 
-    // Extract external_tools for use in the loop
     let external_tools = recall_result.external_tools;
 
-    // Tool execution loop - similar to Request::Message handler
     let max_tool_calls = 10;
     let mut tool_call_count = 0;
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
-    // Track last tool_calls for native tool mode persistence
     let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
-    // Track total token usage across all iterations
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
+
     // Channel for incremental tool trace persistence (native tool mode)
-    let (tool_trace_tx, mut tool_trace_rx) =
+    let (tool_trace_tx, trace_rx) =
         tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
-    let trace_store = ConversationStore::init();
-    let trace_conv_id = conv_id.to_string();
-    let trace_agent_name = agent_name.to_string();
-    let trace_logger = logger.clone();
-
-    let trace_handle = tokio::spawn(async move {
-        let store = match trace_store {
-            Ok(s) => s,
-            Err(e) => {
-                trace_logger.log(&format!("[notify] Failed to init trace store: {}", e));
-                return;
-            }
-        };
-        while let Some(exec) = tool_trace_rx.recv().await {
-            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-            let content = exec.content.as_deref().unwrap_or("");
-            if let Err(e) = store.add_message_with_tool_calls(
-                &trace_conv_id, &trace_agent_name, content, &[], None,
-                tool_calls_json.as_deref(),
-            ) {
-                trace_logger.log(&format!("[notify] Failed to store tool call: {}", e));
-            }
-            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            if let Err(e) = store.add_message(&trace_conv_id, "tool", &tool_result_msg, &[]) {
-                trace_logger.log(&format!("[notify] Failed to store tool result: {}", e));
-            }
-        }
-    });
-
-    // Mutable conversation history - refreshed from DB after each tool result
-    let mut conversation_history = conversation_history;
+    let trace_handle = spawn_tool_trace_persister(
+        Some(conv_id.to_string()),
+        agent_name.to_string(),
+        logger.clone(),
+        trace_rx,
+    );
 
     loop {
         // Clear agent's internal history EACH iteration to avoid duplication.
@@ -2529,50 +2501,34 @@ async fn handle_notify(
                         .as_ref()
                         .and_then(|r| r.find_by_name(&tc.tool));
 
-                    match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
+                    // Execute tool and format result message
+                    let tool_message = match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
                         Ok(tool_result) => {
                             logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
-                            current_message =
-                                format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
-                            // Store tool result in conversation
-                            if let Err(e) =
-                                store.add_message(conv_id, "tool", &current_message, &[])
-                            {
-                                logger.log(&format!("[notify] Failed to store tool result: {}", e));
-                            }
-                            // Refresh conversation_history from DB to include the tool result we just stored.
-                            // This ensures we use ONLY DB-backed history and avoids duplication with agent's
-                            // internal history (which we cleared at the start of handle_notify).
-                            // IMPORTANT: Also update current_message from refreshed_final to avoid passing
-                            // the tool result twice (once in history, once as the task).
-                            if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
-                                let (refreshed_history, refreshed_final) =
-                                    format_conversation_history(&msgs, agent_name);
-                                conversation_history = refreshed_history;
-                                current_message = refreshed_final;
-                            }
-                            // Continue to next iteration
+                            format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                         }
                         Err(e) => {
                             logger.tool(&format!("[notify] Error: {}", e));
-                            current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
-                            // Store tool error in conversation
-                            if let Err(e) =
-                                store.add_message(conv_id, "tool", &current_message, &[])
-                            {
-                                logger.log(&format!("[notify] Failed to store tool error: {}", e));
-                            }
-                            // Refresh conversation_history from DB (same as success case)
-                            // IMPORTANT: Also update current_message from refreshed_final to avoid passing
-                            // the tool result twice (once in history, once as the task).
-                            if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
-                                let (refreshed_history, refreshed_final) =
-                                    format_conversation_history(&msgs, agent_name);
-                                conversation_history = refreshed_history;
-                                current_message = refreshed_final;
-                            }
-                            // Continue to next iteration to let LLM handle the error
+                            format!("[Tool Error for {}]\n{}", tc.tool, e)
                         }
+                    };
+
+                    // Store tool result/error in conversation
+                    if let Err(e) = store.add_message(conv_id, "tool", &tool_message, &[]) {
+                        logger.log(&format!("[notify] Failed to store tool message: {}", e));
+                    }
+
+                    // Refresh conversation_history from DB to include the tool result we just stored.
+                    // This ensures we use ONLY DB-backed history and avoids duplication with agent's
+                    // internal history (which we cleared at the start of each iteration).
+                    // Also update current_message from refreshed_final to avoid passing
+                    // the tool result twice (once in history, once as the task).
+                    current_message = tool_message;
+                    if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
+                        let (refreshed_history, refreshed_final) =
+                            format_conversation_history(&msgs, agent_name);
+                        conversation_history = refreshed_history;
+                        current_message = refreshed_final;
                     }
                 } else {
                     // No more tool calls - done
@@ -2592,21 +2548,11 @@ async fn handle_notify(
     // Store final response in conversation with duration, tool_calls, and token usage
     let cleaned_response = final_response.unwrap_or_default();
     let duration_ms = start_time.elapsed().as_millis() as i64;
-    // Serialize tool_calls to JSON for persistence
     let tool_calls_json = last_tool_calls
         .as_ref()
         .and_then(|tc| serde_json::to_string(tc).ok());
-    // Token tracking: only include if we have any token data
-    let tokens_in = if total_tokens_in > 0 {
-        Some(total_tokens_in as i64)
-    } else {
-        None
-    };
-    let tokens_out = if total_tokens_out > 0 {
-        Some(total_tokens_out as i64)
-    } else {
-        None
-    };
+    let tokens_in = (total_tokens_in > 0).then_some(total_tokens_in as i64);
+    let tokens_out = (total_tokens_out > 0).then_some(total_tokens_out as i64);
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
 
     // Flush tool trace channel — drop sender so consumer finishes
@@ -2896,81 +2842,32 @@ async fn run_heartbeat(
         conversation_history.len()
     ));
 
-    // 4. Build effective always with tools and memory injection
-    // Native mode: pass ALL allowed tools (model can only call tools in the array)
-    // JSON-block mode: keyword-match relevant tools (injected into prompt)
-    let (tools_injection, external_tools) = if use_native_tools {
-        // Native tool calling: pass ALL allowed tools from registry
-        let all_tools = if let Some(registry) = tool_registry {
-            let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
-            filter_by_allowlist(all, allowed_tools)
-        } else {
-            Vec::new()
-        };
-        if !all_tools.is_empty() {
-            logger.tool(&format!(
-                "[heartbeat] Native tools: {} allowed",
-                all_tools.len()
-            ));
-        }
-        let specs = if !all_tools.is_empty() {
-            Some(tool_definitions_to_specs(&all_tools))
-        } else {
-            None
-        };
-        (String::new(), specs)
-    } else if let Some(registry) = tool_registry {
-        // JSON-block mode: keyword-match relevant tools
-        let relevant = registry.find_relevant(&heartbeat_prompt, recall_limit);
-        let relevant = filter_by_allowlist(relevant, allowed_tools);
-        (ToolRegistry::format_for_prompt(&relevant), None)
-    } else {
-        (String::new(), None)
-    };
+    // 4. Build recall (tools + memories) for the heartbeat prompt
+    let recall_result = build_recall_for_query(
+        &heartbeat_prompt,
+        allowed_tools,
+        semantic_memory,
+        embedding_client,
+        tool_registry,
+        use_native_tools,
+        recall,
+        model_recall,
+        recall_limit,
+        logger,
+    )
+    .await;
 
-    let memory_injection = if let Some(mem_store) = semantic_memory {
-        let query_embedding = if let Some(emb_client) = embedding_client {
-            emb_client.embed(&heartbeat_prompt).await.ok()
-        } else {
-            None
-        };
+    let recall_content = recall_result.recall_content;
 
-        let store_guard = mem_store.lock().await;
-        match store_guard.recall_with_embedding(
-            &heartbeat_prompt,
-            recall_limit,
-            query_embedding.as_deref(),
-        ) {
-            Ok(memories) => {
-                if !memories.is_empty() {
-                    logger.memory(&format!("[heartbeat] Recall: {} memories", memories.len()));
-                }
-                let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                build_memory_injection(&entries)
-            }
-            Err(_) => String::new(),
-        }
-    } else {
-        String::new()
-    };
-
-    // Recall content will be stored AFTER response, so it appears before next user message
-    let recall_content =
-        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
-
-    // 5. Build conversation history
-    // (recall not yet stored - will be stored after response)
-    let full_history = if conversation_history.is_empty() {
-        None
-    } else {
-        Some(conversation_history)
-    };
-
-    // 6. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
+    // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
-        conversation_history: full_history,
-        external_tools,
+        conversation_history: if conversation_history.is_empty() {
+            None
+        } else {
+            Some(conversation_history)
+        },
+        external_tools: recall_result.external_tools,
         ..Default::default()
     };
 
@@ -2990,30 +2887,7 @@ async fn run_heartbeat(
     // 6. Process response: strip thinking tags, extract memories
     let without_thinking = strip_thinking_tags(&result.response);
     let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
-
-    // Save memories
-    if !memories_to_save.is_empty()
-        && let Some(mem_store) = semantic_memory
-    {
-        let store_guard = mem_store.lock().await;
-        for memory in &memories_to_save {
-            let embedding = if let Some(emb_client) = embedding_client {
-                emb_client.embed(memory).await.ok()
-            } else {
-                None
-            };
-            match store_guard.save_with_embedding(memory, 0.9, "explicit", embedding.as_deref()) {
-                Ok(SaveResult::New(id)) => {
-                    logger.memory(&format!("[heartbeat] Save #{}: \"{}\"", id, memory))
-                }
-                Ok(SaveResult::Reinforced(id, old, new)) => logger.memory(&format!(
-                    "[heartbeat] Reinforce #{}: ({:.2} → {:.2})",
-                    id, old, new
-                )),
-                Err(e) => logger.log(&format!("[heartbeat] Failed to save memory: {}", e)),
-            }
-        }
-    }
+    save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
     // 7. Store response in <agent>-heartbeat conversation (just the response, not the prompt)
     match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
@@ -3264,7 +3138,7 @@ async fn notify_task_complete(
 async fn handle_connection(
     mut api: SocketApi,
     agent: Arc<Mutex<Agent>>,
-    agent_name: String,
+    _agent_name: String,
     system_prompt: Option<String>,
     recall: Option<String>,
     model_recall: Option<String>,
@@ -3278,19 +3152,9 @@ async fn handle_connection(
     recall_limit: usize,
     _history_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
-    task_store: Option<Arc<Mutex<TaskStore>>>,
+    _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Create tool execution context for tools that need daemon state
-    // Note: conv_id is None in handle_connection context (direct socket messages)
-    let _tool_context = ToolExecutionContext {
-        agent_name: agent_name.clone(),
-        task_store: task_store.clone(),
-        conv_id: None,
-        semantic_memory_store: semantic_memory.clone(),
-        embedding_client: embedding_client.clone(),
-        allowed_tools: allowed_tools.clone(),
-    };
     loop {
         // Read request with a timeout
         let request = tokio::select! {
@@ -3380,102 +3244,29 @@ async fn handle_connection(
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
 
-                // Build tools injection or tool specs
-                // Native mode: pass ALL allowed tools (model can only call tools in the array)
-                // JSON-block mode: keyword-match relevant tools (injected into prompt)
-                let (tools_injection, external_tools) = if use_native_tools {
-                    // Native tool calling: pass ALL allowed tools from registry
-                    let all_tools = if let Some(ref registry) = tool_registry {
-                        let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
-                        filter_by_allowlist(all, &allowed_tools)
-                    } else {
-                        Vec::new()
-                    };
-                    if !all_tools.is_empty() {
-                        logger.tool(&format!(
-                            "[socket] Native tools: {} allowed",
-                            all_tools.len()
-                        ));
-                    }
-                    let specs = if !all_tools.is_empty() {
-                        Some(tool_definitions_to_specs(&all_tools))
-                    } else {
-                        None
-                    };
-                    (String::new(), specs)
-                } else if let Some(ref registry) = tool_registry {
-                    // JSON-block mode: keyword-match relevant tools
-                    let relevant = registry.find_relevant(content, recall_limit);
-                    let relevant = filter_by_allowlist(relevant, &allowed_tools);
-                    if !relevant.is_empty() {
-                        logger.tool(&format!("Recall: {} tools for incoming", relevant.len()));
-                        for t in &relevant {
-                            logger.tool(&format!("  - {}", t.name));
-                        }
-                    }
-                    (ToolRegistry::format_for_prompt(&relevant), None)
-                } else {
-                    (String::new(), None)
-                };
+                // Build recall (tools + memories) for the incoming message
+                let recall_result = build_recall_for_query(
+                    content,
+                    &allowed_tools,
+                    &semantic_memory,
+                    &embedding_client,
+                    &tool_registry,
+                    use_native_tools,
+                    &recall,
+                    &model_recall,
+                    recall_limit,
+                    &logger,
+                )
+                .await;
 
-                // Inject relevant memories if enabled
-                let memory_injection = if let Some(ref mem_store) = semantic_memory {
-                    // Generate query embedding if we have an embedding client
-                    let query_embedding = if let Some(ref emb_client) = embedding_client {
-                        match emb_client.embed(content).await {
-                            Ok(emb) => Some(emb),
-                            Err(e) => {
-                                logger.log(&format!(
-                                    "[socket] Failed to generate query embedding: {}",
-                                    e
-                                ));
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    let store = mem_store.lock().await;
-                    match store.recall_with_embedding(
-                        content,
-                        recall_limit,
-                        query_embedding.as_deref(),
-                    ) {
-                        Ok(memories) => {
-                            if !memories.is_empty() {
-                                logger.memory(&format!(
-                                    "Recall: {} memories for incoming",
-                                    memories.len()
-                                ));
-                                for (m, score) in &memories {
-                                    logger.memory(&format!(
-                                        "  ({:.3}) \"{}\" [#{}]",
-                                        score, m.content, m.id
-                                    ));
-                                }
-                            }
-                            let entries: Vec<_> = memories.iter().map(|(m, _)| m.clone()).collect();
-                            build_memory_injection(&entries)
-                        }
-                        Err(e) => {
-                            logger.log(&format!("[socket] Memory recall error: {}", e));
-                            String::new()
-                        }
-                    }
-                } else {
-                    String::new()
-                };
-
-                // No fresh recall injection for streaming - recall should be stored
-                // in DB by the caller and included in conversation history when fetched.
-                // This enables KV cache reuse.
-                let _ = (&tools_injection, &memory_injection, &recall, &model_recall); // suppress unused warnings
+                // Note: recall injection is skipped for IncomingMessage - recall should be
+                // stored in DB by the caller and included in conversation history when fetched.
+                let _ = &recall_result.recall_content;
 
                 let options = ThinkOptions {
                     system_prompt: system_prompt.clone(),
                     conversation_history: None,
-                    external_tools,
+                    external_tools: recall_result.external_tools,
                     ..Default::default()
                 };
 
@@ -3485,52 +3276,17 @@ async fn handle_connection(
                     .await
                 {
                     Ok(result) => {
-                        // Strip thinking tags and extract [REMEMBER: ...] tags
                         let without_thinking = strip_thinking_tags(&result.response);
                         let (cleaned_response, memories_to_save) =
                             extract_remember_tags(&without_thinking);
 
-                        if !memories_to_save.is_empty()
-                            && let Some(ref mem_store) = semantic_memory
-                        {
-                            let store = mem_store.lock().await;
-                            for memory in &memories_to_save {
-                                // Generate embedding if we have a client
-                                let embedding = if let Some(ref emb_client) = embedding_client {
-                                    match emb_client.embed(memory).await {
-                                        Ok(emb) => Some(emb),
-                                        Err(e) => {
-                                            logger.log(&format!(
-                                                "[socket] Failed to generate embedding: {}",
-                                                e
-                                            ));
-                                            None
-                                        }
-                                    }
-                                } else {
-                                    None
-                                };
-
-                                match store.save_with_embedding(
-                                    memory,
-                                    0.9,
-                                    "explicit",
-                                    embedding.as_deref(),
-                                ) {
-                                    Ok(SaveResult::New(id)) => {
-                                        logger.memory(&format!("Save #{}: \"{}\"", id, memory))
-                                    }
-                                    Ok(SaveResult::Reinforced(id, old, new)) => {
-                                        logger.memory(&format!(
-                                            "Reinforce #{}: \"{}\" ({:.2} → {:.2})",
-                                            id, memory, old, new
-                                        ))
-                                    }
-                                    Err(e) => logger
-                                        .log(&format!("[socket] Failed to save memory: {}", e)),
-                                }
-                            }
-                        }
+                        save_memories(
+                            &memories_to_save,
+                            &semantic_memory,
+                            &embedding_client,
+                            &logger,
+                        )
+                        .await;
 
                         logger.log(&format!(
                             "[socket] Response to {}: {}",
