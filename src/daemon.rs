@@ -2366,6 +2366,8 @@ async fn handle_notify(
     // Track total token usage across all iterations
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
+    // Track tool execution trace for native tool mode persistence
+    let mut tool_trace: Vec<crate::agent::ToolExecution> = Vec::new();
 
     // Mutable conversation history - refreshed from DB after each tool result
     let mut conversation_history = conversation_history;
@@ -2392,12 +2394,20 @@ async fn handle_notify(
             ..Default::default()
         };
 
-        // Generate response
+        // Generate response (use streaming to avoid Ollama non-streaming issues)
+        let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
+        let drain_handle = tokio::spawn(async move {
+            while token_rx.recv().await.is_some() {}
+        });
+
         let mut agent_guard = agent.lock().await;
         let result = agent_guard
-            .think_with_options(&current_message, options)
+            .think_streaming_with_options(&current_message, options, token_tx)
             .await;
         drop(agent_guard); // Release lock before potential tool execution
+
+        // Drain completes when token_tx is dropped
+        let _ = drain_handle.await;
 
         match result {
             Ok(think_result) => {
@@ -2413,6 +2423,9 @@ async fn handle_notify(
                 if let Some(tokens) = think_result.tokens_out {
                     total_tokens_out += tokens;
                 }
+
+                // Accumulate tool trace for native tool mode
+                tool_trace.extend(think_result.tool_trace);
 
                 // Strip thinking tags and extract [REMEMBER: ...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
@@ -2549,6 +2562,30 @@ async fn handle_notify(
         None
     };
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
+    // For native tool mode, persist each tool execution before the final response.
+    // This ensures the conversation history includes the full tool call trace.
+    for exec in &tool_trace {
+        // Store the tool call (as an assistant message with tool_calls)
+        let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
+        // Use the content that accompanied the tool call (narration/status)
+        let content = exec.content.as_deref().unwrap_or("");
+        if let Err(e) = store.add_message_with_tool_calls(
+            conv_id,
+            agent_name,
+            content,
+            &[],
+            None,
+            tool_calls_json.as_deref(),
+        ) {
+            logger.log(&format!("[notify] Failed to store tool call: {}", e));
+        }
+        // Store the tool result
+        let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
+        if let Err(e) = store.add_message(conv_id, "tool", &tool_result_msg, &[]) {
+            logger.log(&format!("[notify] Failed to store tool result: {}", e));
+        }
+    }
+
     // Store recall AFTER response for persistence (but recall was already injected in memory)
     // This positions recall in DB right before the response, preserving context for future turns
     if let Some(ref recall_text) = recall_content_for_storage {
