@@ -103,8 +103,8 @@ use crate::discovery;
 use crate::embedding::EmbeddingClient;
 use crate::auth;
 use crate::llm::{
-    AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient, OpenAIClient, ToolSpec,
-    strip_thinking_tags,
+    AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, LLMError, LLMResponse, OllamaClient,
+    OpenAIClient, ToolSpec, strip_thinking_tags,
 };
 use crate::memory::{
     InMemoryStore, Memory, SaveResult, SemanticMemoryStore, SqliteMemory, build_memory_injection,
@@ -1864,6 +1864,7 @@ async fn create_llm_from_config(
             }
             Arc::new(client)
         }
+        "claude-code" => Arc::new(ClaudeCodeClient::new(&config.model)),
         other => return Err(format!("Unsupported LLM provider: {}", other).into()),
     };
     Ok(llm)

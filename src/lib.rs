@@ -36,8 +36,8 @@ pub use conversation::{
 pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
 pub use error::{AgentError, ErrorContext, ToolError};
 pub use llm::{
-    AnthropicAuth, AnthropicClient, ChatMessage, LLM, LLMError, LLMResponse, OllamaClient,
-    OpenAIClient, ToolCall, ToolSpec, UsageInfo, strip_thinking_tags,
+    AnthropicAuth, AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, LLMError, LLMResponse,
+    OllamaClient, OpenAIClient, ToolCall, ToolSpec, UsageInfo, strip_thinking_tags,
 };
 pub use memory::{
     InMemoryStore, Memory, MemoryEntry, MemoryError, SaveResult, SemanticMemoryEntry,

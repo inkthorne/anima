@@ -2339,6 +2339,7 @@ async fn run_agent_task(
             }
             Arc::new(client)
         }
+        "claude-code" => Arc::new(anima::ClaudeCodeClient::new(&config.llm.model)),
         other => return Err(format!("Unknown LLM provider: {}", other).into()),
     };
 

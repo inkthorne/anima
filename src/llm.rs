@@ -1273,6 +1273,269 @@ fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude Code client (routes through `claude -p` CLI)
+// ---------------------------------------------------------------------------
+
+/// LLM client that routes calls through the `claude` CLI.
+///
+/// This lets Anima agents use Anthropic subscription credentials (API keys
+/// or OAuth tokens from `anima login`) that are restricted to Claude Code.
+/// The CLI handles its own auth, so no API key is needed here.
+///
+/// **Important:** model configs using this provider must set `tools = false`
+/// (JSON-block mode) because native tool calling is not available via the CLI.
+pub struct ClaudeCodeClient {
+    model: String,
+}
+
+impl ClaudeCodeClient {
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            model: model.into(),
+        }
+    }
+}
+
+/// Flatten `ChatMessage`s into a plain-text prompt for the `claude -p` CLI.
+///
+/// Returns `(system_prompt, user_prompt)`.  The system prompt is extracted
+/// via `split_system_prompt()`.  The remaining messages are formatted as:
+///
+/// - Single user message → returned as-is.
+/// - Multi-turn → `[Previous conversation]\nrole: content\n...\n\n[Current message]\ncontent`
+fn format_messages_for_cli(messages: Vec<ChatMessage>) -> (Option<String>, String) {
+    let (system, msgs) = split_system_prompt(messages);
+
+    if msgs.is_empty() {
+        return (system, String::new());
+    }
+
+    if msgs.len() == 1 {
+        let prompt = msgs[0].content.clone().unwrap_or_default();
+        return (system, prompt);
+    }
+
+    // Multi-turn: format previous messages as context, last as current
+    let last = &msgs[msgs.len() - 1];
+    let previous = &msgs[..msgs.len() - 1];
+
+    let mut out = String::from("[Previous conversation]\n");
+    for msg in previous {
+        let content = msg.content.as_deref().unwrap_or("");
+        out.push_str(&format!("{}: {}\n", msg.role, content));
+    }
+    out.push_str(&format!(
+        "\n[Current message]\n{}",
+        last.content.as_deref().unwrap_or("")
+    ));
+
+    (system, out)
+}
+
+#[async_trait]
+impl LLM for ClaudeCodeClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        _tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        use tokio::process::Command;
+
+        let (system, prompt) = format_messages_for_cli(messages);
+
+        let mut cmd = Command::new("claude");
+        cmd.args(["-p", "--output-format", "json", "--no-session-persistence"]);
+        cmd.args(["--model", &self.model]);
+        cmd.args(["--tools", ""]);
+
+        if let Some(ref sys) = system {
+            cmd.args(["--system-prompt", sys]);
+        }
+
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| LLMError::permanent(format!("Failed to spawn claude CLI: {}", e)))?;
+
+        // Write prompt to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| LLMError::permanent(format!("Failed to wait for claude CLI: {}", e)))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(LLMError::permanent(format!(
+                "claude CLI exited with {}: {}{}",
+                output.status,
+                stderr,
+                if stdout.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nstdout: {}", stdout)
+                }
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Parse JSON response: {"type":"result","result":"...","usage":{...}}
+        let parsed: Value = serde_json::from_str(&stdout)
+            .map_err(|e| LLMError::permanent(format!("Failed to parse claude CLI output: {}", e)))?;
+
+        let content = parsed["result"].as_str().map(|s| s.to_string());
+
+        let usage = parsed["usage"].as_object().map(|u| UsageInfo {
+            prompt_tokens: u
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            completion_tokens: u
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+        });
+
+        if parsed["is_error"].as_bool() == Some(true) {
+            return Err(LLMError::permanent(format!(
+                "claude CLI returned error: {}",
+                content.as_deref().unwrap_or("unknown error")
+            )));
+        }
+
+        Ok(LLMResponse {
+            content,
+            tool_calls: Vec::new(),
+            usage,
+        })
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        _tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use tokio::io::AsyncBufReadExt;
+        use tokio::process::Command;
+
+        let (system, prompt) = format_messages_for_cli(messages);
+
+        let mut cmd = Command::new("claude");
+        cmd.args([
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+        ]);
+        cmd.args(["--model", &self.model]);
+        cmd.args(["--tools", ""]);
+
+        if let Some(ref sys) = system {
+            cmd.args(["--system-prompt", sys]);
+        }
+
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| LLMError::permanent(format!("Failed to spawn claude CLI: {}", e)))?;
+
+        // Write prompt to stdin
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        }
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LLMError::permanent("Failed to capture claude CLI stdout"))?;
+
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        let mut full_content = String::new();
+        let mut usage: Option<UsageInfo> = None;
+        let mut is_error = false;
+
+        while let Ok(Some(line)) = reader.next_line().await {
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
+                match parsed["type"].as_str() {
+                    Some("content_block_delta") => {
+                        if let Some(text) = parsed["delta"]["text"].as_str() {
+                            full_content.push_str(text);
+                            let _ = tx.send(text.to_string()).await;
+                        }
+                    }
+                    Some("result") => {
+                        // Final result event — capture usage and any content we missed
+                        if let Some(result_text) = parsed["result"].as_str() {
+                            if full_content.is_empty() {
+                                full_content = result_text.to_string();
+                            }
+                        }
+                        is_error = parsed["is_error"].as_bool() == Some(true);
+                        usage = parsed["usage"].as_object().map(|u| UsageInfo {
+                            prompt_tokens: u
+                                .get("input_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32,
+                            completion_tokens: u
+                                .get("output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0)
+                                as u32,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Wait for process to finish
+        let _ = child.wait().await;
+
+        if is_error {
+            return Err(LLMError::permanent(format!(
+                "claude CLI returned error: {}",
+                if full_content.is_empty() {
+                    "unknown error"
+                } else {
+                    &full_content
+                }
+            )));
+        }
+
+        Ok(LLMResponse {
+            content: none_if_empty(full_content),
+            tool_calls: Vec::new(),
+            usage,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1432,5 +1695,84 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].arguments["path"], "a.txt");
         assert_eq!(calls[1].arguments["path"], "b.txt");
+    }
+
+    #[test]
+    fn test_claude_code_client_new() {
+        let client = ClaudeCodeClient::new("sonnet");
+        assert_eq!(client.model_name(), "sonnet");
+    }
+
+    #[test]
+    fn test_format_messages_for_cli_single_user() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("Hello".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let (system, prompt) = format_messages_for_cli(messages);
+        assert!(system.is_none());
+        assert_eq!(prompt, "Hello");
+    }
+
+    #[test]
+    fn test_format_messages_for_cli_with_system() {
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some("You are helpful.".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("Hi".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let (system, prompt) = format_messages_for_cli(messages);
+        assert_eq!(system, Some("You are helpful.".to_string()));
+        assert_eq!(prompt, "Hi");
+    }
+
+    #[test]
+    fn test_format_messages_for_cli_multi_turn() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("What is 2+2?".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some("4".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some("And 3+3?".to_string()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+        let (system, prompt) = format_messages_for_cli(messages);
+        assert!(system.is_none());
+        assert!(prompt.contains("[Previous conversation]"));
+        assert!(prompt.contains("user: What is 2+2?"));
+        assert!(prompt.contains("assistant: 4"));
+        assert!(prompt.contains("[Current message]"));
+        assert!(prompt.contains("And 3+3?"));
+    }
+
+    #[test]
+    fn test_format_messages_for_cli_empty() {
+        let messages: Vec<ChatMessage> = vec![];
+        let (system, prompt) = format_messages_for_cli(messages);
+        assert!(system.is_none());
+        assert!(prompt.is_empty());
     }
 }
