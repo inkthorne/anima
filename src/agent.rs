@@ -33,6 +33,25 @@ pub fn strip_thinking(content: &str) -> String {
     stray_tags.replace_all(&result, "").trim().to_string()
 }
 
+/// Returns a tool-budget nudge string when the agent has used ≥50% of its
+/// tool iterations, or None if below the threshold.
+pub fn tool_budget_nudge(iteration: usize, max: usize) -> Option<String> {
+    let pct = (iteration * 100) / max.max(1);
+    if pct >= 80 {
+        Some(format!(
+            "[Tool call {} of {} — approaching limit, provide your response now]",
+            iteration, max
+        ))
+    } else if pct >= 50 {
+        Some(format!(
+            "[Tool call {} of {} — consider responding if you have sufficient information]",
+            iteration, max
+        ))
+    } else {
+        None
+    }
+}
+
 /// Generate a brief summary of a tool result for logging.
 /// Extracts key metadata based on tool type.
 fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) -> Option<String> {
@@ -92,6 +111,102 @@ fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) 
     }
 }
 
+/// Truncate a string to max_len, appending "..." if truncated.
+pub fn truncate(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len])
+    }
+}
+
+/// Summarize tool params by type for checkpoint summaries.
+pub fn summarize_tool_params(tool_name: &str, params: &Value) -> String {
+    match tool_name {
+        "read_file" | "write_file" => {
+            params.get("path").and_then(|v| v.as_str()).unwrap_or("?").to_string()
+        }
+        "shell" | "safe_shell" => {
+            let cmd = params.get("command").and_then(|v| v.as_str()).unwrap_or("?");
+            truncate(cmd, 60)
+        }
+        "http" => {
+            let method = params.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            let url = params.get("url").and_then(|v| v.as_str()).unwrap_or("?");
+            format!("{} {}", method.to_uppercase(), url)
+        }
+        _ => truncate(&params.to_string(), 60),
+    }
+}
+
+/// Summarize a tool result string for checkpoint summaries.
+fn summarize_tool_result(tool_name: &str, params: &Value, result: &str) -> String {
+    match tool_name {
+        "read_file" => format!("{} bytes", result.len()),
+        "write_file" => {
+            let bytes = params.get("content").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+            format!("{} bytes", bytes)
+        }
+        "shell" | "safe_shell" => truncate(result, 100),
+        _ => truncate(result, 100),
+    }
+}
+
+/// Lightweight trace entry for checkpoint summaries.
+pub struct CheckpointTraceEntry {
+    pub tool_name: String,
+    pub params_summary: String,
+    pub result_summary: String,
+    pub content: Option<String>,
+}
+
+impl From<&ToolExecution> for CheckpointTraceEntry {
+    fn from(exec: &ToolExecution) -> Self {
+        let params = &exec.call.arguments;
+        Self {
+            tool_name: exec.call.name.clone(),
+            params_summary: summarize_tool_params(&exec.call.name, params),
+            result_summary: summarize_tool_result(&exec.call.name, params, &exec.result),
+            content: exec.content.as_ref().map(|c| truncate(c, 200)),
+        }
+    }
+}
+
+/// Build a checkpoint summary from trace entries.
+pub fn build_checkpoint_summary(entries: &[CheckpointTraceEntry], checkpoint_num: usize) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "[Checkpoint {}: {} tool calls completed]",
+        checkpoint_num,
+        entries.len()
+    ));
+    lines.push("Summary of work done so far:".to_string());
+    lines.push(String::new());
+
+    for (i, entry) in entries.iter().enumerate() {
+        let mut line = format!(
+            "{}. {}({}) → {}",
+            i + 1,
+            entry.tool_name,
+            entry.params_summary,
+            entry.result_summary
+        );
+        if let Some(ref narration) = entry.content {
+            if !narration.is_empty() {
+                line.push_str(&format!("  [{}]", narration));
+            }
+        }
+        lines.push(line);
+    }
+
+    lines.push(String::new());
+    lines.push("Continue working on the original task using the results above.".to_string());
+    lines.push("Do not repeat tool calls that already succeeded.".to_string());
+    lines.push("Provide your response when you have sufficient information.".to_string());
+
+    lines.join("\n")
+}
+
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
     /// Maximum iterations before giving up (default: 10)
@@ -119,6 +234,12 @@ pub struct ThinkOptions {
     /// Optional cancellation flag. When set to true, the agent stops the tool loop
     /// at the next iteration boundary and returns a Cancelled error.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Tool calls per checkpoint window. None = checkpoints disabled (default).
+    /// When set, the loop hard-stops after this many tool calls, builds a compact
+    /// summary, and restarts with the summary as context and a fresh budget.
+    pub checkpoint_interval: Option<usize>,
+    /// Maximum number of checkpoint restarts (default: 5).
+    pub max_checkpoints: usize,
 }
 
 impl Default for ThinkOptions {
@@ -134,6 +255,8 @@ impl Default for ThinkOptions {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            checkpoint_interval: None,
+            max_checkpoints: 5,
         }
     }
 }
@@ -1028,100 +1151,140 @@ impl Agent {
         let mut total_tokens_out: u32 = 0;
         let mut has_token_data = false;
 
-        for _iteration in 0..options.max_iterations {
-            // Check cancellation before each LLM call
-            if let Some(ref cancel) = options.cancel {
-                if cancel.load(Ordering::Relaxed) {
+        // Checkpoint support: when checkpoint_interval is set, the inner loop runs for
+        // checkpoint_interval iterations, then builds a summary and restarts with fresh context.
+        let checkpoint_interval = options.checkpoint_interval.unwrap_or(options.max_iterations);
+        let use_checkpoints = options.checkpoint_interval.is_some();
+        let max_checkpoint_loops = if use_checkpoints { options.max_checkpoints + 1 } else { 1 };
+
+        for _checkpoint in 0..max_checkpoint_loops {
+            for _iteration in 0..checkpoint_interval {
+                // Check cancellation before each LLM call
+                if let Some(ref cancel) = options.cancel {
+                    if cancel.load(Ordering::Relaxed) {
+                        self.trim_history();
+                        return Err(crate::error::AgentError::Cancelled);
+                    }
+                }
+
+                self.dump_context(&tools, &messages);
+
+                let llm_start = Instant::now();
+                let response = self
+                    .call_llm(&llm, &messages, &tools, &options.retry_policy)
+                    .await?;
+
+                let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+                self.emit(Event::LlmCall {
+                    model: llm.model_name().to_string(),
+                    tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
+                    tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
+                    duration_ms: llm_duration_ms,
+                })
+                .await;
+
+                if let Some(ref usage) = response.usage {
+                    total_tokens_in += usage.prompt_tokens;
+                    total_tokens_out += usage.completion_tokens;
+                    has_token_data = true;
+                }
+
+                if response.tool_calls.is_empty() {
+                    let final_response = response
+                        .content
+                        .unwrap_or_else(|| "No response".to_string());
+
+                    // Store stripped version in history (thinking tags removed)
+                    let stripped_response = strip_thinking(&final_response);
+                    self.history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(stripped_response),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+
                     self.trim_history();
-                    return Err(crate::error::AgentError::Cancelled);
+
+                    let response_text = if let Some(ref config) = options.reflection {
+                        self.reflect_and_revise(task, &final_response, config, &options)
+                            .await?
+                    } else {
+                        final_response
+                    };
+
+                    let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
+                    let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
+                    return Ok(ThinkResult {
+                        response: response_text,
+                        tools_used: !tool_names_used.is_empty(),
+                        tool_names: tool_names_used,
+                        last_tool_calls,
+                        tool_trace,
+                        tokens_in,
+                        tokens_out,
+                    });
+                }
+
+                last_tool_calls = Some(response.tool_calls.clone());
+
+                let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
+                let assistant_message = ChatMessage {
+                    role: "assistant".to_string(),
+                    content: assistant_content.clone(),
+                    tool_call_id: None,
+                    tool_calls: Some(response.tool_calls.clone()),
+                };
+                self.history.push(assistant_message.clone());
+                messages.push(assistant_message);
+
+                self.execute_tool_calls(
+                    &response.tool_calls,
+                    &assistant_content,
+                    &mut tool_names_used,
+                    &mut tool_trace,
+                    &options.tool_trace_tx,
+                    &mut messages,
+                )
+                .await;
+
+                // Inject tool budget nudge — uses window-local iteration count and checkpoint_interval
+                if let Some(nudge) = tool_budget_nudge(_iteration + 1, checkpoint_interval) {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(nudge),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
                 }
             }
 
-            self.dump_context(&tools, &messages);
-
-            let llm_start = Instant::now();
-            let response = self
-                .call_llm(&llm, &messages, &tools, &options.retry_policy)
-                .await?;
-
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.emit(Event::LlmCall {
-                model: llm.model_name().to_string(),
-                tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
-                tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
-                duration_ms: llm_duration_ms,
-            })
-            .await;
-
-            if let Some(ref usage) = response.usage {
-                total_tokens_in += usage.prompt_tokens;
-                total_tokens_out += usage.completion_tokens;
-                has_token_data = true;
+            // Inner loop exhausted without LLM finishing — checkpoint or give up
+            if !use_checkpoints {
+                break;
             }
 
-            if response.tool_calls.is_empty() {
-                let final_response = response
-                    .content
-                    .unwrap_or_else(|| "No response".to_string());
+            // Build checkpoint summary and restart with fresh context
+            let entries: Vec<CheckpointTraceEntry> = tool_trace.iter().map(|t| t.into()).collect();
+            let summary = build_checkpoint_summary(&entries, _checkpoint + 1);
 
-                // Store stripped version in history (thinking tags removed)
-                let stripped_response = strip_thinking(&final_response);
-                self.history.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: Some(stripped_response),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
-
-                self.trim_history();
-
-                let response_text = if let Some(ref config) = options.reflection {
-                    self.reflect_and_revise(task, &final_response, config, &options)
-                        .await?
-                } else {
-                    final_response
-                };
-
-                let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
-                let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
-                return Ok(ThinkResult {
-                    response: response_text,
-                    tools_used: !tool_names_used.is_empty(),
-                    tool_names: tool_names_used,
-                    last_tool_calls,
-                    tool_trace,
-                    tokens_in,
-                    tokens_out,
-                });
-            }
-
-            last_tool_calls = Some(response.tool_calls.clone());
-
-            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
-            let assistant_message = ChatMessage {
-                role: "assistant".to_string(),
-                content: assistant_content.clone(),
+            messages = self.build_messages(
+                &effective_system_prompt,
+                &options.conversation_history,
+                Some(&summary),
+            );
+            self.history.clear();
+            self.history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(summary),
                 tool_call_id: None,
-                tool_calls: Some(response.tool_calls.clone()),
-            };
-            self.history.push(assistant_message.clone());
-            messages.push(assistant_message);
-
-            self.execute_tool_calls(
-                &response.tool_calls,
-                &assistant_content,
-                &mut tool_names_used,
-                &mut tool_trace,
-                &options.tool_trace_tx,
-                &mut messages,
-            )
-            .await;
+                tool_calls: None,
+            });
+            // tool_trace and token counters keep accumulating across checkpoints
         }
 
         self.trim_history();
-        Err(crate::error::AgentError::MaxIterationsExceeded(
-            options.max_iterations,
-        ))
+        let total_budget = checkpoint_interval * max_checkpoint_loops;
+        Err(crate::error::AgentError::MaxIterationsExceeded(total_budget))
     }
 
     pub async fn think(&mut self, task: &str) -> Result<ThinkResult, crate::error::AgentError> {
@@ -1205,93 +1368,120 @@ impl Agent {
         let mut total_tokens_out: u32 = 0;
         let mut has_token_data = false;
 
-        for _iteration in 0..options.max_iterations {
-            // Check cancellation before each LLM call
-            if let Some(ref cancel) = options.cancel {
-                if cancel.load(Ordering::Relaxed) {
-                    self.trim_history();
-                    return Err(crate::error::AgentError::Cancelled);
+        // Checkpoint support (mirrors think_with_options_inner)
+        let checkpoint_interval = options.checkpoint_interval.unwrap_or(options.max_iterations);
+        let use_checkpoints = options.checkpoint_interval.is_some();
+        let max_checkpoint_loops = if use_checkpoints { options.max_checkpoints + 1 } else { 1 };
+
+        for _checkpoint in 0..max_checkpoint_loops {
+            for _iteration in 0..checkpoint_interval {
+                // Check cancellation before each LLM call
+                if let Some(ref cancel) = options.cancel {
+                    if cancel.load(Ordering::Relaxed) {
+                        self.trim_history();
+                        return Err(crate::error::AgentError::Cancelled);
+                    }
                 }
-            }
 
-            self.dump_context(&tools, &messages);
+                self.dump_context(&tools, &messages);
 
-            let llm_start = Instant::now();
-            let response = self
-                .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
-                .await?;
+                let llm_start = Instant::now();
+                let response = self
+                    .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
+                    .await?;
 
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.emit(Event::LlmCall {
-                model: llm.model_name().to_string(),
-                tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
-                tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
-                duration_ms: llm_duration_ms,
-            })
-            .await;
+                let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+                self.emit(Event::LlmCall {
+                    model: llm.model_name().to_string(),
+                    tokens_in: response.usage.as_ref().map(|u| u.prompt_tokens),
+                    tokens_out: response.usage.as_ref().map(|u| u.completion_tokens),
+                    duration_ms: llm_duration_ms,
+                })
+                .await;
 
-            if let Some(ref usage) = response.usage {
-                total_tokens_in += usage.prompt_tokens;
-                total_tokens_out += usage.completion_tokens;
-                has_token_data = true;
-            }
+                if let Some(ref usage) = response.usage {
+                    total_tokens_in += usage.prompt_tokens;
+                    total_tokens_out += usage.completion_tokens;
+                    has_token_data = true;
+                }
 
-            if response.tool_calls.is_empty() {
-                let final_response = response
-                    .content
-                    .unwrap_or_else(|| "No response".to_string());
+                if response.tool_calls.is_empty() {
+                    let final_response = response
+                        .content
+                        .unwrap_or_else(|| "No response".to_string());
 
-                let stripped_response = strip_thinking(&final_response);
-                self.history.push(ChatMessage {
+                    let stripped_response = strip_thinking(&final_response);
+                    self.history.push(ChatMessage {
+                        role: "assistant".to_string(),
+                        content: Some(stripped_response),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+
+                    self.trim_history();
+
+                    return Ok(ThinkResult {
+                        response: final_response,
+                        tools_used: !tool_names_used.is_empty(),
+                        tool_names: tool_names_used,
+                        last_tool_calls,
+                        tool_trace,
+                        tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
+                        tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
+                    });
+                }
+
+                last_tool_calls = Some(response.tool_calls.clone());
+
+                let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
+                let assistant_message = ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some(stripped_response),
+                    content: assistant_content.clone(),
                     tool_call_id: None,
-                    tool_calls: None,
-                });
+                    tool_calls: Some(response.tool_calls.clone()),
+                };
+                self.history.push(assistant_message.clone());
+                messages.push(assistant_message);
 
-                self.trim_history();
+                self.execute_tool_calls(
+                    &response.tool_calls,
+                    &assistant_content,
+                    &mut tool_names_used,
+                    &mut tool_trace,
+                    &options.tool_trace_tx,
+                    &mut messages,
+                )
+                .await;
 
-                return Ok(ThinkResult {
-                    response: final_response,
-                    tools_used: !tool_names_used.is_empty(),
-                    tool_names: tool_names_used,
-                    last_tool_calls,
-                    tool_trace,
-                    tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
-                    tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
-                });
+                let _ = token_tx.send("\n".to_string()).await;
             }
 
-            last_tool_calls = Some(response.tool_calls.clone());
+            // Inner loop exhausted — checkpoint or give up
+            if !use_checkpoints {
+                break;
+            }
 
-            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
-            let assistant_message = ChatMessage {
-                role: "assistant".to_string(),
-                content: assistant_content.clone(),
+            // Build checkpoint summary and restart with fresh context
+            let entries: Vec<CheckpointTraceEntry> = tool_trace.iter().map(|t| t.into()).collect();
+            let summary = build_checkpoint_summary(&entries, _checkpoint + 1);
+
+            messages = self.build_messages(
+                &effective_system_prompt,
+                &options.conversation_history,
+                Some(&summary),
+            );
+            self.history.clear();
+            self.history.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(summary),
                 tool_call_id: None,
-                tool_calls: Some(response.tool_calls.clone()),
-            };
-            self.history.push(assistant_message.clone());
-            messages.push(assistant_message);
-
-            self.execute_tool_calls(
-                &response.tool_calls,
-                &assistant_content,
-                &mut tool_names_used,
-                &mut tool_trace,
-                &options.tool_trace_tx,
-                &mut messages,
-            )
-            .await;
-
-            let _ = token_tx.send("\n".to_string()).await;
+                tool_calls: None,
+            });
         }
 
         self.trim_history();
-
-        Err(crate::error::AgentError::MaxIterationsExceeded(
-            options.max_iterations,
-        ))
+        let total_budget = checkpoint_interval * max_checkpoint_loops;
+        Err(crate::error::AgentError::MaxIterationsExceeded(total_budget))
     }
 
     /// Reflect on a response and potentially revise it
@@ -1354,6 +1544,8 @@ impl Agent {
                 external_tools: options.external_tools.clone(),
                 tool_trace_tx: None,
                 cancel: options.cancel.clone(),
+                checkpoint_interval: options.checkpoint_interval,
+                max_checkpoints: options.max_checkpoints,
             };
 
             current_response = self
@@ -1758,6 +1950,8 @@ mod tests {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            checkpoint_interval: None,
+            max_checkpoints: 5,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2445,6 +2639,8 @@ mod tests {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            checkpoint_interval: None,
+            max_checkpoints: 5,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();
@@ -2454,5 +2650,149 @@ mod tests {
             history[0].content.as_ref().unwrap(),
             "Recall content here."
         );
+    }
+
+    // =========================================================================
+    // Checkpoint summary tests
+    // =========================================================================
+
+    #[test]
+    fn test_truncate_short_string() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn test_truncate_exact_length() {
+        assert_eq!(truncate("hello", 5), "hello");
+    }
+
+    #[test]
+    fn test_truncate_long_string() {
+        assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn test_truncate_empty() {
+        assert_eq!(truncate("", 5), "");
+    }
+
+    #[test]
+    fn test_summarize_tool_params_read_file() {
+        let params = json!({"path": "/tmp/test.rs"});
+        assert_eq!(summarize_tool_params("read_file", &params), "/tmp/test.rs");
+    }
+
+    #[test]
+    fn test_summarize_tool_params_write_file() {
+        let params = json!({"path": "src/main.rs", "content": "fn main() {}"});
+        assert_eq!(summarize_tool_params("write_file", &params), "src/main.rs");
+    }
+
+    #[test]
+    fn test_summarize_tool_params_shell() {
+        let params = json!({"command": "cargo check"});
+        assert_eq!(summarize_tool_params("shell", &params), "cargo check");
+    }
+
+    #[test]
+    fn test_summarize_tool_params_shell_long() {
+        let long_cmd = "a".repeat(100);
+        let params = json!({"command": long_cmd});
+        let result = summarize_tool_params("shell", &params);
+        assert!(result.len() <= 63); // 60 + "..."
+        assert!(result.ends_with("..."));
+    }
+
+    #[test]
+    fn test_summarize_tool_params_http() {
+        let params = json!({"method": "post", "url": "https://api.example.com/data"});
+        assert_eq!(
+            summarize_tool_params("http", &params),
+            "POST https://api.example.com/data"
+        );
+    }
+
+    #[test]
+    fn test_summarize_tool_params_unknown() {
+        let params = json!({"key": "value"});
+        let result = summarize_tool_params("unknown_tool", &params);
+        assert!(result.contains("key"));
+    }
+
+    #[test]
+    fn test_build_checkpoint_summary_basic() {
+        let entries = vec![
+            CheckpointTraceEntry {
+                tool_name: "read_file".to_string(),
+                params_summary: "src/main.rs".to_string(),
+                result_summary: "2847 bytes".to_string(),
+                content: None,
+            },
+            CheckpointTraceEntry {
+                tool_name: "shell".to_string(),
+                params_summary: "cargo check".to_string(),
+                result_summary: "exit 0".to_string(),
+                content: Some("Running cargo check...".to_string()),
+            },
+        ];
+
+        let summary = build_checkpoint_summary(&entries, 1);
+        assert!(summary.contains("[Checkpoint 1: 2 tool calls completed]"));
+        assert!(summary.contains("1. read_file(src/main.rs) → 2847 bytes"));
+        assert!(summary.contains("2. shell(cargo check) → exit 0"));
+        assert!(summary.contains("[Running cargo check...]"));
+        assert!(summary.contains("Continue working on the original task"));
+        assert!(summary.contains("Do not repeat tool calls that already succeeded"));
+    }
+
+    #[test]
+    fn test_build_checkpoint_summary_empty() {
+        let entries: Vec<CheckpointTraceEntry> = vec![];
+        let summary = build_checkpoint_summary(&entries, 1);
+        assert!(summary.contains("[Checkpoint 1: 0 tool calls completed]"));
+        assert!(summary.contains("Continue working"));
+    }
+
+    #[test]
+    fn test_build_checkpoint_summary_no_narration() {
+        let entries = vec![CheckpointTraceEntry {
+            tool_name: "read_file".to_string(),
+            params_summary: "test.rs".to_string(),
+            result_summary: "100 bytes".to_string(),
+            content: None,
+        }];
+
+        let summary = build_checkpoint_summary(&entries, 2);
+        assert!(summary.contains("[Checkpoint 2:"));
+        assert!(summary.contains("1. read_file(test.rs) → 100 bytes"));
+        // Tool line should not have narration brackets (only checkpoint header has brackets)
+        let tool_line = summary.lines().find(|l| l.starts_with("1.")).unwrap();
+        assert!(!tool_line.contains('['));
+    }
+
+    #[test]
+    fn test_checkpoint_trace_entry_from_tool_execution() {
+        let exec = ToolExecution {
+            call: crate::llm::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({"path": "/tmp/test.rs"}),
+            },
+            result: "file contents here".to_string(),
+            content: Some("Let me read the file.".to_string()),
+        };
+
+        let entry = CheckpointTraceEntry::from(&exec);
+        assert_eq!(entry.tool_name, "read_file");
+        assert_eq!(entry.params_summary, "/tmp/test.rs");
+        assert_eq!(entry.result_summary, "18 bytes");
+        assert_eq!(entry.content, Some("Let me read the file.".to_string()));
+    }
+
+    #[test]
+    fn test_think_options_checkpoint_defaults() {
+        let opts = ThinkOptions::default();
+        assert!(opts.checkpoint_interval.is_none());
+        assert_eq!(opts.max_checkpoints, 5);
     }
 }

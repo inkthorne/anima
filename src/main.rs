@@ -1753,7 +1753,7 @@ async fn handle_chat_command(
 
             let messages: Vec<_> = messages
                 .into_iter()
-                .filter(|m| m.from_agent != "tool")
+                .filter(|m| m.from_agent != "tool" && m.from_agent != "recall")
                 .collect();
 
             if raw {
@@ -2285,6 +2285,8 @@ async fn run_agent_task(
         external_tools: None,
         tool_trace_tx: None,
         cancel: None,
+        checkpoint_interval: config.think.checkpoint_interval,
+        max_checkpoints: config.think.max_checkpoints,
     };
 
     if stream {

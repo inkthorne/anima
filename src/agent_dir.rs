@@ -166,6 +166,10 @@ impl Default for SemanticMemorySection {
 pub struct ThinkSection {
     /// Maximum iterations for tool call loops (default: 10)
     pub max_iterations: Option<usize>,
+    /// Tool calls per checkpoint window. None = checkpoints disabled (default).
+    pub checkpoint_interval: Option<usize>,
+    /// Maximum number of checkpoint restarts before giving up (default: 5).
+    pub max_checkpoints: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]

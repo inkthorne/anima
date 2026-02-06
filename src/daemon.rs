@@ -928,6 +928,10 @@ pub struct DaemonConfig {
     pub num_ctx: Option<u32>,
     /// Maximum tool call iterations per turn
     pub max_iterations: Option<usize>,
+    /// Tool calls per checkpoint window (None = disabled)
+    pub checkpoint_interval: Option<usize>,
+    /// Maximum number of checkpoint restarts (default: 5)
+    pub max_checkpoints: Option<usize>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1026,6 +1030,8 @@ impl DaemonConfig {
             allowed_tools,
             num_ctx: llm_config.num_ctx,
             max_iterations: agent_dir.config.think.max_iterations,
+            checkpoint_interval: agent_dir.config.think.checkpoint_interval,
+            max_checkpoints: agent_dir.config.think.max_checkpoints,
         })
     }
 }
@@ -1339,6 +1345,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &task_store,
                             config.num_ctx,
                             config.max_iterations,
+                            config.checkpoint_interval,
+                            config.max_checkpoints,
                         )
                         .await;
 
@@ -1422,6 +1430,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let worker_num_ctx = config.num_ctx;
         let worker_max_iterations = config.max_iterations;
+        let worker_checkpoint_interval = config.checkpoint_interval;
+        let worker_max_checkpoints = config.max_checkpoints;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1442,6 +1452,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_heartbeat_config,
                 worker_num_ctx,
                 worker_max_iterations,
+                worker_checkpoint_interval,
+                worker_max_checkpoints,
             )
             .await
         })
@@ -1767,6 +1779,8 @@ async fn agent_worker(
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -1837,6 +1851,8 @@ async fn agent_worker(
                     &task_store,
                     num_ctx,
                     max_iterations,
+                    checkpoint_interval,
+                    max_checkpoints,
                 )
                 .await;
             }
@@ -2005,6 +2021,8 @@ async fn process_message_work(
             logger,
             &tool_context,
             conversation_history,
+            None, // checkpoint_interval — not used for direct messages
+            None, // max_checkpoints
         )
         .await;
         (response, None)
@@ -2140,9 +2158,15 @@ async fn process_json_block_mode(
     logger: &Arc<AgentLogger>,
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) -> String {
     let mut current_message = content.to_string();
-    let max_tool_calls = 10;
+    let max_tool_calls = checkpoint_interval.unwrap_or(10);
+    let use_checkpoints = checkpoint_interval.is_some();
+    let json_max_checkpoints = max_checkpoints.unwrap_or(5);
+    let mut json_checkpoint_count: usize = 0;
+    let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut tool_call_count = 0;
 
     loop {
@@ -2242,7 +2266,25 @@ async fn process_json_block_mode(
 
         if let Some(tc) = tool_call {
             tool_call_count += 1;
-            if tool_call_count > max_tool_calls {
+
+            // Check checkpoint boundary
+            if use_checkpoints && tool_call_count >= max_tool_calls {
+                json_checkpoint_count += 1;
+                if json_checkpoint_count > json_max_checkpoints {
+                    logger.tool("[worker] Max checkpoints exhausted, stopping");
+                    return cleaned_response;
+                }
+                let summary = crate::agent::build_checkpoint_summary(
+                    &checkpoint_trace, json_checkpoint_count,
+                );
+                logger.log(&format!(
+                    "[worker] Checkpoint {} reached ({} tool calls), restarting with summary",
+                    json_checkpoint_count, tool_call_count
+                ));
+                tool_call_count = 0;
+                current_message = summary;
+                continue;
+            } else if !use_checkpoints && tool_call_count > max_tool_calls {
                 logger.tool("[worker] Max tool calls reached, stopping");
                 return cleaned_response;
             }
@@ -2259,12 +2301,28 @@ async fn process_json_block_mode(
             match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                 Ok(tool_result) => {
                     logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
+                    checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
+                        tool_name: tc.tool.clone(),
+                        params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
+                        result_summary: crate::agent::truncate(&tool_result, 100),
+                        content: None,
+                    });
                     current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
                 }
                 Err(e) => {
                     logger.tool(&format!("[worker] Error: {}", e));
+                    checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
+                        tool_name: tc.tool.clone(),
+                        params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
+                        result_summary: format!("ERROR: {}", crate::agent::truncate(&e.to_string(), 80)),
+                        content: None,
+                    });
                     current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
                 }
+            }
+
+            if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_tool_calls) {
+                current_message.push_str(&format!("\n\n---\n{}", nudge));
             }
         } else {
             return cleaned_response;
@@ -2298,6 +2356,8 @@ async fn handle_notify(
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2380,7 +2440,7 @@ async fn handle_notify(
 
     let external_tools = recall_result.external_tools;
 
-    let max_tool_calls = 10;
+    let json_block_budget = checkpoint_interval.unwrap_or(max_iterations.unwrap_or(10));
     let mut tool_call_count = 0;
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
@@ -2388,6 +2448,9 @@ async fn handle_notify(
     let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
+    let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
+    let mut json_checkpoint_count: usize = 0;
+    let json_max_checkpoints = max_checkpoints.unwrap_or(5);
 
     // Channel for incremental tool trace persistence (native tool mode)
     let (tool_trace_tx, trace_rx) =
@@ -2438,6 +2501,8 @@ async fn handle_notify(
             max_iterations: max_iterations.unwrap_or(10),
             tool_trace_tx: Some(tool_trace_tx.clone()),
             cancel: Some(cancel_flag.clone()),
+            checkpoint_interval,
+            max_checkpoints: max_checkpoints.unwrap_or(5),
             ..Default::default()
         };
 
@@ -2492,9 +2557,34 @@ async fn handle_notify(
                     }
 
                     tool_call_count += 1;
-                    if tool_call_count > max_tool_calls {
+
+                    // Check if we've hit the checkpoint boundary (JSON-block mode)
+                    if checkpoint_interval.is_some() && tool_call_count >= json_block_budget {
+                        json_checkpoint_count += 1;
+                        if json_checkpoint_count > json_max_checkpoints {
+                            logger.tool("[notify] Max checkpoints exhausted, stopping");
+                            final_response = Some(after_remember.clone());
+                            break;
+                        }
+                        // Build checkpoint summary and reset counter
+                        let summary = crate::agent::build_checkpoint_summary(
+                            &checkpoint_trace, json_checkpoint_count,
+                        );
+                        logger.log(&format!(
+                            "[notify] Checkpoint {} reached ({} tool calls), restarting with summary",
+                            json_checkpoint_count, tool_call_count
+                        ));
+                        tool_call_count = 0;
+                        current_message = summary;
+                        // Refresh conversation_history from DB for fresh context
+                        if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
+                            let (refreshed_history, _) =
+                                format_conversation_history(&msgs, agent_name);
+                            conversation_history = refreshed_history;
+                        }
+                        continue;
+                    } else if checkpoint_interval.is_none() && tool_call_count > json_block_budget {
                         logger.tool("[notify] Max tool calls reached, stopping");
-                        // Use after_remember to preserve the tool call that couldn't be executed
                         final_response = Some(after_remember.clone());
                         break;
                     }
@@ -2531,10 +2621,23 @@ async fn handle_notify(
                     let tool_message = match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
                         Ok(tool_result) => {
                             logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
+                            // Track for checkpoint summary
+                            checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
+                                tool_name: tc.tool.clone(),
+                                params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
+                                result_summary: crate::agent::truncate(&tool_result, 100),
+                                content: None,
+                            });
                             format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                         }
                         Err(e) => {
                             logger.tool(&format!("[notify] Error: {}", e));
+                            checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
+                                tool_name: tc.tool.clone(),
+                                params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
+                                result_summary: format!("ERROR: {}", crate::agent::truncate(&e.to_string(), 80)),
+                                content: None,
+                            });
                             format!("[Tool Error for {}]\n{}", tc.tool, e)
                         }
                     };
@@ -2555,6 +2658,10 @@ async fn handle_notify(
                             format_conversation_history(&msgs, agent_name);
                         conversation_history = refreshed_history;
                         current_message = refreshed_final;
+                    }
+
+                    if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, json_block_budget) {
+                        current_message.push_str(&format!("\n\n---\n{}", nudge));
                     }
                 } else {
                     // No more tool calls - done
