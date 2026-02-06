@@ -2044,7 +2044,7 @@ async fn process_native_tool_mode(
     };
 
     let (result, tool_calls, tool_trace) = if let Some(tx) = token_tx {
-        // Streaming mode - no tool_calls available from streaming API
+        // Streaming mode - now returns ThinkResult with tool_calls and trace
         let agent_clone = agent.clone();
         let content_clone = content.to_string();
 
@@ -2056,7 +2056,7 @@ async fn process_native_tool_mode(
         });
 
         match handle.await {
-            Ok(Ok(response)) => (response, None, Vec::new()),
+            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.tool_trace),
             Ok(Err(e)) => (format!("Error: {}", e), None, Vec::new()),
             Err(e) => (format!("Error: task panicked: {}", e), None, Vec::new()),
         }
@@ -2171,7 +2171,7 @@ async fn process_json_block_mode(
             }
 
             match handle.await {
-                Ok(Ok(response)) => response,
+                Ok(Ok(result)) => result.response,
                 Ok(Err(e)) => return format!("Error: {}", e),
                 Err(e) => return format!("Error: task panicked: {}", e),
             }

@@ -1052,7 +1052,7 @@ impl Agent {
         &mut self,
         task: &str,
         token_tx: mpsc::Sender<String>,
-    ) -> Result<String, crate::error::AgentError> {
+    ) -> Result<ThinkResult, crate::error::AgentError> {
         self.think_streaming_with_options(task, ThinkOptions::default(), token_tx)
             .await
     }
@@ -1063,7 +1063,7 @@ impl Agent {
         task: &str,
         options: ThinkOptions,
         token_tx: mpsc::Sender<String>,
-    ) -> Result<String, crate::error::AgentError> {
+    ) -> Result<ThinkResult, crate::error::AgentError> {
         let agent_start = Instant::now();
 
         // Emit agent start event
@@ -1103,7 +1103,7 @@ impl Agent {
         task: &str,
         options: ThinkOptions,
         token_tx: mpsc::Sender<String>,
-    ) -> Result<String, crate::error::AgentError> {
+    ) -> Result<ThinkResult, crate::error::AgentError> {
         // Drain any pending messages from inbox (must happen before borrowing llm)
         let pending_messages = self.drain_inbox();
         let effective_task = if pending_messages.is_empty() {
@@ -1185,6 +1185,14 @@ impl Agent {
         // Add user message to LLM messages
         messages.push(user_message);
 
+        // Track tool usage across the agentic loop (same as non-streaming)
+        let mut tool_names_used: Vec<String> = Vec::new();
+        let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
+        let mut tool_trace: Vec<ToolExecution> = Vec::new();
+        let mut total_tokens_in: u32 = 0;
+        let mut total_tokens_out: u32 = 0;
+        let mut has_token_data = false;
+
         // Agentic loop with streaming
         for _iteration in 0..options.max_iterations {
             // Dump context before each LLM call
@@ -1246,6 +1254,13 @@ impl Agent {
             })
             .await;
 
+            // Track token usage
+            if let Some(ref usage) = response.usage {
+                total_tokens_in += usage.prompt_tokens;
+                total_tokens_out += usage.completion_tokens;
+                has_token_data = true;
+            }
+
             // If no tool calls, we have a final response
             if response.tool_calls.is_empty() {
                 let final_response = response
@@ -1264,8 +1279,27 @@ impl Agent {
                 // Trim history to stay within limit
                 self.trim_history();
 
-                return Ok(final_response);
+                return Ok(ThinkResult {
+                    response: final_response,
+                    tools_used: !tool_names_used.is_empty(),
+                    tool_names: tool_names_used,
+                    last_tool_calls,
+                    tool_trace,
+                    tokens_in: if has_token_data {
+                        Some(total_tokens_in)
+                    } else {
+                        None
+                    },
+                    tokens_out: if has_token_data {
+                        Some(total_tokens_out)
+                    } else {
+                        None
+                    },
+                });
             }
+
+            // Track the tool_calls for conversation persistence
+            last_tool_calls = Some(response.tool_calls.clone());
 
             // Create assistant message with tool calls (strip thinking tags for storage)
             let assistant_message = ChatMessage {
@@ -1279,12 +1313,26 @@ impl Agent {
             self.history.push(assistant_message.clone());
             messages.push(assistant_message);
 
+            // Capture content that accompanied the tool calls (for display alongside tool execution)
+            let assistant_content = response.content.as_ref().map(|c| strip_thinking(c));
+
             // Execute each tool and add results
-            for tool_call in &response.tool_calls {
+            for (i, tool_call) in response.tool_calls.iter().enumerate() {
+                // Track tool name
+                tool_names_used.push(tool_call.name.clone());
+
                 let result = self
                     .call_tool(&tool_call.name, &tool_call.arguments.to_string())
                     .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
+
+                // Record tool execution for persistence.
+                // Only attach content to the first tool call to avoid duplication.
+                tool_trace.push(ToolExecution {
+                    call: tool_call.clone(),
+                    result: result.clone(),
+                    content: if i == 0 { assistant_content.clone() } else { None },
+                });
 
                 let tool_message = ChatMessage {
                     role: "tool".to_string(),
