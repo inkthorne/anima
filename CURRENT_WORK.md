@@ -1,10 +1,11 @@
-# Current Work: Anima v3.6.8
+# Current Work: Anima v3.6.9
 
 **Date:** 2026-02-05
 **Status:** Idle ✅
 
 ## Recent Releases
 
+- **v3.6.9** — Fix recall message ordering in conversation history
 - **v3.6.8** — Fix streaming mode tool_calls persistence for KV caching
 - **v3.6.1** — SafeShellTool for native tool mode
 - **v3.6.0** — Rename persona.md to system.md (BREAKING)

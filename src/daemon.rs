@@ -309,14 +309,19 @@ fn format_conversation_history(
 
     // Process all messages
     for msg in messages {
-        if msg.from_agent == current_agent || msg.from_agent == "recall" {
-            // Current agent's message or recall → assistant role, raw text
-            // Recall messages were stored by the daemon and should become standalone assistant messages
-            // First, flush any pending user messages
+        if msg.from_agent == "recall" {
+            // Recall goes BEFORE pending user messages to maintain:
+            // [recall] [user] ordering (recall precedes the query it supports)
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(msg.content.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        } else if msg.from_agent == current_agent {
+            // Agent's own response — flush pending user messages first
             flush_user_batch(&mut pending_user_batch, &mut history);
 
-            // Deserialize tool_calls if present (for native tool mode persistence)
-            // (recall messages won't have tool_calls, but this is harmless)
             let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg
                 .tool_calls
                 .as_ref()
@@ -4123,9 +4128,11 @@ api_key = "sk-test"
 
     #[test]
     fn test_format_conversation_history_recall_becomes_assistant() {
-        // Recall messages should become standalone assistant messages, NOT JSON-wrapped user content
-        // Pattern: user₁, recall, assistant₁, user₂
-        // Should map: [user₁-JSON], [assistant: recall], [assistant: assistant₁], final = [user₂-JSON]
+        // Recall messages should become standalone assistant messages, NOT JSON-wrapped user content.
+        // DB order after a completed turn: user₁, recall, assistant₁, user₂
+        // Correct history: [recall], [user₁-JSON], [assistant₁], final = [user₂-JSON]
+        // Recall is placed BEFORE the user message it was associated with, matching
+        // the in-memory ordering during the original turn.
         let msgs = vec![
             make_conv_msg("user", "hello"),
             make_conv_msg("recall", "[Relevant memories]\n- Memory 1\n- Memory 2"),
@@ -4134,20 +4141,21 @@ api_key = "sk-test"
         ];
         let (history, final_content) = format_conversation_history(&msgs, "arya");
 
-        // Should have 3 messages in history: user, assistant (recall), assistant (arya)
+        // Should have 3 messages in history: assistant (recall), user, assistant (arya)
         assert_eq!(history.len(), 3);
-        assert_eq!(history[0].role, "user");
+        // Recall should be first — assistant role with raw content (not JSON-wrapped)
+        assert_eq!(history[0].role, "assistant");
+        assert!(history[0].content.as_ref().unwrap().contains("[Relevant memories]"));
+        assert!(!history[0].content.as_ref().unwrap().contains("\"from\": \"recall\""));
+        // User message comes after recall
+        assert_eq!(history[1].role, "user");
         assert!(
-            history[0]
+            history[1]
                 .content
                 .as_ref()
                 .unwrap()
                 .contains("\"from\": \"user\"")
         );
-        // Recall should be assistant role with raw content (not JSON-wrapped)
-        assert_eq!(history[1].role, "assistant");
-        assert!(history[1].content.as_ref().unwrap().contains("[Relevant memories]"));
-        assert!(!history[1].content.as_ref().unwrap().contains("\"from\": \"recall\""));
         // Arya's response should also be assistant role
         assert_eq!(history[2].role, "assistant");
         assert_eq!(history[2].content.as_ref().unwrap(), "Hi! How can I help?");
