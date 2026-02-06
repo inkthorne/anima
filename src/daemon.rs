@@ -1837,7 +1837,43 @@ async fn process_message_work(
         agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
     }
 
-    // Build recall (tools + memories)
+    // Load conversation history first
+    let (mut conversation_history, final_user_content): (Vec<ChatMessage>, String) =
+        if let Some(cname) = conv_name {
+            match ConversationStore::init() {
+                Ok(store) => match store.get_messages(cname, Some(history_limit)) {
+                    Ok(msgs) if !msgs.is_empty() => {
+                        let (history, final_content) =
+                            format_conversation_history(&msgs, agent_name);
+                        logger.log(&format!(
+                            "[worker] Loaded {} history messages for conversation {}",
+                            history.len(),
+                            cname
+                        ));
+                        (history, final_content)
+                    }
+                    Ok(_) => (Vec::new(), content.to_string()),
+                    Err(e) => {
+                        logger.log(&format!(
+                            "[worker] Failed to load conversation history: {}",
+                            e
+                        ));
+                        (Vec::new(), content.to_string())
+                    }
+                },
+                Err(e) => {
+                    logger.log(&format!(
+                        "[worker] Failed to init conversation store for history: {}",
+                        e
+                    ));
+                    (Vec::new(), content.to_string())
+                }
+            }
+        } else {
+            (Vec::new(), content.to_string())
+        };
+
+    // Build recall (tools + memories) based on user message
     let recall_result = build_recall_for_query(
         content,
         allowed_tools,
@@ -1852,40 +1888,20 @@ async fn process_message_work(
     )
     .await;
 
-    // Recall content will be stored AFTER response, so it appears before next user message
-    let recall_content_to_store = recall_result.recall_content.clone();
-
-    // Load conversation history if conv_name is provided
-    // (recall not yet stored - will be stored after response)
-    let conversation_history: Vec<ChatMessage> = if let Some(cname) = conv_name {
-        match ConversationStore::init() {
-            Ok(store) => match store.get_messages(cname, Some(history_limit)) {
-                Ok(msgs) if !msgs.is_empty() => {
-                    let (history, _) = format_conversation_history(&msgs, agent_name);
-                    logger.log(&format!(
-                        "[worker] Loaded {} history messages for conversation {}",
-                        history.len(),
-                        cname
-                    ));
-                    history
-                }
-                Ok(_) => Vec::new(),
-                Err(e) => {
-                    logger.log(&format!("[worker] Failed to load conversation history: {}", e));
-                    Vec::new()
-                }
-            },
-            Err(e) => {
-                logger.log(&format!(
-                    "[worker] Failed to init conversation store for history: {}",
-                    e
-                ));
-                Vec::new()
-            }
+    // Prepend recall as assistant message to conversation_history (in memory)
+    // This positions it BEFORE the user message (which is passed as task)
+    // Pattern: [history...] [assistant: recall] [user: task]
+    let recall_content_for_storage = recall_result.recall_content.clone();
+    if let Some(ref recall_text) = recall_result.recall_content {
+        if !recall_text.is_empty() {
+            conversation_history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(recall_text.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
-    } else {
-        Vec::new()
-    };
+    }
 
     // Create tool execution context
     let tool_context = ToolExecutionContext {
@@ -1901,7 +1917,7 @@ async fn process_message_work(
     let (final_response, _tool_calls, tool_trace) = if use_native_tools {
         // Native tool mode with optional streaming
         let result = process_native_tool_mode(
-            content,
+            &final_user_content,
             recall_result.external_tools,
             token_tx,
             agent,
@@ -1916,7 +1932,7 @@ async fn process_message_work(
     } else {
         // JSON-block mode with optional streaming (no native tool_calls)
         let response = process_json_block_mode(
-            content,
+            &final_user_content,
             &recall_result.relevant_tools,
             token_tx,
             agent,
@@ -1961,6 +1977,18 @@ async fn process_message_work(
                         logger.log(&format!("[worker] Failed to store tool result: {}", e));
                     }
                 }
+                // Store recall AFTER response for persistence (but recall was already injected in memory)
+                // This positions recall in DB right before the response, preserving context for future turns
+                if let Some(ref recall_text) = recall_content_for_storage {
+                    if !recall_text.is_empty() {
+                        if let Err(e) = store.add_message(cname, "recall", recall_text, &[]) {
+                            logger.log(&format!(
+                                "[worker] Failed to store recall in conversation: {}",
+                                e
+                            ));
+                        }
+                    }
+                }
                 // Store the final response (no tool_calls since this is the terminal response)
                 if let Err(e) = store.add_message_with_tool_calls(
                     cname,
@@ -1974,18 +2002,6 @@ async fn process_message_work(
                         "[worker] Failed to store response in conversation: {}",
                         e
                     ));
-                }
-
-                // Store recall AFTER response so it appears before next user message in history
-                if let Some(ref recall_text) = recall_content_to_store
-                    && !recall_text.is_empty()
-                {
-                    if let Err(e) = store.add_message(cname, "recall", recall_text, &[]) {
-                        logger.log(&format!(
-                            "[worker] Failed to store recall in conversation: {}",
-                            e
-                        ));
-                    }
                 }
             }
             Err(e) => {
@@ -2282,9 +2298,10 @@ async fn handle_notify(
     }
 
     // Extract final_user_content for building recall
-    let (_, final_user_content) = format_conversation_history(&context_messages, agent_name);
+    let (mut conversation_history, final_user_content) =
+        format_conversation_history(&context_messages, agent_name);
 
-    // Build recall (tools + memories)
+    // Build recall (tools + memories) based on current user message
     let recall_result = build_recall_for_query(
         &final_user_content,
         allowed_tools,
@@ -2299,22 +2316,20 @@ async fn handle_notify(
     )
     .await;
 
-    // Recall content will be stored AFTER response, so it appears before next user message
-    let recall_content_to_store = recall_result.recall_content.clone();
-
-    // Fetch messages for conversation history (recall not yet stored - will be stored after response)
-    let context_messages = match store.get_messages(conv_id, Some(history_limit)) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            logger.log(&format!("[notify] Failed to reload messages: {}", e));
-            return Response::Error {
-                message: format!("Failed to reload messages: {}", e),
-            };
+    // Prepend recall as assistant message to conversation_history (in memory)
+    // This positions it BEFORE the user message (which is passed as task)
+    // Pattern: [history...] [assistant: recall] [user: task]
+    let recall_content_for_storage = recall_result.recall_content.clone();
+    if let Some(ref recall_text) = recall_result.recall_content {
+        if !recall_text.is_empty() {
+            conversation_history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(recall_text.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
         }
-    };
-
-    // Format conversation into proper user/assistant ChatMessages
-    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+    }
 
     logger.log(&format!(
         "[notify] Context: {} messages → {} history + final user turn",
@@ -2357,8 +2372,9 @@ async fn handle_notify(
         // iteration, the growing internal history appears before DB-backed history.
         agent.lock().await.clear_history();
 
-        // No fresh recall injection - recall is already stored in DB and included
-        // in conversation_history when fetched. This enables KV cache reuse.
+        // No fresh recall injection - recall was injected in the initial conversation_history
+        // on first iteration. After tool execution, we refresh from DB which won't include
+        // recall (stored after response), but that's fine - LLM has already seen it.
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
             conversation_history: if conversation_history.is_empty() {
@@ -2528,6 +2544,19 @@ async fn handle_notify(
         None
     };
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
+    // Store recall AFTER response for persistence (but recall was already injected in memory)
+    // This positions recall in DB right before the response, preserving context for future turns
+    if let Some(ref recall_text) = recall_content_for_storage {
+        if !recall_text.is_empty() {
+            if let Err(e) = store.add_message(conv_id, "recall", recall_text, &[]) {
+                logger.log(&format!(
+                    "[notify] Failed to store recall in conversation: {}",
+                    e
+                ));
+            }
+        }
+    }
+
     match store.add_message_with_tokens(
         conv_id,
         agent_name,
@@ -2544,17 +2573,6 @@ async fn handle_notify(
                 "[notify] Stored response as msg_id={} ({}ms)",
                 response_msg_id, duration_ms
             ));
-
-            // Store recall AFTER response so it appears before next user message in history
-            if let Some(ref recall_text) = recall_content_to_store
-                && !recall_text.is_empty()
-                && let Err(e) = store.add_message(conv_id, "recall", recall_text, &[])
-            {
-                logger.log(&format!(
-                    "[notify] Failed to store recall in conversation: {}",
-                    e
-                ));
-            }
 
             // Parse @mentions from our response and forward to other agents
             // Only forward if not paused and not at depth limit

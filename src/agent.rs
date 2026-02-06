@@ -825,22 +825,27 @@ impl Agent {
             messages.extend(extra_history.clone());
         }
 
-        // Create and add user message
+        // Create and add user message (unless empty with existing history)
         // Note: Recall content (tools, memories, recall.md) is now injected as an assistant
         // message by the daemon BEFORE the user message, not prepended to user content.
         // This improves KV caching since user messages stay unchanged.
-        let user_message = ChatMessage {
-            role: "user".to_string(),
-            content: Some(effective_task.clone()),
-            tool_call_id: None,
-            tool_calls: None,
-        };
+        //
+        // When final_user_content is empty (after storing recall and re-fetching history),
+        // the user message is already in conversation_history. Skip adding an empty user message.
+        if !effective_task.is_empty() {
+            let user_message = ChatMessage {
+                role: "user".to_string(),
+                content: Some(effective_task.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            };
 
-        // Add user message to internal history
-        self.history.push(user_message.clone());
+            // Add user message to internal history
+            self.history.push(user_message.clone());
 
-        // Add user message to LLM messages
-        messages.push(user_message);
+            // Add user message to LLM messages
+            messages.push(user_message);
+        }
 
         // Track tool usage across the agentic loop
         let mut tool_names_used: Vec<String> = Vec::new();
