@@ -25,8 +25,18 @@ pub trait LLM: Send + Sync {
     fn model_name(&self) -> &str;
 }
 
-/// Format tool calls for OpenAI-compatible API (arguments as JSON string)
-fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a potentially empty `String` to `Option<String>`, returning `None`
+/// when the string is empty.
+fn none_if_empty(s: String) -> Option<String> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Format tool calls for OpenAI-compatible API (arguments as JSON string).
+fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<Value> {
     tool_calls
         .iter()
         .map(|tc| {
@@ -42,8 +52,8 @@ fn format_tool_calls_for_api(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> 
         .collect()
 }
 
-/// Format tool calls for native Ollama API (arguments as object, not string)
-fn format_tool_calls_for_ollama(tool_calls: &[ToolCall]) -> Vec<serde_json::Value> {
+/// Format tool calls for native Ollama API (arguments as object, not string).
+fn format_tool_calls_for_ollama(tool_calls: &[ToolCall]) -> Vec<Value> {
     tool_calls
         .iter()
         .map(|tc| {
@@ -59,13 +69,181 @@ fn format_tool_calls_for_ollama(tool_calls: &[ToolCall]) -> Vec<serde_json::Valu
         .collect()
 }
 
+/// Format messages for the OpenAI API, serialising tool_calls arguments as
+/// JSON strings (the format OpenAI expects).
+fn format_messages_openai(messages: Vec<ChatMessage>) -> Vec<Value> {
+    messages
+        .into_iter()
+        .map(|msg| {
+            let tool_calls = msg.tool_calls.clone();
+            let mut val = serde_json::to_value(&msg).unwrap();
+            if let Some(tcs) = tool_calls
+                && !tcs.is_empty()
+            {
+                val["tool_calls"] = serde_json::to_value(format_tool_calls_for_api(&tcs)).unwrap();
+            }
+            val
+        })
+        .collect()
+}
+
+/// Format messages for the native Ollama API.
+///
+/// Handles two Ollama-specific concerns:
+/// - Tool call arguments are kept as objects (not stringified).
+/// - The last user message may have its content replaced with a stripped
+///   version (after removing a `/think` or `/no_think` prefix).
+fn format_messages_ollama(
+    messages: &[ChatMessage],
+    last_user_idx: Option<usize>,
+    stripped_user_content: &Option<String>,
+) -> Vec<Value> {
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| {
+            let mut val = serde_json::to_value(msg).unwrap();
+            if Some(i) == last_user_idx {
+                if let Some(stripped) = stripped_user_content {
+                    val["content"] = Value::String(stripped.clone());
+                }
+            }
+            if let Some(tcs) = &msg.tool_calls
+                && !tcs.is_empty()
+            {
+                val["tool_calls"] =
+                    serde_json::to_value(format_tool_calls_for_ollama(tcs)).unwrap();
+            }
+            val
+        })
+        .collect()
+}
+
+/// Format `ToolSpec`s into the OpenAI / Ollama function-tool JSON shape.
+fn format_tools_openai(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters
+                }
+            })
+        })
+        .collect()
+}
+
+/// Format `ToolSpec`s into the Anthropic tool JSON shape (`input_schema`).
+fn format_tools_anthropic(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.parameters
+            })
+        })
+        .collect()
+}
+
+/// Finalize tool calls that were accumulated during streaming.
+///
+/// `builders` maps an index to `(id, name, arguments_json_string)`.
+/// Entries are emitted in index order; entries whose arguments fail to parse
+/// as JSON are silently dropped (matching the original behaviour).
+fn finalize_tool_call_builders(
+    mut builders: std::collections::HashMap<usize, (String, String, String)>,
+) -> Vec<ToolCall> {
+    let mut indices: Vec<usize> = builders.keys().cloned().collect();
+    indices.sort();
+
+    let mut out = Vec::with_capacity(indices.len());
+    for index in indices {
+        if let Some((id, name, arguments_str)) = builders.remove(&index)
+            && let Ok(arguments) = serde_json::from_str(&arguments_str)
+        {
+            out.push(ToolCall {
+                id,
+                name,
+                arguments,
+            });
+        }
+    }
+    out
+}
+
+/// Apply the XML tool-call fallback for Ollama models.
+///
+/// When the model returned no native tool calls but the content text contains
+/// XML-encoded tool invocations, extract them and strip the XML from the
+/// content.
+fn apply_xml_tool_fallback(
+    content: Option<String>,
+    tool_calls: Vec<ToolCall>,
+) -> (Option<String>, Vec<ToolCall>) {
+    if !tool_calls.is_empty() {
+        return (content, tool_calls);
+    }
+    if let Some(text) = &content {
+        let (cleaned, xml_calls) = extract_xml_tool_calls(text);
+        if !xml_calls.is_empty() {
+            return (none_if_empty(cleaned), xml_calls);
+        }
+    }
+    (content, tool_calls)
+}
+
+/// Extract the system prompt and non-system messages for the Anthropic API,
+/// which requires the system prompt to be a separate top-level field.
+fn split_system_prompt(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
+    let system_prompt = messages
+        .iter()
+        .find(|msg| msg.role == "system")
+        .and_then(|msg| msg.content.clone());
+
+    let filtered: Vec<ChatMessage> = messages
+        .into_iter()
+        .filter(|msg| msg.role != "system")
+        .collect();
+
+    (system_prompt, filtered)
+}
+
+/// Detect a `/think` or `/no_think` prefix in the last user message.
+///
+/// Returns `(thinking_override, last_user_index, stripped_content)`.
+fn detect_thinking_override(
+    messages: &[ChatMessage],
+) -> (Option<bool>, Option<usize>, Option<String>) {
+    let last_user_idx = messages.iter().rposition(|m| m.role == "user");
+
+    if let Some(idx) = last_user_idx
+        && let Some(content) = &messages[idx].content
+    {
+        let (prefix_override, stripped) = parse_thinking_prefix(content);
+        if prefix_override.is_some() {
+            return (prefix_override, last_user_idx, Some(stripped.to_string()));
+        }
+    }
+
+    (None, last_user_idx, None)
+}
+
+// ---------------------------------------------------------------------------
+// Data types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String, // "system", "user", "assistant", "tool"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>, // For tool responses
+    pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
 }
@@ -88,7 +266,6 @@ pub struct ToolCall {
 pub struct LLMResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
-    /// Token usage information if available from the API
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageInfo>,
 }
@@ -100,20 +277,21 @@ pub struct UsageInfo {
     pub completion_tokens: u32,
 }
 
+// ---------------------------------------------------------------------------
+// LLMError
+// ---------------------------------------------------------------------------
+
 /// Error from LLM operations with retryability classification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMError {
     pub message: String,
-    /// HTTP status code if available
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
-    /// Whether this error is likely transient and worth retrying
     #[serde(default)]
     pub is_retryable: bool,
 }
 
 impl LLMError {
-    /// Create a retryable error (transient failures like timeouts, rate limits)
     pub fn retryable(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -122,7 +300,6 @@ impl LLMError {
         }
     }
 
-    /// Create a retryable error with status code
     pub fn retryable_with_status(message: impl Into<String>, status: u16) -> Self {
         Self {
             message: message.into(),
@@ -131,7 +308,6 @@ impl LLMError {
         }
     }
 
-    /// Create a non-retryable error (auth failures, bad requests)
     pub fn permanent(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -140,7 +316,6 @@ impl LLMError {
         }
     }
 
-    /// Create a non-retryable error with status code
     pub fn permanent_with_status(message: impl Into<String>, status: u16) -> Self {
         Self {
             message: message.into(),
@@ -149,7 +324,7 @@ impl LLMError {
         }
     }
 
-    /// Classify an HTTP status code as retryable or not
+    /// Classify an HTTP status code as retryable or not.
     pub fn from_status(status: u16, message: impl Into<String>) -> Self {
         let is_retryable = matches!(status, 408 | 429 | 500..=599);
         Self {
@@ -171,6 +346,10 @@ impl std::fmt::Display for LLMError {
 }
 
 impl std::error::Error for LLMError {}
+
+// ---------------------------------------------------------------------------
+// OpenAI client
+// ---------------------------------------------------------------------------
 
 pub struct OpenAIClient {
     client: Client,
@@ -199,6 +378,213 @@ impl OpenAIClient {
         self
     }
 }
+
+/// Parse an OpenAI tool_calls JSON array into `Vec<ToolCall>`.
+fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    let id = tc["id"].as_str()?.to_string();
+                    let name = tc["function"]["name"].as_str()?.to_string();
+                    let arguments: Value =
+                        serde_json::from_str(tc["function"]["arguments"].as_str()?).ok()?;
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract `UsageInfo` from an OpenAI-shaped usage object.
+fn parse_openai_usage(value: &Value) -> Option<UsageInfo> {
+    value.as_object().map(|u| UsageInfo {
+        prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        completion_tokens: u
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+    })
+}
+
+#[async_trait]
+impl LLM for OpenAIClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let formatted_messages = format_messages_openai(messages);
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages
+        });
+
+        if let Some(tool_list) = tools {
+            request_body["tools"] = serde_json::to_value(format_tools_openai(&tool_list)).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
+
+        let status = response.status().as_u16();
+
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to read response: {}", e)))?;
+
+        if status >= 400 {
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", response_text),
+            ));
+        }
+
+        let parsed: Value = serde_json::from_str(&response_text)
+            .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
+
+        let message = &parsed["choices"][0]["message"];
+
+        Ok(LLMResponse {
+            content: message["content"].as_str().map(|s| s.to_string()),
+            tool_calls: parse_openai_tool_calls(&message["tool_calls"]),
+            usage: parse_openai_usage(&parsed["usage"]),
+        })
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let formatted_messages = format_messages_openai(messages);
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages,
+            "stream": true
+        });
+
+        if let Some(tool_list) = tools {
+            request_body["tools"] = serde_json::to_value(format_tools_openai(&tool_list)).unwrap();
+            request_body["tool_choice"] = serde_json::json!("auto");
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", error_text),
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut full_content = String::new();
+        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
+            std::collections::HashMap::new();
+        let mut buffer = String::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                if line == "data: [DONE]" {
+                    break;
+                }
+
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
+                {
+                    let delta = &parsed["choices"][0]["delta"];
+
+                    if let Some(content) = delta["content"].as_str() {
+                        full_content.push_str(content);
+                        let _ = tx.send(content.to_string()).await;
+                    }
+
+                    if let Some(tc_array) = delta["tool_calls"].as_array() {
+                        for tc in tc_array {
+                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
+                            let entry = tool_call_builders
+                                .entry(index)
+                                .or_insert_with(|| (String::new(), String::new(), String::new()));
+
+                            if let Some(id) = tc["id"].as_str() {
+                                entry.0 = id.to_string();
+                            }
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                entry.1.push_str(name);
+                            }
+                            if let Some(args) = tc["function"]["arguments"].as_str() {
+                                entry.2.push_str(args);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(LLMResponse {
+            content: none_if_empty(full_content),
+            tool_calls: finalize_tool_call_builders(tool_call_builders),
+            usage: None,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic client
+// ---------------------------------------------------------------------------
 
 pub struct AnthropicClient {
     client: Client,
@@ -229,292 +615,11 @@ impl AnthropicClient {
 }
 
 #[async_trait]
-impl LLM for OpenAIClient {
-    fn model_name(&self) -> &str {
-        &self.model
-    }
-
-    async fn chat_complete(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolSpec>>,
-    ) -> Result<LLMResponse, LLMError> {
-        let url = format!("{}/chat/completions", self.base_url);
-
-        // Transform messages to fix tool_calls serialization for API compatibility
-        let mut formatted_messages = Vec::new();
-        for message in messages {
-            let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls
-                && !tool_calls.is_empty()
-            {
-                let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
-                formatted_message["tool_calls"] =
-                    serde_json::to_value(formatted_tool_calls).unwrap();
-            }
-            formatted_messages.push(formatted_message);
-        }
-
-        let mut request_body = serde_json::json!({
-            "model": self.model,
-            "messages": formatted_messages
-        });
-
-        if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
-            request_body["tool_choice"] = serde_json::json!("auto");
-        }
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| {
-                // Network errors are typically retryable
-                LLMError::retryable(format!("Failed to send request: {}", e))
-            })?;
-
-        let status = response.status().as_u16();
-
-        let response_text = response.text().await.map_err(|e| {
-            // Read errors are retryable
-            LLMError::retryable(format!("Failed to read response: {}", e))
-        })?;
-
-        // Check for HTTP errors before parsing
-        if status >= 400 {
-            return Err(LLMError::from_status(
-                status,
-                format!("API error: {}", response_text),
-            ));
-        }
-
-        let openai_response: serde_json::Value =
-            serde_json::from_str(&response_text).map_err(|e| {
-                // Parse errors are not retryable
-                LLMError::permanent(format!("Failed to parse response: {}", e))
-            })?;
-
-        let content = openai_response["choices"][0]["message"]["content"]
-            .as_str()
-            .map(|s| s.to_string());
-
-        let tool_calls = openai_response["choices"][0]["message"]["tool_calls"]
-            .as_array()
-            .map(|tool_calls_array| {
-                tool_calls_array
-                    .iter()
-                    .filter_map(|tool_call| {
-                        let id = tool_call["id"].as_str().map(|s| s.to_string())?;
-                        let name = tool_call["function"]["name"]
-                            .as_str()
-                            .map(|s| s.to_string())?;
-                        let arguments_str = tool_call["function"]["arguments"].as_str()?;
-                        let arguments: serde_json::Value =
-                            serde_json::from_str(arguments_str).ok()?;
-                        Some(ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Extract usage information
-        let usage = openai_response["usage"].as_object().map(|u| UsageInfo {
-            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-            completion_tokens: u
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-        });
-
-        Ok(LLMResponse {
-            content,
-            tool_calls,
-            usage,
-        })
-    }
-
-    async fn chat_complete_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolSpec>>,
-        tx: mpsc::Sender<String>,
-    ) -> Result<LLMResponse, LLMError> {
-        use futures_util::StreamExt;
-
-        let url = format!("{}/chat/completions", self.base_url);
-
-        // Transform messages for API compatibility
-        let mut formatted_messages = Vec::new();
-        for message in messages {
-            let mut formatted_message = serde_json::to_value(&message).unwrap();
-            if let Some(tool_calls) = message.tool_calls
-                && !tool_calls.is_empty()
-            {
-                let formatted_tool_calls = format_tool_calls_for_api(&tool_calls);
-                formatted_message["tool_calls"] =
-                    serde_json::to_value(formatted_tool_calls).unwrap();
-            }
-            formatted_messages.push(formatted_message);
-        }
-
-        let mut request_body = serde_json::json!({
-            "model": self.model,
-            "messages": formatted_messages,
-            "stream": true
-        });
-
-        if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
-            request_body["tool_choice"] = serde_json::json!("auto");
-        }
-
-        let response = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
-
-        let status = response.status().as_u16();
-        if status >= 400 {
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(LLMError::from_status(
-                status,
-                format!("API error: {}", error_text),
-            ));
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut full_content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
-            std::collections::HashMap::new(); // index -> (id, name, arguments)
-        let mut buffer = String::new();
-
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
-
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-            // Process complete SSE lines
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
-                buffer = buffer[line_end + 1..].to_string();
-
-                if line.is_empty() || line.starts_with(':') {
-                    continue;
-                }
-
-                if line == "data: [DONE]" {
-                    break;
-                }
-
-                if let Some(data) = line.strip_prefix("data: ")
-                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
-                {
-                    // Handle content delta
-                    if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
-                        full_content.push_str(content);
-                        let _ = tx.send(content.to_string()).await;
-                    }
-
-                    // Handle tool calls delta
-                    if let Some(tc_array) = parsed["choices"][0]["delta"]["tool_calls"].as_array() {
-                        for tc in tc_array {
-                            let index = tc["index"].as_u64().unwrap_or(0) as usize;
-                            let entry = tool_call_builders
-                                .entry(index)
-                                .or_insert_with(|| (String::new(), String::new(), String::new()));
-
-                            if let Some(id) = tc["id"].as_str() {
-                                entry.0 = id.to_string();
-                            }
-                            if let Some(name) = tc["function"]["name"].as_str() {
-                                entry.1.push_str(name);
-                            }
-                            if let Some(args) = tc["function"]["arguments"].as_str() {
-                                entry.2.push_str(args);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Convert tool call builders to final tool calls
-        let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
-        indices.sort();
-        for index in indices {
-            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index)
-                && let Ok(arguments) = serde_json::from_str(&arguments_str)
-            {
-                tool_calls.push(ToolCall {
-                    id,
-                    name,
-                    arguments,
-                });
-            }
-        }
-
-        Ok(LLMResponse {
-            content: if full_content.is_empty() {
-                None
-            } else {
-                Some(full_content)
-            },
-            tool_calls,
-            usage: None, // Streaming typically doesn't provide usage info
-        })
-    }
-}
-
-#[async_trait]
 impl LLM for AnthropicClient {
     fn model_name(&self) -> &str {
         &self.model
     }
+
     async fn chat_complete(
         &self,
         messages: Vec<ChatMessage>,
@@ -522,17 +627,7 @@ impl LLM for AnthropicClient {
     ) -> Result<LLMResponse, LLMError> {
         let url = format!("{}/v1/messages", self.base_url);
 
-        // Separate system prompt from messages
-        let system_prompt = messages
-            .iter()
-            .find(|msg| msg.role == "system")
-            .and_then(|msg| msg.content.as_ref())
-            .cloned();
-
-        let filtered_messages: Vec<ChatMessage> = messages
-            .into_iter()
-            .filter(|msg| msg.role != "system")
-            .collect();
+        let (system_prompt, filtered_messages) = split_system_prompt(messages);
 
         let mut request_body = serde_json::json!({
             "model": self.model,
@@ -540,22 +635,12 @@ impl LLM for AnthropicClient {
         });
 
         if let Some(system) = system_prompt {
-            request_body["system"] = serde_json::Value::String(system);
+            request_body["system"] = Value::String(system);
         }
 
         if let Some(tool_list) = tools {
-            // Anthropic uses input_schema instead of parameters, and tools are top-level (not wrapped in function)
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tools"] =
+                serde_json::to_value(format_tools_anthropic(&tool_list)).unwrap();
         }
 
         let response = self
@@ -576,7 +661,6 @@ impl LLM for AnthropicClient {
             .await
             .map_err(|e| LLMError::retryable(format!("Failed to read response: {}", e)))?;
 
-        // Check for HTTP errors before parsing
         if status >= 400 {
             return Err(LLMError::from_status(
                 status,
@@ -584,35 +668,25 @@ impl LLM for AnthropicClient {
             ));
         }
 
-        let anthropic_response: serde_json::Value = serde_json::from_str(&response_text)
+        let parsed: Value = serde_json::from_str(&response_text)
             .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
 
-        // Extract content (text and tool_use blocks)
         let mut content_text = String::new();
         let mut tool_calls = Vec::new();
 
-        if let Some(content_array) = anthropic_response["content"].as_array() {
-            for content_block in content_array {
-                match content_block["type"].as_str() {
+        if let Some(content_array) = parsed["content"].as_array() {
+            for block in content_array {
+                match block["type"].as_str() {
                     Some("text") => {
-                        if let Some(text) = content_block["text"].as_str() {
+                        if let Some(text) = block["text"].as_str() {
                             content_text.push_str(text);
                         }
                     }
                     Some("tool_use") => {
-                        let id = content_block["id"]
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
-                        let name = content_block["name"]
-                            .as_str()
-                            .map(|s| s.to_string())
-                            .unwrap_or_default();
-                        let input = content_block["input"].clone();
                         tool_calls.push(ToolCall {
-                            id,
-                            name,
-                            arguments: input,
+                            id: block["id"].as_str().unwrap_or_default().to_string(),
+                            name: block["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: block["input"].clone(),
                         });
                     }
                     _ => {}
@@ -620,18 +694,13 @@ impl LLM for AnthropicClient {
             }
         }
 
-        // Extract usage information (Anthropic format)
-        let usage = anthropic_response["usage"].as_object().map(|u| UsageInfo {
+        let usage = parsed["usage"].as_object().map(|u| UsageInfo {
             prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         });
 
         Ok(LLMResponse {
-            content: if content_text.is_empty() {
-                None
-            } else {
-                Some(content_text)
-            },
+            content: none_if_empty(content_text),
             tool_calls,
             usage,
         })
@@ -647,17 +716,7 @@ impl LLM for AnthropicClient {
 
         let url = format!("{}/v1/messages", self.base_url);
 
-        // Separate system prompt from messages
-        let system_prompt = messages
-            .iter()
-            .find(|msg| msg.role == "system")
-            .and_then(|msg| msg.content.as_ref())
-            .cloned();
-
-        let filtered_messages: Vec<ChatMessage> = messages
-            .into_iter()
-            .filter(|msg| msg.role != "system")
-            .collect();
+        let (system_prompt, filtered_messages) = split_system_prompt(messages);
 
         let mut request_body = serde_json::json!({
             "model": self.model,
@@ -666,21 +725,12 @@ impl LLM for AnthropicClient {
         });
 
         if let Some(system) = system_prompt {
-            request_body["system"] = serde_json::Value::String(system);
+            request_body["system"] = Value::String(system);
         }
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
-                        "description": t.description,
-                        "input_schema": t.parameters
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tools"] =
+                serde_json::to_value(format_tools_anthropic(&tool_list)).unwrap();
         }
 
         let response = self
@@ -709,7 +759,6 @@ impl LLM for AnthropicClient {
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        // Track tool_use blocks being built: index -> (id, name, input_json_str)
         let mut current_tool_use: Option<(String, String, String)> = None;
         let mut buffer = String::new();
 
@@ -719,7 +768,6 @@ impl LLM for AnthropicClient {
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            // Process complete SSE lines
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
@@ -728,25 +776,20 @@ impl LLM for AnthropicClient {
                     continue;
                 }
 
-                // Anthropic uses "event:" lines followed by "data:" lines
                 if let Some(data) = line.strip_prefix("data: ")
-                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data)
+                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
                 {
-                    let event_type = parsed["type"].as_str().unwrap_or("");
-
-                    match event_type {
+                    match parsed["type"].as_str().unwrap_or("") {
                         "content_block_start" => {
-                            // Check if this is a tool_use block
-                            if let Some(content_block) = parsed["content_block"].as_object()
-                                && content_block.get("type").and_then(|v| v.as_str())
-                                    == Some("tool_use")
+                            if let Some(block) = parsed["content_block"].as_object()
+                                && block.get("type").and_then(|v| v.as_str()) == Some("tool_use")
                             {
-                                let id = content_block
+                                let id = block
                                     .get("id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let name = content_block
+                                let name = block
                                     .get("name")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
@@ -756,48 +799,43 @@ impl LLM for AnthropicClient {
                         }
                         "content_block_delta" => {
                             if let Some(delta) = parsed["delta"].as_object() {
-                                // Text delta
-                                if delta.get("type").and_then(|v| v.as_str()) == Some("text_delta")
+                                let delta_type = delta.get("type").and_then(|v| v.as_str());
+
+                                if delta_type == Some("text_delta")
                                     && let Some(text) = delta.get("text").and_then(|v| v.as_str())
                                 {
                                     full_content.push_str(text);
                                     let _ = tx.send(text.to_string()).await;
                                 }
-                                // Input JSON delta for tool_use
-                                if delta.get("type").and_then(|v| v.as_str())
-                                    == Some("input_json_delta")
-                                    && let Some(partial_json) =
+
+                                if delta_type == Some("input_json_delta")
+                                    && let Some(partial) =
                                         delta.get("partial_json").and_then(|v| v.as_str())
-                                    && let Some((_, _, ref mut input_str)) = current_tool_use
                                 {
-                                    input_str.push_str(partial_json);
+                                    if let Some((_, _, ref mut input_str)) = current_tool_use {
+                                        input_str.push_str(partial);
+                                    }
                                 }
                             }
                         }
                         "content_block_stop" => {
-                            // Finalize tool_use if we were building one
                             if let Some((id, name, input_str)) = current_tool_use.take()
                                 && !id.is_empty()
                                 && !name.is_empty()
                             {
-                                if let Ok(arguments) = serde_json::from_str(&input_str) {
-                                    tool_calls.push(ToolCall {
-                                        id,
-                                        name,
-                                        arguments,
-                                    });
-                                } else if input_str.is_empty() {
-                                    // Empty input is valid (tool with no parameters)
-                                    tool_calls.push(ToolCall {
-                                        id,
-                                        name,
-                                        arguments: serde_json::json!({}),
-                                    });
-                                }
+                                let arguments = if input_str.is_empty() {
+                                    serde_json::json!({})
+                                } else if let Ok(parsed) = serde_json::from_str(&input_str) {
+                                    parsed
+                                } else {
+                                    continue;
+                                };
+                                tool_calls.push(ToolCall {
+                                    id,
+                                    name,
+                                    arguments,
+                                });
                             }
-                        }
-                        "message_stop" => {
-                            // End of message
                         }
                         _ => {}
                     }
@@ -806,23 +844,23 @@ impl LLM for AnthropicClient {
         }
 
         Ok(LLMResponse {
-            content: if full_content.is_empty() {
-                None
-            } else {
-                Some(full_content)
-            },
+            content: none_if_empty(full_content),
             tool_calls,
-            usage: None, // Streaming typically doesn't provide usage info
+            usage: None,
         })
     }
 }
 
+// ---------------------------------------------------------------------------
+// Thinking-prefix parsing
+// ---------------------------------------------------------------------------
+
 /// Parse thinking prefix from message content.
 ///
 /// Returns (thinking_override, stripped_content):
-/// - "/think ..." → (Some(true), "...")
-/// - "/no_think ..." → (Some(false), "...")
-/// - "..." → (None, "...")
+/// - "/think ..." -> (Some(true), "...")
+/// - "/no_think ..." -> (Some(false), "...")
+/// - "..." -> (None, "...")
 ///
 /// Case-insensitive, trims whitespace after prefix.
 fn parse_thinking_prefix(content: &str) -> (Option<bool>, &str) {
@@ -837,21 +875,22 @@ fn parse_thinking_prefix(content: &str) -> (Option<bool>, &str) {
 }
 
 /// Strip <think>...</think> blocks from model output.
-/// Returns the cleaned content with thinking removed.
 pub fn strip_thinking_tags(content: &str) -> String {
     let re = regex::Regex::new(r"(?s)<think>.*?</think>\s*").unwrap();
     re.replace_all(content, "").trim().to_string()
 }
 
-/// Ollama client using OpenAI-compatible API.
+// ---------------------------------------------------------------------------
+// Ollama client
+// ---------------------------------------------------------------------------
+
+/// Ollama client using native Ollama API.
 /// Configure with OLLAMA_HOST env var (defaults to http://localhost:11434)
 pub struct OllamaClient {
     client: Client,
     base_url: String,
     model: String,
-    /// Enable thinking mode (Ollama "think" parameter)
     thinking: Option<bool>,
-    /// Context window size (num_ctx)
     num_ctx: Option<u32>,
 }
 
@@ -887,11 +926,86 @@ impl OllamaClient {
         self.num_ctx = num_ctx;
         self
     }
+
+    /// Build the common parts of an Ollama request body.
+    fn build_request_body(
+        &self,
+        formatted_messages: Vec<Value>,
+        stream: bool,
+        thinking: bool,
+    ) -> Value {
+        let mut body = serde_json::json!({
+            "model": self.model,
+            "messages": formatted_messages,
+            "stream": stream,
+            "think": thinking
+        });
+
+        if let Some(ctx) = self.num_ctx {
+            body["options"] = serde_json::json!({ "num_ctx": ctx });
+        }
+
+        body
+    }
 }
 
 impl Default for OllamaClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse tool calls from the native Ollama response format.
+///
+/// Handles both string and object argument formats.
+fn parse_ollama_tool_calls(value: &Value) -> Vec<ToolCall> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|tc| {
+                    let id = tc["id"]
+                        .as_str()
+                        .or_else(|| tc["function"]["name"].as_str())
+                        .map(|s| s.to_string())?;
+                    let name = tc["function"]["name"].as_str()?.to_string();
+                    let arguments =
+                        if let Some(args_str) = tc["function"]["arguments"].as_str() {
+                            serde_json::from_str(args_str).ok()?
+                        } else {
+                            tc["function"]["arguments"].clone()
+                        };
+                    Some(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract `UsageInfo` from an Ollama response, trying the OpenAI-style
+/// `usage` object first, then falling back to native Ollama fields
+/// (`prompt_eval_count`, `eval_count`).
+fn parse_ollama_usage(response: &Value) -> Option<UsageInfo> {
+    if let Some(usage_obj) = response["usage"].as_object() {
+        Some(UsageInfo {
+            prompt_tokens: usage_obj
+                .get("prompt_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            completion_tokens: usage_obj
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+        })
+    } else {
+        Some(UsageInfo {
+            prompt_tokens: response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
+            completion_tokens: response["eval_count"].as_u64().unwrap_or(0) as u32,
+        })
     }
 }
 
@@ -906,80 +1020,21 @@ impl LLM for OllamaClient {
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolSpec>>,
     ) -> Result<LLMResponse, LLMError> {
-        // Use native Ollama API for proper `think` parameter support
         let url = format!("{}/api/chat", self.base_url);
 
-        // Find thinking override from the last user message
-        let mut thinking_override: Option<bool> = None;
-        let mut stripped_user_content: Option<String> = None;
-        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
-
-        if let Some(idx) = last_user_idx
-            && let Some(ref content) = messages[idx].content
-        {
-            let (prefix_override, stripped) = parse_thinking_prefix(content);
-            if prefix_override.is_some() {
-                thinking_override = prefix_override;
-                stripped_user_content = Some(stripped.to_string());
-            }
-        }
-
-        // Determine final thinking value: prefix > config > false
+        let (thinking_override, last_user_idx, stripped_user_content) =
+            detect_thinking_override(&messages);
         let thinking = thinking_override.or(self.thinking).unwrap_or(false);
 
-        // Transform messages for API compatibility
-        let mut formatted_messages = Vec::new();
-        for (i, message) in messages.iter().enumerate() {
-            let mut formatted_message = serde_json::to_value(message).unwrap();
-            // Use stripped content for the last user message if we have it
-            if Some(i) == last_user_idx
-                && let Some(ref stripped) = stripped_user_content
-            {
-                formatted_message["content"] = serde_json::Value::String(stripped.clone());
-            }
-            if let Some(ref tool_calls) = message.tool_calls
-                && !tool_calls.is_empty()
-            {
-                // Use native Ollama format (arguments as object, not string)
-                let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
-                formatted_message["tool_calls"] =
-                    serde_json::to_value(formatted_tool_calls).unwrap();
-            }
-            formatted_messages.push(formatted_message);
-        }
+        let formatted_messages =
+            format_messages_ollama(&messages, last_user_idx, &stripped_user_content);
 
-        let mut request_body = serde_json::json!({
-            "model": self.model,
-            "messages": formatted_messages,
-            "stream": false,
-            "think": thinking
-        });
+        let mut request_body = self.build_request_body(formatted_messages, false, thinking);
 
-        // Add num_ctx option if configured
-        if let Some(ctx) = self.num_ctx {
-            request_body["options"] = serde_json::json!({
-                "num_ctx": ctx
-            });
-        }
-
-        // Debug log the request (before adding tools for cleaner output)
         crate::debug::log_json("OLLAMA REQUEST (chat_complete)", &request_body);
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tools"] = serde_json::to_value(format_tools_openai(&tool_list)).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
 
@@ -1006,88 +1061,18 @@ impl LLM for OllamaClient {
             ));
         }
 
-        let ollama_response: serde_json::Value = serde_json::from_str(&response_text)
+        let parsed: Value = serde_json::from_str(&response_text)
             .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
 
-        // Debug log the response
-        crate::debug::log_json("OLLAMA RESPONSE (chat_complete)", &ollama_response);
+        crate::debug::log_json("OLLAMA RESPONSE (chat_complete)", &parsed);
 
-        // Native Ollama API returns message directly, not in choices array
-        let content = ollama_response["message"]["content"]
+        let content = parsed["message"]["content"]
             .as_str()
             .map(|s| s.to_string());
+        let tool_calls = parse_ollama_tool_calls(&parsed["message"]["tool_calls"]);
+        let usage = parse_ollama_usage(&parsed);
 
-        let tool_calls: Vec<ToolCall> = ollama_response["message"]["tool_calls"]
-            .as_array()
-            .map(|tool_calls_array| {
-                tool_calls_array
-                    .iter()
-                    .filter_map(|tool_call| {
-                        let id = tool_call["id"]
-                            .as_str()
-                            .or_else(|| tool_call["function"]["name"].as_str()) // fallback to name if no id
-                            .map(|s| s.to_string())?;
-                        let name = tool_call["function"]["name"]
-                            .as_str()
-                            .map(|s| s.to_string())?;
-                        // Arguments might be a string (OpenAI style) or object (Ollama native)
-                        let arguments =
-                            if let Some(args_str) = tool_call["function"]["arguments"].as_str() {
-                                serde_json::from_str(args_str).ok()?
-                            } else {
-                                tool_call["function"]["arguments"].clone()
-                            };
-                        Some(ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Native Ollama uses eval_count/prompt_eval_count instead of usage
-        let usage = if let Some(usage_obj) = ollama_response["usage"].as_object() {
-            Some(UsageInfo {
-                prompt_tokens: usage_obj
-                    .get("prompt_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-                completion_tokens: usage_obj
-                    .get("completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-            })
-        } else {
-            Some(UsageInfo {
-                prompt_tokens: ollama_response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
-                completion_tokens: ollama_response["eval_count"].as_u64().unwrap_or(0) as u32,
-            })
-        };
-
-        // Fallback: detect XML-format tool calls in content text
-        let (content, tool_calls) = if tool_calls.is_empty() {
-            if let Some(ref text) = content {
-                let (cleaned, xml_calls) = extract_xml_tool_calls(text);
-                if !xml_calls.is_empty() {
-                    (
-                        if cleaned.is_empty() {
-                            None
-                        } else {
-                            Some(cleaned)
-                        },
-                        xml_calls,
-                    )
-                } else {
-                    (content, tool_calls)
-                }
-            } else {
-                (content, tool_calls)
-            }
-        } else {
-            (content, tool_calls)
-        };
+        let (content, tool_calls) = apply_xml_tool_fallback(content, tool_calls);
 
         Ok(LLMResponse {
             content,
@@ -1104,73 +1089,21 @@ impl LLM for OllamaClient {
     ) -> Result<LLMResponse, LLMError> {
         use futures_util::StreamExt;
 
-        // Use native Ollama API for proper `think` parameter support
         let url = format!("{}/api/chat", self.base_url);
 
-        // Find thinking override from the last user message
-        let mut thinking_override: Option<bool> = None;
-        let mut stripped_user_content: Option<String> = None;
-        let last_user_idx = messages.iter().rposition(|m| m.role == "user");
-
-        if let Some(idx) = last_user_idx
-            && let Some(ref content) = messages[idx].content
-        {
-            let (prefix_override, stripped) = parse_thinking_prefix(content);
-            if prefix_override.is_some() {
-                thinking_override = prefix_override;
-                stripped_user_content = Some(stripped.to_string());
-            }
-        }
-
-        // Determine final thinking value: prefix > config > false
+        let (thinking_override, last_user_idx, stripped_user_content) =
+            detect_thinking_override(&messages);
         let thinking = thinking_override.or(self.thinking).unwrap_or(false);
 
-        // Transform messages for API compatibility
-        let mut formatted_messages = Vec::new();
-        for (i, message) in messages.iter().enumerate() {
-            let mut formatted_message = serde_json::to_value(message).unwrap();
-            // Use stripped content for the last user message if we have it
-            if Some(i) == last_user_idx
-                && let Some(ref stripped) = stripped_user_content
-            {
-                formatted_message["content"] = serde_json::Value::String(stripped.clone());
-            }
-            if let Some(ref tool_calls) = message.tool_calls
-                && !tool_calls.is_empty()
-            {
-                // Use native Ollama format (arguments as object, not string)
-                let formatted_tool_calls = format_tool_calls_for_ollama(tool_calls);
-                formatted_message["tool_calls"] =
-                    serde_json::to_value(formatted_tool_calls).unwrap();
-            }
-            formatted_messages.push(formatted_message);
-        }
+        let formatted_messages =
+            format_messages_ollama(&messages, last_user_idx, &stripped_user_content);
 
-        let mut request_body = serde_json::json!({
-            "model": self.model,
-            "messages": formatted_messages,
-            "stream": true,
-            "think": thinking
-        });
+        let mut request_body = self.build_request_body(formatted_messages, true, thinking);
 
-        // Debug log the request (before adding tools for cleaner output)
         crate::debug::log_json("OLLAMA REQUEST (chat_complete_stream)", &request_body);
 
         if let Some(tool_list) = tools {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::to_value(formatted_tools).unwrap();
+            request_body["tools"] = serde_json::to_value(format_tools_openai(&tool_list)).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
 
@@ -1197,7 +1130,6 @@ impl LLM for OllamaClient {
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new();
         let mut buffer = String::new();
@@ -1208,7 +1140,6 @@ impl LLM for OllamaClient {
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
-            // Native Ollama API streams as JSONL (no "data: " prefix)
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
@@ -1217,13 +1148,11 @@ impl LLM for OllamaClient {
                     continue;
                 }
 
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&line) {
-                    // Check if stream is done
+                if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
                     if parsed["done"].as_bool() == Some(true) {
                         break;
                     }
 
-                    // Native Ollama: message.content (not delta)
                     if let Some(content) = parsed["message"]["content"].as_str()
                         && !content.is_empty()
                     {
@@ -1231,7 +1160,6 @@ impl LLM for OllamaClient {
                         let _ = tx.send(content.to_string()).await;
                     }
 
-                    // Handle tool calls in native format
                     if let Some(tc_array) = parsed["message"]["tool_calls"].as_array() {
                         for tc in tc_array {
                             let index = tc["index"].as_u64().unwrap_or(0) as usize;
@@ -1248,7 +1176,6 @@ impl LLM for OllamaClient {
                             if let Some(args) = tc["function"]["arguments"].as_str() {
                                 entry.2.push_str(args);
                             } else if !tc["function"]["arguments"].is_null() {
-                                // Arguments might be an object directly
                                 entry.2 = tc["function"]["arguments"].to_string();
                             }
                         }
@@ -1257,60 +1184,22 @@ impl LLM for OllamaClient {
             }
         }
 
-        let mut indices: Vec<usize> = tool_call_builders.keys().cloned().collect();
-        indices.sort();
-        for index in indices {
-            if let Some((id, name, arguments_str)) = tool_call_builders.remove(&index)
-                && let Ok(arguments) = serde_json::from_str(&arguments_str)
-            {
-                tool_calls.push(ToolCall {
-                    id,
-                    name,
-                    arguments,
-                });
-            }
-        }
+        let tool_calls = finalize_tool_call_builders(tool_call_builders);
 
-        // Fallback: detect XML-format tool calls in content text
-        let (final_content, tool_calls) = if tool_calls.is_empty() && !full_content.is_empty() {
-            let (cleaned, xml_calls) = extract_xml_tool_calls(&full_content);
-            if !xml_calls.is_empty() {
-                (
-                    if cleaned.is_empty() {
-                        None
-                    } else {
-                        Some(cleaned)
-                    },
-                    xml_calls,
-                )
-            } else {
-                (
-                    if full_content.is_empty() {
-                        None
-                    } else {
-                        Some(full_content)
-                    },
-                    tool_calls,
-                )
-            }
-        } else {
-            (
-                if full_content.is_empty() {
-                    None
-                } else {
-                    Some(full_content)
-                },
-                tool_calls,
-            )
-        };
+        let (content, tool_calls) =
+            apply_xml_tool_fallback(none_if_empty(full_content), tool_calls);
 
         Ok(LLMResponse {
-            content: final_content,
+            content,
             tool_calls,
             usage: None,
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// XML tool-call extraction (fallback for some Ollama models)
+// ---------------------------------------------------------------------------
 
 /// Extract tool calls from XML-format text that some models output.
 /// Handles the `<function=name><parameter=key>value</parameter></function>` format.
@@ -1321,9 +1210,8 @@ fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
     let param_re = regex::Regex::new(r"(?s)<parameter=(\w+)>\s*(.*?)\s*</parameter>").unwrap();
 
     let mut tool_calls = Vec::new();
-    let mut call_index = 0u32;
 
-    for cap in fn_re.captures_iter(content) {
+    for (i, cap) in fn_re.captures_iter(content).enumerate() {
         let name = cap[1].to_string();
         let body = &cap[2];
 
@@ -1331,26 +1219,27 @@ fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
         for param_cap in param_re.captures_iter(body) {
             params.insert(
                 param_cap[1].to_string(),
-                serde_json::Value::String(param_cap[2].to_string()),
+                Value::String(param_cap[2].to_string()),
             );
         }
 
         tool_calls.push(ToolCall {
-            id: format!("xmlcall_{}", call_index),
+            id: format!("xmlcall_{}", i),
             name,
-            arguments: serde_json::Value::Object(params),
+            arguments: Value::Object(params),
         });
-        call_index += 1;
     }
 
-    // Strip XML blocks from content
     let cleaned = fn_re.replace_all(content, "").to_string();
-    // Also clean any leftover </tool_call> tags
     let leftover_re = regex::Regex::new(r"\s*</tool_call>\s*").unwrap();
     let cleaned = leftover_re.replace_all(&cleaned, "").trim().to_string();
 
     (cleaned, tool_calls)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1358,7 +1247,6 @@ mod tests {
 
     #[test]
     fn test_anthropic_tool_format() {
-        // Verify tools are formatted with input_schema
         let tool = ToolSpec {
             name: "add".to_string(),
             description: "Add two numbers".to_string(),
@@ -1383,7 +1271,6 @@ mod tests {
 
     #[test]
     fn test_anthropic_message_format() {
-        // Test that tool results become tool_result content blocks
         let tool_msg = ChatMessage {
             role: "tool".to_string(),
             content: Some("8.0".to_string()),
@@ -1391,7 +1278,6 @@ mod tests {
             tool_calls: None,
         };
 
-        // This is how it should be formatted for Anthropic
         let formatted = serde_json::json!({
             "role": "user",
             "content": [{
@@ -1451,7 +1337,6 @@ mod tests {
 
     #[test]
     fn test_parse_thinking_prefix_whitespace() {
-        // Extra whitespace after prefix should be trimmed
         let (override_val, stripped) = parse_thinking_prefix("/think    Hello world");
         assert_eq!(override_val, Some(true));
         assert_eq!(stripped, "Hello world");

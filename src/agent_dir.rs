@@ -65,7 +65,7 @@ pub struct LlmSection {
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
-/// This struct has all required fields guaranteed to be present.
+/// All required fields are guaranteed to be present.
 #[derive(Debug, Clone)]
 pub struct ResolvedLlmConfig {
     pub provider: String,
@@ -231,50 +231,39 @@ impl AgentDir {
     /// Returns Ok(None) if no system file is configured.
     /// Expands {{include:filename}} directives recursively.
     pub fn load_system(&self) -> Result<Option<String>, AgentDirError> {
-        match &self.config.agent.system_file {
-            Some(system_path) => {
-                let full_path = self.path.join(system_path);
-                let content = std::fs::read_to_string(&full_path)?;
-                let mut seen = HashSet::new();
-                seen.insert(full_path.canonicalize().unwrap_or(full_path));
-                let expanded = self.expand_includes(&content, &mut seen)?;
-                Ok(Some(expanded))
-            }
-            None => Ok(None),
-        }
+        let Some(system_file) = &self.config.agent.system_file else {
+            return Ok(None);
+        };
+        let full_path = self.path.join(system_file);
+        self.load_and_expand(&full_path).map(Some)
     }
 
-    /// Load recall content from the configured recall file.
+    /// Load recall content from the configured recall file (or default `recall.md`).
     /// Returns Ok(None) if no recall file exists.
     /// Expands {{include:filename}} directives recursively.
-    ///
-    /// Load agent's recall.md file if it exists.
-    /// Returns Ok(None) if no recall.md exists in the agent directory.
-    ///
-    /// Global recall.md files are available via `<!-- @include:path -->` directives
-    /// if agents want to share common content.
     pub fn load_recall(&self) -> Result<Option<String>, AgentDirError> {
-        // Try agent-specific recall file first
-        let agent_recall_path = match &self.config.agent.recall_file {
-            Some(recall_path) => self.path.join(recall_path),
+        let recall_path = match &self.config.agent.recall_file {
+            Some(recall_file) => self.path.join(recall_file),
             None => self.path.join("recall.md"),
         };
 
-        if agent_recall_path.exists() {
-            let content = std::fs::read_to_string(&agent_recall_path)?;
-            let mut seen = HashSet::new();
-            seen.insert(
-                agent_recall_path
-                    .canonicalize()
-                    .unwrap_or(agent_recall_path),
-            );
-            let expanded = self.expand_includes(&content, &mut seen)?;
-            return Ok(Some(expanded));
+        if !recall_path.exists() {
+            return Ok(None);
         }
 
-        // No agent-specific recall.md — return None
-        // (Global recall.md is available via includes if agents want it)
-        Ok(None)
+        self.load_and_expand(&recall_path).map(Some)
+    }
+
+    /// Read a file and recursively expand all {{include:...}} directives.
+    fn load_and_expand(&self, file_path: &Path) -> Result<String, AgentDirError> {
+        let content = std::fs::read_to_string(file_path)?;
+        let mut seen = HashSet::new();
+        seen.insert(
+            file_path
+                .canonicalize()
+                .unwrap_or(file_path.to_path_buf()),
+        );
+        self.expand_includes(&content, &mut seen)
     }
 
     /// Expand {{include:filename}} patterns in content.
@@ -299,7 +288,6 @@ impl AgentDir {
         let re = Regex::new(r"\{\{include:([^}]+)\}\}").unwrap();
         let mut result = content.to_string();
 
-        // Find all matches first to avoid borrowing issues
         let matches: Vec<(String, String)> = re
             .captures_iter(content)
             .map(|cap| (cap[0].to_string(), cap[1].to_string()))
@@ -320,7 +308,6 @@ impl AgentDir {
             let include_content = std::fs::read_to_string(&canonical)
                 .map_err(|_| AgentDirError::IncludeNotFound(include_path))?;
 
-            // Recursively expand includes in the included content
             let expanded_include =
                 Self::expand_includes_with_base(&include_content, base_path, seen)?;
 
@@ -349,41 +336,38 @@ impl AgentDir {
     }
 
     /// Get the API key for a resolved LLM config.
-    pub fn api_key_for_config(config: &ResolvedLlmConfig) -> Result<Option<String>, AgentDirError> {
-        match &config.api_key {
-            Some(key) => {
-                // Expand env vars in the key (e.g., "${ANTHROPIC_API_KEY}")
-                let expanded = Self::expand_env_vars(key)?;
-                Ok(Some(expanded))
-            }
-            None => {
-                // Fallback to provider-specific env var
-                let env_var = match config.provider.as_str() {
-                    "openai" => "OPENAI_API_KEY",
-                    "anthropic" => "ANTHROPIC_API_KEY",
-                    "ollama" => return Ok(None), // Ollama doesn't need an API key
-                    _ => return Ok(None),
-                };
-                Ok(std::env::var(env_var).ok())
-            }
+    pub fn api_key_for_config(
+        config: &ResolvedLlmConfig,
+    ) -> Result<Option<String>, AgentDirError> {
+        if let Some(key) = &config.api_key {
+            return Self::expand_env_vars(key).map(Some);
         }
+
+        // Fallback to provider-specific env var
+        let env_var = match config.provider.as_str() {
+            "openai" => "OPENAI_API_KEY",
+            "anthropic" => "ANTHROPIC_API_KEY",
+            _ => return Ok(None),
+        };
+        Ok(std::env::var(env_var).ok())
     }
+}
+
+/// Get the anima base directory path (~/.anima/)
+fn anima_dir() -> PathBuf {
+    dirs::home_dir()
+        .expect("Could not determine home directory")
+        .join(".anima")
 }
 
 /// Get the agents directory path (~/.anima/agents/)
 pub fn agents_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Could not determine home directory")
-        .join(".anima")
-        .join("agents")
+    anima_dir().join("agents")
 }
 
 /// Get the models directory path (~/.anima/models/)
 pub fn models_dir() -> PathBuf {
-    dirs::home_dir()
-        .expect("Could not determine home directory")
-        .join(".anima")
-        .join("models")
+    anima_dir().join("models")
 }
 
 /// Load a shared model definition file from ~/.anima/models/{name}.toml
@@ -402,81 +386,55 @@ fn load_model_file(name: &str) -> Result<LlmSection, AgentDirError> {
 /// Resolve LLM configuration by loading model file (if specified) and applying overrides.
 /// Returns a ResolvedLlmConfig with all required fields guaranteed.
 pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig, AgentDirError> {
-    // If model_file is specified, load it and merge with overrides
-    let base_config = if let Some(ref model_file) = llm_section.model_file {
-        load_model_file(model_file)?
-    } else {
-        // No model file - use the section directly as base
-        llm_section.clone()
+    let base = match &llm_section.model_file {
+        Some(model_file) => load_model_file(model_file)?,
+        None => llm_section.clone(),
     };
 
-    // Apply overrides from agent config on top of base (model file or direct config)
-    // For model_file case: agent's llm_section values override model file values
-    // For direct config case: just use the values directly
+    // Helper to build a "missing field" error pointing at the model file path
+    let missing_field = |field: &str| AgentDirError::ModelFileMissingField {
+        field: field.to_string(),
+        path: llm_section
+            .model_file
+            .as_ref()
+            .map(|n| models_dir().join(format!("{}.toml", n)))
+            .unwrap_or_default(),
+    };
+
+    // Agent config overrides model file for all fields
     let provider = llm_section
         .provider
         .clone()
-        .or(base_config.provider.clone())
-        .ok_or_else(|| AgentDirError::ModelFileMissingField {
-            field: "provider".to_string(),
-            path: llm_section
-                .model_file
-                .as_ref()
-                .map(|n| models_dir().join(format!("{}.toml", n)))
-                .unwrap_or_default(),
-        })?;
-
+        .or(base.provider.clone())
+        .ok_or_else(|| missing_field("provider"))?;
     let model = llm_section
         .model
         .clone()
-        .or(base_config.model.clone())
-        .ok_or_else(|| AgentDirError::ModelFileMissingField {
-            field: "model".to_string(),
-            path: llm_section
-                .model_file
-                .as_ref()
-                .map(|n| models_dir().join(format!("{}.toml", n)))
-                .unwrap_or_default(),
-        })?;
-
-    // For optional fields, agent config overrides model file
-    let api_key = llm_section.api_key.clone().or(base_config.api_key.clone());
-    let base_url = llm_section
-        .base_url
-        .clone()
-        .or(base_config.base_url.clone());
-    let thinking = llm_section.thinking.or(base_config.thinking);
-    let num_ctx = llm_section.num_ctx.or(base_config.num_ctx);
-    let recall = llm_section.recall.clone().or(base_config.recall.clone());
-    let allowed_tools = llm_section
-        .allowed_tools
-        .clone()
-        .or(base_config.allowed_tools.clone());
-
-    // tools: agent override takes precedence, then model file, then default true
-    let tools = llm_section.tools.or(base_config.tools).unwrap_or(true);
+        .or(base.model.clone())
+        .ok_or_else(|| missing_field("model"))?;
 
     Ok(ResolvedLlmConfig {
         provider,
         model,
-        api_key,
-        base_url,
-        thinking,
-        tools,
-        num_ctx,
-        recall,
-        allowed_tools,
+        api_key: llm_section.api_key.clone().or(base.api_key.clone()),
+        base_url: llm_section.base_url.clone().or(base.base_url.clone()),
+        thinking: llm_section.thinking.or(base.thinking),
+        tools: llm_section.tools.or(base.tools).unwrap_or(true),
+        num_ctx: llm_section.num_ctx.or(base.num_ctx),
+        recall: llm_section.recall.clone().or(base.recall.clone()),
+        allowed_tools: llm_section
+            .allowed_tools
+            .clone()
+            .or(base.allowed_tools.clone()),
     })
 }
 
 /// Scaffold a new agent directory with config.toml, system.md, and recall.md templates.
-///
 /// Creates the directory at the specified path, or defaults to ~/.anima/agents/<name>/.
 /// Returns an error if the directory already exists.
 pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirError> {
     let agent_path = path.unwrap_or_else(|| agents_dir().join(name));
 
-    // Check if directory already exists
     if agent_path.exists() {
         return Err(AgentDirError::IoError(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -484,10 +442,8 @@ pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirErr
         )));
     }
 
-    // Create the directory
     std::fs::create_dir_all(&agent_path)?;
 
-    // Write config.toml template
     let config_content = format!(
         r#"[agent]
 name = "{name}"
@@ -511,7 +467,6 @@ path = "memory.db"
     );
     std::fs::write(agent_path.join("config.toml"), config_content)?;
 
-    // Write system.md template
     let system_content = format!(
         r#"# {name}
 
@@ -538,7 +493,6 @@ You have access to tools for:
     );
     std::fs::write(agent_path.join("system.md"), system_content)?;
 
-    // Write recall.md template
     let recall_content = r#"# Recall
 
 ## How Conversations Work
@@ -595,6 +549,31 @@ mod tests {
     use serial_test::serial;
     use std::fs;
     use tempfile::tempdir;
+
+    /// Write a minimal agent config.toml to the given directory.
+    /// `agent_extra` is appended to the [agent] section.
+    /// `llm_extra` is appended to the [llm] section.
+    fn write_config(dir: &Path, agent_extra: &str, llm_extra: &str) {
+        let content = format!(
+            "[agent]\nname = \"test\"\n{agent_extra}\n[llm]\nprovider = \"openai\"\nmodel = \"gpt-4\"\n{llm_extra}"
+        );
+        fs::write(dir.join("config.toml"), content).unwrap();
+    }
+
+    /// Run a closure with HOME temporarily set to `fake_home`.
+    /// Restores the original HOME after the closure completes (or panics).
+    fn with_fake_home<F: FnOnce()>(fake_home: &Path, f: F) {
+        let original = std::env::var("HOME").ok();
+        unsafe { std::env::set_var("HOME", fake_home) };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        match original {
+            Some(h) => unsafe { std::env::set_var("HOME", h) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+        if let Err(e) = result {
+            std::panic::resume_unwind(e);
+        }
+    }
 
     #[test]
     fn test_load_agent_dir() {
@@ -677,74 +656,41 @@ message = "heartbeat"
     #[test]
     fn test_load_system() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "I am a helpful assistant.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap();
-        assert_eq!(system_prompt, Some("I am a helpful assistant.".to_string()));
+        assert_eq!(
+            agent_dir.load_system().unwrap(),
+            Some("I am a helpful assistant.".to_string())
+        );
     }
 
     #[test]
     fn test_load_system_none() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "", "");
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap();
-        assert_eq!(system_prompt, None);
+        assert_eq!(agent_dir.load_system().unwrap(), None);
     }
 
     #[test]
     fn test_memory_path() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-
-[memory]
-path = "data/memory.db"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "", "\n[memory]\npath = \"data/memory.db\"\n");
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let mem_path = agent_dir.memory_path().unwrap();
-        assert_eq!(mem_path, dir.path().join("data/memory.db"));
+        assert_eq!(
+            agent_dir.memory_path().unwrap(),
+            dir.path().join("data/memory.db")
+        );
     }
 
     #[test]
     fn test_memory_path_none() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "", "");
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
         assert!(agent_dir.memory_path().is_none());
@@ -753,56 +699,33 @@ model = "gpt-4"
     #[test]
     fn test_api_key_literal() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-api_key = "sk-literal-key"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "", "api_key = \"sk-literal-key\"\n");
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let key = agent_dir.api_key().unwrap();
-        assert_eq!(key, Some("sk-literal-key".to_string()));
+        assert_eq!(
+            agent_dir.api_key().unwrap(),
+            Some("sk-literal-key".to_string())
+        );
     }
 
     #[test]
     fn test_api_key_env_expansion() {
         let dir = tempdir().unwrap();
         unsafe { std::env::set_var("TEST_API_KEY", "sk-from-env") };
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-api_key = "${TEST_API_KEY}"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "", "api_key = \"${TEST_API_KEY}\"\n");
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let key = agent_dir.api_key().unwrap();
-        assert_eq!(key, Some("sk-from-env".to_string()));
+        assert_eq!(
+            agent_dir.api_key().unwrap(),
+            Some("sk-from-env".to_string())
+        );
         unsafe { std::env::remove_var("TEST_API_KEY") };
     }
 
     #[test]
     fn test_load_system_with_include() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(
             dir.path().join("system.md"),
             "Header\n{{include:SOUL.md}}\nFooter",
@@ -811,23 +734,16 @@ model = "gpt-4"
         fs::write(dir.path().join("SOUL.md"), "I am the soul.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap().unwrap();
-        assert_eq!(system_prompt, "Header\nI am the soul.\nFooter");
+        assert_eq!(
+            agent_dir.load_system().unwrap().unwrap(),
+            "Header\nI am the soul.\nFooter"
+        );
     }
 
     #[test]
     fn test_load_system_with_multiple_includes() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(
             dir.path().join("system.md"),
             "{{include:IDENTITY.md}}\n---\n{{include:USER.md}}",
@@ -837,23 +753,16 @@ model = "gpt-4"
         fs::write(dir.path().join("USER.md"), "My user is Alice.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap().unwrap();
-        assert_eq!(system_prompt, "I am Arya.\n---\nMy user is Alice.");
+        assert_eq!(
+            agent_dir.load_system().unwrap().unwrap(),
+            "I am Arya.\n---\nMy user is Alice."
+        );
     }
 
     #[test]
     fn test_load_system_with_nested_includes() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "{{include:outer.md}}").unwrap();
         fs::write(
             dir.path().join("outer.md"),
@@ -863,85 +772,57 @@ model = "gpt-4"
         fs::write(dir.path().join("inner.md"), "INNER").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap().unwrap();
-        assert_eq!(system_prompt, "Outer[INNER]Outer");
+        assert_eq!(
+            agent_dir.load_system().unwrap().unwrap(),
+            "Outer[INNER]Outer"
+        );
     }
 
     #[test]
     fn test_load_system_include_not_found() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "{{include:nonexistent.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_system();
-        assert!(matches!(result, Err(AgentDirError::IncludeNotFound(_))));
+        assert!(matches!(
+            agent_dir.load_system(),
+            Err(AgentDirError::IncludeNotFound(_))
+        ));
     }
 
     #[test]
     fn test_load_system_include_cycle_self() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "{{include:system.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_system();
-        assert!(matches!(result, Err(AgentDirError::IncludeCycle(_))));
+        assert!(matches!(
+            agent_dir.load_system(),
+            Err(AgentDirError::IncludeCycle(_))
+        ));
     }
 
     #[test]
     fn test_load_system_include_cycle_indirect() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "{{include:a.md}}").unwrap();
         fs::write(dir.path().join("a.md"), "{{include:b.md}}").unwrap();
         fs::write(dir.path().join("b.md"), "{{include:system.md}}").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let result = agent_dir.load_system();
-        assert!(matches!(result, Err(AgentDirError::IncludeCycle(_))));
+        assert!(matches!(
+            agent_dir.load_system(),
+            Err(AgentDirError::IncludeCycle(_))
+        ));
     }
 
     #[test]
     fn test_load_system_no_includes() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(
             dir.path().join("system.md"),
             "Plain content with no includes.",
@@ -949,141 +830,79 @@ model = "gpt-4"
         .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap().unwrap();
-        assert_eq!(system_prompt, "Plain content with no includes.");
+        assert_eq!(
+            agent_dir.load_system().unwrap().unwrap(),
+            "Plain content with no includes."
+        );
     }
 
     #[test]
     fn test_load_system_include_with_whitespace() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "system_file = \"system.md\"\n", "");
         fs::write(dir.path().join("system.md"), "{{include: SOUL.md }}").unwrap();
         fs::write(dir.path().join("SOUL.md"), "Soul content").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let system_prompt = agent_dir.load_system().unwrap().unwrap();
-        assert_eq!(system_prompt, "Soul content");
+        assert_eq!(
+            agent_dir.load_system().unwrap().unwrap(),
+            "Soul content"
+        );
     }
 
     #[test]
     fn test_load_recall() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-system_file = "system.md"
-recall_file = "recall.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(
+            dir.path(),
+            "system_file = \"system.md\"\nrecall_file = \"recall.md\"\n",
+            "",
+        );
         fs::write(dir.path().join("system.md"), "I am a helpful assistant.").unwrap();
         fs::write(dir.path().join("recall.md"), "Always be concise.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-        assert_eq!(recall, Some("Always be concise.".to_string()));
+        assert_eq!(
+            agent_dir.load_recall().unwrap(),
+            Some("Always be concise.".to_string())
+        );
     }
 
     #[test]
     #[serial]
     fn test_load_recall_none() {
-        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        // NO recall.md in global directory
+        fs::create_dir_all(fake_home.path().join(".anima").join("agents")).unwrap();
 
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
+        write_config(dir.path(), "", "");
 
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
-
-        // Override HOME temporarily to avoid picking up real global recall.md
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert_eq!(recall, None);
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(dir.path()).unwrap();
+            assert_eq!(agent_dir.load_recall().unwrap(), None);
+        });
     }
 
     #[test]
     #[serial]
     fn test_load_recall_file_missing() {
-        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        // NO recall.md in global directory
+        fs::create_dir_all(fake_home.path().join(".anima").join("agents")).unwrap();
 
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-recall_file = "recall.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "recall_file = \"recall.md\"\n", "");
         // Note: recall.md file is NOT created
 
-        // Override HOME temporarily to avoid picking up real global recall.md
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(dir.path()).unwrap();
-        // Should return None when file is missing (backward compatible)
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert_eq!(recall, None);
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(dir.path()).unwrap();
+            assert_eq!(agent_dir.load_recall().unwrap(), None);
+        });
     }
 
     #[test]
     fn test_load_recall_with_include() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-recall_file = "recall.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "recall_file = \"recall.md\"\n", "");
         fs::write(
             dir.path().join("recall.md"),
             "Header\n{{include:RULES.md}}\nFooter",
@@ -1092,28 +911,20 @@ model = "gpt-4"
         fs::write(dir.path().join("RULES.md"), "Be helpful.").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap().unwrap();
-        assert_eq!(recall, "Header\nBe helpful.\nFooter");
+        assert_eq!(
+            agent_dir.load_recall().unwrap().unwrap(),
+            "Header\nBe helpful.\nFooter"
+        );
     }
 
     // =========================================================================
     // Global fallback tests for recall.md
     // =========================================================================
 
-    /// Test: Agent-specific recall.md is used when present (explicit config)
     #[test]
     fn test_load_recall_agent_specific_explicit() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-recall_file = "my_recall.md"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+        write_config(dir.path(), "recall_file = \"my_recall.md\"\n", "");
         fs::write(
             dir.path().join("my_recall.md"),
             "Agent-specific recall content",
@@ -1121,186 +932,93 @@ model = "gpt-4"
         .unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-        assert_eq!(recall, Some("Agent-specific recall content".to_string()));
+        assert_eq!(
+            agent_dir.load_recall().unwrap(),
+            Some("Agent-specific recall content".to_string())
+        );
     }
 
-    /// Test: Default recall.md in agent directory is used when no recall_file configured
     #[test]
     fn test_load_recall_agent_specific_default() {
         let dir = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(dir.path().join("config.toml"), config_content).unwrap();
-        // Create recall.md in agent directory (not configured explicitly)
+        write_config(dir.path(), "", "");
         fs::write(dir.path().join("recall.md"), "Default agent recall content").unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-        assert_eq!(recall, Some("Default agent recall content".to_string()));
+        assert_eq!(
+            agent_dir.load_recall().unwrap(),
+            Some("Default agent recall content".to_string())
+        );
     }
 
-    /// Test: Agent-specific recall.md overrides global (no merge)
-    /// Note: This test creates a mock global recall.md in a temp dir and temporarily
-    /// overrides HOME. Since dirs::home_dir() uses the HOME env var on Unix, we can test this.
     #[test]
     #[serial]
     fn test_load_recall_agent_overrides_global() {
-        // Create fake home directory
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        fs::write(global_recall_dir.join("recall.md"), "Global recall content").unwrap();
+        let global_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(global_dir.join("recall.md"), "Global recall content").unwrap();
 
-        // Create agent directory
         let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // Agent-specific recall.md
+        write_config(agent_dir_path.path(), "", "");
         fs::write(
             agent_dir_path.path().join("recall.md"),
             "Agent-specific recall",
         )
         .unwrap();
 
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Agent-specific should be used, NOT global
-        assert_eq!(recall, Some("Agent-specific recall".to_string()));
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            assert_eq!(
+                agent_dir.load_recall().unwrap(),
+                Some("Agent-specific recall".to_string())
+            );
+        });
     }
 
-    /// Test: Returns None when agent-specific doesn't exist (no global fallback)
     #[test]
     #[serial]
     fn test_load_recall_no_global_fallback() {
-        // Create fake home directory with global recall.md
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        fs::write(global_recall_dir.join("recall.md"), "Global recall content").unwrap();
+        let global_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(global_dir.join("recall.md"), "Global recall content").unwrap();
 
-        // Create agent directory WITHOUT recall.md
         let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
+        write_config(agent_dir_path.path(), "", "");
 
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // NO recall.md in agent directory
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Should return None — no global fallback
-        assert_eq!(recall, None);
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            assert_eq!(agent_dir.load_recall().unwrap(), None);
+        });
     }
 
-    /// Test: Returns None when neither agent-specific nor global exists
     #[test]
     #[serial]
     fn test_load_recall_neither_exists() {
-        // Create fake home directory WITHOUT global recall.md
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        // NO recall.md in global directory
+        fs::create_dir_all(fake_home.path().join(".anima").join("agents")).unwrap();
 
-        // Create agent directory WITHOUT recall.md
         let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
+        write_config(agent_dir_path.path(), "", "");
 
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // NO recall.md in agent directory
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Should return None when neither exists
-        assert_eq!(recall, None);
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            assert_eq!(agent_dir.load_recall().unwrap(), None);
+        });
     }
 
-    /// Test: Agent recall.md can include shared files from global agents directory
     #[test]
     #[serial]
     fn test_load_recall_agent_includes_global_shared() {
-        // Create fake home directory with shared files
         let fake_home = tempdir().unwrap();
-        let global_recall_dir = fake_home.path().join(".anima").join("agents");
-        fs::create_dir_all(&global_recall_dir).unwrap();
-        // Shared file that agents can include
-        fs::write(
-            global_recall_dir.join("shared-tools.md"),
-            "Tool instructions here",
-        )
-        .unwrap();
+        let global_dir = fake_home.path().join(".anima").join("agents");
+        fs::create_dir_all(&global_dir).unwrap();
+        fs::write(global_dir.join("shared-tools.md"), "Tool instructions here").unwrap();
 
-        // Create agent directory with recall.md that includes the shared file
         let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-provider = "openai"
-model = "gpt-4"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-        // Agent recall.md includes the global shared file
-        let global_path = global_recall_dir.join("shared-tools.md");
+        write_config(agent_dir_path.path(), "", "");
+        let global_path = global_dir.join("shared-tools.md");
         fs::write(
             agent_dir_path.path().join("recall.md"),
             format!(
@@ -1311,11 +1029,8 @@ model = "gpt-4"
         .unwrap();
 
         let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let recall = agent_dir.load_recall().unwrap();
-
-        // Includes should be expanded
         assert_eq!(
-            recall,
+            agent_dir.load_recall().unwrap(),
             Some("Agent header\nTool instructions here\nAgent footer".to_string())
         );
     }
@@ -1324,78 +1039,54 @@ model = "gpt-4"
     // Shared model definitions tests
     // =========================================================================
 
-    /// Test: Agent with model_file loads configuration from shared model file
+    /// Helper: create a fake ~/.anima/models/ directory and write a model file.
+    fn write_model_file(fake_home: &Path, name: &str, content: &str) -> PathBuf {
+        let dir = fake_home.join(".anima").join("models");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{name}.toml")), content).unwrap();
+        dir
+    }
+
     #[test]
     #[serial]
     fn test_model_file_loading() {
-        // Create fake home directory with a model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
+        write_model_file(
+            fake_home.path(),
+            "test-model",
+            "provider = \"ollama\"\nmodel = \"gemma3:27b\"\nnum_ctx = 32768\ntools = false\nthinking = true\n",
+        );
+
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = "[agent]\nname = \"test\"\n\n[llm]\nmodel_file = \"test-model\"\n";
         fs::write(
-            models_dir.join("test-model.toml"),
-            r#"
-provider = "ollama"
-model = "gemma3:27b"
-num_ctx = 32768
-tools = false
-thinking = true
-"#,
+            agent_dir_path.path().join("config.toml"),
+            config_content,
         )
         .unwrap();
 
-        // Create agent directory with model_file reference
-        let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_llm_config().unwrap();
 
-[llm]
-model_file = "test-model"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let resolved = agent_dir.resolve_llm_config().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert_eq!(resolved.provider, "ollama");
-        assert_eq!(resolved.model, "gemma3:27b");
-        assert_eq!(resolved.num_ctx, Some(32768));
-        assert_eq!(resolved.tools, false);
-        assert_eq!(resolved.thinking, Some(true));
+            assert_eq!(resolved.provider, "ollama");
+            assert_eq!(resolved.model, "gemma3:27b");
+            assert_eq!(resolved.num_ctx, Some(32768));
+            assert_eq!(resolved.tools, false);
+            assert_eq!(resolved.thinking, Some(true));
+        });
     }
 
-    /// Test: Agent overrides are applied on top of model file
     #[test]
     #[serial]
     fn test_model_file_with_overrides() {
-        // Create fake home directory with a model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-        fs::write(
-            models_dir.join("base-model.toml"),
-            r#"
-provider = "ollama"
-model = "gemma3:27b"
-num_ctx = 32768
-tools = false
-thinking = false
-"#,
-        )
-        .unwrap();
+        write_model_file(
+            fake_home.path(),
+            "base-model",
+            "provider = \"ollama\"\nmodel = \"gemma3:27b\"\nnum_ctx = 32768\ntools = false\nthinking = false\n",
+        );
 
-        // Create agent directory with model_file reference AND overrides
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1406,32 +1097,24 @@ model_file = "base-model"
 num_ctx = 65536
 thinking = true
 "#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
 
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_llm_config().unwrap();
 
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let resolved = agent_dir.resolve_llm_config().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Base values from model file
-        assert_eq!(resolved.provider, "ollama");
-        assert_eq!(resolved.model, "gemma3:27b");
-        assert_eq!(resolved.tools, false);
-
-        // Overridden values from agent config
-        assert_eq!(resolved.num_ctx, Some(65536));
-        assert_eq!(resolved.thinking, Some(true));
+            assert_eq!(resolved.provider, "ollama");
+            assert_eq!(resolved.model, "gemma3:27b");
+            assert_eq!(resolved.tools, false);
+            assert_eq!(resolved.num_ctx, Some(65536));
+            assert_eq!(resolved.thinking, Some(true));
+        });
     }
 
-    /// Test: Legacy config without model_file still works
     #[test]
     fn test_legacy_direct_config() {
         let dir = tempdir().unwrap();
@@ -1456,111 +1139,63 @@ tools = true
         assert_eq!(resolved.tools, true);
     }
 
-    /// Test: Missing model file returns clear error
     #[test]
     #[serial]
     fn test_model_file_not_found() {
-        // Create fake home directory WITHOUT the model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-        // NO test-model.toml file
+        fs::create_dir_all(fake_home.path().join(".anima").join("models")).unwrap();
 
-        // Create agent directory with model_file reference
         let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
+        let config_content = "[agent]\nname = \"test\"\n\n[llm]\nmodel_file = \"nonexistent-model\"\n";
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
 
-[llm]
-model_file = "nonexistent-model"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let result = agent_dir.resolve_llm_config();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert!(matches!(result, Err(AgentDirError::ModelFileNotFound(_))));
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            assert!(matches!(
+                agent_dir.resolve_llm_config(),
+                Err(AgentDirError::ModelFileNotFound(_))
+            ));
+        });
     }
 
-    /// Test: Model file with missing required field returns clear error
     #[test]
     #[serial]
     fn test_model_file_missing_provider() {
-        // Create fake home directory with incomplete model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
+        write_model_file(fake_home.path(), "incomplete", "model = \"gemma3:27b\"\n");
+
+        let agent_dir_path = tempdir().unwrap();
+        let config_content =
+            "[agent]\nname = \"test\"\n\n[llm]\nmodel_file = \"incomplete\"\n";
         fs::write(
-            models_dir.join("incomplete.toml"),
-            r#"
-model = "gemma3:27b"
-"#,
+            agent_dir_path.path().join("config.toml"),
+            config_content,
         )
         .unwrap();
 
-        // Create agent directory with model_file reference
-        let agent_dir_path = tempdir().unwrap();
-        let config_content = r#"
-[agent]
-name = "test"
-
-[llm]
-model_file = "incomplete"
-"#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
-
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
-
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let result = agent_dir.resolve_llm_config();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        assert!(matches!(
-            result,
-            Err(AgentDirError::ModelFileMissingField { .. })
-        ));
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            assert!(matches!(
+                agent_dir.resolve_llm_config(),
+                Err(AgentDirError::ModelFileMissingField { .. })
+            ));
+        });
     }
 
-    /// Test: Partial overrides - only specified fields are overridden
     #[test]
     #[serial]
     fn test_partial_overrides() {
-        // Create fake home directory with a model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-        fs::write(
-            models_dir.join("full-model.toml"),
-            r#"
-provider = "ollama"
-model = "gemma3:27b"
-num_ctx = 32768
-tools = false
-thinking = true
-base_url = "http://localhost:11434"
-"#,
-        )
-        .unwrap();
+        write_model_file(
+            fake_home.path(),
+            "full-model",
+            "provider = \"ollama\"\nmodel = \"gemma3:27b\"\nnum_ctx = 32768\ntools = false\nthinking = true\nbase_url = \"http://localhost:11434\"\n",
+        );
 
-        // Create agent directory with only num_ctx override
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1570,36 +1205,28 @@ name = "test"
 model_file = "full-model"
 num_ctx = 65536
 "#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
 
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_llm_config().unwrap();
 
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let resolved = agent_dir.resolve_llm_config().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // All fields from model file except num_ctx
-        assert_eq!(resolved.provider, "ollama");
-        assert_eq!(resolved.model, "gemma3:27b");
-        assert_eq!(resolved.tools, false);
-        assert_eq!(resolved.thinking, Some(true));
-        assert_eq!(
-            resolved.base_url,
-            Some("http://localhost:11434".to_string())
-        );
-
-        // Only this field was overridden
-        assert_eq!(resolved.num_ctx, Some(65536));
+            assert_eq!(resolved.provider, "ollama");
+            assert_eq!(resolved.model, "gemma3:27b");
+            assert_eq!(resolved.tools, false);
+            assert_eq!(resolved.thinking, Some(true));
+            assert_eq!(
+                resolved.base_url,
+                Some("http://localhost:11434".to_string())
+            );
+            assert_eq!(resolved.num_ctx, Some(65536));
+        });
     }
 
-    /// Test: tools defaults to true when not specified
     #[test]
     fn test_tools_default_true() {
         let dir = tempdir().unwrap();
@@ -1614,30 +1241,19 @@ model = "claude-sonnet-4-20250514"
         fs::write(dir.path().join("config.toml"), config_content).unwrap();
 
         let agent_dir = AgentDir::load(dir.path()).unwrap();
-        let resolved = agent_dir.resolve_llm_config().unwrap();
-
-        assert_eq!(resolved.tools, true);
+        assert_eq!(agent_dir.resolve_llm_config().unwrap().tools, true);
     }
 
-    /// Test: Agent can override model to different provider
     #[test]
     #[serial]
     fn test_override_provider_and_model() {
-        // Create fake home directory with an ollama model file
         let fake_home = tempdir().unwrap();
-        let models_dir = fake_home.path().join(".anima").join("models");
-        fs::create_dir_all(&models_dir).unwrap();
-        fs::write(
-            models_dir.join("ollama-base.toml"),
-            r#"
-provider = "ollama"
-model = "gemma3:27b"
-tools = false
-"#,
-        )
-        .unwrap();
+        write_model_file(
+            fake_home.path(),
+            "ollama-base",
+            "provider = \"ollama\"\nmodel = \"gemma3:27b\"\ntools = false\n",
+        );
 
-        // Create agent directory that overrides both provider and model
         let agent_dir_path = tempdir().unwrap();
         let config_content = r#"
 [agent]
@@ -1650,26 +1266,21 @@ model = "claude-sonnet-4-20250514"
 api_key = "sk-test"
 tools = true
 "#;
-        fs::write(agent_dir_path.path().join("config.toml"), config_content).unwrap();
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
 
-        // Override HOME temporarily
-        let original_home = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", fake_home.path()) };
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_llm_config().unwrap();
 
-        let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
-        let resolved = agent_dir.resolve_llm_config().unwrap();
-
-        // Restore HOME
-        match original_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
-
-        // Everything is overridden
-        assert_eq!(resolved.provider, "anthropic");
-        assert_eq!(resolved.model, "claude-sonnet-4-20250514");
-        assert_eq!(resolved.api_key, Some("sk-test".to_string()));
-        assert_eq!(resolved.tools, true);
+            assert_eq!(resolved.provider, "anthropic");
+            assert_eq!(resolved.model, "claude-sonnet-4-20250514");
+            assert_eq!(resolved.api_key, Some("sk-test".to_string()));
+            assert_eq!(resolved.tools, true);
+        });
     }
 
     // =========================================================================
@@ -1684,24 +1295,20 @@ tools = true
         let result = create_agent("test-agent", Some(agent_path.clone()));
         assert!(result.is_ok());
 
-        // Check files were created
         assert!(agent_path.join("config.toml").exists());
         assert!(agent_path.join("system.md").exists());
         assert!(agent_path.join("recall.md").exists());
 
-        // Check config.toml content
         let config_content = fs::read_to_string(agent_path.join("config.toml")).unwrap();
         assert!(config_content.contains("name = \"test-agent\""));
         assert!(config_content.contains("[llm]"));
         assert!(config_content.contains("[memory]"));
         assert!(config_content.contains("recall_file = \"recall.md\""));
 
-        // Check system.md content
         let system_content = fs::read_to_string(agent_path.join("system.md")).unwrap();
         assert!(system_content.contains("# test-agent"));
         assert!(system_content.contains("You are test-agent"));
 
-        // Check recall.md content
         let recall_content = fs::read_to_string(agent_path.join("recall.md")).unwrap();
         assert!(recall_content.contains("# Recall"));
         assert!(recall_content.contains("How Conversations Work"));
@@ -1713,7 +1320,6 @@ tools = true
         let dir = tempdir().unwrap();
         let agent_path = dir.path().join("existing-agent");
 
-        // Create the directory first
         fs::create_dir_all(&agent_path).unwrap();
 
         let result = create_agent("existing-agent", Some(agent_path));

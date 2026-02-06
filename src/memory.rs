@@ -117,10 +117,8 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
-    /// Open or create a SQLite database at the given path
-    pub fn open(path: &str, agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-
+    /// Build a SqliteMemory from an already-opened connection, initializing the schema.
+    fn from_connection(conn: Connection, agent_id: &str) -> Result<Self, MemoryError> {
         let memory = SqliteMemory {
             conn: Arc::new(Mutex::new(conn)),
             agent_id: agent_id.to_string(),
@@ -129,17 +127,17 @@ impl SqliteMemory {
         Ok(memory)
     }
 
-    /// Create an in-memory SQLite database (useful for testing)
+    /// Open or create a SQLite database at the given path.
+    pub fn open(path: &str, agent_id: &str) -> Result<Self, MemoryError> {
+        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        Self::from_connection(conn, agent_id)
+    }
+
+    /// Create an in-memory SQLite database (useful for testing).
     pub fn open_in_memory(agent_id: &str) -> Result<Self, MemoryError> {
         let conn =
             Connection::open_in_memory().map_err(|e| MemoryError::StorageError(e.to_string()))?;
-
-        let memory = SqliteMemory {
-            conn: Arc::new(Mutex::new(conn)),
-            agent_id: agent_id.to_string(),
-        };
-        memory.init_schema()?;
-        Ok(memory)
+        Self::from_connection(conn, agent_id)
     }
 
     fn init_schema(&self) -> Result<(), MemoryError> {
@@ -304,40 +302,21 @@ impl Memory for SqliteMemory {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
-            let mut keys = Vec::new();
-
-            match &prefix {
-                Some(p) => {
-                    let mut stmt = match conn
-                        .prepare("SELECT key FROM memories WHERE agent_id = ?1 AND key LIKE ?2")
-                    {
-                        Ok(s) => s,
-                        Err(_) => return keys,
-                    };
-                    let pattern = format!("{}%", p);
-                    if let Ok(rows) =
-                        stmt.query_map(params![agent_id, pattern], |row| row.get::<_, String>(0))
-                    {
-                        keys = rows.filter_map(|r| r.ok()).collect();
-                    }
-                }
-                None => {
-                    let mut stmt =
-                        match conn.prepare("SELECT key FROM memories WHERE agent_id = ?1") {
-                            Ok(s) => s,
-                            Err(_) => return keys,
-                        };
-                    if let Ok(rows) =
-                        stmt.query_map(params![agent_id], |row| row.get::<_, String>(0))
-                    {
-                        keys = rows.filter_map(|r| r.ok()).collect();
-                    }
-                }
-            }
-
-            keys
+            // Use LIKE with a wildcard pattern: "prefix%" for filtered, "%" for all keys
+            let pattern = match &prefix {
+                Some(p) => format!("{}%", p),
+                None => "%".to_string(),
+            };
+            let mut stmt = conn
+                .prepare("SELECT key FROM memories WHERE agent_id = ?1 AND key LIKE ?2")
+                .ok()?;
+            let rows = stmt
+                .query_map(params![agent_id, pattern], |row| row.get::<_, String>(0))
+                .ok()?;
+            Some(rows.filter_map(|r| r.ok()).collect())
         })
         .await
+        .unwrap_or_default()
         .unwrap_or_default()
     }
 }
@@ -387,6 +366,27 @@ fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Standard column list for SemanticMemoryEntry queries.
+/// All queries that construct SemanticMemoryEntry should SELECT these columns in this order.
+const SEMANTIC_MEMORY_COLUMNS: &str =
+    "id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding";
+
+/// Map a rusqlite row (using SEMANTIC_MEMORY_COLUMNS order) to a SemanticMemoryEntry.
+fn row_to_semantic_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<SemanticMemoryEntry> {
+    let embedding_blob: Option<Vec<u8>> = row.get(8)?;
+    Ok(SemanticMemoryEntry {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        importance: row.get(2)?,
+        source: row.get(3)?,
+        created_at: row.get(4)?,
+        keywords: row.get(5)?,
+        access_count: row.get(6)?,
+        last_accessed: row.get(7)?,
+        embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
+    })
+}
+
 /// Common English stopwords to filter from keyword extraction.
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "he", "in", "is", "it",
@@ -408,10 +408,9 @@ fn extract_keywords(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Calculate recency score with exponential decay (half-life of ~7 days).
+/// Calculate recency score with exponential decay (half-life of ~7 days / 168 hours).
 fn recency_score(created_at: i64, now: i64) -> f64 {
     let age_hours = (now - created_at) as f64 / 3600.0;
-    // Exponential decay: half-life of ~7 days (168 hours)
     0.5_f64.powf(age_hours / 168.0)
 }
 
@@ -434,10 +433,8 @@ pub fn format_age(created_at: i64) -> String {
 }
 
 impl SemanticMemoryStore {
-    /// Open or create a semantic memory database at the given path.
-    pub fn open(path: &std::path::Path, agent_id: &str) -> Result<Self, MemoryError> {
-        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-
+    /// Build a SemanticMemoryStore from an already-opened connection, initializing the schema.
+    fn from_connection(conn: Connection, agent_id: &str) -> Result<Self, MemoryError> {
         let store = SemanticMemoryStore {
             conn: Arc::new(Mutex::new(conn)),
             agent_id: agent_id.to_string(),
@@ -446,17 +443,17 @@ impl SemanticMemoryStore {
         Ok(store)
     }
 
+    /// Open or create a semantic memory database at the given path.
+    pub fn open(path: &std::path::Path, agent_id: &str) -> Result<Self, MemoryError> {
+        let conn = Connection::open(path).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        Self::from_connection(conn, agent_id)
+    }
+
     /// Create an in-memory semantic memory store (useful for testing).
     pub fn open_in_memory(agent_id: &str) -> Result<Self, MemoryError> {
         let conn =
             Connection::open_in_memory().map_err(|e| MemoryError::StorageError(e.to_string()))?;
-
-        let store = SemanticMemoryStore {
-            conn: Arc::new(Mutex::new(conn)),
-            agent_id: agent_id.to_string(),
-        };
-        store.init_schema()?;
-        Ok(store)
+        Self::from_connection(conn, agent_id)
     }
 
     fn init_schema(&self) -> Result<(), MemoryError> {
@@ -534,23 +531,16 @@ impl SemanticMemoryStore {
             .ok();
 
         if let Some((id, old_importance)) = existing {
-            // Reinforce: boost importance by 0.05 (cap at 1.0), refresh timestamp, update embedding
+            // Reinforce: boost importance by 0.05 (cap at 1.0), refresh timestamp, update embedding if provided
             let new_importance = (old_importance + 0.05).min(1.0);
-            if let Some(ref blob) = embedding_blob {
-                conn.execute(
-                    "UPDATE semantic_memories SET importance = ?1, created_at = ?2, embedding = ?3 WHERE id = ?4",
-                    params![new_importance, timestamp, blob, id]
-                ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
-            } else {
-                conn.execute(
-                    "UPDATE semantic_memories SET importance = ?1, created_at = ?2 WHERE id = ?3",
-                    params![new_importance, timestamp, id],
-                )
-                .map_err(|e| MemoryError::StorageError(e.to_string()))?;
-            }
+            conn.execute(
+                "UPDATE semantic_memories SET importance = ?1, created_at = ?2, embedding = COALESCE(?3, embedding) WHERE id = ?4",
+                params![new_importance, timestamp, embedding_blob, id],
+            )
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
             debug::log(&format!(
-                "[memory] REINFORCE #{}: \"{}\" (importance {} → {})",
+                "[memory] REINFORCE #{}: \"{}\" (importance {} -> {})",
                 id, content, old_importance, new_importance
             ));
             Ok(SaveResult::Reinforced(id, old_importance, new_importance))
@@ -624,28 +614,16 @@ impl SemanticMemoryStore {
         let conn = self.conn.lock().unwrap();
 
         // Load all memories for this agent with their embeddings
-        let mut stmt = conn.prepare(
-            "SELECT id, created_at, content, importance, source, keywords, access_count, last_accessed, embedding
-             FROM semantic_memories
-             WHERE agent_id = ?1 AND embedding IS NOT NULL
-             ORDER BY created_at DESC"
-        ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let query = format!(
+            "SELECT {} FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NOT NULL ORDER BY created_at DESC",
+            SEMANTIC_MEMORY_COLUMNS
+        );
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![self.agent_id], |row| {
-                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
-                Ok(SemanticMemoryEntry {
-                    id: row.get(0)?,
-                    created_at: row.get(1)?,
-                    content: row.get(2)?,
-                    importance: row.get(3)?,
-                    source: row.get(4)?,
-                    keywords: row.get(5)?,
-                    access_count: row.get(6)?,
-                    last_accessed: row.get(7)?,
-                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
-                })
-            })
+            .query_map(params![self.agent_id], row_to_semantic_entry)
             .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let candidates: Vec<SemanticMemoryEntry> = rows.filter_map(|r| r.ok()).collect();
@@ -738,27 +716,16 @@ impl SemanticMemoryStore {
             .lock()
             .map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let limit_clause = limit.map(|l| format!(" LIMIT {}", l)).unwrap_or_default();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding
-             FROM semantic_memories WHERE agent_id = ?1 ORDER BY created_at DESC{}",
-            limit_clause
-        )).map_err(|e| MemoryError::StorageError(e.to_string()))?;
+        let query = format!(
+            "SELECT {} FROM semantic_memories WHERE agent_id = ?1 ORDER BY created_at DESC{}",
+            SEMANTIC_MEMORY_COLUMNS, limit_clause
+        );
+        let mut stmt = conn
+            .prepare(&query)
+            .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         let entries = stmt
-            .query_map(params![self.agent_id], |row| {
-                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
-                Ok(SemanticMemoryEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    importance: row.get(2)?,
-                    source: row.get(3)?,
-                    created_at: row.get(4)?,
-                    keywords: row.get(5)?,
-                    access_count: row.get(6)?,
-                    last_accessed: row.get(7)?,
-                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
-                })
-            })
+            .query_map(params![self.agent_id], row_to_semantic_entry)
             .map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         entries
@@ -799,10 +766,7 @@ impl SemanticMemoryStore {
     /// Update the content of an existing memory. Keeps importance, updates timestamp.
     /// Returns true if updated, false if not found.
     pub fn update_content(&self, id: i64, new_content: &str) -> Result<bool, MemoryError> {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let timestamp = now();
         let conn = self
             .conn
             .lock()
@@ -820,24 +784,11 @@ impl SemanticMemoryStore {
             .conn
             .lock()
             .map_err(|e| MemoryError::StorageError(e.to_string()))?;
-        let result = conn.query_row(
-            "SELECT id, content, importance, source, created_at, keywords, access_count, last_accessed, embedding FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
-            params![id, self.agent_id],
-            |row| {
-                let embedding_blob: Option<Vec<u8>> = row.get(8)?;
-                Ok(SemanticMemoryEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    importance: row.get(2)?,
-                    source: row.get(3)?,
-                    created_at: row.get(4)?,
-                    keywords: row.get(5)?,
-                    access_count: row.get(6)?,
-                    last_accessed: row.get(7)?,
-                    embedding: embedding_blob.map(|b| blob_to_embedding(&b)),
-                })
-            }
+        let query = format!(
+            "SELECT {} FROM semantic_memories WHERE id = ?1 AND agent_id = ?2",
+            SEMANTIC_MEMORY_COLUMNS
         );
+        let result = conn.query_row(&query, params![id, self.agent_id], row_to_semantic_entry);
         match result {
             Ok(entry) => Ok(Some(entry)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -945,8 +896,7 @@ pub fn extract_remember_tags(output: &str) -> (String, Vec<String>) {
         }
     }
 
-    let cleaned = re.replace_all(output, "").to_string();
-    let cleaned = cleaned.trim().to_string();
+    let cleaned = re.replace_all(output, "").trim().to_string();
 
     if !memories.is_empty() {
         debug::log(&format!(
