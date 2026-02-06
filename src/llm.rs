@@ -1017,7 +1017,7 @@ impl LLM for OllamaClient {
             .as_str()
             .map(|s| s.to_string());
 
-        let tool_calls = ollama_response["message"]["tool_calls"]
+        let tool_calls: Vec<ToolCall> = ollama_response["message"]["tool_calls"]
             .as_array()
             .map(|tool_calls_array| {
                 tool_calls_array
@@ -1064,6 +1064,29 @@ impl LLM for OllamaClient {
                 prompt_tokens: ollama_response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
                 completion_tokens: ollama_response["eval_count"].as_u64().unwrap_or(0) as u32,
             })
+        };
+
+        // Fallback: detect XML-format tool calls in content text
+        let (content, tool_calls) = if tool_calls.is_empty() {
+            if let Some(ref text) = content {
+                let (cleaned, xml_calls) = extract_xml_tool_calls(text);
+                if !xml_calls.is_empty() {
+                    (
+                        if cleaned.is_empty() {
+                            None
+                        } else {
+                            Some(cleaned)
+                        },
+                        xml_calls,
+                    )
+                } else {
+                    (content, tool_calls)
+                }
+            } else {
+                (content, tool_calls)
+            }
+        } else {
+            (content, tool_calls)
         };
 
         Ok(LLMResponse {
@@ -1248,16 +1271,85 @@ impl LLM for OllamaClient {
             }
         }
 
-        Ok(LLMResponse {
-            content: if full_content.is_empty() {
-                None
+        // Fallback: detect XML-format tool calls in content text
+        let (final_content, tool_calls) = if tool_calls.is_empty() && !full_content.is_empty() {
+            let (cleaned, xml_calls) = extract_xml_tool_calls(&full_content);
+            if !xml_calls.is_empty() {
+                (
+                    if cleaned.is_empty() {
+                        None
+                    } else {
+                        Some(cleaned)
+                    },
+                    xml_calls,
+                )
             } else {
-                Some(full_content)
-            },
+                (
+                    if full_content.is_empty() {
+                        None
+                    } else {
+                        Some(full_content)
+                    },
+                    tool_calls,
+                )
+            }
+        } else {
+            (
+                if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content)
+                },
+                tool_calls,
+            )
+        };
+
+        Ok(LLMResponse {
+            content: final_content,
             tool_calls,
             usage: None,
         })
     }
+}
+
+/// Extract tool calls from XML-format text that some models output.
+/// Handles the `<function=name><parameter=key>value</parameter></function>` format.
+/// Returns extracted tool calls and content with XML blocks stripped.
+fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
+    let fn_re =
+        regex::Regex::new(r"(?s)<function=(\w+)>(.*?)</function>(?:\s*</tool_call>)?").unwrap();
+    let param_re = regex::Regex::new(r"(?s)<parameter=(\w+)>\s*(.*?)\s*</parameter>").unwrap();
+
+    let mut tool_calls = Vec::new();
+    let mut call_index = 0u32;
+
+    for cap in fn_re.captures_iter(content) {
+        let name = cap[1].to_string();
+        let body = &cap[2];
+
+        let mut params = serde_json::Map::new();
+        for param_cap in param_re.captures_iter(body) {
+            params.insert(
+                param_cap[1].to_string(),
+                serde_json::Value::String(param_cap[2].to_string()),
+            );
+        }
+
+        tool_calls.push(ToolCall {
+            id: format!("xmlcall_{}", call_index),
+            name,
+            arguments: serde_json::Value::Object(params),
+        });
+        call_index += 1;
+    }
+
+    // Strip XML blocks from content
+    let cleaned = fn_re.replace_all(content, "").to_string();
+    // Also clean any leftover </tool_call> tags
+    let leftover_re = regex::Regex::new(r"\s*</tool_call>\s*").unwrap();
+    let cleaned = leftover_re.replace_all(&cleaned, "").trim().to_string();
+
+    (cleaned, tool_calls)
 }
 
 #[cfg(test)]
@@ -1373,5 +1465,43 @@ mod tests {
 
         assert_eq!(client.model, "qwen3");
         assert_eq!(client.thinking, Some(true));
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_single() {
+        let content = "Let me read that file. \u{26a1}\n\n<function=read_file>\n<parameter=path>\nclaude.md\n</parameter>\n</function>\n</tool_call>";
+        let (cleaned, calls) = extract_xml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "claude.md");
+        assert_eq!(cleaned, "Let me read that file. \u{26a1}");
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_multiple_params() {
+        let content = "<function=write_file>\n<parameter=path>test.txt</parameter>\n<parameter=content>hello world</parameter>\n</function>";
+        let (cleaned, calls) = extract_xml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(calls[0].arguments["path"], "test.txt");
+        assert_eq!(calls[0].arguments["content"], "hello world");
+        assert!(cleaned.is_empty());
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_no_xml() {
+        let content = "Just a normal response with no tool calls.";
+        let (cleaned, calls) = extract_xml_tool_calls(content);
+        assert!(calls.is_empty());
+        assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn test_extract_xml_tool_calls_multiple_calls() {
+        let content = "<function=read_file>\n<parameter=path>a.txt</parameter>\n</function>\nSome text\n<function=read_file>\n<parameter=path>b.txt</parameter>\n</function>";
+        let (_, calls) = extract_xml_tool_calls(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["path"], "a.txt");
+        assert_eq!(calls[1].arguments["path"], "b.txt");
     }
 }
