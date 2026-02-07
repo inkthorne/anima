@@ -78,7 +78,7 @@ pub fn discover_daemons() -> Vec<DaemonInfo> {
 }
 
 /// Get the agents directory path (~/.anima/agents/)
-fn agents_dir() -> PathBuf {
+pub fn agents_dir() -> PathBuf {
     dirs::home_dir()
         .map(|h| h.join(".anima").join("agents"))
         .unwrap_or_else(|| PathBuf::from("~/.anima/agents"))
@@ -207,6 +207,44 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Start an agent daemon process.
+///
+/// If the agent is already running, returns its existing PID (no-op).
+/// Otherwise spawns `anima run <name> --daemon` as a background process.
+pub fn start_agent_daemon(agent_name: &str) -> Result<u32, String> {
+    if !agent_exists(agent_name) {
+        return Err(format!("Agent '{}' does not exist", agent_name));
+    }
+
+    // If already running, return existing PID
+    let pid_file = agents_dir().join(agent_name).join("daemon.pid");
+    if pid_file.exists() {
+        if let Ok(content) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = content.trim().parse::<u32>() {
+                if is_process_alive(pid) {
+                    return Ok(pid);
+                }
+            }
+        }
+    }
+
+    // Find our own executable
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Failed to find executable: {}", e))?;
+
+    // Spawn: anima run <name> --daemon
+    let child = std::process::Command::new(exe)
+        .arg("run")
+        .arg(agent_name)
+        .arg("--daemon")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start daemon for '{}': {}", agent_name, e))?;
+
+    Ok(child.id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +318,12 @@ mod tests {
         // When using wildcards but no agents match, should return empty
         let matches = match_agents("zzz-nonexistent-*");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn test_start_agent_daemon_nonexistent() {
+        let result = start_agent_daemon("nonexistent-agent-xyz-999");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
     }
 }

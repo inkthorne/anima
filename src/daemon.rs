@@ -118,6 +118,8 @@ use crate::tool_registry::{ToolDefinition, ToolRegistry};
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_process_running};
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
+use crate::tools::spawn_child::DaemonSpawnChildTool;
+use crate::tools::wait_for_child::DaemonWaitForChildTool;
 use crate::tools::{
     AddTool, DaemonRememberTool, EchoTool, HttpTool, ReadFileTool, SafeShellTool, ShellTool,
     WriteFileTool,
@@ -809,7 +811,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_child"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -828,10 +830,40 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_child\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
+            }
+        }
+        "spawn_child" => {
+            let ctx = context.ok_or("spawn_child tool requires execution context")?;
+            let tool = DaemonSpawnChildTool::new(ctx.agent_name.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                    let child_id = result.get("child_id").and_then(|s| s.as_str()).unwrap_or("");
+                    let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
+                    Ok(format!("Task delegated to '{}'. child_id: {} (status: {}). Use wait_for_child with this child_id to get the result. Agent responses typically take 30-120s — use the default timeout.", agent, child_id, status))
+                }
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "wait_for_child" => {
+            let ctx = context.ok_or("wait_for_child tool requires execution context")?;
+            let tool = DaemonWaitForChildTool::new(ctx.agent_name.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                    if status == "completed" {
+                        let response = result.get("result").and_then(|s| s.as_str()).unwrap_or("");
+                        Ok(response.to_string())
+                    } else {
+                        let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("Child task has not completed yet. Call wait_for_child again to keep waiting.");
+                        Ok(message.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
         _ => Err(format!("Unknown tool: {}", tool_call.tool)),
@@ -1708,6 +1740,8 @@ async fn create_agent_from_dir(
         // Register daemon-aware messaging tools
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonSpawnChildTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonWaitForChildTool::new(agent_name.clone())));
     }
 
     // Apply LLM, memory, and agent_dir
