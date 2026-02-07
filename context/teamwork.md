@@ -74,3 +74,87 @@
 
   Steps 1-3 get you a working prototype of the team workflow. Steps 4-7 make it reliable.
 
+---
+
+● Here's the assessment:
+
+  What's Done vs. What's Left
+  #: 1
+  Feature: spawn_child / wait_for_children
+  Status: Done
+  Notes: Fully wired up, retry-connect fixed, tested in production
+  ────────────────────────────────────────
+  #: 2
+  Feature: Structured artifacts / typed messages
+  Status: Not started
+  Notes: Messages are plain content: String
+  ────────────────────────────────────────
+  #: 3
+  Feature: Workflow orchestration / state machine
+  Status: Not started
+  Notes: No phase tracking or workflow config
+  ────────────────────────────────────────
+  #: 4
+  Feature: Timeouts on agent responses
+  Status: Partial
+  Notes: wait_for_children has timeouts; daemon notify handler does not
+  ────────────────────────────────────────
+  #: 5
+  Feature: Approval gates
+  Status: Done
+  Notes: pause/resume/stop + catchup replay
+  ────────────────────────────────────────
+  #: 6
+  Feature: Shared workspace / file awareness
+  Status: Partial
+  Notes: Agents share filesystem but no workspace abstraction
+  ────────────────────────────────────────
+  #: 7
+  Feature: Context management
+  Status: Basic
+  Notes: Semantic memory recall + last N messages, no pinning or smart selection
+  Plus the checkpoint system (not in the doc) is fully implemented.
+
+  So items 1 and 5 are done, items 4/6/7 are partially there, and items 2/3 are untouched.
+
+  ---
+  My Assessment: What's Actually Valuable
+
+  The teamwork doc was written before spawn_child existed. Now that agents can delegate and wait on results, the
+  landscape has shifted. Here's what I'd prioritize:
+
+  High value — addresses real pain you've already hit:
+
+  1. Daemon-level timeouts (#4) — If a child agent gets stuck in a tool loop or the LLM hangs, the parent waits forever.
+   Adding a max_response_time to daemon config is straightforward and prevents silent stalls. Small effort, high
+  reliability payoff.
+  2. Smarter context injection (#7) — With multi-agent conversations, the 20-message window fills fast. You already have
+   semantic memory — the bang-for-buck move is pinning the original task message so it never scrolls out of context. A
+  pinned boolean on messages would be simple and solve the "telephone game" problem better than structured artifacts
+  would.
+
+  Medium value — nice but not urgent:
+
+  3. Structured artifacts (#2) — Theoretically important, but in practice agents communicate pretty well in prose. The
+  real issue is context loss (solved by pinning). Typed messages add schema complexity for a problem that semantic
+  memory + pinning mostly solves. I'd defer this.
+  4. Workflow state machine (#3) — An orchestrator agent with a good system prompt already approximates this. Encoding
+  workflows in config adds complexity that prompt engineering can handle for now. Worth revisiting if/when prompt-based
+  orchestration breaks down.
+
+  Low value — skip for now:
+
+  5. Shared workspace (#6) — Agents already share the filesystem. A formal workspace abstraction is over-engineering
+  unless you're doing sandboxed multi-project work.
+  6. Approval gates — Already done via pause/resume.
+
+  ---
+  What I'd Actually Recommend
+
+  If I had to pick the one thing that gives the most bang-for-buck right now, it's message pinning for context
+  management. It's a small schema change (pinned BOOLEAN DEFAULT 0), a small change to format_conversation_history() to
+  always include pinned messages, and it directly solves the biggest practical problem in multi-agent work: agents
+  forgetting the original task.
+
+  Second would be daemon-level response timeouts — small effort, prevents the silent-stall failure mode.
+
