@@ -293,6 +293,20 @@ enum ChatCommands {
         #[arg(short, long)]
         force: bool,
     },
+    /// Pin a message so it always appears in agent context
+    Pin {
+        /// Name of the conversation
+        conv: String,
+        /// Message ID to pin
+        id: i64,
+    },
+    /// Unpin a previously pinned message
+    Unpin {
+        /// Name of the conversation
+        conv: String,
+        /// Message ID to unpin
+        id: i64,
+    },
     /// Run cleanup to delete expired messages and empty conversations
     Cleanup,
 }
@@ -500,9 +514,11 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
         msg.content.clone()
     };
 
+    let pin_str = if msg.pinned { " \x1b[33m[pinned]\x1b[0m" } else { "" };
+
     format!(
-        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}\n{}\n\n",
-        msg.id, datetime, color, msg.from_agent, duration_str, ctx_str, display_content
+        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}{}\n{}\n\n",
+        msg.id, datetime, color, msg.from_agent, pin_str, duration_str, ctx_str, display_content
     )
 }
 
@@ -872,8 +888,30 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
                         }
                         "/help" => {
                             println!(
-                                "\x1b[90mCommands: /clear, /pause, /resume, /quit, /exit, /help\x1b[0m"
+                                "\x1b[90mCommands: /clear, /pause, /resume, /pin <id>, /unpin <id>, /quit, /exit, /help\x1b[0m"
                             );
+                            continue;
+                        }
+                        _ if line.starts_with("/pin ") => {
+                            let arg = line.strip_prefix("/pin ").unwrap().trim();
+                            match arg.parse::<i64>() {
+                                Ok(id) => match store.pin_message(conv_name, id, true) {
+                                    Ok(_) => println!("\x1b[90mPinned message {}.\x1b[0m", id),
+                                    Err(e) => eprintln!("\x1b[31mFailed to pin: {}\x1b[0m", e),
+                                },
+                                Err(_) => eprintln!("\x1b[33mUsage: /pin <message_id>\x1b[0m"),
+                            }
+                            continue;
+                        }
+                        _ if line.starts_with("/unpin ") => {
+                            let arg = line.strip_prefix("/unpin ").unwrap().trim();
+                            match arg.parse::<i64>() {
+                                Ok(id) => match store.pin_message(conv_name, id, false) {
+                                    Ok(_) => println!("\x1b[90mUnpinned message {}.\x1b[0m", id),
+                                    Err(e) => eprintln!("\x1b[31mFailed to unpin: {}\x1b[0m", e),
+                                },
+                                Err(_) => eprintln!("\x1b[33mUsage: /unpin <message_id>\x1b[0m"),
+                            }
                             continue;
                         }
                         _ => {
@@ -2021,6 +2059,16 @@ async fn handle_chat_command(
                     deleted, conv_name
                 );
             }
+        }
+
+        Some(ChatCommands::Pin { conv, id }) => {
+            store.pin_message(&conv, id, true)?;
+            println!("Pinned message \x1b[36m{}\x1b[0m in '\x1b[36m{}\x1b[0m'", id, conv);
+        }
+
+        Some(ChatCommands::Unpin { conv, id }) => {
+            store.pin_message(&conv, id, false)?;
+            println!("Unpinned message \x1b[36m{}\x1b[0m in '\x1b[36m{}\x1b[0m'", id, conv);
         }
 
         Some(ChatCommands::Cleanup) => {

@@ -2088,7 +2088,7 @@ async fn process_message_work(
     let (mut conversation_history, final_user_content): (Vec<ChatMessage>, String) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match store.get_messages(cname, Some(history_limit)) {
+                Ok(store) => match store.get_messages_with_pinned(cname, Some(history_limit)) {
                     Ok(msgs) if !msgs.is_empty() => {
                         let (history, final_content) =
                             format_conversation_history(&msgs, agent_name);
@@ -2552,7 +2552,7 @@ async fn handle_notify(
     };
 
     // First fetch: get messages to extract final_user_content for recall query
-    let context_messages = match store.get_messages(conv_id, Some(history_limit)) {
+    let context_messages = match store.get_messages_with_pinned(conv_id, Some(history_limit)) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -2784,7 +2784,7 @@ async fn handle_notify(
                         tool_call_count = 0;
                         current_message = summary;
                         // Refresh conversation_history from DB for fresh context
-                        if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
+                        if let Ok(msgs) = store.get_messages_with_pinned(conv_id, Some(history_limit)) {
                             let (refreshed_history, _) =
                                 format_conversation_history(&msgs, agent_name);
                             conversation_history = refreshed_history;
@@ -2860,7 +2860,7 @@ async fn handle_notify(
                     // Also update current_message from refreshed_final to avoid passing
                     // the tool result twice (once in history, once as the task).
                     current_message = tool_message;
-                    if let Ok(msgs) = store.get_messages(conv_id, Some(history_limit)) {
+                    if let Ok(msgs) = store.get_messages_with_pinned(conv_id, Some(history_limit)) {
                         let (refreshed_history, refreshed_final) =
                             format_conversation_history(&msgs, agent_name);
                         conversation_history = refreshed_history;
@@ -3181,7 +3181,7 @@ async fn run_heartbeat(
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = store
-        .get_messages(&conv_name, Some(history_limit))
+        .get_messages_with_pinned(&conv_name, Some(history_limit))
         .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
@@ -4152,6 +4152,7 @@ api_key = "sk-test"
             tokens_out: None,
             num_ctx: None,
             triggered_by: None,
+            pinned: false,
         }
     }
 
@@ -4170,6 +4171,7 @@ api_key = "sk-test"
             tokens_out: None,
             num_ctx: None,
             triggered_by: triggered_by.map(|s| s.to_string()),
+            pinned: false,
         }
     }
 

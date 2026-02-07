@@ -66,6 +66,8 @@ pub struct ConversationMessage {
     pub num_ctx: Option<i64>,
     /// Which agent triggered this message (for tool results: the agent that invoked the tool)
     pub triggered_by: Option<String>,
+    /// Whether this message is pinned (always included in LLM context regardless of history window)
+    pub pinned: bool,
 }
 
 /// A pending notification for an offline agent.
@@ -234,6 +236,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "tokens_out", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "num_ctx", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "triggered_by", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "pinned", "INTEGER DEFAULT 0")?;
         Ok(())
     }
 
@@ -785,6 +788,77 @@ impl ConversationStore {
         Ok(messages)
     }
 
+    /// Pin or unpin a message. Returns error if the message doesn't exist in the conversation.
+    pub fn pin_message(
+        &self,
+        conv_name: &str,
+        msg_id: i64,
+        pinned: bool,
+    ) -> Result<(), ConversationError> {
+        let rows = self.conn.execute(
+            "UPDATE messages SET pinned = ?1 WHERE id = ?2 AND conv_name = ?3",
+            params![pinned as i64, msg_id, conv_name],
+        )?;
+        if rows == 0 {
+            return Err(ConversationError::NotFound(format!(
+                "message {} in conversation {}",
+                msg_id, conv_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Get messages with pinned messages always included, regardless of the limit window.
+    ///
+    /// When `limit` is Some(n): fetches pinned messages + last N messages, merging them
+    /// in chronological order without duplicates. Pinned messages that fall outside the
+    /// recent window appear first.
+    ///
+    /// When `limit` is None: delegates to `get_messages()` (all messages returned).
+    pub fn get_messages_with_pinned(
+        &self,
+        conv_name: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        let limit = match limit {
+            Some(n) => n,
+            None => return self.get_messages(conv_name, None),
+        };
+
+        let now = current_timestamp();
+
+        // 1. Fetch pinned messages (chronological)
+        let pinned_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 AND pinned = 1 ORDER BY created_at ASC",
+            MESSAGE_COLUMNS
+        );
+        let mut pinned_stmt = self.conn.prepare(&pinned_query)?;
+        let pinned: Vec<ConversationMessage> = pinned_stmt
+            .query_map(params![conv_name, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 2. Fetch last N messages (DESC + reverse)
+        let recent_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 ORDER BY created_at DESC LIMIT {}",
+            MESSAGE_COLUMNS, limit
+        );
+        let mut recent_stmt = self.conn.prepare(&recent_query)?;
+        let mut recent: Vec<ConversationMessage> = recent_stmt
+            .query_map(params![conv_name, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+        recent.reverse();
+
+        // 3. Merge: pinned messages outside the window go first, then recent in order
+        let recent_ids: std::collections::HashSet<i64> = recent.iter().map(|m| m.id).collect();
+        let mut result: Vec<ConversationMessage> = pinned
+            .into_iter()
+            .filter(|m| !recent_ids.contains(&m.id))
+            .collect();
+        result.extend(recent);
+
+        Ok(result)
+    }
+
     /// Add a pending notification for an offline agent.
     pub fn add_pending_notification(
         &self,
@@ -1072,11 +1146,12 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> 
         tokens_out: row.get(10)?,
         num_ctx: row.get(11)?,
         triggered_by: row.get(12)?,
+        pinned: row.get::<_, i64>(13).unwrap_or(0) != 0,
     })
 }
 
 /// SQL column list for message queries.
-const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by";
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
@@ -2410,5 +2485,144 @@ mod tests {
         let messages = store.get_messages(&conv_name, None).unwrap();
         assert_eq!(messages.len(), 1);
         assert!(messages[0].triggered_by.is_none());
+    }
+
+    #[test]
+    fn test_pin_message() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-test"), &["arya"]).unwrap();
+        let id = store.add_message(&conv, "user", "important task", &[]).unwrap();
+
+        store.pin_message(&conv, id, true).unwrap();
+
+        let msgs = store.get_messages(&conv, None).unwrap();
+        assert!(msgs[0].pinned);
+    }
+
+    #[test]
+    fn test_unpin_message() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("unpin-test"), &["arya"]).unwrap();
+        let id = store.add_message(&conv, "user", "important task", &[]).unwrap();
+
+        store.pin_message(&conv, id, true).unwrap();
+        assert!(store.get_messages(&conv, None).unwrap()[0].pinned);
+
+        store.pin_message(&conv, id, false).unwrap();
+        assert!(!store.get_messages(&conv, None).unwrap()[0].pinned);
+    }
+
+    #[test]
+    fn test_pin_nonexistent_message() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-missing"), &["arya"]).unwrap();
+
+        let result = store.pin_message(&conv, 999, true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_messages_with_pinned_no_pins() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("no-pins"), &["arya"]).unwrap();
+
+        for i in 0..5 {
+            store.add_message(&conv, "user", &format!("msg {}", i), &[]).unwrap();
+        }
+
+        let normal = store.get_messages(&conv, Some(3)).unwrap();
+        let with_pinned = store.get_messages_with_pinned(&conv, Some(3)).unwrap();
+        assert_eq!(normal.len(), with_pinned.len());
+        for (a, b) in normal.iter().zip(with_pinned.iter()) {
+            assert_eq!(a.id, b.id);
+        }
+    }
+
+    #[test]
+    fn test_get_messages_with_pinned_in_window() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-in-window"), &["arya"]).unwrap();
+
+        store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+        let id3 = store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+
+        // Pin a message that's within the window
+        store.pin_message(&conv, id3, true).unwrap();
+
+        let msgs = store.get_messages_with_pinned(&conv, Some(3)).unwrap();
+        // Should be exactly 3, no duplication
+        assert_eq!(msgs.len(), 3);
+        // The pinned message should appear exactly once
+        assert_eq!(msgs.iter().filter(|m| m.id == id3).count(), 1);
+    }
+
+    #[test]
+    fn test_get_messages_with_pinned_outside_window() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-outside"), &["arya"]).unwrap();
+
+        let id1 = store.add_message(&conv, "user", "important task", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 4", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 5", &[]).unwrap();
+
+        // Pin the first message, which is outside a window of 3
+        store.pin_message(&conv, id1, true).unwrap();
+
+        let msgs = store.get_messages_with_pinned(&conv, Some(3)).unwrap();
+        // Should be 4: the pinned message + the last 3
+        assert_eq!(msgs.len(), 4);
+        // Pinned message should come first
+        assert_eq!(msgs[0].id, id1);
+        assert!(msgs[0].pinned);
+        // Last 3 should follow
+        assert_eq!(msgs[1].content, "msg 3");
+        assert_eq!(msgs[2].content, "msg 4");
+        assert_eq!(msgs[3].content, "msg 5");
+    }
+
+    #[test]
+    fn test_get_messages_with_pinned_multiple() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-multi"), &["arya"]).unwrap();
+
+        let id1 = store.add_message(&conv, "user", "task A", &[]).unwrap();
+        let id2 = store.add_message(&conv, "user", "task B", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 4", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 5", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 6", &[]).unwrap();
+
+        // Pin first two messages (outside a window of 2)
+        store.pin_message(&conv, id1, true).unwrap();
+        store.pin_message(&conv, id2, true).unwrap();
+
+        let msgs = store.get_messages_with_pinned(&conv, Some(2)).unwrap();
+        // Should be 4: 2 pinned + 2 recent
+        assert_eq!(msgs.len(), 4);
+        // Pinned messages first, in chronological order
+        assert_eq!(msgs[0].id, id1);
+        assert_eq!(msgs[1].id, id2);
+        // Then recent
+        assert_eq!(msgs[2].content, "msg 5");
+        assert_eq!(msgs[3].content, "msg 6");
+    }
+
+    #[test]
+    fn test_get_messages_with_pinned_no_limit() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("pin-no-limit"), &["arya"]).unwrap();
+
+        let id1 = store.add_message(&conv, "user", "task", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+
+        store.pin_message(&conv, id1, true).unwrap();
+
+        // No limit — should return all messages normally
+        let msgs = store.get_messages_with_pinned(&conv, None).unwrap();
+        assert_eq!(msgs.len(), 3);
     }
 }
