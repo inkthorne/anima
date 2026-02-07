@@ -74,7 +74,7 @@ impl Tool for DaemonSpawnChildTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a task to another agent. Starts the agent if needed, creates a task conversation, and sends the task. Returns a child_id to use with wait_for_child."
+        "Delegate a task to another agent. Starts the agent if needed, creates a task conversation, and sends the task. Returns a child_id to use with wait_for_children."
     }
 
     fn schema(&self) -> Value {
@@ -124,23 +124,6 @@ impl Tool for DaemonSpawnChildTool {
             discovery::start_agent_daemon(agent).map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to start agent '{}': {}", agent, e))
             })?;
-
-            // Wait up to 5s for socket to appear
-            let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
-            let mut ready = false;
-            for _ in 0..50 {
-                if socket_path.exists() {
-                    ready = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-            if !ready {
-                return Err(ToolError::ExecutionFailed(format!(
-                    "Agent '{}' started but socket not ready after 5s",
-                    agent
-                )));
-            }
         }
 
         // Generate short random ID for task conversation
@@ -172,13 +155,25 @@ impl Tool for DaemonSpawnChildTool {
                 ToolError::ExecutionFailed(format!("Failed to post task message: {}", e))
             })?;
 
-        // Notify child agent via socket
-        let socket_path = discovery::agent_socket_path(agent).ok_or_else(|| {
-            ToolError::ExecutionFailed("Could not determine agent socket path".to_string())
-        })?;
-
-        let stream = UnixStream::connect(&socket_path).await.map_err(|e| {
-            ToolError::ExecutionFailed(format!("Failed to connect to agent '{}': {}", agent, e))
+        // Connect to child agent with retry (handles both fresh-start and already-running)
+        let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
+        let mut stream_opt = None;
+        for _ in 0..50 {
+            match UnixStream::connect(&socket_path).await {
+                Ok(s) => {
+                    stream_opt = Some(s);
+                    break;
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        let stream = stream_opt.ok_or_else(|| {
+            ToolError::ExecutionFailed(format!(
+                "Failed to connect to agent '{}' after retries",
+                agent
+            ))
         })?;
 
         let mut api = SocketApi::new(stream);

@@ -4,8 +4,8 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.8.2
-**Tests:** 547 passing
+**Version:** v3.8.3
+**Tests:** 552 passing
 **Repo:** github.com/inkthorne/anima
 
 ## Quick Context
@@ -51,7 +51,7 @@ src/
     ├── remember.rs     # RememberTool, DaemonRememberTool
     ├── claude_code.rs  # ClaudeCodeTool (delegate tasks to Claude Code)
     ├── spawn_child.rs  # SpawnChildTool
-    ├── wait_for_child.rs # WaitForChildTool
+    ├── wait_for_child.rs # WaitForChildTool, WaitForChildrenTool
     ├── add.rs          # AddTool (demo)
     └── echo.rs         # EchoTool (demo)
 ```
@@ -87,7 +87,7 @@ src/
 - `tools = true` in model config: Native tool calling — LLM gets ToolSpecs
 - `tools = false`: JSON-block — Model outputs `{"tool": "x", "params": {...}}`, daemon parses and executes
 
-**Available Tools:** `read_file`, `write_file`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `claude_code`, `spawn_child`, `wait_for_child`
+**Available Tools:** `read_file`, `write_file`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `claude_code`, `spawn_child`, `wait_for_children`
 
 **Safe Shell:** `SafeShellTool` has a command allowlist — only approved commands can be executed, including in pipelines.
 

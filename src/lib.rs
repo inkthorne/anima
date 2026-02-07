@@ -54,5 +54,5 @@ pub use supervision::{ChildConfig, ChildHandle, ChildStatus};
 pub use tool::{Tool, ToolInfo};
 pub use tool_registry::{ToolDefinition, ToolRegistry, ToolRegistryError};
 pub use tools::{
-    DaemonSpawnChildTool, DaemonWaitForChildTool, ListAgentsTool, SendMessageTool,
+    DaemonSpawnChildTool, ListAgentsTool, SendMessageTool,
 };

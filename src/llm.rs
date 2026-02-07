@@ -563,7 +563,7 @@ impl LLM for OpenAIClient {
                                 entry.0 = id.to_string();
                             }
                             if let Some(name) = tc["function"]["name"].as_str() {
-                                entry.1.push_str(name);
+                                entry.1 = name.to_string();
                             }
                             if let Some(args) = tc["function"]["arguments"].as_str() {
                                 entry.2.push_str(args);
@@ -1208,7 +1208,7 @@ impl LLM for OllamaClient {
                                 entry.0 = id.to_string();
                             }
                             if let Some(name) = tc["function"]["name"].as_str() {
-                                entry.1.push_str(name);
+                                entry.1 = name.to_string();
                             }
                             if let Some(args) = tc["function"]["arguments"].as_str() {
                                 entry.2.push_str(args);

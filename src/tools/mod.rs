@@ -25,5 +25,5 @@ pub use safe_shell::SafeShellTool;
 pub use send_message::{DaemonSendMessageTool, ListAgentsTool, SendMessageTool};
 pub use shell::ShellTool;
 pub use spawn_child::{DaemonSpawnChildTool, SpawnChildTool};
-pub use wait_for_child::{DaemonWaitForChildTool, WaitForChildTool};
+pub use wait_for_child::{DaemonWaitForChildrenTool, WaitForChildrenTool};
 pub use write_file::WriteFileTool;

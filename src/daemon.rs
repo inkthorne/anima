@@ -119,7 +119,7 @@ use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_proces
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::spawn_child::DaemonSpawnChildTool;
-use crate::tools::wait_for_child::DaemonWaitForChildTool;
+use crate::tools::wait_for_child::DaemonWaitForChildrenTool;
 use crate::tools::{
     AddTool, DaemonRememberTool, EchoTool, HttpTool, ReadFileTool, SafeShellTool, ShellTool,
     WriteFileTool,
@@ -811,7 +811,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_child"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_children"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -830,7 +830,7 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_child\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_children\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
@@ -844,23 +844,36 @@ async fn execute_tool_call(
                     let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
                     let child_id = result.get("child_id").and_then(|s| s.as_str()).unwrap_or("");
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
-                    Ok(format!("Task delegated to '{}'. child_id: {} (status: {}). Use wait_for_child with this child_id to get the result. Agent responses typically take 30-120s — use the default timeout.", agent, child_id, status))
+                    Ok(format!("Task delegated to '{}'. child_id: {} (status: {}). Use wait_for_children with this child_id to get the result. Agent responses typically take 30-120s — use the default timeout.", agent, child_id, status))
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
-        "wait_for_child" => {
-            let ctx = context.ok_or("wait_for_child tool requires execution context")?;
-            let tool = DaemonWaitForChildTool::new(ctx.agent_name.clone());
+        "wait_for_children" => {
+            let ctx = context.ok_or("wait_for_children tool requires execution context")?;
+            let tool = DaemonWaitForChildrenTool::new(ctx.agent_name.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                    if status == "completed" {
-                        let response = result.get("result").and_then(|s| s.as_str()).unwrap_or("");
-                        Ok(response.to_string())
+                    if status == "completed" || status == "partial" {
+                        let mut lines = Vec::new();
+                        if let Some(results) = result.get("results").and_then(|r| r.as_array()) {
+                            for r in results {
+                                let child_id = r.get("child_id").and_then(|s| s.as_str()).unwrap_or("unknown");
+                                let child_status = r.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+                                if child_status == "completed" {
+                                    let from = r.get("from_agent").and_then(|s| s.as_str()).unwrap_or("unknown");
+                                    let response = r.get("result").and_then(|s| s.as_str()).unwrap_or("");
+                                    lines.push(format!("[{}] (from: {}) {}", child_id, from, response));
+                                } else {
+                                    let msg = r.get("message").and_then(|s| s.as_str()).unwrap_or("Not completed");
+                                    lines.push(format!("[{}] (status: {}) {}", child_id, child_status, msg));
+                                }
+                            }
+                        }
+                        Ok(format!("Results ({}):\n{}", status, lines.join("\n\n")))
                     } else {
-                        let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("Child task has not completed yet. Call wait_for_child again to keep waiting.");
-                        Ok(message.to_string())
+                        Err(format!("Unexpected status: {}", status))
                     }
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
@@ -1741,7 +1754,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonSpawnChildTool::new(agent_name.clone())));
-        agent.register_tool(Arc::new(DaemonWaitForChildTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonWaitForChildrenTool::new(agent_name.clone())));
     }
 
     // Apply LLM, memory, and agent_dir
