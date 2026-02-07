@@ -2592,7 +2592,7 @@ async fn handle_notify(
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
-    let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
+    // last_tool_calls no longer needed — trace persister handles tool call persistence
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
@@ -2671,9 +2671,7 @@ async fn handle_notify(
         match result {
             Ok(think_result) => {
                 // Capture tool_calls from native tool mode for persistence
-                if think_result.last_tool_calls.is_some() {
-                    last_tool_calls = think_result.last_tool_calls.clone();
-                }
+                // Tool calls persisted by spawn_tool_trace_persister — no need to capture here
 
                 // Accumulate token usage
                 if let Some(tokens) = think_result.tokens_in {
@@ -2837,9 +2835,8 @@ async fn handle_notify(
     // Store final response in conversation with duration, tool_calls, and token usage
     let cleaned_response = final_response.unwrap_or_default();
     let duration_ms = start_time.elapsed().as_millis() as i64;
-    let tool_calls_json = last_tool_calls
-        .as_ref()
-        .and_then(|tc| serde_json::to_string(tc).ok());
+    // Tool calls already persisted by spawn_tool_trace_persister — don't duplicate on final response
+    let tool_calls_json: Option<String> = None;
     let tokens_in = (total_tokens_in > 0).then_some(total_tokens_in as i64);
     let tokens_out = (total_tokens_out > 0).then_some(total_tokens_out as i64);
     let num_ctx_i64 = num_ctx.map(|n| n as i64);

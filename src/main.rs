@@ -488,10 +488,33 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
         String::new()
     };
 
+    let display_content = if msg.content.is_empty() {
+        if let Some(names) = extract_tool_names(msg) {
+            format!("\x1b[90m🔧 {}\x1b[0m", names.join(", "))
+        } else {
+            msg.content.clone()
+        }
+    } else if let Some(names) = extract_tool_names(msg) {
+        format!("{}\n\x1b[90m🔧 {}\x1b[0m", msg.content, names.join(", "))
+    } else {
+        msg.content.clone()
+    };
+
     format!(
         "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}\n{}\n\n",
-        msg.id, datetime, color, msg.from_agent, duration_str, ctx_str, msg.content
+        msg.id, datetime, color, msg.from_agent, duration_str, ctx_str, display_content
     )
+}
+
+/// Extract tool names from a message's tool_calls JSON, if present.
+fn extract_tool_names(msg: &anima::conversation::ConversationMessage) -> Option<Vec<String>> {
+    let json = msg.tool_calls.as_ref()?;
+    let calls: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let names: Vec<String> = calls
+        .iter()
+        .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(String::from))
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
 }
 
 /// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.
@@ -747,7 +770,7 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
     {
         println!("\x1b[90m--- Recent messages ---\x1b[0m");
         for msg in &recent_msgs {
-            if msg.from_agent == "tool" {
+            if msg.from_agent == "tool" || msg.from_agent == "recall" {
                 continue;
             }
             print!("{}", format_message_display(msg));
