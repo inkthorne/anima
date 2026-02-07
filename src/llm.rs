@@ -1168,6 +1168,7 @@ impl LLM for OllamaClient {
         let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new();
         let mut buffer = String::new();
+        let mut usage: Option<UsageInfo> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -1185,6 +1186,7 @@ impl LLM for OllamaClient {
 
                 if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
                     if parsed["done"].as_bool() == Some(true) {
+                        usage = parse_ollama_usage(&parsed);
                         break;
                     }
 
@@ -1227,7 +1229,7 @@ impl LLM for OllamaClient {
         Ok(LLMResponse {
             content,
             tool_calls,
-            usage: None,
+            usage,
         })
     }
 }
