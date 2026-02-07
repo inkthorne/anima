@@ -175,6 +175,8 @@ pub struct ThinkSection {
     pub checkpoint_interval: Option<usize>,
     /// Maximum number of checkpoint restarts before giving up (default: 5).
     pub max_checkpoints: Option<usize>,
+    /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h").
+    pub max_response_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

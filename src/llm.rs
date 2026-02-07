@@ -361,7 +361,10 @@ pub struct OpenAIClient {
 impl OpenAIClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
@@ -602,7 +605,10 @@ pub struct AnthropicClient {
 impl AnthropicClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
             auth: AnthropicAuth::ApiKey(api_key.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -612,7 +618,10 @@ impl AnthropicClient {
 
     pub fn with_bearer(token: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
             auth: AnthropicAuth::Bearer(token.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -934,7 +943,10 @@ impl OllamaClient {
         let base_url =
             std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
             base_url,
             model: "llama3".to_string(),
             thinking: None,

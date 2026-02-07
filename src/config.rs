@@ -193,6 +193,10 @@ pub struct ThinkSection {
     /// Maximum number of checkpoint restarts before giving up (default: 5).
     #[serde(default = "default_max_checkpoints")]
     pub max_checkpoints: usize,
+    /// Maximum wall-clock time for a single notify response. None = no limit (default).
+    /// Parsed as a duration string: "5m", "10m", "1h", etc.
+    #[serde(default)]
+    pub max_response_time: Option<String>,
 }
 
 impl Default for ThinkSection {
@@ -204,6 +208,7 @@ impl Default for ThinkSection {
             reflection: false,
             checkpoint_interval: None,
             max_checkpoints: default_max_checkpoints(),
+            max_response_time: None,
         }
     }
 }

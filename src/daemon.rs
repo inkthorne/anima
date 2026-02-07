@@ -979,6 +979,8 @@ pub struct DaemonConfig {
     pub checkpoint_interval: Option<usize>,
     /// Maximum number of checkpoint restarts (default: 5)
     pub max_checkpoints: Option<usize>,
+    /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h")
+    pub max_response_time: Option<String>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1079,6 +1081,7 @@ impl DaemonConfig {
             max_iterations: agent_dir.config.think.max_iterations,
             checkpoint_interval: agent_dir.config.think.checkpoint_interval,
             max_checkpoints: agent_dir.config.think.max_checkpoints,
+            max_response_time: agent_dir.config.think.max_response_time.clone(),
         })
     }
 }
@@ -1394,6 +1397,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.max_iterations,
                             config.checkpoint_interval,
                             config.max_checkpoints,
+                            config.max_response_time.as_deref(),
                         )
                         .await;
 
@@ -1479,6 +1483,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_max_iterations = config.max_iterations;
         let worker_checkpoint_interval = config.checkpoint_interval;
         let worker_max_checkpoints = config.max_checkpoints;
+        let worker_max_response_time = config.max_response_time.clone();
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1501,6 +1506,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_max_iterations,
                 worker_checkpoint_interval,
                 worker_max_checkpoints,
+                worker_max_response_time,
             )
             .await
         })
@@ -1941,6 +1947,7 @@ async fn agent_worker(
     max_iterations: Option<usize>,
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
+    max_response_time: Option<String>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2013,6 +2020,7 @@ async fn agent_worker(
                     max_iterations,
                     checkpoint_interval,
                     max_checkpoints,
+                    max_response_time.as_deref(),
                 )
                 .await;
             }
@@ -2518,6 +2526,7 @@ async fn handle_notify(
     max_iterations: Option<usize>,
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
+    max_response_time: Option<&str>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2640,7 +2649,23 @@ async fn handle_notify(
         }
     });
 
+    // Parse max_response_time from config
+    let response_deadline = max_response_time.and_then(parse_duration);
+
     loop {
+        // Check wall-clock time limit at each iteration boundary
+        if let Some(deadline) = response_deadline {
+            if start_time.elapsed() >= deadline {
+                logger.log(&format!(
+                    "[notify] Response time limit exceeded ({:?})", deadline
+                ));
+                final_response = Some(format!(
+                    "[Response terminated: exceeded time limit of {:?}]", deadline
+                ));
+                break;
+            }
+        }
+
         // Clear agent's internal history EACH iteration to avoid duplication.
         // think_with_options adds to self.history, and agent.rs injects self.history
         // BEFORE options.conversation_history (lines 655-660). Without clearing each
@@ -2672,11 +2697,35 @@ async fn handle_notify(
             while token_rx.recv().await.is_some() {}
         });
 
-        let mut agent_guard = agent.lock().await;
-        let result = agent_guard
-            .think_streaming_with_options(&current_message, options, token_tx)
-            .await;
-        drop(agent_guard); // Release lock before potential tool execution
+        // Apply per-LLM-call timeout if response deadline is set
+        let result = if let Some(deadline) = response_deadline {
+            let remaining = deadline.saturating_sub(start_time.elapsed());
+            let mut agent_guard = agent.lock().await;
+            match tokio::time::timeout(
+                remaining,
+                agent_guard.think_streaming_with_options(&current_message, options, token_tx),
+            ).await {
+                Ok(r) => { drop(agent_guard); r }
+                Err(_elapsed) => {
+                    drop(agent_guard);
+                    let _ = drain_handle.await;
+                    logger.log(&format!(
+                        "[notify] Response time limit exceeded ({:?})", deadline
+                    ));
+                    final_response = Some(format!(
+                        "[Response terminated: exceeded time limit of {:?}]", deadline
+                    ));
+                    break;
+                }
+            }
+        } else {
+            let mut agent_guard = agent.lock().await;
+            let r = agent_guard
+                .think_streaming_with_options(&current_message, options, token_tx)
+                .await;
+            drop(agent_guard);
+            r
+        };
 
         // Drain completes when token_tx is dropped
         let _ = drain_handle.await;
