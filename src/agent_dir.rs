@@ -179,12 +179,18 @@ pub struct ThinkSection {
     pub max_response_time: Option<String>,
 }
 
+fn default_mentions_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AgentSection {
     pub name: String,
     pub description: Option<String>,
     pub system_file: Option<PathBuf>,
     pub recall_file: Option<PathBuf>,
+    #[serde(default = "default_mentions_enabled")]
+    pub mentions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,6 +467,7 @@ pub fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), AgentDirErr
 name = "{name}"
 system_file = "system.md"
 recall_file = "recall.md"
+# mentions = true
 
 [llm]
 provider = "anthropic"
@@ -1325,6 +1332,24 @@ tools = true
         assert!(recall_content.contains("# Recall"));
         assert!(recall_content.contains("How Conversations Work"));
         assert!(recall_content.contains("Never @mention yourself"));
+    }
+
+    #[test]
+    fn test_mentions_default_true() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "", "");
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        assert!(agent_dir.config.agent.mentions);
+    }
+
+    #[test]
+    fn test_mentions_disabled() {
+        let dir = tempdir().unwrap();
+        write_config(dir.path(), "mentions = false\n", "");
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        assert!(!agent_dir.config.agent.mentions);
     }
 
     #[test]

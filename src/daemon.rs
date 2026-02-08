@@ -982,6 +982,8 @@ pub struct DaemonConfig {
     pub max_checkpoints: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h")
     pub max_response_time: Option<String>,
+    /// Whether outbound @mention forwarding is enabled (default: true)
+    pub mentions: bool,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1083,6 +1085,7 @@ impl DaemonConfig {
             checkpoint_interval: agent_dir.config.think.checkpoint_interval,
             max_checkpoints: agent_dir.config.think.max_checkpoints,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
+            mentions: agent_dir.config.agent.mentions,
         })
     }
 }
@@ -1401,6 +1404,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.checkpoint_interval,
                             config.max_checkpoints,
                             config.max_response_time.as_deref(),
+                            config.mentions,
                             &startup_shutdown,
                         )
                         .await;
@@ -1488,6 +1492,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_checkpoint_interval = config.checkpoint_interval;
         let worker_max_checkpoints = config.max_checkpoints;
         let worker_max_response_time = config.max_response_time.clone();
+        let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
         tokio::spawn(async move {
             agent_worker(
@@ -1512,6 +1517,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_checkpoint_interval,
                 worker_max_checkpoints,
                 worker_max_response_time,
+                worker_mentions,
                 worker_shutdown,
             )
             .await
@@ -1954,6 +1960,7 @@ async fn agent_worker(
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
     max_response_time: Option<String>,
+    mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
 ) {
     logger.log("[worker] Agent worker started");
@@ -2005,6 +2012,7 @@ async fn agent_worker(
                     recall_limit,
                     history_limit,
                     &task_store,
+                    mentions_enabled,
                     &shutdown,
                 )
                 .await;
@@ -2042,6 +2050,7 @@ async fn agent_worker(
                     checkpoint_interval,
                     max_checkpoints,
                     max_response_time.as_deref(),
+                    mentions_enabled,
                     &shutdown,
                 )
                 .await;
@@ -2064,6 +2073,7 @@ async fn agent_worker(
                         &logger,
                         recall_limit,
                         history_limit,
+                        mentions_enabled,
                         &shutdown,
                     )
                     .await;
@@ -2098,6 +2108,7 @@ async fn process_message_work(
     recall_limit: usize,
     history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
+    mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
 ) -> MessageWorkResult {
     let start_time = std::time::Instant::now();
@@ -2265,32 +2276,34 @@ async fn process_message_work(
                 ) {
                     Ok(response_msg_id) => {
                         // Parse @mentions from response and forward to other agents
-                        let mentions = crate::conversation::parse_mentions(&final_response);
-                        let valid_mentions: Vec<String> = mentions
-                            .into_iter()
-                            .filter(|m| m != agent_name && m != "user" && m != "all")
-                            .filter(|m| discovery::agent_exists(m))
-                            .collect();
+                        if mentions_enabled {
+                            let mentions = crate::conversation::parse_mentions(&final_response);
+                            let valid_mentions: Vec<String> = mentions
+                                .into_iter()
+                                .filter(|m| m != agent_name && m != "user" && m != "all")
+                                .filter(|m| discovery::agent_exists(m))
+                                .collect();
 
-                        if !valid_mentions.is_empty() {
-                            logger.log(&format!(
-                                "[worker] Forwarding to {} agents: {:?}",
-                                valid_mentions.len(),
-                                valid_mentions
-                            ));
+                            if !valid_mentions.is_empty() {
+                                logger.log(&format!(
+                                    "[worker] Forwarding to {} agents: {:?}",
+                                    valid_mentions.len(),
+                                    valid_mentions
+                                ));
 
-                            for mention in valid_mentions {
-                                // Add mentioned agent as participant
-                                let _ = store.add_participant(cname, &mention);
+                                for mention in valid_mentions {
+                                    // Add mentioned agent as participant
+                                    let _ = store.add_participant(cname, &mention);
 
-                                forward_notify_to_agent(
-                                    &mention,
-                                    cname,
-                                    response_msg_id,
-                                    0,
-                                    logger,
-                                )
-                                .await;
+                                    forward_notify_to_agent(
+                                        &mention,
+                                        cname,
+                                        response_msg_id,
+                                        0,
+                                        logger,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -2713,6 +2726,7 @@ async fn handle_notify(
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
     max_response_time: Option<&str>,
+    mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
 ) -> Response {
     // Track start time for response duration
@@ -3159,9 +3173,10 @@ async fn handle_notify(
             );
 
             // Parse @mentions from our response and forward to other agents
-            // Only forward if not paused and not at depth limit
-            let should_forward =
-                depth < MAX_MENTION_DEPTH && !store.is_paused(conv_id).unwrap_or(false);
+            // Only forward if mentions enabled, not paused, and not at depth limit
+            let should_forward = mentions_enabled
+                && depth < MAX_MENTION_DEPTH
+                && !store.is_paused(conv_id).unwrap_or(false);
 
             if should_forward {
                 // Parse @mentions from our response
@@ -3351,6 +3366,7 @@ async fn run_heartbeat(
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
     history_limit: usize,
+    mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
 ) {
     // Set current conversation for debug file naming
@@ -3494,36 +3510,38 @@ async fn run_heartbeat(
     }
 
     // 8. Parse @mentions from response and notify (reuse existing logic)
-    let mentions = crate::conversation::parse_mentions(&cleaned_response);
-    let valid_mentions: Vec<String> = mentions
-        .into_iter()
-        .filter(|m| m != agent_name && m != "user" && m != "all")
-        .filter(|m| discovery::agent_exists(m))
-        .collect();
+    if mentions_enabled {
+        let mentions = crate::conversation::parse_mentions(&cleaned_response);
+        let valid_mentions: Vec<String> = mentions
+            .into_iter()
+            .filter(|m| m != agent_name && m != "user" && m != "all")
+            .filter(|m| discovery::agent_exists(m))
+            .collect();
 
-    if !valid_mentions.is_empty() {
-        logger.log(&format!(
-            "[heartbeat] Notifying {} agents: {:?}",
-            valid_mentions.len(),
-            valid_mentions
-        ));
+        if !valid_mentions.is_empty() {
+            logger.log(&format!(
+                "[heartbeat] Notifying {} agents: {:?}",
+                valid_mentions.len(),
+                valid_mentions
+            ));
 
-        // Get the message ID we just stored
-        if let Ok(msgs) = store.get_messages(&conv_name, Some(1))
-            && let Some(last_msg) = msgs.last()
-        {
-            for mention in valid_mentions {
-                // Add mentioned agent as participant
-                let _ = store.add_participant(&conv_name, &mention);
+            // Get the message ID we just stored
+            if let Ok(msgs) = store.get_messages(&conv_name, Some(1))
+                && let Some(last_msg) = msgs.last()
+            {
+                for mention in valid_mentions {
+                    // Add mentioned agent as participant
+                    let _ = store.add_participant(&conv_name, &mention);
 
-                forward_notify_to_agent(
-                    &mention,
-                    &conv_name,
-                    last_msg.id,
-                    0, // Start at depth 0
-                    logger,
-                )
-                .await;
+                    forward_notify_to_agent(
+                        &mention,
+                        &conv_name,
+                        last_msg.id,
+                        0, // Start at depth 0
+                        logger,
+                    )
+                    .await;
+                }
             }
         }
     }
