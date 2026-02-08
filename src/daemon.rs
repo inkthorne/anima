@@ -1376,6 +1376,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             notification.conv_name, notification.message_id
                         ));
 
+                        // Startup processing — no shutdown signal yet
+                        let startup_shutdown = Arc::new(tokio::sync::Notify::new());
                         let response = handle_notify(
                             &notification.conv_name,
                             notification.message_id,
@@ -1399,6 +1401,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.checkpoint_interval,
                             config.max_checkpoints,
                             config.max_response_time.as_deref(),
+                            &startup_shutdown,
                         )
                         .await;
 
@@ -1485,6 +1488,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_checkpoint_interval = config.checkpoint_interval;
         let worker_max_checkpoints = config.max_checkpoints;
         let worker_max_response_time = config.max_response_time.clone();
+        let worker_shutdown = shutdown.clone();
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1508,6 +1512,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_checkpoint_interval,
                 worker_max_checkpoints,
                 worker_max_response_time,
+                worker_shutdown,
             )
             .await
         })
@@ -1949,10 +1954,24 @@ async fn agent_worker(
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
     max_response_time: Option<String>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) {
     logger.log("[worker] Agent worker started");
 
-    while let Some(work) = work_rx.recv().await {
+    loop {
+        let work = tokio::select! {
+            item = work_rx.recv() => {
+                match item {
+                    Some(w) => w,
+                    None => break, // channel closed
+                }
+            }
+            _ = shutdown.notified() => {
+                logger.log("[worker] Shutdown signal received, stopping");
+                break;
+            }
+        };
+
         // Clear agent history before processing ANY work item
         // This prevents context bleed between different requests
         {
@@ -1986,6 +2005,7 @@ async fn agent_worker(
                     recall_limit,
                     history_limit,
                     &task_store,
+                    &shutdown,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2022,6 +2042,7 @@ async fn agent_worker(
                     checkpoint_interval,
                     max_checkpoints,
                     max_response_time.as_deref(),
+                    &shutdown,
                 )
                 .await;
             }
@@ -2043,6 +2064,7 @@ async fn agent_worker(
                         &logger,
                         recall_limit,
                         history_limit,
+                        &shutdown,
                     )
                     .await;
                 } else {
@@ -2076,6 +2098,7 @@ async fn process_message_work(
     recall_limit: usize,
     history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
+    shutdown: &Arc<tokio::sync::Notify>,
 ) -> MessageWorkResult {
     let start_time = std::time::Instant::now();
 
@@ -2159,42 +2182,55 @@ async fn process_message_work(
         trace_rx,
     );
 
-    // Process with or without streaming
-    let (final_response, _tool_calls) = if use_native_tools {
-        // Native tool mode with optional streaming
-        let result = process_native_tool_mode(
-            &final_user_content,
-            recall_result.external_tools,
-            token_tx,
-            agent,
-            system_prompt,
-            semantic_memory,
-            embedding_client,
-            logger,
-            conversation_history,
-            Some(trace_tx.clone()),
-        )
-        .await;
-        (result.response, result.tool_calls)
-    } else {
-        // JSON-block mode with optional streaming (no native tool_calls)
-        let response = process_json_block_mode(
-            &final_user_content,
-            &recall_result.relevant_tools,
-            token_tx,
-            agent,
-            system_prompt,
-            semantic_memory,
-            embedding_client,
-            tool_registry,
-            logger,
-            &tool_context,
-            conversation_history,
-            None, // checkpoint_interval — not used for direct messages
-            None, // max_checkpoints
-        )
-        .await;
-        (response, None)
+    // Process with or without streaming, with shutdown awareness
+    let llm_future = async {
+        if use_native_tools {
+            // Native tool mode with optional streaming
+            let result = process_native_tool_mode(
+                &final_user_content,
+                recall_result.external_tools,
+                token_tx,
+                agent,
+                system_prompt,
+                semantic_memory,
+                embedding_client,
+                logger,
+                conversation_history,
+                Some(trace_tx.clone()),
+            )
+            .await;
+            (result.response, result.tool_calls)
+        } else {
+            // JSON-block mode with optional streaming (no native tool_calls)
+            let response = process_json_block_mode(
+                &final_user_content,
+                &recall_result.relevant_tools,
+                token_tx,
+                agent,
+                system_prompt,
+                semantic_memory,
+                embedding_client,
+                tool_registry,
+                logger,
+                &tool_context,
+                conversation_history,
+                None, // checkpoint_interval — not used for direct messages
+                None, // max_checkpoints
+            )
+            .await;
+            (response, None)
+        }
+    };
+
+    let (final_response, _tool_calls) = tokio::select! {
+        result = llm_future => result,
+        _ = shutdown.notified() => {
+            logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
+            return MessageWorkResult {
+                response: String::new(),
+                error: Some("Shutdown during LLM call".to_string()),
+            };
+        }
     };
 
     // Wait for incremental tool trace storage to complete
@@ -2227,8 +2263,36 @@ async fn process_message_work(
                     Some(duration_ms),
                     None,
                 ) {
-                    Ok(_response_msg_id) => {
-                        // Cursor is anchored at cold start; no update needed here
+                    Ok(response_msg_id) => {
+                        // Parse @mentions from response and forward to other agents
+                        let mentions = crate::conversation::parse_mentions(&final_response);
+                        let valid_mentions: Vec<String> = mentions
+                            .into_iter()
+                            .filter(|m| m != agent_name && m != "user" && m != "all")
+                            .filter(|m| discovery::agent_exists(m))
+                            .collect();
+
+                        if !valid_mentions.is_empty() {
+                            logger.log(&format!(
+                                "[worker] Forwarding to {} agents: {:?}",
+                                valid_mentions.len(),
+                                valid_mentions
+                            ));
+
+                            for mention in valid_mentions {
+                                // Add mentioned agent as participant
+                                let _ = store.add_participant(cname, &mention);
+
+                                forward_notify_to_agent(
+                                    &mention,
+                                    cname,
+                                    response_msg_id,
+                                    0,
+                                    logger,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Err(e) => {
                         logger.log(&format!(
@@ -2649,6 +2713,7 @@ async fn handle_notify(
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
     max_response_time: Option<&str>,
+    shutdown: &Arc<tokio::sync::Notify>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2820,34 +2885,50 @@ async fn handle_notify(
             while token_rx.recv().await.is_some() {}
         });
 
-        // Apply per-LLM-call timeout if response deadline is set
-        let result = if let Some(deadline) = response_deadline {
-            let remaining = deadline.saturating_sub(start_time.elapsed());
-            let mut agent_guard = agent.lock().await;
-            match tokio::time::timeout(
-                remaining,
-                agent_guard.think_streaming_with_options(&current_message, options, token_tx),
-            ).await {
-                Ok(r) => { drop(agent_guard); r }
-                Err(_elapsed) => {
-                    drop(agent_guard);
-                    let _ = drain_handle.await;
-                    logger.log(&format!(
-                        "[notify] Response time limit exceeded ({:?})", deadline
-                    ));
-                    final_response = Some(format!(
-                        "[Response terminated: exceeded time limit of {:?}]", deadline
-                    ));
-                    break;
+        // Apply per-LLM-call timeout if response deadline is set, with shutdown awareness
+        let llm_future = async {
+            if let Some(deadline) = response_deadline {
+                let remaining = deadline.saturating_sub(start_time.elapsed());
+                let mut agent_guard = agent.lock().await;
+                match tokio::time::timeout(
+                    remaining,
+                    agent_guard.think_streaming_with_options(&current_message, options, token_tx),
+                ).await {
+                    Ok(r) => { drop(agent_guard); Ok(r) }
+                    Err(_elapsed) => {
+                        drop(agent_guard);
+                        Err(format!("[Response terminated: exceeded time limit of {:?}]", deadline))
+                    }
+                }
+            } else {
+                let mut agent_guard = agent.lock().await;
+                let r = agent_guard
+                    .think_streaming_with_options(&current_message, options, token_tx)
+                    .await;
+                drop(agent_guard);
+                Ok(r)
+            }
+        };
+
+        let result = tokio::select! {
+            r = llm_future => {
+                match r {
+                    Ok(think_result) => think_result,
+                    Err(timeout_msg) => {
+                        let _ = drain_handle.await;
+                        logger.log(&format!("[notify] Response time limit exceeded"));
+                        final_response = Some(timeout_msg);
+                        break;
+                    }
                 }
             }
-        } else {
-            let mut agent_guard = agent.lock().await;
-            let r = agent_guard
-                .think_streaming_with_options(&current_message, options, token_tx)
-                .await;
-            drop(agent_guard);
-            r
+            _ = shutdown.notified() => {
+                logger.log("[worker] Shutdown during LLM call in handle_notify, aborting");
+                let _ = drain_handle.await;
+                return Response::Error {
+                    message: "Shutdown during LLM call".to_string(),
+                };
+            }
         };
 
         // Drain completes when token_tx is dropped
@@ -3270,6 +3351,7 @@ async fn run_heartbeat(
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
     history_limit: usize,
+    shutdown: &Arc<tokio::sync::Notify>,
 ) {
     // Set current conversation for debug file naming
     {
@@ -3358,18 +3440,30 @@ async fn run_heartbeat(
         ..Default::default()
     };
 
-    let mut agent_guard = agent.lock().await;
-    let result = match agent_guard
-        .think_with_options(&heartbeat_prompt, options)
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            logger.log(&format!("[heartbeat] Think error: {}", e));
+    let llm_future = async {
+        let mut agent_guard = agent.lock().await;
+        let r = agent_guard
+            .think_with_options(&heartbeat_prompt, options)
+            .await;
+        drop(agent_guard);
+        r
+    };
+
+    let result = tokio::select! {
+        r = llm_future => {
+            match r {
+                Ok(r) => r,
+                Err(e) => {
+                    logger.log(&format!("[heartbeat] Think error: {}", e));
+                    return;
+                }
+            }
+        }
+        _ = shutdown.notified() => {
+            logger.log("[worker] Shutdown during LLM call in run_heartbeat, aborting");
             return;
         }
     };
-    drop(agent_guard);
 
     // 6. Process response: strip thinking tags, extract memories
     let without_thinking = strip_thinking_tags(&result.response);
