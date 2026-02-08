@@ -344,11 +344,11 @@ pub struct ThinkResult {
     /// Each entry contains the assistant's tool call and the tool's result.
     /// Used for persisting the full conversation to history.
     pub tool_trace: Vec<ToolExecution>,
-    /// Total input tokens used across all LLM calls in this think operation
+    /// Input tokens from the last LLM call in this think operation
     pub tokens_in: Option<u32>,
-    /// Total output tokens used across all LLM calls in this think operation
+    /// Output tokens from the last LLM call in this think operation
     pub tokens_out: Option<u32>,
-    /// Accumulated prompt eval duration in nanoseconds (Ollama-specific).
+    /// Prompt eval duration from the last LLM call in nanoseconds (Ollama-specific).
     /// When KV caching is active, this drops significantly.
     pub prompt_eval_duration_ns: Option<u64>,
     /// Wall-clock duration of the last LLM call in milliseconds.
@@ -1165,10 +1165,9 @@ impl Agent {
         let mut tool_names_used: Vec<String> = Vec::new();
         let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
-        let mut total_tokens_in: u32 = 0;
-        let mut total_tokens_out: u32 = 0;
-        let mut total_prompt_eval_ns: u64 = 0;
-        let mut has_token_data = false;
+        let mut last_tokens_in: Option<u32> = None;
+        let mut last_tokens_out: Option<u32> = None;
+        let mut last_prompt_eval_ns: Option<u64> = None;
 
         // Checkpoint support: when checkpoint_interval is set, the inner loop runs for
         // checkpoint_interval iterations, then builds a summary and restarts with fresh context.
@@ -1203,12 +1202,9 @@ impl Agent {
                 .await;
 
                 if let Some(ref usage) = response.usage {
-                    total_tokens_in += usage.prompt_tokens;
-                    total_tokens_out += usage.completion_tokens;
-                    if let Some(ns) = usage.prompt_eval_duration_ns {
-                        total_prompt_eval_ns += ns;
-                    }
-                    has_token_data = true;
+                    last_tokens_in = Some(usage.prompt_tokens);
+                    last_tokens_out = Some(usage.completion_tokens);
+                    last_prompt_eval_ns = usage.prompt_eval_duration_ns;
                 }
 
                 if response.tool_calls.is_empty() {
@@ -1234,17 +1230,15 @@ impl Agent {
                         final_response
                     };
 
-                    let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
-                    let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
                     return Ok(ThinkResult {
                         response: response_text,
                         tools_used: !tool_names_used.is_empty(),
                         tool_names: tool_names_used,
                         last_tool_calls,
                         tool_trace,
-                        tokens_in,
-                        tokens_out,
-                        prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+                        tokens_in: last_tokens_in,
+                        tokens_out: last_tokens_out,
+                        prompt_eval_duration_ns: last_prompt_eval_ns,
                         duration_ms: Some(llm_duration_ms),
                     });
                 }
@@ -1305,22 +1299,20 @@ impl Agent {
                 tool_call_id: None,
                 tool_calls: None,
             });
-            // tool_trace and token counters keep accumulating across checkpoints
+            // tool_trace keeps accumulating across checkpoints; token counters hold last-call values
         }
 
         self.trim_history();
         let total_budget = checkpoint_interval * max_checkpoint_loops;
-        let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
-        let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
         Ok(ThinkResult {
             response: format!("[Max iterations reached: {}]", total_budget),
             tools_used: !tool_names_used.is_empty(),
             tool_names: tool_names_used,
             last_tool_calls,
             tool_trace,
-            tokens_in,
-            tokens_out,
-            prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+            tokens_in: last_tokens_in,
+            tokens_out: last_tokens_out,
+            prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
         })
     }
@@ -1402,10 +1394,9 @@ impl Agent {
         let mut tool_names_used: Vec<String> = Vec::new();
         let mut last_tool_calls: Option<Vec<crate::llm::ToolCall>> = None;
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
-        let mut total_tokens_in: u32 = 0;
-        let mut total_tokens_out: u32 = 0;
-        let mut total_prompt_eval_ns: u64 = 0;
-        let mut has_token_data = false;
+        let mut last_tokens_in: Option<u32> = None;
+        let mut last_tokens_out: Option<u32> = None;
+        let mut last_prompt_eval_ns: Option<u64> = None;
 
         // Checkpoint support (mirrors think_with_options_inner)
         let checkpoint_interval = options.checkpoint_interval.unwrap_or(options.max_iterations);
@@ -1439,12 +1430,9 @@ impl Agent {
                 .await;
 
                 if let Some(ref usage) = response.usage {
-                    total_tokens_in += usage.prompt_tokens;
-                    total_tokens_out += usage.completion_tokens;
-                    if let Some(ns) = usage.prompt_eval_duration_ns {
-                        total_prompt_eval_ns += ns;
-                    }
-                    has_token_data = true;
+                    last_tokens_in = Some(usage.prompt_tokens);
+                    last_tokens_out = Some(usage.completion_tokens);
+                    last_prompt_eval_ns = usage.prompt_eval_duration_ns;
                 }
 
                 if response.tool_calls.is_empty() {
@@ -1468,9 +1456,9 @@ impl Agent {
                         tool_names: tool_names_used,
                         last_tool_calls,
                         tool_trace,
-                        tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
-                        tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
-                        prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+                        tokens_in: last_tokens_in,
+                        tokens_out: last_tokens_out,
+                        prompt_eval_duration_ns: last_prompt_eval_ns,
                         duration_ms: Some(llm_duration_ms),
                     });
                 }
@@ -1533,9 +1521,9 @@ impl Agent {
             tool_names: tool_names_used,
             last_tool_calls,
             tool_trace,
-            tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
-            tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
-            prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+            tokens_in: last_tokens_in,
+            tokens_out: last_tokens_out,
+            prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
         })
     }

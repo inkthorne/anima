@@ -2832,9 +2832,9 @@ async fn handle_notify(
     #[allow(unused_assignments)]
     let mut final_response: Option<String> = None;
     // last_tool_calls no longer needed — trace persister handles tool call persistence
-    let mut total_tokens_in: u32 = 0;
-    let mut total_tokens_out: u32 = 0;
-    let mut total_prompt_eval_ns: u64 = 0;
+    let mut last_tokens_in: Option<u32> = None;
+    let mut last_tokens_out: Option<u32> = None;
+    let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_duration_ms: Option<u64> = None;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut json_checkpoint_count: usize = 0;
@@ -2974,16 +2974,10 @@ async fn handle_notify(
 
                 last_duration_ms = think_result.duration_ms;
 
-                // Accumulate token usage
-                if let Some(tokens) = think_result.tokens_in {
-                    total_tokens_in += tokens;
-                }
-                if let Some(tokens) = think_result.tokens_out {
-                    total_tokens_out += tokens;
-                }
-                if let Some(ns) = think_result.prompt_eval_duration_ns {
-                    total_prompt_eval_ns += ns;
-                }
+                // Capture last-call token usage
+                last_tokens_in = think_result.tokens_in;
+                last_tokens_out = think_result.tokens_out;
+                last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
 
                 // Per-iteration stats for JSON-block intermediate messages
                 let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
@@ -3151,10 +3145,10 @@ async fn handle_notify(
     let duration_ms = last_duration_ms.map(|d| d as i64);
     // Tool calls already persisted by spawn_tool_trace_persister — don't duplicate on final response
     let tool_calls_json: Option<String> = None;
-    let tokens_in = (total_tokens_in > 0).then_some(total_tokens_in as i64);
-    let tokens_out = (total_tokens_out > 0).then_some(total_tokens_out as i64);
+    let tokens_in = last_tokens_in.map(|t| t as i64);
+    let tokens_out = last_tokens_out.map(|t| t as i64);
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
-    let prompt_eval_ns_i64 = (total_prompt_eval_ns > 0).then_some(total_prompt_eval_ns as i64);
+    let prompt_eval_ns_i64 = last_prompt_eval_ns.map(|t| t as i64);
 
     // Flush tool trace channel — drop sender so consumer finishes
     drop(tool_trace_tx);
