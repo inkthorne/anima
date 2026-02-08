@@ -2427,6 +2427,7 @@ async fn process_json_block_mode(
     let mut json_checkpoint_count: usize = 0;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut tool_call_count = 0;
+    #[allow(unused_assignments)]
     let mut last_duration_ms: Option<u64> = None;
 
     loop {

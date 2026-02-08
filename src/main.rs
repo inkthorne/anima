@@ -530,12 +530,14 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
 
     let display_content = if msg.content.is_empty() {
         if let Some(names) = extract_tool_names(msg) {
-            format!("\x1b[90m🛠️ {}\x1b[0m", names.join(", "))
+            let tools = names.iter().map(|n| format!("🛠️ {}", n)).collect::<Vec<_>>().join("\n");
+            format!("\x1b[90m{}\x1b[0m", tools)
         } else {
             msg.content.clone()
         }
     } else if let Some(names) = extract_tool_names(msg) {
-        format!("{}\n\x1b[90m🛠️ {}\x1b[0m", msg.content, names.join(", "))
+        let tools = names.iter().map(|n| format!("🛠️ {}", n)).collect::<Vec<_>>().join("\n");
+        format!("{}\n\x1b[90m{}\x1b[0m", msg.content, tools)
     } else {
         msg.content.clone()
     };
@@ -543,15 +545,89 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
     format!("{}\n{}\n\n", header, display_content)
 }
 
-/// Extract tool names from a message's tool_calls JSON, if present.
+/// Extract tool call summaries from a message's tool_calls JSON, if present.
 fn extract_tool_names(msg: &anima::conversation::ConversationMessage) -> Option<Vec<String>> {
     let json = msg.tool_calls.as_ref()?;
     let calls: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
-    let names: Vec<String> = calls
+    let summaries: Vec<String> = calls
         .iter()
-        .filter_map(|c| c.get("name").and_then(|n| n.as_str()).map(String::from))
+        .filter_map(|c| {
+            let name = c.get("name").and_then(|n| n.as_str())?;
+            let args = c.get("arguments")
+                .and_then(|a| {
+                    if a.is_string() {
+                        serde_json::from_str(a.as_str().unwrap()).ok()
+                    } else {
+                        Some(a.clone())
+                    }
+                })
+                .unwrap_or(serde_json::Value::Null);
+            Some(tool_call_summary(name, &args))
+        })
         .collect();
-    if names.is_empty() { None } else { Some(names) }
+    if summaries.is_empty() { None } else { Some(summaries) }
+}
+
+/// Produce a short summary string for a tool call, e.g. "shell: ls -la ~/dev".
+fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
+    let truncate = |s: &str, max: usize| -> String {
+        if s.len() <= max {
+            s.to_string()
+        } else {
+            format!("{}...", &s[..s.floor_char_boundary(max)])
+        }
+    };
+
+    let detail = match name {
+        "shell" | "safe_shell" => {
+            args.get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| s.lines().next().unwrap_or(s))
+                .map(|s| truncate(s, 60))
+        }
+        "read_file" | "write_file" => {
+            args.get("path").and_then(|v| v.as_str()).map(String::from)
+        }
+        "http" => {
+            let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
+            args.get("url").and_then(|v| v.as_str()).map(|url| format!("{} {}", method, url))
+        }
+        "send_message" => {
+            args.get("to").and_then(|v| v.as_str()).map(|to| format!("@{}", to))
+        }
+        "spawn_child" => {
+            args.get("agent").and_then(|v| v.as_str()).map(String::from)
+        }
+        "wait_for_children" => {
+            args.get("child_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| format!("{} children", arr.len()))
+        }
+        "claude_code" => {
+            args.get("task").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
+        }
+        "remember" => {
+            args.get("content").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
+        }
+        "list_agents" => None,
+        "add" => {
+            let a = args.get("a").and_then(|v| v.as_f64());
+            let b = args.get("b").and_then(|v| v.as_f64());
+            match (a, b) {
+                (Some(a), Some(b)) => Some(format!("{} + {}", a, b)),
+                _ => None,
+            }
+        }
+        "echo" => {
+            args.get("message").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
+        }
+        _ => None,
+    };
+
+    match detail {
+        Some(d) => format!("{}: {}", name, d),
+        None => name.to_string(),
+    }
 }
 
 /// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.
