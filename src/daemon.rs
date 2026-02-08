@@ -157,6 +157,7 @@ pub struct MessageWorkResult {
 struct NativeToolModeResult {
     response: String,
     tool_calls: Option<Vec<crate::llm::ToolCall>>,
+    duration_ms: Option<u64>,
 }
 
 /// Expand injection directives in always.md content.
@@ -554,6 +555,7 @@ fn inject_recall_into_history(
 fn spawn_tool_trace_persister(
     conv_name: Option<String>,
     agent_name: String,
+    num_ctx: Option<u32>,
     logger: Arc<AgentLogger>,
     trace_rx: tokio::sync::mpsc::Receiver<crate::agent::ToolExecution>,
 ) -> tokio::task::JoinHandle<()> {
@@ -572,12 +574,18 @@ fn spawn_tool_trace_persister(
                 return;
             }
         };
+        let num_ctx_i64 = num_ctx.map(|n| n as i64);
         while let Some(exec) = trace_rx.recv().await {
             let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
             let content = exec.content.as_deref().unwrap_or("");
-            if let Err(e) = store.add_message_with_tool_calls(
-                &cname, &agent_name, content, &[], None,
+            let tokens_in = exec.iter_tokens_in.map(|t| t as i64);
+            let tokens_out = exec.iter_tokens_out.map(|t| t as i64);
+            let eval_ns = exec.iter_prompt_eval_ns.map(|t| t as i64);
+            if let Err(e) = store.add_message_with_tokens(
+                &cname, &agent_name, content, &[],
+                exec.iter_duration_ms.map(|d| d as i64),
                 tool_calls_json.as_deref(),
+                tokens_in, tokens_out, num_ctx_i64, eval_ns,
             ) {
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
@@ -2111,8 +2119,6 @@ async fn process_message_work(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
 ) -> MessageWorkResult {
-    let start_time = std::time::Instant::now();
-
     // Set current conversation for debug file naming
     {
         let mut agent_guard = agent.lock().await;
@@ -2189,6 +2195,7 @@ async fn process_message_work(
     let trace_handle = spawn_tool_trace_persister(
         conv_name.map(|s| s.to_string()),
         agent_name.to_string(),
+        None, // num_ctx not available in process_message_work path
         logger.clone(),
         trace_rx,
     );
@@ -2210,10 +2217,10 @@ async fn process_message_work(
                 Some(trace_tx.clone()),
             )
             .await;
-            (result.response, result.tool_calls)
+            (result.response, result.tool_calls, result.duration_ms)
         } else {
             // JSON-block mode with optional streaming (no native tool_calls)
-            let response = process_json_block_mode(
+            let (response, duration_ms) = process_json_block_mode(
                 &final_user_content,
                 &recall_result.relevant_tools,
                 token_tx,
@@ -2229,11 +2236,11 @@ async fn process_message_work(
                 None, // max_checkpoints
             )
             .await;
-            (response, None)
+            (response, None, duration_ms)
         }
     };
 
-    let (final_response, _tool_calls) = tokio::select! {
+    let (final_response, _tool_calls, last_duration_ms) = tokio::select! {
         result = llm_future => result,
         _ = shutdown.notified() => {
             logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
@@ -2250,7 +2257,7 @@ async fn process_message_work(
 
     // Store response in conversation if conv_name was provided
     if let Some(cname) = conv_name {
-        let duration_ms = start_time.elapsed().as_millis() as i64;
+        let duration_ms = last_duration_ms.map(|d| d as i64);
         match ConversationStore::init() {
             Ok(store) => {
                 // Store recall AFTER response for persistence (but recall was already injected in memory)
@@ -2271,7 +2278,7 @@ async fn process_message_work(
                     agent_name,
                     &final_response,
                     &[],
-                    Some(duration_ms),
+                    duration_ms,
                     None,
                 ) {
                     Ok(response_msg_id) => {
@@ -2356,7 +2363,7 @@ async fn process_native_tool_mode(
         ..Default::default()
     };
 
-    let (result, tool_calls) = if let Some(tx) = token_tx {
+    let (result, tool_calls, duration_ms) = if let Some(tx) = token_tx {
         // Streaming mode - now returns ThinkResult with tool_calls
         let agent_clone = agent.clone();
         let content_clone = content.to_string();
@@ -2369,16 +2376,16 @@ async fn process_native_tool_mode(
         });
 
         match handle.await {
-            Ok(Ok(result)) => (result.response, result.last_tool_calls),
-            Ok(Err(e)) => (format!("Error: {}", e), None),
-            Err(e) => (format!("Error: task panicked: {}", e), None),
+            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.duration_ms),
+            Ok(Err(e)) => (format!("Error: {}", e), None, None),
+            Err(e) => (format!("Error: task panicked: {}", e), None, None),
         }
     } else {
         // Non-streaming mode - can capture tool_calls
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.last_tool_calls),
-            Err(e) => (format!("Error: {}", e), None),
+            Ok(result) => (result.response, result.last_tool_calls, result.duration_ms),
+            Err(e) => (format!("Error: {}", e), None, None),
         }
     };
 
@@ -2392,6 +2399,7 @@ async fn process_native_tool_mode(
     NativeToolModeResult {
         response: after_remember,
         tool_calls,
+        duration_ms,
     }
 }
 
@@ -2411,7 +2419,7 @@ async fn process_json_block_mode(
     conversation_history: Vec<ChatMessage>,
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
-) -> String {
+) -> (String, Option<u64>) {
     let mut current_message = content.to_string();
     let max_tool_calls = checkpoint_interval.unwrap_or(10);
     let use_checkpoints = checkpoint_interval.is_some();
@@ -2419,6 +2427,7 @@ async fn process_json_block_mode(
     let mut json_checkpoint_count: usize = 0;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut tool_call_count = 0;
+    let mut last_duration_ms: Option<u64> = None;
 
     loop {
         let options = ThinkOptions {
@@ -2489,9 +2498,12 @@ async fn process_json_block_mode(
             }
 
             match handle.await {
-                Ok(Ok(result)) => result.response,
-                Ok(Err(e)) => return format!("Error: {}", e),
-                Err(e) => return format!("Error: task panicked: {}", e),
+                Ok(Ok(result)) => {
+                    last_duration_ms = result.duration_ms;
+                    result.response
+                }
+                Ok(Err(e)) => return (format!("Error: {}", e), None),
+                Err(e) => return (format!("Error: task panicked: {}", e), None),
             }
         } else {
             // Non-streaming mode
@@ -2500,8 +2512,11 @@ async fn process_json_block_mode(
                 .think_with_options(&current_message, options)
                 .await
             {
-                Ok(result) => result.response,
-                Err(e) => return format!("Error: {}", e),
+                Ok(result) => {
+                    last_duration_ms = result.duration_ms;
+                    result.response
+                }
+                Err(e) => return (format!("Error: {}", e), None),
             }
         };
 
@@ -2523,7 +2538,7 @@ async fn process_json_block_mode(
                 json_checkpoint_count += 1;
                 if json_checkpoint_count > json_max_checkpoints {
                     logger.tool("[worker] Max checkpoints exhausted, stopping");
-                    return cleaned_response;
+                    return (cleaned_response, last_duration_ms);
                 }
                 let summary = crate::agent::build_checkpoint_summary(
                     &checkpoint_trace, json_checkpoint_count,
@@ -2537,7 +2552,7 @@ async fn process_json_block_mode(
                 continue;
             } else if !use_checkpoints && tool_call_count > max_tool_calls {
                 logger.tool("[worker] Max tool calls reached, stopping");
-                return cleaned_response;
+                return (cleaned_response, last_duration_ms);
             }
 
             logger.tool(&format!(
@@ -2576,7 +2591,7 @@ async fn process_json_block_mode(
                 current_message.push_str(&format!("\n\n---\n{}", nudge));
             }
         } else {
-            return cleaned_response;
+            return (cleaned_response, last_duration_ms);
         }
     }
 }
@@ -2819,9 +2834,11 @@ async fn handle_notify(
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
     let mut total_prompt_eval_ns: u64 = 0;
+    let mut last_duration_ms: Option<u64> = None;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut json_checkpoint_count: usize = 0;
     let json_max_checkpoints = max_checkpoints.unwrap_or(5);
+    let mut agent_error: Option<String> = None;
 
     // Channel for incremental tool trace persistence (native tool mode)
     let (tool_trace_tx, trace_rx) =
@@ -2829,6 +2846,7 @@ async fn handle_notify(
     let trace_handle = spawn_tool_trace_persister(
         Some(conv_id.to_string()),
         agent_name.to_string(),
+        num_ctx,
         logger.clone(),
         trace_rx,
     );
@@ -2953,6 +2971,8 @@ async fn handle_notify(
                 // Capture tool_calls from native tool mode for persistence
                 // Tool calls persisted by spawn_tool_trace_persister — no need to capture here
 
+                last_duration_ms = think_result.duration_ms;
+
                 // Accumulate token usage
                 if let Some(tokens) = think_result.tokens_in {
                     total_tokens_in += tokens;
@@ -2963,6 +2983,12 @@ async fn handle_notify(
                 if let Some(ns) = think_result.prompt_eval_duration_ns {
                     total_prompt_eval_ns += ns;
                 }
+
+                // Per-iteration stats for JSON-block intermediate messages
+                let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
+                let iter_tokens_out = think_result.tokens_out.map(|t| t as i64);
+                let iter_eval_ns = think_result.prompt_eval_duration_ns.map(|t| t as i64);
+                let num_ctx_i64 = num_ctx.map(|n| n as i64);
 
                 // Strip thinking tags and extract [REMEMBER: ...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
@@ -3021,8 +3047,11 @@ async fn handle_notify(
                     // Use after_remember (not cleaned_response) to preserve the tool call JSON block
                     // so the model can see what it called in conversation history
                     if !after_remember.trim().is_empty() {
-                        if let Err(e) = store.add_message(conv_id, agent_name, &after_remember, &[])
-                        {
+                        if let Err(e) = store.add_message_with_tokens(
+                            conv_id, agent_name, &after_remember, &[],
+                            think_result.duration_ms.map(|d| d as i64), None,
+                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
+                        ) {
                             logger.log(&format!(
                                 "[notify] Failed to store intermediate response: {}",
                                 e
@@ -3107,10 +3136,8 @@ async fn handle_notify(
                 // Store error in conversation so user can see it via chat view
                 let error_msg = format!("[Error: {}]", e);
                 let _ = store.add_message(conv_id, agent_name, &error_msg, &[]);
-                pause_watcher.abort();
-                return Response::Error {
-                    message: e.to_string(),
-                };
+                agent_error = Some(e.to_string());
+                break;
             }
         }
     }
@@ -3120,7 +3147,7 @@ async fn handle_notify(
 
     // Store final response in conversation with duration, tool_calls, and token usage
     let cleaned_response = final_response.unwrap_or_default();
-    let duration_ms = start_time.elapsed().as_millis() as i64;
+    let duration_ms = last_duration_ms.map(|d| d as i64);
     // Tool calls already persisted by spawn_tool_trace_persister — don't duplicate on final response
     let tool_calls_json: Option<String> = None;
     let tokens_in = (total_tokens_in > 0).then_some(total_tokens_in as i64);
@@ -3131,6 +3158,19 @@ async fn handle_notify(
     // Flush tool trace channel — drop sender so consumer finishes
     drop(tool_trace_tx);
     let _ = trace_handle.await;
+
+    // Stamp stats on intermediate messages now that persister has flushed
+    if tokens_in.is_some() || tokens_out.is_some() {
+        let _ = store.stamp_unstamped_messages(
+            conv_id, agent_name, tokens_in, tokens_out, num_ctx_i64, prompt_eval_ns_i64,
+        );
+    }
+
+    // If we broke out due to an error, return after flushing persister + stamping
+    if let Some(err_msg) = agent_error {
+        pause_watcher.abort();
+        return Response::Error { message: err_msg };
+    }
 
     // Store recall AFTER response for persistence (but recall was already injected in memory)
     // This positions recall in DB right before the response, preserving context for future turns
@@ -3150,7 +3190,7 @@ async fn handle_notify(
         agent_name,
         &cleaned_response,
         &[],
-        Some(duration_ms),
+        duration_ms,
         tool_calls_json.as_deref(),
         tokens_in,
         tokens_out,
@@ -3160,7 +3200,7 @@ async fn handle_notify(
         Ok(response_msg_id) => {
             logger.log(&format!(
                 "[notify] Stored response as msg_id={} ({}ms)",
-                response_msg_id, duration_ms
+                response_msg_id, duration_ms.unwrap_or(0)
             ));
 
             // Cursor is anchored at cold start; no update needed here.

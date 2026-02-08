@@ -483,8 +483,9 @@ async fn connect_to_agent(agent: &str) -> Result<SocketApi, Box<dyn std::error::
 /// Default number of context messages to load from conversation history.
 const DEFAULT_CONTEXT_MESSAGES: usize = 20;
 
-/// Format a conversation message header and content for pretty display.
-fn format_message_display(msg: &anima::conversation::ConversationMessage) -> String {
+/// Format the header line for a conversation message.
+/// Example: `[2419] 2026-02-08 15:03 • dash • 2m 51s (23.7s) • 37k/131k (28%)`
+fn format_message_header(msg: &anima::conversation::ConversationMessage) -> String {
     let color = if msg.from_agent == "user" { "33" } else { "36" };
     let datetime = format_timestamp_pretty(msg.created_at);
 
@@ -515,6 +516,18 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
         String::new()
     };
 
+    let pin_str = if msg.pinned { " \x1b[33m[pinned]\x1b[0m" } else { "" };
+
+    format!(
+        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}{}",
+        msg.id, datetime, color, msg.from_agent, pin_str, duration_str, ctx_str
+    )
+}
+
+/// Format a conversation message header and content for pretty display.
+fn format_message_display(msg: &anima::conversation::ConversationMessage) -> String {
+    let header = format_message_header(msg);
+
     let display_content = if msg.content.is_empty() {
         if let Some(names) = extract_tool_names(msg) {
             format!("\x1b[90m🛠️ {}\x1b[0m", names.join(", "))
@@ -527,12 +540,7 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
         msg.content.clone()
     };
 
-    let pin_str = if msg.pinned { " \x1b[33m[pinned]\x1b[0m" } else { "" };
-
-    format!(
-        "\x1b[90m[{}] {}\x1b[0m \x1b[90m•\x1b[0m \x1b[{}m{}\x1b[0m{}{}{}\n{}\n\n",
-        msg.id, datetime, color, msg.from_agent, pin_str, duration_str, ctx_str, display_content
-    )
+    format!("{}\n{}\n\n", header, display_content)
 }
 
 /// Extract tool names from a message's tool_calls JSON, if present.

@@ -723,6 +723,41 @@ impl ConversationStore {
         Ok(message_id)
     }
 
+    /// Update token stats on an existing message by ID.
+    pub fn update_message_stats(
+        &self,
+        message_id: i64,
+        duration_ms: Option<i64>,
+        tokens_in: Option<i64>,
+        tokens_out: Option<i64>,
+        num_ctx: Option<i64>,
+        prompt_eval_ns: Option<i64>,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE messages SET duration_ms = ?1, tokens_in = ?2, tokens_out = ?3, num_ctx = ?4, prompt_eval_ns = ?5 WHERE id = ?6",
+            params![duration_ms, tokens_in, tokens_out, num_ctx, prompt_eval_ns, message_id],
+        )?;
+        Ok(())
+    }
+
+    /// Stamp token stats on all messages from an agent that don't have stats yet.
+    pub fn stamp_unstamped_messages(
+        &self,
+        conv_name: &str,
+        from_agent: &str,
+        tokens_in: Option<i64>,
+        tokens_out: Option<i64>,
+        num_ctx: Option<i64>,
+        prompt_eval_ns: Option<i64>,
+    ) -> Result<usize, ConversationError> {
+        let count = self.conn.execute(
+            "UPDATE messages SET tokens_in = ?1, tokens_out = ?2, num_ctx = ?3, prompt_eval_ns = ?4
+             WHERE conv_name = ?5 AND from_agent = ?6 AND tokens_in IS NULL",
+            params![tokens_in, tokens_out, num_ctx, prompt_eval_ns, conv_name, from_agent],
+        )?;
+        Ok(count)
+    }
+
     /// Get messages for a conversation, optionally limited to the last N messages.
     /// Messages are returned in chronological order (oldest first).
     pub fn get_messages(

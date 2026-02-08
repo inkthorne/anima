@@ -321,6 +321,12 @@ pub struct ToolExecution {
     /// Assistant content (narration) that accompanied the tool call, if any.
     /// When the LLM returns both content AND tool_calls, this captures that content.
     pub content: Option<String>,
+    /// Per-iteration LLM token stats for inline persistence by the trace persister.
+    pub iter_tokens_in: Option<u32>,
+    pub iter_tokens_out: Option<u32>,
+    pub iter_prompt_eval_ns: Option<u64>,
+    /// Per-iteration LLM wall-clock duration in milliseconds.
+    pub iter_duration_ms: Option<u64>,
 }
 
 /// Result from a think operation, including tool usage information.
@@ -345,6 +351,8 @@ pub struct ThinkResult {
     /// Accumulated prompt eval duration in nanoseconds (Ollama-specific).
     /// When KV caching is active, this drops significantly.
     pub prompt_eval_duration_ns: Option<u64>,
+    /// Wall-clock duration of the last LLM call in milliseconds.
+    pub duration_ms: Option<u64>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -866,6 +874,8 @@ impl Agent {
         tool_trace: &mut Vec<ToolExecution>,
         tool_trace_tx: &Option<mpsc::Sender<ToolExecution>>,
         messages: &mut Vec<ChatMessage>,
+        iter_usage: Option<&crate::llm::UsageInfo>,
+        iter_duration_ms: Option<u64>,
     ) {
         for (i, tool_call) in tool_calls.iter().enumerate() {
             tool_names_used.push(tool_call.name.clone());
@@ -876,6 +886,7 @@ impl Agent {
                 .unwrap_or_else(|e| format!("Error: {}", e));
 
             // Only attach assistant content to the first tool call to avoid duplication
+            // Only attach iter stats to the first tool call (one LLM call → one set of stats)
             let execution = ToolExecution {
                 call: tool_call.clone(),
                 result: result.clone(),
@@ -884,6 +895,10 @@ impl Agent {
                 } else {
                     None
                 },
+                iter_tokens_in: if i == 0 { iter_usage.map(|u| u.prompt_tokens) } else { None },
+                iter_tokens_out: if i == 0 { iter_usage.map(|u| u.completion_tokens) } else { None },
+                iter_prompt_eval_ns: if i == 0 { iter_usage.and_then(|u| u.prompt_eval_duration_ns) } else { None },
+                iter_duration_ms: if i == 0 { iter_duration_ms } else { None },
             };
             tool_trace.push(execution.clone());
 
@@ -1230,6 +1245,7 @@ impl Agent {
                         tokens_in,
                         tokens_out,
                         prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+                        duration_ms: Some(llm_duration_ms),
                     });
                 }
 
@@ -1252,6 +1268,8 @@ impl Agent {
                     &mut tool_trace,
                     &options.tool_trace_tx,
                     &mut messages,
+                    response.usage.as_ref(),
+                    Some(llm_duration_ms),
                 )
                 .await;
 
@@ -1292,7 +1310,19 @@ impl Agent {
 
         self.trim_history();
         let total_budget = checkpoint_interval * max_checkpoint_loops;
-        Err(crate::error::AgentError::MaxIterationsExceeded(total_budget))
+        let tokens_in = if has_token_data { Some(total_tokens_in) } else { None };
+        let tokens_out = if has_token_data { Some(total_tokens_out) } else { None };
+        Ok(ThinkResult {
+            response: format!("[Max iterations reached: {}]", total_budget),
+            tools_used: !tool_names_used.is_empty(),
+            tool_names: tool_names_used,
+            last_tool_calls,
+            tool_trace,
+            tokens_in,
+            tokens_out,
+            prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+            duration_ms: None,
+        })
     }
 
     pub async fn think(&mut self, task: &str) -> Result<ThinkResult, crate::error::AgentError> {
@@ -1441,6 +1471,7 @@ impl Agent {
                         tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
                         tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
                         prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+                        duration_ms: Some(llm_duration_ms),
                     });
                 }
 
@@ -1463,6 +1494,8 @@ impl Agent {
                     &mut tool_trace,
                     &options.tool_trace_tx,
                     &mut messages,
+                    response.usage.as_ref(),
+                    Some(llm_duration_ms),
                 )
                 .await;
 
@@ -1494,7 +1527,17 @@ impl Agent {
 
         self.trim_history();
         let total_budget = checkpoint_interval * max_checkpoint_loops;
-        Err(crate::error::AgentError::MaxIterationsExceeded(total_budget))
+        Ok(ThinkResult {
+            response: format!("[Max iterations reached: {}]", total_budget),
+            tools_used: !tool_names_used.is_empty(),
+            tool_names: tool_names_used,
+            last_tool_calls,
+            tool_trace,
+            tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
+            tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
+            prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
+            duration_ms: None,
+        })
     }
 
     /// Reflect on a response and potentially revise it
@@ -2793,6 +2836,10 @@ mod tests {
             },
             result: "file contents here".to_string(),
             content: Some("Let me read the file.".to_string()),
+            iter_tokens_in: None,
+            iter_tokens_out: None,
+            iter_prompt_eval_ns: None,
+            iter_duration_ms: None,
         };
 
         let entry = CheckpointTraceEntry::from(&exec);
