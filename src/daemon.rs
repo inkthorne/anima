@@ -99,6 +99,7 @@ use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection};
 use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
+use crate::conversation::ConversationError;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
 use crate::auth;
@@ -2084,11 +2085,11 @@ async fn process_message_work(
         agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
     }
 
-    // Load conversation history first
+    // Load conversation history first (using append-only context cursors)
     let (mut conversation_history, final_user_content): (Vec<ChatMessage>, String) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match store.get_messages_with_pinned(cname, Some(history_limit)) {
+                Ok(store) => match load_agent_context(&store, cname, agent_name, history_limit, &logger) {
                     Ok(msgs) if !msgs.is_empty() => {
                         let (history, final_content) =
                             format_conversation_history(&msgs, agent_name);
@@ -2218,7 +2219,7 @@ async fn process_message_work(
                     }
                 }
                 // Store the final response (no tool_calls since this is the terminal response)
-                if let Err(e) = store.add_message_with_tool_calls(
+                match store.add_message_with_tool_calls(
                     cname,
                     agent_name,
                     &final_response,
@@ -2226,10 +2227,25 @@ async fn process_message_work(
                     Some(duration_ms),
                     None,
                 ) {
-                    logger.log(&format!(
-                        "[worker] Failed to store response in conversation: {}",
-                        e
-                    ));
+                    Ok(response_msg_id) => {
+                        // Update context cursor for append-only context
+                        if let Err(e) = store.set_context_cursor(cname, agent_name, response_msg_id) {
+                            logger.log(&format!(
+                                "[worker] Failed to update context cursor: {}", e
+                            ));
+                        } else {
+                            logger.log(&format!(
+                                "[context] Updated cursor for {} in {} to msg_id={}",
+                                agent_name, cname, response_msg_id
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        logger.log(&format!(
+                            "[worker] Failed to store response in conversation: {}",
+                            e
+                        ));
+                    }
                 }
             }
             Err(e) => {
@@ -2501,6 +2517,89 @@ async fn process_json_block_mode(
 /// Maximum depth for @mention chains to prevent infinite loops
 const MAX_MENTION_DEPTH: u32 = 100;
 
+/// Context fill threshold — if (tokens_in + tokens_out) / num_ctx >= this, reset the cursor
+const CONTEXT_FILL_THRESHOLD: f64 = 0.80;
+
+/// Load agent context using append-only cursors for KV cache stability.
+///
+/// - If cursor is NULL (cold start): load last N messages + pins (sliding window).
+/// - If cursor is set: load messages since cursor + pins (append mode).
+/// - If too many messages since cursor (> history_limit) or zero messages: fall back to cold start.
+fn load_agent_context(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    history_limit: usize,
+    logger: &AgentLogger,
+) -> Result<Vec<ConversationMessage>, ConversationError> {
+    match store.get_context_cursor(conv_name, agent_name)? {
+        Some(cursor_id) => {
+            let count = store.count_messages_since(conv_name, cursor_id)?;
+            if count > history_limit as i64 {
+                // Agent has been away too long — cold start
+                logger.log(&format!(
+                    "[context] {} messages since cursor for {} in {} (> {}), falling back to cold start",
+                    count, agent_name, conv_name, history_limit
+                ));
+                store.clear_context_cursor(conv_name, agent_name)?;
+                store.get_messages_with_pinned(conv_name, Some(history_limit))
+            } else if count == 0 {
+                // Stale cursor or conversation cleared — cold start
+                logger.log(&format!(
+                    "[context] No messages since cursor for {} in {}, falling back to cold start",
+                    agent_name, conv_name
+                ));
+                store.clear_context_cursor(conv_name, agent_name)?;
+                store.get_messages_with_pinned(conv_name, Some(history_limit))
+            } else {
+                // Append mode — fetch only messages since cursor
+                logger.log(&format!(
+                    "[context] Append mode for {} in {}: {} messages since cursor {}",
+                    agent_name, conv_name, count, cursor_id
+                ));
+                store.get_messages_since_with_pinned(conv_name, cursor_id)
+            }
+        }
+        None => {
+            // Cold start — no cursor set
+            logger.log(&format!(
+                "[context] Cold start for {} in {} (no cursor)",
+                agent_name, conv_name
+            ));
+            store.get_messages_with_pinned(conv_name, Some(history_limit))
+        }
+    }
+}
+
+/// Check context fill ratio and reset cursor if threshold exceeded.
+fn check_fill_and_maybe_reset(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    num_ctx: Option<i64>,
+    logger: &AgentLogger,
+) {
+    if let (Some(t_in), Some(t_out), Some(ctx)) = (tokens_in, tokens_out, num_ctx) {
+        if ctx > 0 {
+            let fill = (t_in + t_out) as f64 / ctx as f64;
+            if fill >= CONTEXT_FILL_THRESHOLD {
+                logger.log(&format!(
+                    "[context] Fill {:.0}% >= threshold {:.0}% for {} in {}, resetting cursor",
+                    fill * 100.0,
+                    CONTEXT_FILL_THRESHOLD * 100.0,
+                    agent_name,
+                    conv_name
+                ));
+                if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
+                    logger.log(&format!("[context] Failed to clear cursor: {}", e));
+                }
+            }
+        }
+    }
+}
+
 /// Handle a Notify request: fetch conversation context, generate response, store it,
 /// and forward @mentions to other agents (daemon-to-daemon).
 #[allow(clippy::too_many_arguments)]
@@ -2551,8 +2650,8 @@ async fn handle_notify(
         }
     };
 
-    // First fetch: get messages to extract final_user_content for recall query
-    let context_messages = match store.get_messages_with_pinned(conv_id, Some(history_limit)) {
+    // First fetch: get messages using append-only context cursors
+    let context_messages = match load_agent_context(&store, conv_id, agent_name, history_limit, logger) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -2937,6 +3036,27 @@ async fn handle_notify(
                 response_msg_id, duration_ms
             ));
 
+            // Update context cursor for append-only context
+            if let Err(e) = store.set_context_cursor(conv_id, agent_name, response_msg_id) {
+                logger.log(&format!("[context] Failed to update cursor: {}", e));
+            } else {
+                logger.log(&format!(
+                    "[context] Updated cursor for {} in {} to msg_id={}",
+                    agent_name, conv_id, response_msg_id
+                ));
+            }
+
+            // Check fill and reset cursor if context is too full
+            check_fill_and_maybe_reset(
+                &store,
+                conv_id,
+                agent_name,
+                tokens_in,
+                tokens_out,
+                num_ctx_i64,
+                logger,
+            );
+
             // Parse @mentions from our response and forward to other agents
             // Only forward if not paused and not at depth limit
             let should_forward =
@@ -3177,11 +3297,10 @@ async fn run_heartbeat(
         logger.log(&format!("[heartbeat] Created conversation '{}'", conv_name));
     }
 
-    // 3. Get conversation context (recent heartbeat outputs for continuity)
+    // 3. Get conversation context using append-only cursors
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
-    let context_messages = store
-        .get_messages_with_pinned(&conv_name, Some(history_limit))
+    let context_messages = load_agent_context(&store, &conv_name, agent_name, history_limit, logger)
         .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
@@ -3241,6 +3360,15 @@ async fn run_heartbeat(
     match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
         Ok(msg_id) => {
             logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
+            // Update context cursor for append-only context
+            if let Err(e) = store.set_context_cursor(&conv_name, agent_name, msg_id) {
+                logger.log(&format!("[context] Failed to update cursor: {}", e));
+            } else {
+                logger.log(&format!(
+                    "[context] Updated cursor for {} in {} to msg_id={}",
+                    agent_name, conv_name, msg_id
+                ));
+            }
         }
         Err(e) => {
             logger.log(&format!("[heartbeat] Failed to store response: {}", e));
@@ -4558,5 +4686,107 @@ api_key = "sk-test"
         let base_pos = effective.find("Base").unwrap();
         let model_pos = effective.find("Model always").unwrap();
         assert!(base_pos < model_pos);
+    }
+
+    fn test_logger() -> AgentLogger {
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+        std::mem::forget(dir);
+        logger
+    }
+
+    #[test]
+    fn test_load_agent_context_cold_start() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+        let logger = test_logger();
+
+        let conv = store
+            .create_conversation(Some("ctx-cold"), &["arya"])
+            .unwrap();
+        store.add_message(&conv, "user", "hello", &[]).unwrap();
+        store.add_message(&conv, "arya", "hi", &[]).unwrap();
+        store.add_message(&conv, "user", "how are you?", &[]).unwrap();
+
+        // No cursor set → cold start → should get last N messages
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn test_load_agent_context_append() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+        let logger = test_logger();
+
+        let conv = store
+            .create_conversation(Some("ctx-append"), &["arya"])
+            .unwrap();
+        store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        let cursor_id = store.add_message(&conv, "arya", "response 1", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+
+        // Set cursor to arya's response
+        store.set_context_cursor(&conv, "arya", cursor_id).unwrap();
+
+        // Should only get messages after cursor (msg 2)
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "msg 2");
+    }
+
+    #[test]
+    fn test_load_agent_context_stale_cursor() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+        let logger = test_logger();
+
+        let conv = store
+            .create_conversation(Some("ctx-stale"), &["arya"])
+            .unwrap();
+        store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        store.add_message(&conv, "arya", "response 1", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+
+        // Set cursor to a very high ID (no messages after it)
+        store.set_context_cursor(&conv, "arya", 99999).unwrap();
+
+        // count == 0 → falls back to sliding window
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "msg 1");
+
+        // Cursor should have been cleared
+        assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_load_agent_context_too_many_messages() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+        let logger = test_logger();
+
+        let conv = store
+            .create_conversation(Some("ctx-overflow"), &["arya"])
+            .unwrap();
+        let cursor_id = store.add_message(&conv, "arya", "old response", &[]).unwrap();
+        store.set_context_cursor(&conv, "arya", cursor_id).unwrap();
+
+        // Add more messages than history_limit
+        for i in 0..5 {
+            store.add_message(&conv, "user", &format!("msg {}", i), &[]).unwrap();
+        }
+
+        // history_limit=3, but 5 messages since cursor → falls back to sliding window
+        let msgs = load_agent_context(&store, &conv, "arya", 3, &logger).unwrap();
+        // Sliding window returns last 3
+        assert_eq!(msgs.len(), 3);
+
+        // Cursor should have been cleared
+        assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
     }
 }

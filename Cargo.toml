@@ -1,6 +1,6 @@
 [package]
 name = "anima"
-version = "3.8.5"
+version = "3.8.6"
 edition = "2024"
 license = "MIT"
 authors = ["Arya <arya@inkthorne.com>"]

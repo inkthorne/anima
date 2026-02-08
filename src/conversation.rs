@@ -237,6 +237,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "num_ctx", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "triggered_by", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("messages", "pinned", "INTEGER DEFAULT 0")?;
+        self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
         Ok(())
     }
 
@@ -855,6 +856,104 @@ impl ConversationStore {
             .filter(|m| !recent_ids.contains(&m.id))
             .collect();
         result.extend(recent);
+
+        Ok(result)
+    }
+
+    /// Get the context cursor for an agent in a conversation.
+    /// Returns None if no cursor is set (cold start needed).
+    pub fn get_context_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<i64>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT context_cursor FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let cursor: Option<Option<i64>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(cursor.flatten())
+    }
+
+    /// Set the context cursor for an agent in a conversation.
+    pub fn set_context_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        cursor_id: i64,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET context_cursor = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![cursor_id, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the context cursor for an agent (triggers cold start on next turn).
+    pub fn clear_context_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET context_cursor = NULL WHERE conv_name = ?1 AND agent = ?2",
+            params![conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Count messages in a conversation since a given message ID.
+    pub fn count_messages_since(
+        &self,
+        conv_name: &str,
+        since_id: i64,
+    ) -> Result<i64, ConversationError> {
+        let now = current_timestamp();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conv_name = ?1 AND id > ?2 AND expires_at > ?3",
+            params![conv_name, since_id, now],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get messages since a cursor ID, merged with pinned messages.
+    /// Returns messages in chronological order with deduplication.
+    pub fn get_messages_since_with_pinned(
+        &self,
+        conv_name: &str,
+        since_id: i64,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        let now = current_timestamp();
+
+        // 1. Fetch pinned messages (chronological)
+        let pinned_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 AND pinned = 1 ORDER BY created_at ASC",
+            MESSAGE_COLUMNS
+        );
+        let mut pinned_stmt = self.conn.prepare(&pinned_query)?;
+        let pinned: Vec<ConversationMessage> = pinned_stmt
+            .query_map(params![conv_name, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 2. Fetch messages since cursor (chronological)
+        let since_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND id > ?2 AND expires_at > ?3 ORDER BY created_at ASC",
+            MESSAGE_COLUMNS
+        );
+        let mut since_stmt = self.conn.prepare(&since_query)?;
+        let since: Vec<ConversationMessage> = since_stmt
+            .query_map(params![conv_name, since_id, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 3. Merge: pinned messages not in since-range go first, then since messages
+        let since_ids: std::collections::HashSet<i64> = since.iter().map(|m| m.id).collect();
+        let mut result: Vec<ConversationMessage> = pinned
+            .into_iter()
+            .filter(|m| !since_ids.contains(&m.id))
+            .collect();
+        result.extend(since);
 
         Ok(result)
     }
@@ -2624,5 +2723,133 @@ mod tests {
         // No limit — should return all messages normally
         let msgs = store.get_messages_with_pinned(&conv, None).unwrap();
         assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn test_context_cursor_default_null() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("cursor-test"), &["arya"])
+            .unwrap();
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert!(cursor.is_none());
+    }
+
+    #[test]
+    fn test_set_and_get_context_cursor() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("cursor-test"), &["arya"])
+            .unwrap();
+
+        store.set_context_cursor(&conv, "arya", 42).unwrap();
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert_eq!(cursor, Some(42));
+
+        // Update to a new value
+        store.set_context_cursor(&conv, "arya", 99).unwrap();
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert_eq!(cursor, Some(99));
+    }
+
+    #[test]
+    fn test_clear_context_cursor() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("cursor-test"), &["arya"])
+            .unwrap();
+
+        store.set_context_cursor(&conv, "arya", 42).unwrap();
+        assert_eq!(store.get_context_cursor(&conv, "arya").unwrap(), Some(42));
+
+        store.clear_context_cursor(&conv, "arya").unwrap();
+        assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_messages_since_with_pinned() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("since-test"), &["arya"])
+            .unwrap();
+
+        let id1 = store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        let _id2 = store.add_message(&conv, "arya", "msg 2", &[]).unwrap();
+        let _id3 = store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+
+        // Get messages since id1 — should return msg 2 and msg 3 only
+        let msgs = store.get_messages_since_with_pinned(&conv, id1).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "msg 2");
+        assert_eq!(msgs[1].content, "msg 3");
+    }
+
+    #[test]
+    fn test_get_messages_since_with_pinned_includes_pinned() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("since-pin"), &["arya"])
+            .unwrap();
+
+        // Pin an early message
+        let id1 = store.add_message(&conv, "user", "pinned task", &[]).unwrap();
+        store.pin_message(&conv, id1, true).unwrap();
+
+        let id2 = store.add_message(&conv, "arya", "response", &[]).unwrap();
+        let _id3 = store.add_message(&conv, "user", "follow up", &[]).unwrap();
+
+        // Get messages since id2 — should include pinned msg (id1) + msg 3
+        let msgs = store.get_messages_since_with_pinned(&conv, id2).unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].content, "pinned task");
+        assert!(msgs[0].pinned);
+        assert_eq!(msgs[1].content, "follow up");
+    }
+
+    #[test]
+    fn test_get_messages_since_with_pinned_deduplicates() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("since-dedup"), &["arya"])
+            .unwrap();
+
+        let id1 = store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        let id2 = store.add_message(&conv, "user", "msg 2", &[]).unwrap();
+
+        // Pin msg 2 — it's both pinned AND after cursor, should not be doubled
+        store.pin_message(&conv, id2, true).unwrap();
+
+        let msgs = store.get_messages_since_with_pinned(&conv, id1).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "msg 2");
+    }
+
+    #[test]
+    fn test_get_messages_since_empty() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("since-empty"), &["arya"])
+            .unwrap();
+
+        let id1 = store.add_message(&conv, "user", "only msg", &[]).unwrap();
+
+        // No messages after id1
+        let msgs = store.get_messages_since_with_pinned(&conv, id1).unwrap();
+        assert_eq!(msgs.len(), 0);
+    }
+
+    #[test]
+    fn test_count_messages_since() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("count-test"), &["arya"])
+            .unwrap();
+
+        let id1 = store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        store.add_message(&conv, "arya", "msg 2", &[]).unwrap();
+        store.add_message(&conv, "user", "msg 3", &[]).unwrap();
+
+        assert_eq!(store.count_messages_since(&conv, id1).unwrap(), 2);
+        assert_eq!(store.count_messages_since(&conv, 999).unwrap(), 0);
     }
 }
