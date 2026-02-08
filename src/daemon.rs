@@ -2227,18 +2227,8 @@ async fn process_message_work(
                     Some(duration_ms),
                     None,
                 ) {
-                    Ok(response_msg_id) => {
-                        // Update context cursor for append-only context
-                        if let Err(e) = store.set_context_cursor(cname, agent_name, response_msg_id) {
-                            logger.log(&format!(
-                                "[worker] Failed to update context cursor: {}", e
-                            ));
-                        } else {
-                            logger.log(&format!(
-                                "[context] Updated cursor for {} in {} to msg_id={}",
-                                agent_name, cname, response_msg_id
-                            ));
-                        }
+                    Ok(_response_msg_id) => {
+                        // Cursor is anchored at cold start; no update needed here
                     }
                     Err(e) => {
                         logger.log(&format!(
@@ -2534,30 +2524,34 @@ fn load_agent_context(
 ) -> Result<Vec<ConversationMessage>, ConversationError> {
     match store.get_context_cursor(conv_name, agent_name)? {
         Some(cursor_id) => {
-            let count = store.count_messages_since(conv_name, cursor_id)?;
-            if count > history_limit as i64 {
-                // Agent has been away too long — cold start
+            let count = store.count_messages_from(conv_name, cursor_id)?;
+            if count > (history_limit * 5) as i64 {
+                // Too many messages accumulated — cold start with new anchor
                 logger.log(&format!(
-                    "[context] {} messages since cursor for {} in {} (> {}), falling back to cold start",
-                    count, agent_name, conv_name, history_limit
+                    "[context] {} messages from cursor for {} in {} (> {}), falling back to cold start",
+                    count, agent_name, conv_name, history_limit * 5
                 ));
                 store.clear_context_cursor(conv_name, agent_name)?;
-                store.get_messages_with_pinned(conv_name, Some(history_limit))
+                let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+                set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
+                Ok(msgs)
             } else if count == 0 {
-                // Stale cursor or conversation cleared — cold start
+                // Stale cursor or conversation cleared — cold start with new anchor
                 logger.log(&format!(
-                    "[context] No messages since cursor for {} in {}, falling back to cold start",
+                    "[context] No messages from cursor for {} in {}, falling back to cold start",
                     agent_name, conv_name
                 ));
                 store.clear_context_cursor(conv_name, agent_name)?;
-                store.get_messages_with_pinned(conv_name, Some(history_limit))
+                let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+                set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
+                Ok(msgs)
             } else {
-                // Append mode — fetch only messages since cursor
+                // Append mode — fetch messages from cursor (inclusive)
                 logger.log(&format!(
-                    "[context] Append mode for {} in {}: {} messages since cursor {}",
+                    "[context] Append mode for {} in {}: {} messages from cursor {}",
                     agent_name, conv_name, count, cursor_id
                 ));
-                store.get_messages_since_with_pinned(conv_name, cursor_id)
+                store.get_messages_from_with_pinned(conv_name, cursor_id)
             }
         }
         None => {
@@ -2566,8 +2560,37 @@ fn load_agent_context(
                 "[context] Cold start for {} in {} (no cursor)",
                 agent_name, conv_name
             ));
-            store.get_messages_with_pinned(conv_name, Some(history_limit))
+            let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+            set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
+            Ok(msgs)
         }
+    }
+}
+
+/// Set the context cursor to the anchor (oldest non-pinned message) in the window.
+fn set_anchor_cursor(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    msgs: &[ConversationMessage],
+    logger: &AgentLogger,
+) {
+    if msgs.is_empty() {
+        return;
+    }
+    let anchor_id = msgs
+        .iter()
+        .filter(|m| !m.pinned)
+        .map(|m| m.id)
+        .min()
+        .unwrap_or(msgs[0].id);
+    if let Err(e) = store.set_context_cursor(conv_name, agent_name, anchor_id) {
+        logger.log(&format!("[context] Failed to set anchor cursor: {}", e));
+    } else {
+        logger.log(&format!(
+            "[context] Set anchor for {} in {} to msg_id={}",
+            agent_name, conv_name, anchor_id
+        ));
     }
 }
 
@@ -3036,16 +3059,7 @@ async fn handle_notify(
                 response_msg_id, duration_ms
             ));
 
-            // Update context cursor for append-only context
-            if let Err(e) = store.set_context_cursor(conv_id, agent_name, response_msg_id) {
-                logger.log(&format!("[context] Failed to update cursor: {}", e));
-            } else {
-                logger.log(&format!(
-                    "[context] Updated cursor for {} in {} to msg_id={}",
-                    agent_name, conv_id, response_msg_id
-                ));
-            }
-
+            // Cursor is anchored at cold start; no update needed here.
             // Check fill and reset cursor if context is too full
             check_fill_and_maybe_reset(
                 &store,
@@ -3360,15 +3374,7 @@ async fn run_heartbeat(
     match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
         Ok(msg_id) => {
             logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
-            // Update context cursor for append-only context
-            if let Err(e) = store.set_context_cursor(&conv_name, agent_name, msg_id) {
-                logger.log(&format!("[context] Failed to update cursor: {}", e));
-            } else {
-                logger.log(&format!(
-                    "[context] Updated cursor for {} in {} to msg_id={}",
-                    agent_name, conv_name, msg_id
-                ));
-            }
+            // Cursor is anchored at cold start; no update needed here
         }
         Err(e) => {
             logger.log(&format!("[heartbeat] Failed to store response: {}", e));
@@ -4705,13 +4711,17 @@ api_key = "sk-test"
         let conv = store
             .create_conversation(Some("ctx-cold"), &["arya"])
             .unwrap();
-        store.add_message(&conv, "user", "hello", &[]).unwrap();
+        let id1 = store.add_message(&conv, "user", "hello", &[]).unwrap();
         store.add_message(&conv, "arya", "hi", &[]).unwrap();
         store.add_message(&conv, "user", "how are you?", &[]).unwrap();
 
         // No cursor set → cold start → should get last N messages
         let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
         assert_eq!(msgs.len(), 3);
+
+        // Cursor should be set to anchor (oldest non-pinned msg)
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert_eq!(cursor, Some(id1));
     }
 
     #[test]
@@ -4724,17 +4734,19 @@ api_key = "sk-test"
         let conv = store
             .create_conversation(Some("ctx-append"), &["arya"])
             .unwrap();
-        store.add_message(&conv, "user", "msg 1", &[]).unwrap();
-        let cursor_id = store.add_message(&conv, "arya", "response 1", &[]).unwrap();
+        let anchor_id = store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        store.add_message(&conv, "arya", "response 1", &[]).unwrap();
         store.add_message(&conv, "user", "msg 2", &[]).unwrap();
 
-        // Set cursor to arya's response
-        store.set_context_cursor(&conv, "arya", cursor_id).unwrap();
+        // Set cursor to anchor (oldest message in window)
+        store.set_context_cursor(&conv, "arya", anchor_id).unwrap();
 
-        // Should only get messages after cursor (msg 2)
+        // Should get all messages from anchor (inclusive) — full window + new
         let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "msg 2");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].content, "msg 1");
+        assert_eq!(msgs[1].content, "response 1");
+        assert_eq!(msgs[2].content, "msg 2");
     }
 
     #[test]
@@ -4747,20 +4759,21 @@ api_key = "sk-test"
         let conv = store
             .create_conversation(Some("ctx-stale"), &["arya"])
             .unwrap();
-        store.add_message(&conv, "user", "msg 1", &[]).unwrap();
+        let id1 = store.add_message(&conv, "user", "msg 1", &[]).unwrap();
         store.add_message(&conv, "arya", "response 1", &[]).unwrap();
         store.add_message(&conv, "user", "msg 2", &[]).unwrap();
 
-        // Set cursor to a very high ID (no messages after it)
+        // Set cursor to a very high ID (no messages from it)
         store.set_context_cursor(&conv, "arya", 99999).unwrap();
 
-        // count == 0 → falls back to sliding window
+        // count == 0 → falls back to cold start with new anchor
         let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
 
-        // Cursor should have been cleared
-        assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
+        // Cursor should be set to new anchor (oldest msg)
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert_eq!(cursor, Some(id1));
     }
 
     #[test]
@@ -4776,17 +4789,18 @@ api_key = "sk-test"
         let cursor_id = store.add_message(&conv, "arya", "old response", &[]).unwrap();
         store.set_context_cursor(&conv, "arya", cursor_id).unwrap();
 
-        // Add more messages than history_limit
-        for i in 0..5 {
+        // Add more messages than history_limit * 5
+        for i in 0..16 {
             store.add_message(&conv, "user", &format!("msg {}", i), &[]).unwrap();
         }
 
-        // history_limit=3, but 5 messages since cursor → falls back to sliding window
+        // history_limit=3, count from cursor = 17 (1 + 16) > 3*5=15 → falls back to sliding window
         let msgs = load_agent_context(&store, &conv, "arya", 3, &logger).unwrap();
         // Sliding window returns last 3
         assert_eq!(msgs.len(), 3);
 
-        // Cursor should have been cleared
-        assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
+        // Cursor should be set to new anchor (oldest msg in window)
+        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
+        assert!(cursor.is_some());
     }
 }
