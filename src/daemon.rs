@@ -3104,6 +3104,9 @@ async fn handle_notify(
             }
             Err(e) => {
                 logger.log(&format!("[notify] Agent error: {}", e));
+                // Store error in conversation so user can see it via chat view
+                let error_msg = format!("[Error: {}]", e);
+                let _ = store.add_message(conv_id, agent_name, &error_msg, &[]);
                 pause_watcher.abort();
                 return Response::Error {
                     message: e.to_string(),
@@ -3471,6 +3474,9 @@ async fn run_heartbeat(
                 Ok(r) => r,
                 Err(e) => {
                     logger.log(&format!("[heartbeat] Think error: {}", e));
+                    // Store error in conversation so user can see it via chat view
+                    let error_msg = format!("[Error: {}]", e);
+                    let _ = store.add_message(&conv_name, agent_name, &error_msg, &[]);
                     return;
                 }
             }

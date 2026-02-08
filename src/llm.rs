@@ -366,6 +366,7 @@ impl OpenAIClient {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
             api_key: api_key.into(),
@@ -611,6 +612,7 @@ impl AnthropicClient {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
             auth: AnthropicAuth::ApiKey(api_key.into()),
@@ -624,6 +626,7 @@ impl AnthropicClient {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
             auth: AnthropicAuth::Bearer(token.into()),
@@ -950,6 +953,7 @@ impl OllamaClient {
         Self {
             client: Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(30))
+                .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
             base_url,
