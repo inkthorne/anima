@@ -342,6 +342,9 @@ pub struct ThinkResult {
     pub tokens_in: Option<u32>,
     /// Total output tokens used across all LLM calls in this think operation
     pub tokens_out: Option<u32>,
+    /// Accumulated prompt eval duration in nanoseconds (Ollama-specific).
+    /// When KV caching is active, this drops significantly.
+    pub prompt_eval_duration_ns: Option<u64>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -1149,6 +1152,7 @@ impl Agent {
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
         let mut total_tokens_in: u32 = 0;
         let mut total_tokens_out: u32 = 0;
+        let mut total_prompt_eval_ns: u64 = 0;
         let mut has_token_data = false;
 
         // Checkpoint support: when checkpoint_interval is set, the inner loop runs for
@@ -1186,6 +1190,9 @@ impl Agent {
                 if let Some(ref usage) = response.usage {
                     total_tokens_in += usage.prompt_tokens;
                     total_tokens_out += usage.completion_tokens;
+                    if let Some(ns) = usage.prompt_eval_duration_ns {
+                        total_prompt_eval_ns += ns;
+                    }
                     has_token_data = true;
                 }
 
@@ -1222,6 +1229,7 @@ impl Agent {
                         tool_trace,
                         tokens_in,
                         tokens_out,
+                        prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
                     });
                 }
 
@@ -1366,6 +1374,7 @@ impl Agent {
         let mut tool_trace: Vec<ToolExecution> = Vec::new();
         let mut total_tokens_in: u32 = 0;
         let mut total_tokens_out: u32 = 0;
+        let mut total_prompt_eval_ns: u64 = 0;
         let mut has_token_data = false;
 
         // Checkpoint support (mirrors think_with_options_inner)
@@ -1402,6 +1411,9 @@ impl Agent {
                 if let Some(ref usage) = response.usage {
                     total_tokens_in += usage.prompt_tokens;
                     total_tokens_out += usage.completion_tokens;
+                    if let Some(ns) = usage.prompt_eval_duration_ns {
+                        total_prompt_eval_ns += ns;
+                    }
                     has_token_data = true;
                 }
 
@@ -1428,6 +1440,7 @@ impl Agent {
                         tool_trace,
                         tokens_in: if has_token_data { Some(total_tokens_in) } else { None },
                         tokens_out: if has_token_data { Some(total_tokens_out) } else { None },
+                        prompt_eval_duration_ns: if total_prompt_eval_ns > 0 { Some(total_prompt_eval_ns) } else { None },
                     });
                 }
 

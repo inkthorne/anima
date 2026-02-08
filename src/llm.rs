@@ -275,6 +275,9 @@ pub struct LLMResponse {
 pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// Prompt evaluation duration in nanoseconds (Ollama-specific).
+    /// When KV caching is active, this drops significantly.
+    pub prompt_eval_duration_ns: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +415,7 @@ fn parse_openai_usage(value: &Value) -> Option<UsageInfo> {
             .get("completion_tokens")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
+        prompt_eval_duration_ns: None,
     })
 }
 
@@ -739,6 +743,7 @@ impl LLM for AnthropicClient {
         let usage = parsed["usage"].as_object().map(|u| UsageInfo {
             prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            prompt_eval_duration_ns: None,
         });
 
         Ok(LLMResponse {
@@ -1037,6 +1042,7 @@ fn parse_ollama_tool_calls(value: &Value) -> Vec<ToolCall> {
 /// `usage` object first, then falling back to native Ollama fields
 /// (`prompt_eval_count`, `eval_count`).
 fn parse_ollama_usage(response: &Value) -> Option<UsageInfo> {
+    let prompt_eval_duration_ns = response["prompt_eval_duration"].as_u64();
     if let Some(usage_obj) = response["usage"].as_object() {
         Some(UsageInfo {
             prompt_tokens: usage_obj
@@ -1047,11 +1053,13 @@ fn parse_ollama_usage(response: &Value) -> Option<UsageInfo> {
                 .get("completion_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
+            prompt_eval_duration_ns,
         })
     } else {
         Some(UsageInfo {
             prompt_tokens: response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
             completion_tokens: response["eval_count"].as_u64().unwrap_or(0) as u32,
+            prompt_eval_duration_ns,
         })
     }
 }
@@ -1422,6 +1430,7 @@ impl LLM for ClaudeCodeClient {
                 .get("output_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
+            prompt_eval_duration_ns: None,
         });
 
         if parsed["is_error"].as_bool() == Some(true) {
@@ -1520,6 +1529,7 @@ impl LLM for ClaudeCodeClient {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0)
                                 as u32,
+                            prompt_eval_duration_ns: None,
                         });
                     }
                     _ => {}

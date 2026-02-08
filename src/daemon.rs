@@ -2739,6 +2739,7 @@ async fn handle_notify(
     // last_tool_calls no longer needed — trace persister handles tool call persistence
     let mut total_tokens_in: u32 = 0;
     let mut total_tokens_out: u32 = 0;
+    let mut total_prompt_eval_ns: u64 = 0;
     let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
     let mut json_checkpoint_count: usize = 0;
     let json_max_checkpoints = max_checkpoints.unwrap_or(5);
@@ -2863,6 +2864,9 @@ async fn handle_notify(
                 }
                 if let Some(tokens) = think_result.tokens_out {
                     total_tokens_out += tokens;
+                }
+                if let Some(ns) = think_result.prompt_eval_duration_ns {
+                    total_prompt_eval_ns += ns;
                 }
 
                 // Strip thinking tags and extract [REMEMBER: ...] tags
@@ -3024,6 +3028,7 @@ async fn handle_notify(
     let tokens_in = (total_tokens_in > 0).then_some(total_tokens_in as i64);
     let tokens_out = (total_tokens_out > 0).then_some(total_tokens_out as i64);
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
+    let prompt_eval_ns_i64 = (total_prompt_eval_ns > 0).then_some(total_prompt_eval_ns as i64);
 
     // Flush tool trace channel — drop sender so consumer finishes
     drop(tool_trace_tx);
@@ -3052,6 +3057,7 @@ async fn handle_notify(
         tokens_in,
         tokens_out,
         num_ctx_i64,
+        prompt_eval_ns_i64,
     ) {
         Ok(response_msg_id) => {
             logger.log(&format!(
@@ -4287,6 +4293,7 @@ api_key = "sk-test"
             num_ctx: None,
             triggered_by: None,
             pinned: false,
+            prompt_eval_ns: None,
         }
     }
 
@@ -4306,6 +4313,7 @@ api_key = "sk-test"
             num_ctx: None,
             triggered_by: triggered_by.map(|s| s.to_string()),
             pinned: false,
+            prompt_eval_ns: None,
         }
     }
 

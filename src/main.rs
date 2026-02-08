@@ -491,7 +491,20 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
     let is_agent = msg.from_agent != "user" && msg.from_agent != "tool";
     let duration_str = if is_agent {
         msg.duration_ms
-            .map(|d| format!(" \x1b[90m•\x1b[0m \x1b[33m{}\x1b[0m", format_duration_ms(d)))
+            .map(|d| {
+                let eval_part = msg.prompt_eval_ns
+                    .filter(|&ns| ns > 0)
+                    .map(|ns| {
+                        let secs = ns as f64 / 1_000_000_000.0;
+                        if secs >= 1.0 {
+                            format!(" ({:.1}s)", secs)
+                        } else {
+                            format!(" ({:.0}ms)", secs * 1000.0)
+                        }
+                    })
+                    .unwrap_or_default();
+                format!(" \x1b[90m•\x1b[0m \x1b[33m{}{}\x1b[0m", format_duration_ms(d), eval_part)
+            })
             .unwrap_or_default()
     } else {
         String::new()
@@ -504,12 +517,12 @@ fn format_message_display(msg: &anima::conversation::ConversationMessage) -> Str
 
     let display_content = if msg.content.is_empty() {
         if let Some(names) = extract_tool_names(msg) {
-            format!("\x1b[90m🔧 {}\x1b[0m", names.join(", "))
+            format!("\x1b[90m🛠️ {}\x1b[0m", names.join(", "))
         } else {
             msg.content.clone()
         }
     } else if let Some(names) = extract_tool_names(msg) {
-        format!("{}\n\x1b[90m🔧 {}\x1b[0m", msg.content, names.join(", "))
+        format!("{}\n\x1b[90m🛠️ {}\x1b[0m", msg.content, names.join(", "))
     } else {
         msg.content.clone()
     };
@@ -565,7 +578,7 @@ fn format_duration_ms(ms: i64) -> String {
 }
 
 /// Format context usage from message token data.
-/// Returns formatted string like "2k/32k (26%)" or empty string if data unavailable.
+/// Returns formatted string like "2k/32k (26%)".
 fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> String {
     match (msg.tokens_in, msg.tokens_out, msg.num_ctx) {
         (Some(tokens_in), Some(tokens_out), Some(num_ctx)) if num_ctx > 0 => {
@@ -573,6 +586,7 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
             let percentage = (total_tokens as f64 / num_ctx as f64 * 100.0) as u32;
             let used_str = format_tokens_short(total_tokens);
             let ctx_str = format_tokens_short(num_ctx);
+
             format!(
                 " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%)\x1b[0m",
                 used_str, ctx_str, percentage

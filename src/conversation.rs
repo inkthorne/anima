@@ -68,6 +68,8 @@ pub struct ConversationMessage {
     pub triggered_by: Option<String>,
     /// Whether this message is pinned (always included in LLM context regardless of history window)
     pub pinned: bool,
+    /// Prompt eval duration in nanoseconds (Ollama-specific, drops when KV caching is active)
+    pub prompt_eval_ns: Option<i64>,
 }
 
 /// A pending notification for an offline agent.
@@ -237,6 +239,8 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "num_ctx", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "triggered_by", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("messages", "pinned", "INTEGER DEFAULT 0")?;
+        self.add_column_if_missing("messages", "prompt_tokens_est", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "prompt_eval_ns", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
         Ok(())
     }
@@ -613,7 +617,7 @@ impl ConversationStore {
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
         self.add_message_with_tokens(
-            conv_name, from_agent, content, mentions, None, None, None, None, None,
+            conv_name, from_agent, content, mentions, None, None, None, None, None, None,
         )
     }
 
@@ -638,6 +642,7 @@ impl ConversationStore {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -655,10 +660,11 @@ impl ConversationStore {
         tokens_in: Option<i64>,
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
+        prompt_eval_ns: Option<i64>,
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, from_agent, content, mentions,
-            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None,
+            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None, prompt_eval_ns,
         )
     }
 
@@ -672,7 +678,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "tool", content, &[],
-            None, None, None, None, None, Some(triggered_by),
+            None, None, None, None, None, Some(triggered_by), None,
         )
     }
 
@@ -690,6 +696,7 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
         triggered_by: Option<&str>,
+        prompt_eval_ns: Option<i64>,
     ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
@@ -701,8 +708,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -1246,11 +1253,12 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> 
         num_ctx: row.get(11)?,
         triggered_by: row.get(12)?,
         pinned: row.get::<_, i64>(13).unwrap_or(0) != 0,
+        prompt_eval_ns: row.get(14)?,
     })
 }
 
 /// SQL column list for message queries.
-const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned";
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned, prompt_eval_ns";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
