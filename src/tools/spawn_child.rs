@@ -148,12 +148,16 @@ impl Tool for DaemonSpawnChildTool {
                 ToolError::ExecutionFailed(format!("Failed to create task conversation: {}", e))
             })?;
 
-        // Post task message
+        // Post task message and pin it so it stays in context
         let message_id = store
             .add_message(&conv_name, &self.agent_name, task, &[agent])
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to post task message: {}", e))
             })?;
+
+        store.pin_message(&conv_name, message_id, true).map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to pin task message: {}", e))
+        })?;
 
         // Connect to child agent with retry (handles both fresh-start and already-running)
         let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
