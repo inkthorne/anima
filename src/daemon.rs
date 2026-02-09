@@ -317,6 +317,12 @@ fn format_conversation_history(
     // Process all messages
     for msg in messages {
         if msg.from_agent == "recall" {
+            // Skip recall injected by other agents — they're irrelevant noise.
+            // Unattributed (triggered_by = None) are included for backward compatibility.
+            match &msg.triggered_by {
+                Some(owner) if owner != current_agent => continue,
+                _ => {}
+            }
             // Recall goes BEFORE pending user messages to maintain:
             // [recall] [user] ordering (recall precedes the query it supports)
             history.push(ChatMessage {
@@ -2375,7 +2381,7 @@ async fn process_message_work(
                 // This positions recall in DB right before the response, preserving context for future turns
                 if let Some(ref recall_text) = recall_content_for_storage {
                     if !recall_text.is_empty() {
-                        if let Err(e) = store.add_message(cname, "recall", recall_text, &[]) {
+                        if let Err(e) = store.add_recall_message(cname, recall_text, &agent_name) {
                             logger.log(&format!(
                                 "[worker] Failed to store recall in conversation: {}",
                                 e
@@ -3313,7 +3319,7 @@ async fn handle_notify(
     // This positions recall in DB right before the response, preserving context for future turns
     if let Some(ref recall_text) = recall_content_for_storage {
         if !recall_text.is_empty() {
-            if let Err(e) = store.add_message(conv_id, "recall", recall_text, &[]) {
+            if let Err(e) = store.add_recall_message(conv_id, recall_text, agent_name) {
                 logger.log(&format!(
                     "[notify] Failed to store recall in conversation: {}",
                     e
@@ -3703,7 +3709,7 @@ async fn run_heartbeat(
     if let Some(ref recall_text) = recall_content
         && !recall_text.is_empty()
     {
-        if let Err(e) = store.add_message(&conv_name, "recall", recall_text, &[]) {
+        if let Err(e) = store.add_recall_message(&conv_name, recall_text, &agent_name) {
             logger.log(&format!(
                 "[heartbeat] Failed to store recall in conversation: {}",
                 e
@@ -4813,6 +4819,45 @@ api_key = "sk-test"
         assert!(final_content.contains("what's up?"));
         // Final content should NOT contain recall (would indicate double injection bug)
         assert!(!final_content.contains("Relevant memories"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_other_agent_recall_filtered() {
+        // Recall messages triggered by another agent should be excluded.
+        // Unattributed recall (triggered_by = None) should still be included for backward compat.
+        let mut own_recall = make_conv_msg("recall", "[recalled memories]\n- My memory");
+        own_recall.triggered_by = Some("arya".to_string());
+
+        let mut other_recall = make_conv_msg("recall", "[recalled memories]\n- Gendry's memory");
+        other_recall.triggered_by = Some("gendry".to_string());
+
+        let unattributed_recall = make_conv_msg("recall", "[recalled memories]\n- Old memory");
+
+        let msgs = vec![
+            make_conv_msg("user", "hello"),
+            own_recall,
+            other_recall,
+            unattributed_recall,
+            make_conv_msg("arya", "Hi!"),
+            make_conv_msg("user", "what's up?"),
+        ];
+        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+
+        // Should have 4 messages: own recall, unattributed recall, user, assistant
+        // (other_recall from gendry is filtered out)
+        assert_eq!(history.len(), 4);
+        // First two are recall (assistant role)
+        assert_eq!(history[0].role, "assistant");
+        assert!(history[0].content.as_ref().unwrap().contains("My memory"));
+        assert_eq!(history[1].role, "assistant");
+        assert!(history[1].content.as_ref().unwrap().contains("Old memory"));
+        // Gendry's recall should NOT appear anywhere
+        let all_content: String = history
+            .iter()
+            .filter_map(|m| m.content.as_ref())
+            .cloned()
+            .collect();
+        assert!(!all_content.contains("Gendry's memory"));
     }
 
     // =========================================================================

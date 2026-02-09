@@ -702,6 +702,20 @@ impl ConversationStore {
         )
     }
 
+    /// Add a recall message attributed to the agent that owns it.
+    /// This allows `format_conversation_history` to filter out other agents' recall injections.
+    pub fn add_recall_message(
+        &self,
+        conv_name: &str,
+        content: &str,
+        triggered_by: &str,
+    ) -> Result<i64, ConversationError> {
+        self.add_message_full(
+            conv_name, "recall", content, &[],
+            None, None, None, None, None, Some(triggered_by), None,
+        )
+    }
+
     /// Internal: add a message with all fields including triggered_by.
     #[allow(clippy::too_many_arguments)]
     fn add_message_full(
