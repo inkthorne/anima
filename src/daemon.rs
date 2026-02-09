@@ -158,6 +158,9 @@ struct NativeToolModeResult {
     response: String,
     tool_calls: Option<Vec<crate::llm::ToolCall>>,
     duration_ms: Option<u64>,
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+    prompt_eval_duration_ns: Option<u64>,
 }
 
 /// Expand injection directives in always.md content.
@@ -1773,6 +1776,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
                         let recall_limit = config.semantic_memory.recall_limit;
                         let history_limit = config.semantic_memory.history_limit;
+                        let conn_max_iterations = config.max_iterations;
+                        let conn_checkpoint_interval = config.checkpoint_interval;
+                        let conn_max_checkpoints = config.max_checkpoints;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
                             if let Err(e) = handle_connection(
@@ -1794,6 +1800,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 conn_heartbeat_config,
                                 conn_task_store,
                                 conn_work_tx,
+                                conn_max_iterations,
+                                conn_checkpoint_interval,
+                                conn_max_checkpoints,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -2136,6 +2145,10 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
+                    max_iterations,
+                    checkpoint_interval,
+                    max_checkpoints,
+                    num_ctx,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2198,6 +2211,9 @@ async fn agent_worker(
                         history_limit,
                         mentions_enabled,
                         &shutdown,
+                        max_iterations,
+                        checkpoint_interval,
+                        max_checkpoints,
                     )
                     .await;
                 } else {
@@ -2234,6 +2250,10 @@ async fn process_message_work(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
+    max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
+    num_ctx: Option<u32>,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -2334,7 +2354,7 @@ async fn process_message_work(
     let trace_handle = spawn_tool_trace_persister(
         conv_name.map(|s| s.to_string()),
         agent_name.to_string(),
-        None, // num_ctx not available in process_message_work path
+        num_ctx,
         logger.clone(),
         trace_rx,
     );
@@ -2354,12 +2374,15 @@ async fn process_message_work(
                 logger,
                 conversation_history,
                 Some(trace_tx.clone()),
+                max_iterations,
+                checkpoint_interval,
+                max_checkpoints,
             )
             .await;
-            (result.response, result.tool_calls, result.duration_ms)
+            (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
         } else {
             // JSON-block mode with optional streaming (no native tool_calls)
-            let (response, duration_ms) = process_json_block_mode(
+            let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns) = process_json_block_mode(
                 &final_user_content,
                 &recall_result.relevant_tools,
                 token_tx,
@@ -2375,11 +2398,11 @@ async fn process_message_work(
                 None, // max_checkpoints
             )
             .await;
-            (response, None, duration_ms)
+            (response, None, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
         }
     };
 
-    let (final_response, _tool_calls, last_duration_ms) = tokio::select! {
+    let (final_response, _tool_calls, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = tokio::select! {
         result = llm_future => result,
         _ = shutdown.notified() => {
             logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
@@ -2397,6 +2420,10 @@ async fn process_message_work(
     // Store response in conversation if conv_name was provided
     if let Some(cname) = conv_name {
         let duration_ms = last_duration_ms.map(|d| d as i64);
+        let tokens_in = last_tokens_in.map(|t| t as i64);
+        let tokens_out = last_tokens_out.map(|t| t as i64);
+        let num_ctx_i64 = num_ctx.map(|n| n as i64);
+        let prompt_eval_ns = last_prompt_eval_ns.map(|t| t as i64);
         match ConversationStore::init() {
             Ok(store) => {
                 // Store recall AFTER response for persistence (but recall was already injected in memory)
@@ -2411,14 +2438,18 @@ async fn process_message_work(
                         }
                     }
                 }
-                // Store the final response (no tool_calls since this is the terminal response)
-                match store.add_message_with_tool_calls(
+                // Store the final response with token stats
+                match store.add_message_with_tokens(
                     cname,
                     agent_name,
                     &final_response,
                     &[],
                     duration_ms,
                     None,
+                    tokens_in,
+                    tokens_out,
+                    num_ctx_i64,
+                    prompt_eval_ns,
                 ) {
                     Ok(response_msg_id) => {
                         // Embed agent response for future conversation recall
@@ -2505,6 +2536,9 @@ async fn process_native_tool_mode(
     logger: &Arc<AgentLogger>,
     conversation_history: Vec<ChatMessage>,
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
+    max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
@@ -2515,10 +2549,13 @@ async fn process_native_tool_mode(
         },
         external_tools,
         tool_trace_tx,
+        max_iterations: max_iterations.unwrap_or(10),
+        checkpoint_interval,
+        max_checkpoints: max_checkpoints.unwrap_or(5),
         ..Default::default()
     };
 
-    let (result, tool_calls, duration_ms) = if let Some(tx) = token_tx {
+    let (result, tool_calls, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns) = if let Some(tx) = token_tx {
         // Streaming mode - now returns ThinkResult with tool_calls
         let agent_clone = agent.clone();
         let content_clone = content.to_string();
@@ -2531,16 +2568,16 @@ async fn process_native_tool_mode(
         });
 
         match handle.await {
-            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.duration_ms),
-            Ok(Err(e)) => (format!("Error: {}", e), None, None),
-            Err(e) => (format!("Error: task panicked: {}", e), None, None),
+            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
+            Ok(Err(e)) => (format!("Error: {}", e), None, None, None, None, None),
+            Err(e) => (format!("Error: task panicked: {}", e), None, None, None, None, None),
         }
     } else {
         // Non-streaming mode - can capture tool_calls
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.last_tool_calls, result.duration_ms),
-            Err(e) => (format!("Error: {}", e), None, None),
+            Ok(result) => (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
+            Err(e) => (format!("Error: {}", e), None, None, None, None, None),
         }
     };
 
@@ -2555,6 +2592,9 @@ async fn process_native_tool_mode(
         response: after_remember,
         tool_calls,
         duration_ms,
+        tokens_in,
+        tokens_out,
+        prompt_eval_duration_ns,
     }
 }
 
@@ -2574,7 +2614,7 @@ async fn process_json_block_mode(
     conversation_history: Vec<ChatMessage>,
     checkpoint_interval: Option<usize>,
     max_checkpoints: Option<usize>,
-) -> (String, Option<u64>) {
+) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
     let mut current_message = content.to_string();
     let max_tool_calls = checkpoint_interval.unwrap_or(10);
     let use_checkpoints = checkpoint_interval.is_some();
@@ -2584,6 +2624,12 @@ async fn process_json_block_mode(
     let mut tool_call_count = 0;
     #[allow(unused_assignments)]
     let mut last_duration_ms: Option<u64> = None;
+    #[allow(unused_assignments)]
+    let mut last_tokens_in: Option<u32> = None;
+    #[allow(unused_assignments)]
+    let mut last_tokens_out: Option<u32> = None;
+    #[allow(unused_assignments)]
+    let mut last_prompt_eval_ns: Option<u64> = None;
 
     loop {
         let options = ThinkOptions {
@@ -2656,10 +2702,13 @@ async fn process_json_block_mode(
             match handle.await {
                 Ok(Ok(result)) => {
                     last_duration_ms = result.duration_ms;
+                    last_tokens_in = result.tokens_in;
+                    last_tokens_out = result.tokens_out;
+                    last_prompt_eval_ns = result.prompt_eval_duration_ns;
                     result.response
                 }
-                Ok(Err(e)) => return (format!("Error: {}", e), None),
-                Err(e) => return (format!("Error: task panicked: {}", e), None),
+                Ok(Err(e)) => return (format!("Error: {}", e), None, None, None, None),
+                Err(e) => return (format!("Error: task panicked: {}", e), None, None, None, None),
             }
         } else {
             // Non-streaming mode
@@ -2670,9 +2719,12 @@ async fn process_json_block_mode(
             {
                 Ok(result) => {
                     last_duration_ms = result.duration_ms;
+                    last_tokens_in = result.tokens_in;
+                    last_tokens_out = result.tokens_out;
+                    last_prompt_eval_ns = result.prompt_eval_duration_ns;
                     result.response
                 }
-                Err(e) => return (format!("Error: {}", e), None),
+                Err(e) => return (format!("Error: {}", e), None, None, None, None),
             }
         };
 
@@ -2694,7 +2746,7 @@ async fn process_json_block_mode(
                 json_checkpoint_count += 1;
                 if json_checkpoint_count > json_max_checkpoints {
                     logger.tool("[worker] Max checkpoints exhausted, stopping");
-                    return (cleaned_response, last_duration_ms);
+                    return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
                 }
                 let summary = crate::agent::build_checkpoint_summary(
                     &checkpoint_trace, json_checkpoint_count,
@@ -2708,7 +2760,7 @@ async fn process_json_block_mode(
                 continue;
             } else if !use_checkpoints && tool_call_count > max_tool_calls {
                 logger.tool("[worker] Max tool calls reached, stopping");
-                return (cleaned_response, last_duration_ms);
+                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
             }
 
             logger.tool(&format!(
@@ -2747,7 +2799,7 @@ async fn process_json_block_mode(
                 current_message.push_str(&format!("\n\n---\n{}", nudge));
             }
         } else {
-            return (cleaned_response, last_duration_ms);
+            return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
         }
     }
 }
@@ -3598,6 +3650,9 @@ async fn run_heartbeat(
     history_limit: usize,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
+    max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) {
     // Set current conversation for debug file naming
     {
@@ -3686,6 +3741,9 @@ async fn run_heartbeat(
             Some(conversation_history)
         },
         external_tools: recall_result.external_tools,
+        max_iterations: max_iterations.unwrap_or(10),
+        checkpoint_interval,
+        max_checkpoints: max_checkpoints.unwrap_or(5),
         ..Default::default()
     };
 
@@ -3990,6 +4048,9 @@ async fn handle_connection(
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
+    max_iterations: Option<usize>,
+    checkpoint_interval: Option<usize>,
+    max_checkpoints: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -4106,6 +4167,9 @@ async fn handle_connection(
                     system_prompt: system_prompt.clone(),
                     conversation_history: None,
                     external_tools: recall_result.external_tools,
+                    max_iterations: max_iterations.unwrap_or(10),
+                    checkpoint_interval,
+                    max_checkpoints: max_checkpoints.unwrap_or(5),
                     ..Default::default()
                 };
 
