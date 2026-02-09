@@ -1108,10 +1108,6 @@ pub struct DaemonConfig {
     pub num_ctx: Option<u32>,
     /// Maximum tool call iterations per turn
     pub max_iterations: Option<usize>,
-    /// Tool calls per checkpoint window (None = disabled)
-    pub checkpoint_interval: Option<usize>,
-    /// Maximum number of checkpoint restarts (default: 5)
-    pub max_checkpoints: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h")
     pub max_response_time: Option<String>,
     /// Whether outbound @mention forwarding is enabled (default: true)
@@ -1214,8 +1210,6 @@ impl DaemonConfig {
             allowed_tools,
             num_ctx: llm_config.num_ctx,
             max_iterations: agent_dir.config.think.max_iterations,
-            checkpoint_interval: agent_dir.config.think.checkpoint_interval,
-            max_checkpoints: agent_dir.config.think.max_checkpoints,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             mentions: agent_dir.config.agent.mentions,
         })
@@ -1533,8 +1527,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &task_store,
                             config.num_ctx,
                             config.max_iterations,
-                            config.checkpoint_interval,
-                            config.max_checkpoints,
                             config.max_response_time.as_deref(),
                             config.mentions,
                             &startup_shutdown,
@@ -1622,8 +1614,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         let worker_num_ctx = config.num_ctx;
         let worker_max_iterations = config.max_iterations;
-        let worker_checkpoint_interval = config.checkpoint_interval;
-        let worker_max_checkpoints = config.max_checkpoints;
         let worker_max_response_time = config.max_response_time.clone();
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
@@ -1648,8 +1638,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_heartbeat_config,
                 worker_num_ctx,
                 worker_max_iterations,
-                worker_checkpoint_interval,
-                worker_max_checkpoints,
                 worker_max_response_time,
                 worker_mentions,
                 worker_shutdown,
@@ -1790,8 +1778,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let recall_limit = config.semantic_memory.recall_limit;
                         let history_limit = config.semantic_memory.history_limit;
                         let conn_max_iterations = config.max_iterations;
-                        let conn_checkpoint_interval = config.checkpoint_interval;
-                        let conn_max_checkpoints = config.max_checkpoints;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
                             if let Err(e) = handle_connection(
@@ -1814,8 +1800,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 conn_task_store,
                                 conn_work_tx,
                                 conn_max_iterations,
-                                conn_checkpoint_interval,
-                                conn_max_checkpoints,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -2100,8 +2084,6 @@ async fn agent_worker(
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
     max_response_time: Option<String>,
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
@@ -2160,8 +2142,6 @@ async fn agent_worker(
                     &shutdown,
                     conversation_recall_limit,
                     max_iterations,
-                    checkpoint_interval,
-                    max_checkpoints,
                     num_ctx,
                 )
                 .await;
@@ -2196,8 +2176,6 @@ async fn agent_worker(
                     &task_store,
                     num_ctx,
                     max_iterations,
-                    checkpoint_interval,
-                    max_checkpoints,
                     max_response_time.as_deref(),
                     mentions_enabled,
                     &shutdown,
@@ -2226,8 +2204,6 @@ async fn agent_worker(
                         mentions_enabled,
                         &shutdown,
                         max_iterations,
-                        checkpoint_interval,
-                        max_checkpoints,
                     )
                     .await;
                 } else {
@@ -2265,8 +2241,6 @@ async fn process_message_work(
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
     num_ctx: Option<u32>,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
@@ -2389,8 +2363,6 @@ async fn process_message_work(
                 conversation_history,
                 Some(trace_tx.clone()),
                 max_iterations,
-                checkpoint_interval,
-                max_checkpoints,
             )
             .await;
             (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
@@ -2408,8 +2380,7 @@ async fn process_message_work(
                 logger,
                 &tool_context,
                 conversation_history,
-                None, // checkpoint_interval — not used for direct messages
-                None, // max_checkpoints
+                max_iterations,
             )
             .await;
             (response, None, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
@@ -2551,8 +2522,6 @@ async fn process_native_tool_mode(
     conversation_history: Vec<ChatMessage>,
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
 ) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
@@ -2563,9 +2532,7 @@ async fn process_native_tool_mode(
         },
         external_tools,
         tool_trace_tx,
-        max_iterations: max_iterations.unwrap_or(10),
-        checkpoint_interval,
-        max_checkpoints: max_checkpoints.unwrap_or(5),
+        max_iterations: max_iterations.unwrap_or(25),
         ..Default::default()
     };
 
@@ -2626,15 +2593,10 @@ async fn process_json_block_mode(
     logger: &Arc<AgentLogger>,
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
+    max_iterations: Option<usize>,
 ) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
     let mut current_message = content.to_string();
-    let max_tool_calls = checkpoint_interval.unwrap_or(10);
-    let use_checkpoints = checkpoint_interval.is_some();
-    let json_max_checkpoints = max_checkpoints.unwrap_or(5);
-    let mut json_checkpoint_count: usize = 0;
-    let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
+    let max_tool_calls = max_iterations.unwrap_or(25);
     let mut tool_call_count = 0;
     #[allow(unused_assignments)]
     let mut last_duration_ms: Option<u64> = None;
@@ -2755,24 +2717,7 @@ async fn process_json_block_mode(
         if let Some(tc) = tool_call {
             tool_call_count += 1;
 
-            // Check checkpoint boundary
-            if use_checkpoints && tool_call_count >= max_tool_calls {
-                json_checkpoint_count += 1;
-                if json_checkpoint_count > json_max_checkpoints {
-                    logger.tool("[worker] Max checkpoints exhausted, stopping");
-                    return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
-                }
-                let summary = crate::agent::build_checkpoint_summary(
-                    &checkpoint_trace, json_checkpoint_count,
-                );
-                logger.log(&format!(
-                    "[worker] Checkpoint {} reached ({} tool calls), restarting with summary",
-                    json_checkpoint_count, tool_call_count
-                ));
-                tool_call_count = 0;
-                current_message = summary;
-                continue;
-            } else if !use_checkpoints && tool_call_count > max_tool_calls {
+            if tool_call_count > max_tool_calls {
                 logger.tool("[worker] Max tool calls reached, stopping");
                 return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
             }
@@ -2789,22 +2734,10 @@ async fn process_json_block_mode(
             match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                 Ok(tool_result) => {
                     logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
-                    checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
-                        tool_name: tc.tool.clone(),
-                        params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
-                        result_summary: crate::agent::truncate(&tool_result, 100),
-                        content: None,
-                    });
                     current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
                 }
                 Err(e) => {
                     logger.tool(&format!("[worker] Error: {}", e));
-                    checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
-                        tool_name: tc.tool.clone(),
-                        params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
-                        result_summary: format!("ERROR: {}", crate::agent::truncate(&e.to_string(), 80)),
-                        content: None,
-                    });
                     current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
                 }
             }
@@ -2960,8 +2893,6 @@ async fn handle_notify(
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
     max_response_time: Option<&str>,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
@@ -3068,7 +2999,7 @@ async fn handle_notify(
 
     let external_tools = recall_result.external_tools;
 
-    let json_block_budget = checkpoint_interval.unwrap_or(max_iterations.unwrap_or(10));
+    let json_block_budget = max_iterations.unwrap_or(25);
     let mut tool_call_count = 0;
     let mut current_message = final_user_content.clone();
     #[allow(unused_assignments)]
@@ -3078,9 +3009,6 @@ async fn handle_notify(
     let mut last_tokens_out: Option<u32> = None;
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_duration_ms: Option<u64> = None;
-    let mut checkpoint_trace: Vec<crate::agent::CheckpointTraceEntry> = Vec::new();
-    let mut json_checkpoint_count: usize = 0;
-    let json_max_checkpoints = max_checkpoints.unwrap_or(5);
     let mut agent_error: Option<String> = None;
 
     // Channel for incremental tool trace persistence (native tool mode)
@@ -3146,11 +3074,9 @@ async fn handle_notify(
                 Some(conversation_history.clone())
             },
             external_tools: external_tools.clone(),
-            max_iterations: max_iterations.unwrap_or(10),
+            max_iterations: max_iterations.unwrap_or(25),
             tool_trace_tx: Some(tool_trace_tx.clone()),
             cancel: Some(cancel_flag.clone()),
-            checkpoint_interval,
-            max_checkpoints: max_checkpoints.unwrap_or(5),
             ..Default::default()
         };
 
@@ -3249,32 +3175,7 @@ async fn handle_notify(
 
                     tool_call_count += 1;
 
-                    // Check if we've hit the checkpoint boundary (JSON-block mode)
-                    if checkpoint_interval.is_some() && tool_call_count >= json_block_budget {
-                        json_checkpoint_count += 1;
-                        if json_checkpoint_count > json_max_checkpoints {
-                            logger.tool("[notify] Max checkpoints exhausted, stopping");
-                            final_response = Some(after_remember.clone());
-                            break;
-                        }
-                        // Build checkpoint summary and reset counter
-                        let summary = crate::agent::build_checkpoint_summary(
-                            &checkpoint_trace, json_checkpoint_count,
-                        );
-                        logger.log(&format!(
-                            "[notify] Checkpoint {} reached ({} tool calls), restarting with summary",
-                            json_checkpoint_count, tool_call_count
-                        ));
-                        tool_call_count = 0;
-                        current_message = summary;
-                        // Refresh conversation_history from DB for fresh context
-                        if let Ok(msgs) = store.get_messages_with_pinned(conv_id, Some(history_limit)) {
-                            let (refreshed_history, _) =
-                                format_conversation_history(&msgs, agent_name);
-                            conversation_history = refreshed_history;
-                        }
-                        continue;
-                    } else if checkpoint_interval.is_none() && tool_call_count > json_block_budget {
+                    if tool_call_count > json_block_budget {
                         logger.tool("[notify] Max tool calls reached, stopping");
                         final_response = Some(after_remember.clone());
                         break;
@@ -3315,23 +3216,10 @@ async fn handle_notify(
                     let tool_message = match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
                         Ok(tool_result) => {
                             logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
-                            // Track for checkpoint summary
-                            checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
-                                tool_name: tc.tool.clone(),
-                                params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
-                                result_summary: crate::agent::truncate(&tool_result, 100),
-                                content: None,
-                            });
                             format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                         }
                         Err(e) => {
                             logger.tool(&format!("[notify] Error: {}", e));
-                            checkpoint_trace.push(crate::agent::CheckpointTraceEntry {
-                                tool_name: tc.tool.clone(),
-                                params_summary: crate::agent::summarize_tool_params(&tc.tool, &tc.params),
-                                result_summary: format!("ERROR: {}", crate::agent::truncate(&e.to_string(), 80)),
-                                content: None,
-                            });
                             format!("[Tool Error for {}]\n{}", tc.tool, e)
                         }
                     };
@@ -3665,8 +3553,6 @@ async fn run_heartbeat(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
 ) {
     // Set current conversation for debug file naming
     {
@@ -3755,9 +3641,7 @@ async fn run_heartbeat(
             Some(conversation_history)
         },
         external_tools: recall_result.external_tools,
-        max_iterations: max_iterations.unwrap_or(10),
-        checkpoint_interval,
-        max_checkpoints: max_checkpoints.unwrap_or(5),
+        max_iterations: max_iterations.unwrap_or(25),
         ..Default::default()
     };
 
@@ -4063,8 +3947,6 @@ async fn handle_connection(
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
     max_iterations: Option<usize>,
-    checkpoint_interval: Option<usize>,
-    max_checkpoints: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -4181,9 +4063,7 @@ async fn handle_connection(
                     system_prompt: system_prompt.clone(),
                     conversation_history: None,
                     external_tools: recall_result.external_tools,
-                    max_iterations: max_iterations.unwrap_or(10),
-                    checkpoint_interval,
-                    max_checkpoints: max_checkpoints.unwrap_or(5),
+                    max_iterations: max_iterations.unwrap_or(25),
                     ..Default::default()
                 };
 

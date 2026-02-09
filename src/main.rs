@@ -2598,8 +2598,6 @@ async fn run_agent_task(
         external_tools: None,
         tool_trace_tx: None,
         cancel: None,
-        checkpoint_interval: config.think.checkpoint_interval,
-        max_checkpoints: config.think.max_checkpoints,
     };
 
     if stream {

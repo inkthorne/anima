@@ -5,11 +5,7 @@ fn default_backend() -> String {
 }
 
 fn default_max_iter() -> usize {
-    10
-}
-
-fn default_max_checkpoints() -> usize {
-    5
+    25
 }
 
 fn default_mem_entries() -> usize {
@@ -187,12 +183,6 @@ pub struct ThinkSection {
     pub max_memory_entries: usize,
     #[serde(default)]
     pub reflection: bool,
-    /// Tool calls per checkpoint window. None = checkpoints disabled (default).
-    #[serde(default)]
-    pub checkpoint_interval: Option<usize>,
-    /// Maximum number of checkpoint restarts before giving up (default: 5).
-    #[serde(default = "default_max_checkpoints")]
-    pub max_checkpoints: usize,
     /// Maximum wall-clock time for a single notify response. None = no limit (default).
     /// Parsed as a duration string: "5m", "10m", "1h", etc.
     #[serde(default)]
@@ -206,8 +196,6 @@ impl Default for ThinkSection {
             auto_memory: false,
             max_memory_entries: default_mem_entries(),
             reflection: false,
-            checkpoint_interval: None,
-            max_checkpoints: default_max_checkpoints(),
             max_response_time: None,
         }
     }
@@ -286,10 +274,7 @@ model = "gpt-4o"
         assert_eq!(config.llm.model, "gpt-4o");
         assert!(config.tools.enabled.is_empty());
         assert_eq!(config.memory.backend, "in_memory");
-        assert_eq!(config.think.max_iterations, 10);
-        // Checkpoint defaults
-        assert!(config.think.checkpoint_interval.is_none());
-        assert_eq!(config.think.max_checkpoints, 5);
+        assert_eq!(config.think.max_iterations, 25);
         // Retry defaults
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.retry.initial_delay_ms, 100);
@@ -467,25 +452,4 @@ model = "gpt-4o"
         assert!(config.heartbeat.interval.is_none());
     }
 
-    #[test]
-    fn test_parse_checkpoint_config() {
-        let toml = r#"
-[agent]
-name = "checkpoint-agent"
-
-[llm]
-provider = "ollama"
-model = "qwen3-coder:30b"
-tools = false
-
-[think]
-max_iterations = 100
-checkpoint_interval = 20
-max_checkpoints = 3
-"#;
-        let config: AgentConfig = toml::from_str(toml).unwrap();
-        assert_eq!(config.think.max_iterations, 100);
-        assert_eq!(config.think.checkpoint_interval, Some(20));
-        assert_eq!(config.think.max_checkpoints, 3);
-    }
 }
