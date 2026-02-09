@@ -355,12 +355,12 @@ pub struct SemanticMemoryStore {
 }
 
 /// Serialize embedding to bytes for SQLite BLOB storage.
-fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
+pub(crate) fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {
     embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 /// Deserialize embedding from SQLite BLOB.
-fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
+pub(crate) fn blob_to_embedding(blob: &[u8]) -> Vec<f32> {
     blob.chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
@@ -914,7 +914,7 @@ pub fn build_memory_injection(memories: &[SemanticMemoryEntry]) -> String {
         return String::new();
     }
 
-    let mut injection = String::from("[Relevant memories]\n");
+    let mut injection = String::from("[recalled memories]\n");
     for m in memories {
         let age = format_age(m.created_at);
         let flag = if m.importance > 0.8 { " ⭐" } else { "" };
@@ -1562,7 +1562,7 @@ mod tests {
         }];
         let injection = build_memory_injection(&memories);
 
-        assert!(injection.starts_with("[Relevant memories]"));
+        assert!(injection.starts_with("[recalled memories]"));
         assert!(injection.contains("User prefers dark mode"));
         assert!(injection.contains("just now"));
         assert!(!injection.contains("⭐")); // Low importance, no star

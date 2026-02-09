@@ -191,6 +191,14 @@ impl ConversationStore {
 
                 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conv_name, created_at);
                 CREATE INDEX IF NOT EXISTS idx_pending_agent ON pending_notifications(agent);
+
+                CREATE TABLE IF NOT EXISTS message_embeddings (
+                    message_id INTEGER PRIMARY KEY,
+                    conv_name TEXT NOT NULL,
+                    embedding BLOB NOT NULL,
+                    FOREIGN KEY (message_id) REFERENCES messages(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_msg_emb_conv ON message_embeddings(conv_name);
                 "#,
             )?;
         }
@@ -242,6 +250,18 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "prompt_tokens_est", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "prompt_eval_ns", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
+
+        // Create message_embeddings table if it doesn't exist (for existing databases)
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_embeddings (
+                message_id INTEGER PRIMARY KEY,
+                conv_name TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                FOREIGN KEY (message_id) REFERENCES messages(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_msg_emb_conv ON message_embeddings(conv_name);",
+        )?;
+
         Ok(())
     }
 
@@ -1000,6 +1020,88 @@ impl ConversationStore {
         Ok(result)
     }
 
+    /// Store an embedding for a message (for conversation recall).
+    pub fn store_message_embedding(
+        &self,
+        message_id: i64,
+        conv_name: &str,
+        embedding: &[f32],
+    ) -> Result<(), ConversationError> {
+        let blob = crate::memory::embedding_to_blob(embedding);
+        self.conn.execute(
+            "INSERT OR REPLACE INTO message_embeddings (message_id, conv_name, embedding) VALUES (?1, ?2, ?3)",
+            params![message_id, conv_name, blob],
+        )?;
+        Ok(())
+    }
+
+    /// Search for similar messages in a conversation using cosine similarity.
+    ///
+    /// Returns `(message_id, from_agent, content, created_at, similarity)` tuples sorted by
+    /// similarity descending, excluding messages in `exclude_ids` (the current window).
+    /// Includes user and agent messages but excludes tool results, recall injections,
+    /// empty messages, and tool-call intermediaries.
+    pub fn search_similar_messages(
+        &self,
+        conv_name: &str,
+        query_embedding: &[f32],
+        exclude_ids: &[i64],
+        limit: usize,
+    ) -> Result<Vec<(i64, String, String, i64, f32)>, ConversationError> {
+        use crate::embedding::cosine_similarity;
+        use crate::memory::blob_to_embedding;
+
+        let now = current_timestamp();
+
+        // Load all embeddings for substantive messages in this conversation (non-expired)
+        let mut stmt = self.conn.prepare(
+            "SELECT me.message_id, m.from_agent, m.content, m.created_at, me.embedding
+             FROM message_embeddings me
+             JOIN messages m ON me.message_id = m.id
+             WHERE me.conv_name = ?1
+               AND m.from_agent NOT IN ('tool', 'recall')
+               AND m.content != ''
+               AND m.tool_calls IS NULL
+               AND m.expires_at > ?2
+             ORDER BY m.created_at DESC",
+        )?;
+
+        let exclude_set: std::collections::HashSet<i64> = exclude_ids.iter().copied().collect();
+
+        let rows = stmt.query_map(params![conv_name, now], |row| {
+            let message_id: i64 = row.get(0)?;
+            let from_agent: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            let embedding_blob: Vec<u8> = row.get(4)?;
+            Ok((message_id, from_agent, content, created_at, embedding_blob))
+        })?;
+
+        let mut scored: Vec<(i64, String, String, i64, f32)> = Vec::new();
+
+        for row in rows {
+            let (message_id, from_agent, content, created_at, embedding_blob) = row?;
+
+            // Skip messages in the current window
+            if exclude_set.contains(&message_id) {
+                continue;
+            }
+
+            let embedding = blob_to_embedding(&embedding_blob);
+            let similarity = cosine_similarity(query_embedding, &embedding);
+
+            if similarity > 0.0 {
+                scored.push((message_id, from_agent, content, created_at, similarity));
+            }
+        }
+
+        // Sort by similarity descending
+        scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+
+        Ok(scored)
+    }
+
     /// Add a pending notification for an offline agent.
     pub fn add_pending_notification(
         &self,
@@ -1106,6 +1208,12 @@ impl ConversationStore {
     pub fn cleanup_expired(&self) -> Result<(usize, usize), ConversationError> {
         let now = current_timestamp();
 
+        // Delete embeddings for expired messages
+        self.conn.execute(
+            "DELETE FROM message_embeddings WHERE message_id IN (SELECT id FROM messages WHERE expires_at <= ?1)",
+            params![now],
+        )?;
+
         // Delete expired messages
         let messages_deleted = self
             .conn
@@ -1144,6 +1252,12 @@ impl ConversationStore {
             params![conv_name],
         )?;
 
+        // Delete embeddings for this conversation
+        self.conn.execute(
+            "DELETE FROM message_embeddings WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+
         // Delete all messages
         let deleted = self.conn.execute(
             "DELETE FROM messages WHERE conv_name = ?1",
@@ -1157,6 +1271,10 @@ impl ConversationStore {
     pub fn delete_conversation(&self, conv_name: &str) -> Result<(), ConversationError> {
         self.conn.execute(
             "DELETE FROM pending_notifications WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+        self.conn.execute(
+            "DELETE FROM message_embeddings WHERE conv_name = ?1",
             params![conv_name],
         )?;
         self.conn.execute(
@@ -2897,5 +3015,153 @@ mod tests {
         // Inclusive: id1 itself + 2 after = 3
         assert_eq!(store.count_messages_from(&conv, id1).unwrap(), 3);
         assert_eq!(store.count_messages_from(&conv, 999).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_store_message_embedding() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("emb-test"), &["arya"]).unwrap();
+        let msg_id = store.add_message(&conv, "user", "hello world", &[]).unwrap();
+
+        let embedding = vec![0.1, 0.2, 0.3, 0.4];
+        store.store_message_embedding(msg_id, &conv, &embedding).unwrap();
+
+        // Verify it was stored by searching
+        let query_emb = vec![0.1, 0.2, 0.3, 0.4];
+        let results = store.search_similar_messages(&conv, &query_emb, &[], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, msg_id);
+        assert_eq!(results[0].1, "user");
+        assert_eq!(results[0].2, "hello world");
+    }
+
+    #[test]
+    fn test_search_similar_messages_excludes_ids() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("excl-test"), &["arya"]).unwrap();
+
+        let emb = vec![0.9, 0.1, 0.0, 0.0];
+        let id1 = store.add_message(&conv, "user", "first question", &[]).unwrap();
+        store.store_message_embedding(id1, &conv, &emb).unwrap();
+
+        let id2 = store.add_message(&conv, "user", "second question", &[]).unwrap();
+        store.store_message_embedding(id2, &conv, &emb).unwrap();
+
+        // Exclude id1 — should only return id2
+        let results = store.search_similar_messages(&conv, &emb, &[id1], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, id2);
+    }
+
+    #[test]
+    fn test_search_similar_messages_limit() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("limit-emb"), &["arya"]).unwrap();
+
+        let emb = vec![0.9, 0.1, 0.0, 0.0];
+        for i in 0..5 {
+            let id = store.add_message(&conv, "user", &format!("msg {}", i), &[]).unwrap();
+            store.store_message_embedding(id, &conv, &emb).unwrap();
+        }
+
+        let results = store.search_similar_messages(&conv, &emb, &[], 2).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_similar_messages_empty() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("empty-emb"), &["arya"]).unwrap();
+
+        let query_emb = vec![0.1, 0.2, 0.3, 0.4];
+        let results = store.search_similar_messages(&conv, &query_emb, &[], 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_similar_messages_includes_agent_messages() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("agent-msg"), &["arya"]).unwrap();
+
+        let emb = vec![0.9, 0.1, 0.0, 0.0];
+
+        // Add a user message with embedding
+        let uid = store.add_message(&conv, "user", "user question", &[]).unwrap();
+        store.store_message_embedding(uid, &conv, &emb).unwrap();
+
+        // Add an agent message with embedding (should now be included)
+        let aid = store.add_message(&conv, "arya", "agent response", &[]).unwrap();
+        store.store_message_embedding(aid, &conv, &emb).unwrap();
+
+        let results = store.search_similar_messages(&conv, &emb, &[], 10).unwrap();
+        assert_eq!(results.len(), 2);
+        // Verify from_agent is returned
+        let agents: Vec<&str> = results.iter().map(|r| r.1.as_str()).collect();
+        assert!(agents.contains(&"user"));
+        assert!(agents.contains(&"arya"));
+    }
+
+    #[test]
+    fn test_search_similar_messages_excludes_tool_and_recall() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("filter-test"), &["arya"]).unwrap();
+
+        let emb = vec![0.9, 0.1, 0.0, 0.0];
+
+        // User message — should be included
+        let uid = store.add_message(&conv, "user", "a question", &[]).unwrap();
+        store.store_message_embedding(uid, &conv, &emb).unwrap();
+
+        // Tool result — should be excluded
+        let tid = store.add_message(&conv, "tool", "tool output", &[]).unwrap();
+        store.store_message_embedding(tid, &conv, &emb).unwrap();
+
+        // Recall injection — should be excluded
+        let rid = store.add_message(&conv, "recall", "recall content", &[]).unwrap();
+        store.store_message_embedding(rid, &conv, &emb).unwrap();
+
+        let results = store.search_similar_messages(&conv, &emb, &[], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, "user");
+    }
+
+    #[test]
+    fn test_search_similar_messages_excludes_tool_call_intermediaries() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("tc-test"), &["arya"]).unwrap();
+
+        let emb = vec![0.9, 0.1, 0.0, 0.0];
+
+        // Normal agent response — should be included
+        let aid = store.add_message(&conv, "arya", "normal response", &[]).unwrap();
+        store.store_message_embedding(aid, &conv, &emb).unwrap();
+
+        // Agent message with tool_calls — should be excluded
+        let tcid = store.add_message_with_tool_calls(
+            &conv, "arya", "calling tool", &[], None, Some(r#"[{"tool":"shell"}]"#),
+        ).unwrap();
+        store.store_message_embedding(tcid, &conv, &emb).unwrap();
+
+        let results = store.search_similar_messages(&conv, &emb, &[], 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].2, "normal response");
+    }
+
+    #[test]
+    fn test_store_message_embedding_replace() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("replace-emb"), &["arya"]).unwrap();
+        let msg_id = store.add_message(&conv, "user", "hello", &[]).unwrap();
+
+        let emb1 = vec![0.1, 0.2, 0.3, 0.4];
+        store.store_message_embedding(msg_id, &conv, &emb1).unwrap();
+
+        // Replace with new embedding — should not error
+        let emb2 = vec![0.9, 0.8, 0.7, 0.6];
+        store.store_message_embedding(msg_id, &conv, &emb2).unwrap();
+
+        // Should still find exactly one result
+        let results = store.search_similar_messages(&conv, &emb2, &[], 10).unwrap();
+        assert_eq!(results.len(), 1);
     }
 }

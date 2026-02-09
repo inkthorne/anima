@@ -173,15 +173,18 @@ fn expand_inject_directives(
     content: &str,
     tools_injection: &str,
     memory_injection: &str,
+    conversation_injection: &str,
 ) -> Option<String> {
     const TOOLS_DIRECTIVE: &str = "<!-- @inject:tools -->";
     const MEMORIES_DIRECTIVE: &str = "<!-- @inject:memories -->";
+    const CONVERSATION_DIRECTIVE: &str = "<!-- @inject:conversation -->";
 
     let has_tools_directive = content.contains(TOOLS_DIRECTIVE);
     let has_memories_directive = content.contains(MEMORIES_DIRECTIVE);
+    let has_conversation_directive = content.contains(CONVERSATION_DIRECTIVE);
 
     // No directives found — signal that user opted out of auto-injection
-    if !has_tools_directive && !has_memories_directive {
+    if !has_tools_directive && !has_memories_directive && !has_conversation_directive {
         return None;
     }
 
@@ -191,6 +194,7 @@ fn expand_inject_directives(
     let directives: &[(&str, &str)] = &[
         (TOOLS_DIRECTIVE, tools_injection),
         (MEMORIES_DIRECTIVE, memory_injection),
+        (CONVERSATION_DIRECTIVE, conversation_injection),
     ];
 
     for &(directive, injection) in directives {
@@ -221,15 +225,16 @@ fn expand_inject_directives(
 fn build_recall_content(
     tools_injection: &str,
     memory_injection: &str,
+    conversation_injection: &str,
     base_recall: &Option<String>,
     model_recall: &Option<String>,
 ) -> Option<String> {
     let mut parts = Vec::new();
 
     // Try directive expansion first
-    let expanded_base = base_recall
-        .as_ref()
-        .and_then(|base| expand_inject_directives(base, tools_injection, memory_injection));
+    let expanded_base = base_recall.as_ref().and_then(|base| {
+        expand_inject_directives(base, tools_injection, memory_injection, conversation_injection)
+    });
 
     if let Some(expanded) = expanded_base {
         // Directives were found and expanded — use the expanded content
@@ -239,12 +244,15 @@ fn build_recall_content(
         // Just use the recall.md content as-is
         parts.push(base.clone());
     } else {
-        // No recall.md at all — inject tools/memories as sensible defaults
+        // No recall.md at all — inject tools/memories/conversation as sensible defaults
         if !tools_injection.is_empty() {
             parts.push(tools_injection.to_string());
         }
         if !memory_injection.is_empty() {
             parts.push(memory_injection.to_string());
+        }
+        if !conversation_injection.is_empty() {
+            parts.push(conversation_injection.to_string());
         }
     }
 
@@ -395,6 +403,8 @@ struct RecallResult {
     external_tools: Option<Vec<ToolSpec>>,
     /// Relevant tool definitions for JSON-block mode (empty in native mode)
     relevant_tools: Vec<ToolDefinition>,
+    /// Query embedding (reusable for conversation recall and user message embedding)
+    query_embedding: Option<Vec<f32>>,
 }
 
 /// Build tools and memory injection for a query.
@@ -402,6 +412,7 @@ struct RecallResult {
 /// This shared helper handles:
 /// - Tool recall (native mode: all allowed tools, JSON-block mode: keyword-matched tools)
 /// - Memory recall (semantic search with embeddings)
+/// - Conversation recall (semantic search over past user messages)
 /// - Combining with recall.md and model-specific recall
 #[allow(clippy::too_many_arguments)]
 async fn build_recall_for_query(
@@ -415,6 +426,9 @@ async fn build_recall_for_query(
     model_recall: &Option<String>,
     recall_limit: usize,
     logger: &Arc<AgentLogger>,
+    conv_name: Option<&str>,
+    window_message_ids: &[i64],
+    conversation_recall_limit: usize,
 ) -> RecallResult {
     // Build tools injection or tool specs
     let (tools_injection, external_tools, relevant_tools) = if use_native_tools {
@@ -455,20 +469,21 @@ async fn build_recall_for_query(
         (injection, None, owned_tools)
     };
 
+    // Compute query embedding once (shared by memory recall + conversation recall)
+    let query_embedding = if let Some(emb_client) = embedding_client {
+        match emb_client.embed(query).await {
+            Ok(emb) => Some(emb),
+            Err(e) => {
+                logger.log(&format!("Failed to generate query embedding: {}", e));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Inject relevant memories
     let memory_injection = if let Some(mem_store) = semantic_memory {
-        let query_embedding = if let Some(emb_client) = embedding_client {
-            match emb_client.embed(query).await {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    logger.log(&format!("Failed to generate query embedding: {}", e));
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         let store = mem_store.lock().await;
         match store.recall_with_embedding(query, recall_limit, query_embedding.as_deref()) {
             Ok(memories) => {
@@ -490,14 +505,88 @@ async fn build_recall_for_query(
         String::new()
     };
 
-    let recall_content =
-        build_recall_content(&tools_injection, &memory_injection, recall, model_recall);
+    // Conversation recall: search past user messages that have scrolled out of the window
+    let conversation_injection = if conversation_recall_limit > 0
+        && conv_name.is_some()
+        && query_embedding.is_some()
+    {
+        let cname = conv_name.unwrap();
+        match ConversationStore::init() {
+            Ok(store) => {
+                match store.search_similar_messages(
+                    cname,
+                    query_embedding.as_deref().unwrap(),
+                    window_message_ids,
+                    conversation_recall_limit,
+                ) {
+                    Ok(results) => {
+                        if !results.is_empty() {
+                            logger.memory(&format!(
+                                "Conversation recall: {} messages for query",
+                                results.len()
+                            ));
+                            for (id, from, content, _, sim) in &results {
+                                logger.memory(&format!(
+                                    "  ({:.3}) [{}] \"{}\" [msg#{}]",
+                                    sim,
+                                    from,
+                                    content.chars().take(80).collect::<String>(),
+                                    id
+                                ));
+                            }
+                        }
+                        build_conversation_recall_injection(&results)
+                    }
+                    Err(e) => {
+                        logger.log(&format!("Conversation recall error: {}", e));
+                        String::new()
+                    }
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("Conversation recall store error: {}", e));
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+
+    let recall_content = build_recall_content(
+        &tools_injection,
+        &memory_injection,
+        &conversation_injection,
+        recall,
+        model_recall,
+    );
 
     RecallResult {
         recall_content,
         external_tools,
         relevant_tools,
+        query_embedding,
     }
+}
+
+/// Build the conversation recall injection string for prepending to context.
+fn build_conversation_recall_injection(results: &[(i64, String, String, i64, f32)]) -> String {
+    if results.is_empty() {
+        return String::new();
+    }
+
+    let mut injection = String::from("[recalled messages]\n");
+    for (_id, from_agent, content, created_at, _sim) in results {
+        let age = crate::memory::format_age(*created_at);
+        // Truncate long messages to 200 chars
+        let display: String = if content.len() > 200 {
+            format!("{}...", content.chars().take(200).collect::<String>())
+        } else {
+            content.clone()
+        };
+        injection.push_str(&format!("- ({}) [{}] {}\n", age, from_agent, display));
+    }
+    injection.push('\n');
+    injection
 }
 /// Save extracted [REMEMBER: ...] tags to semantic memory.
 async fn save_memories(
@@ -1414,6 +1503,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.max_response_time.as_deref(),
                             config.mentions,
                             &startup_shutdown,
+                            config.semantic_memory.conversation_recall_limit,
                         )
                         .await;
 
@@ -1502,6 +1592,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_max_response_time = config.max_response_time.clone();
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
+        let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1527,6 +1618,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_max_response_time,
                 worker_mentions,
                 worker_shutdown,
+                worker_conversation_recall_limit,
             )
             .await
         })
@@ -1970,6 +2062,7 @@ async fn agent_worker(
     max_response_time: Option<String>,
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
+    conversation_recall_limit: usize,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2022,6 +2115,7 @@ async fn agent_worker(
                     &task_store,
                     mentions_enabled,
                     &shutdown,
+                    conversation_recall_limit,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2060,6 +2154,7 @@ async fn agent_worker(
                     max_response_time.as_deref(),
                     mentions_enabled,
                     &shutdown,
+                    conversation_recall_limit,
                 )
                 .await;
             }
@@ -2118,6 +2213,7 @@ async fn process_message_work(
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
+    conversation_recall_limit: usize,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -2126,11 +2222,14 @@ async fn process_message_work(
     }
 
     // Load conversation history first (using append-only context cursors)
-    let (mut conversation_history, final_user_content): (Vec<ChatMessage>, String) =
+    // Also capture window message IDs for conversation recall exclusion
+    let (mut conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
                 Ok(store) => match load_agent_context(&store, cname, agent_name, history_limit, &logger) {
                     Ok(msgs) if !msgs.is_empty() => {
+                        let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
+                        let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
                         let (history, final_content) =
                             format_conversation_history(&msgs, agent_name);
                         logger.log(&format!(
@@ -2138,15 +2237,15 @@ async fn process_message_work(
                             history.len(),
                             cname
                         ));
-                        (history, final_content)
+                        (history, final_content, ids, last_uid)
                     }
-                    Ok(_) => (Vec::new(), content.to_string()),
+                    Ok(_) => (Vec::new(), content.to_string(), Vec::new(), None),
                     Err(e) => {
                         logger.log(&format!(
                             "[worker] Failed to load conversation history: {}",
                             e
                         ));
-                        (Vec::new(), content.to_string())
+                        (Vec::new(), content.to_string(), Vec::new(), None)
                     }
                 },
                 Err(e) => {
@@ -2154,14 +2253,14 @@ async fn process_message_work(
                         "[worker] Failed to init conversation store for history: {}",
                         e
                     ));
-                    (Vec::new(), content.to_string())
+                    (Vec::new(), content.to_string(), Vec::new(), None)
                 }
             }
         } else {
-            (Vec::new(), content.to_string())
+            (Vec::new(), content.to_string(), Vec::new(), None)
         };
 
-    // Build recall (tools + memories) based on user message
+    // Build recall (tools + memories + conversation recall) based on user message
     let recall_result = build_recall_for_query(
         content,
         allowed_tools,
@@ -2173,8 +2272,20 @@ async fn process_message_work(
         model_recall,
         recall_limit,
         logger,
+        conv_name,
+        &window_message_ids,
+        conversation_recall_limit,
     )
     .await;
+
+    // Embed last user message for future conversation recall
+    if let (Some(cname), Some(uid), Some(emb)) = (conv_name, last_user_msg_id, &recall_result.query_embedding) {
+        if let Ok(store) = ConversationStore::init() {
+            if let Err(e) = store.store_message_embedding(uid, cname, emb) {
+                logger.log(&format!("[worker] Failed to store user message embedding: {}", e));
+            }
+        }
+    }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
     inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
@@ -2282,6 +2393,22 @@ async fn process_message_work(
                     None,
                 ) {
                     Ok(response_msg_id) => {
+                        // Embed agent response for future conversation recall
+                        if !final_response.is_empty() {
+                            if let Some(emb_client) = embedding_client {
+                                match emb_client.embed(&final_response).await {
+                                    Ok(emb) => {
+                                        if let Err(e) = store.store_message_embedding(response_msg_id, cname, &emb) {
+                                            logger.log(&format!("[worker] Failed to store response embedding: {}", e));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        logger.log(&format!("[worker] Failed to embed response: {}", e));
+                                    }
+                                }
+                            }
+                        }
+
                         // Parse @mentions from response and forward to other agents
                         if mentions_enabled {
                             let mentions = crate::conversation::parse_mentions(&final_response);
@@ -2744,6 +2871,7 @@ async fn handle_notify(
     max_response_time: Option<&str>,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
+    conversation_recall_limit: usize,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -2787,10 +2915,14 @@ async fn handle_notify(
     }
 
     // Extract final_user_content for building recall
+    let window_message_ids: Vec<i64> = context_messages.iter().map(|m| m.id).collect();
+    let last_user_msg_id = context_messages.iter().rev()
+        .find(|m| m.from_agent == "user")
+        .map(|m| m.id);
     let (mut conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name);
 
-    // Build recall (tools + memories) based on current user message
+    // Build recall (tools + memories + conversation recall) based on current user message
     let recall_result = build_recall_for_query(
         &final_user_content,
         allowed_tools,
@@ -2802,8 +2934,18 @@ async fn handle_notify(
         model_recall,
         recall_limit,
         logger,
+        Some(conv_id),
+        &window_message_ids,
+        conversation_recall_limit,
     )
     .await;
+
+    // Embed last user message for future conversation recall
+    if let (Some(uid), Some(emb)) = (last_user_msg_id, &recall_result.query_embedding) {
+        if let Err(e) = store.store_message_embedding(uid, conv_id, emb) {
+            logger.log(&format!("[notify] Failed to store user message embedding: {}", e));
+        }
+    }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
     inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
@@ -3210,6 +3352,22 @@ async fn handle_notify(
                 logger,
             );
 
+            // Embed agent response for future conversation recall
+            if !cleaned_response.is_empty() {
+                if let Some(emb_client) = embedding_client {
+                    match emb_client.embed(&cleaned_response).await {
+                        Ok(emb) => {
+                            if let Err(e) = store.store_message_embedding(response_msg_id, conv_id, &emb) {
+                                logger.log(&format!("[notify] Failed to store response embedding: {}", e));
+                            }
+                        }
+                        Err(e) => {
+                            logger.log(&format!("[notify] Failed to embed response: {}", e));
+                        }
+                    }
+                }
+            }
+
             // Parse @mentions from our response and forward to other agents
             // Only forward if mentions enabled, not paused, and not at depth limit
             let should_forward = mentions_enabled
@@ -3477,6 +3635,9 @@ async fn run_heartbeat(
         model_recall,
         recall_limit,
         logger,
+        None,
+        &[],
+        0,
     )
     .await;
 
@@ -3897,6 +4058,9 @@ async fn handle_connection(
                     &model_recall,
                     recall_limit,
                     &logger,
+                    None,
+                    &[],
+                    0,
                 )
                 .await;
 
@@ -4619,7 +4783,7 @@ api_key = "sk-test"
         // the in-memory ordering during the original turn.
         let msgs = vec![
             make_conv_msg("user", "hello"),
-            make_conv_msg("recall", "[Relevant memories]\n- Memory 1\n- Memory 2"),
+            make_conv_msg("recall", "[recalled memories]\n- Memory 1\n- Memory 2"),
             make_conv_msg("arya", "Hi! How can I help?"),
             make_conv_msg("user", "what's up?"),
         ];
@@ -4629,7 +4793,7 @@ api_key = "sk-test"
         assert_eq!(history.len(), 3);
         // Recall should be first — assistant role with raw content (not JSON-wrapped)
         assert_eq!(history[0].role, "assistant");
-        assert!(history[0].content.as_ref().unwrap().contains("[Relevant memories]"));
+        assert!(history[0].content.as_ref().unwrap().contains("[recalled memories]"));
         assert!(!history[0].content.as_ref().unwrap().contains("\"from\": \"recall\""));
         // User message comes after recall
         assert_eq!(history[1].role, "user");
@@ -4718,7 +4882,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_no_directives() {
         let content = "Some always content\nwith no directives";
-        let result = expand_inject_directives(content, "tools here", "memories here");
+        let result = expand_inject_directives(content, "tools here", "memories here", "");
         // Should return None to signal fallback behavior
         assert!(result.is_none());
     }
@@ -4726,7 +4890,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_tools_only() {
         let content = "Before\n<!-- @inject:tools -->\nAfter";
-        let result = expand_inject_directives(content, "**Tools:**\n- tool1", "");
+        let result = expand_inject_directives(content, "**Tools:**\n- tool1", "", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert!(expanded.contains("Before"));
@@ -4738,7 +4902,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_memories_only() {
         let content = "Before\n<!-- @inject:memories -->\nAfter";
-        let result = expand_inject_directives(content, "", "[Memories]\n- mem1");
+        let result = expand_inject_directives(content, "", "[Memories]\n- mem1", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert!(expanded.contains("Before"));
@@ -4750,7 +4914,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_both() {
         let content = "Header\n<!-- @inject:tools -->\nMiddle\n<!-- @inject:memories -->\nFooter";
-        let result = expand_inject_directives(content, "TOOLS", "MEMORIES");
+        let result = expand_inject_directives(content, "TOOLS", "MEMORIES", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert!(expanded.contains("Header"));
@@ -4767,7 +4931,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_empty_tools_removes_line() {
         let content = "Line1\n<!-- @inject:tools -->\nLine2";
-        let result = expand_inject_directives(content, "", "");
+        let result = expand_inject_directives(content, "", "", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert_eq!(expanded, "Line1\nLine2");
@@ -4776,7 +4940,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_empty_memories_removes_line() {
         let content = "Line1\n<!-- @inject:memories -->\nLine2";
-        let result = expand_inject_directives(content, "", "");
+        let result = expand_inject_directives(content, "", "", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert_eq!(expanded, "Line1\nLine2");
@@ -4785,7 +4949,7 @@ api_key = "sk-test"
     #[test]
     fn test_expand_inject_directives_both_empty() {
         let content = "Line1\n<!-- @inject:tools -->\nLine2\n<!-- @inject:memories -->\nLine3";
-        let result = expand_inject_directives(content, "", "");
+        let result = expand_inject_directives(content, "", "", "");
         assert!(result.is_some());
         let expanded = result.unwrap();
         assert_eq!(expanded, "Line1\nLine2\nLine3");
@@ -4795,7 +4959,7 @@ api_key = "sk-test"
     fn test_expand_inject_directives_whitespace_tolerance() {
         // Directive with surrounding whitespace on the line
         let content = "Before\n  <!-- @inject:tools -->  \nAfter";
-        let result = expand_inject_directives(content, "TOOLS", "");
+        let result = expand_inject_directives(content, "TOOLS", "", "");
         assert!(result.is_some());
         // The line with only the directive should be filtered out when empty
         // But with content, it replaces the directive text
@@ -4807,7 +4971,7 @@ api_key = "sk-test"
     fn test_build_recall_content_with_directives() {
         let base =
             Some("Header\n<!-- @inject:tools -->\n<!-- @inject:memories -->\nFooter".to_string());
-        let result = build_recall_content("TOOLS", "MEMORIES", &base, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", "", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Tools and memories should be in their directive positions
@@ -4822,7 +4986,7 @@ api_key = "sk-test"
     fn test_build_recall_content_without_directives_no_injection() {
         // If always.md exists but has no directives, user opted out of injection
         let base = Some("Just content, no directives".to_string());
-        let result = build_recall_content("TOOLS", "MEMORIES", &base, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", "", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Should NOT contain tools or memories - user opted out
@@ -4834,7 +4998,7 @@ api_key = "sk-test"
     #[test]
     fn test_build_recall_content_no_base_injects_defaults() {
         // If no always.md at all, inject tools/memories as sensible defaults
-        let result = build_recall_content("TOOLS", "MEMORIES", &None, &None);
+        let result = build_recall_content("TOOLS", "MEMORIES", "", &None, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
         assert!(effective.contains("TOOLS"));
@@ -4845,7 +5009,7 @@ api_key = "sk-test"
     fn test_build_recall_content_model_always_appended() {
         let base = Some("Base\n<!-- @inject:tools -->".to_string());
         let model = Some("Model always".to_string());
-        let result = build_recall_content("TOOLS", "", &base, &model);
+        let result = build_recall_content("TOOLS", "", "", &base, &model);
         assert!(result.is_some());
         let effective = result.unwrap();
         // Model always should be at the end
@@ -4853,6 +5017,63 @@ api_key = "sk-test"
         let base_pos = effective.find("Base").unwrap();
         let model_pos = effective.find("Model always").unwrap();
         assert!(base_pos < model_pos);
+    }
+
+    #[test]
+    fn test_build_conversation_recall_injection_empty() {
+        let results: Vec<(i64, String, String, i64, f32)> = vec![];
+        let injection = build_conversation_recall_injection(&results);
+        assert!(injection.is_empty());
+    }
+
+    #[test]
+    fn test_build_conversation_recall_injection_formats() {
+        let now = chrono::Utc::now().timestamp();
+        let results = vec![
+            (1, "user".to_string(), "What about using Redis?".to_string(), now - 7200, 0.85),
+            (2, "arya".to_string(), "The API should support pagination".to_string(), now - 86400, 0.72),
+        ];
+        let injection = build_conversation_recall_injection(&results);
+        assert!(injection.starts_with("[recalled messages]\n"));
+        assert!(injection.contains("[user] What about using Redis?"));
+        assert!(injection.contains("[arya] The API should support pagination"));
+        // Each entry should be on its own line with age prefix
+        let lines: Vec<&str> = injection.lines().collect();
+        assert_eq!(lines[0], "[recalled messages]");
+        assert!(lines[1].starts_with("- ("));
+        assert!(lines[2].starts_with("- ("));
+    }
+
+    #[test]
+    fn test_build_conversation_recall_injection_truncates_long() {
+        let now = chrono::Utc::now().timestamp();
+        let long_msg = "x".repeat(300);
+        let results = vec![(1, "arya".to_string(), long_msg, now - 60, 0.9)];
+        let injection = build_conversation_recall_injection(&results);
+        // Should truncate to 200 chars + "..."
+        assert!(injection.contains("..."));
+        // The full 300-char message should NOT appear
+        assert!(!injection.contains(&"x".repeat(300)));
+    }
+
+    #[test]
+    fn test_expand_inject_directives_conversation() {
+        let content = "Before\n<!-- @inject:conversation -->\nAfter";
+        let result = expand_inject_directives(content, "", "", "CONVERSATION");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.contains("CONVERSATION"));
+        assert!(!expanded.contains("<!-- @inject:conversation -->"));
+    }
+
+    #[test]
+    fn test_build_recall_content_no_base_with_conversation() {
+        let result = build_recall_content("TOOLS", "MEMORIES", "CONV", &None, &None);
+        assert!(result.is_some());
+        let effective = result.unwrap();
+        assert!(effective.contains("TOOLS"));
+        assert!(effective.contains("MEMORIES"));
+        assert!(effective.contains("CONV"));
     }
 
     fn test_logger() -> AgentLogger {

@@ -115,6 +115,10 @@ fn default_semantic_memory_path() -> String {
     "memory.db".to_string()
 }
 
+fn default_conversation_recall_limit() -> usize {
+    3
+}
+
 fn default_embedding_url() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
@@ -152,6 +156,9 @@ pub struct SemanticMemorySection {
     /// Embedding configuration for semantic search
     #[serde(default)]
     pub embedding: Option<EmbeddingConfig>,
+    /// Maximum number of recalled user messages from conversation history per turn
+    #[serde(default = "default_conversation_recall_limit")]
+    pub conversation_recall_limit: usize,
 }
 
 impl Default for SemanticMemorySection {
@@ -163,6 +170,7 @@ impl Default for SemanticMemorySection {
             history_limit: default_history_limit(),
             min_importance: default_min_importance(),
             embedding: None,
+            conversation_recall_limit: default_conversation_recall_limit(),
         }
     }
 }
