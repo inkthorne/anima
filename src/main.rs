@@ -585,14 +585,8 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
                 .map(|s| s.lines().next().unwrap_or(s))
                 .map(|s| truncate(s, 60))
         }
-        "read_file" | "write_file" => {
+        "read_file" | "write_file" | "edit_file" => {
             args.get("path").and_then(|v| v.as_str()).map(String::from)
-        }
-        "edit_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let old = args.get("old_text").and_then(|v| v.as_str()).map(|s| truncate(s, 20)).unwrap_or_else(|| "?".into());
-            let new = args.get("new_text").and_then(|v| v.as_str()).map(|s| truncate(s, 20)).unwrap_or_else(|| "?".into());
-            Some(format!("{}: '{}' -> '{}'", path, old, new))
         }
         "http" => {
             let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
