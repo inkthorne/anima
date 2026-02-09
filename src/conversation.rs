@@ -1116,6 +1116,62 @@ impl ConversationStore {
         Ok(scored)
     }
 
+    /// Search conversation messages by keyword (SQL LIKE).
+    /// Supports optional sender filter, exclusion of internal messages (tool/recall),
+    /// and content truncation for long messages.
+    pub fn search_messages(
+        &self,
+        conv_name: &str,
+        keyword: &str,
+        from_agent: Option<&str>,
+        include_internal: bool,
+        limit: usize,
+        max_content_len: Option<usize>,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        let pattern = format!("%{}%", keyword);
+
+        let (sql, has_from) = {
+            let mut sql = format!(
+                "SELECT {} FROM messages WHERE conv_name = ?1 AND content LIKE ?2",
+                MESSAGE_COLUMNS
+            );
+            let has_from = from_agent.is_some();
+            if has_from {
+                sql.push_str(" AND from_agent = ?3");
+            } else if !include_internal {
+                sql.push_str(" AND from_agent NOT IN ('tool', 'recall')");
+            }
+            sql.push_str(" ORDER BY created_at ASC LIMIT ");
+            sql.push_str(&limit.to_string());
+            (sql, has_from)
+        };
+
+        let mut messages = if has_from {
+            let mut stmt = self.conn.prepare(&sql)?;
+            stmt.query_map(
+                params![conv_name, pattern, from_agent.unwrap()],
+                row_to_message,
+            )?
+            .collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(&sql)?;
+            stmt.query_map(params![conv_name, pattern], row_to_message)?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        // Truncate content if requested
+        if let Some(max_len) = max_content_len {
+            for msg in &mut messages {
+                if msg.content.len() > max_len {
+                    let end = msg.content.floor_char_boundary(max_len.saturating_sub(3));
+                    msg.content = format!("{}...", &msg.content[..end]);
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
     /// Add a pending notification for an offline agent.
     pub fn add_pending_notification(
         &self,
@@ -3177,5 +3233,121 @@ mod tests {
         // Should still find exactly one result
         let results = store.search_similar_messages(&conv, &emb2, &[], 10).unwrap();
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_messages_basic() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-basic"), &["arya"]).unwrap();
+        store.add_message(&conv, "arya", "hello world", &[]).unwrap();
+        store.add_message(&conv, "arya", "goodbye world", &[]).unwrap();
+        store.add_message(&conv, "arya", "something else", &[]).unwrap();
+
+        let results = store.search_messages(&conv, "world", None, false, 50, None).unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].content.contains("hello"));
+        assert!(results[1].content.contains("goodbye"));
+    }
+
+    #[test]
+    fn test_search_messages_case_insensitive() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-case"), &["arya"]).unwrap();
+        store.add_message(&conv, "arya", "Hello World", &[]).unwrap();
+        store.add_message(&conv, "arya", "hello world", &[]).unwrap();
+
+        // SQLite LIKE is case-insensitive for ASCII by default
+        let results = store.search_messages(&conv, "hello", None, false, 50, None).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_messages_from_agent_filter() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-from"), &["arya", "bob"]).unwrap();
+        store.add_message(&conv, "arya", "hello from arya", &[]).unwrap();
+        store.add_message(&conv, "bob", "hello from bob", &[]).unwrap();
+
+        let results = store.search_messages(&conv, "hello", Some("arya"), false, 50, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].from_agent, "arya");
+    }
+
+    #[test]
+    fn test_search_messages_excludes_tool_and_recall() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-excl"), &["arya"]).unwrap();
+        store.add_message(&conv, "arya", "hello agent", &[]).unwrap();
+        store.add_message(&conv, "tool", "hello tool result", &[]).unwrap();
+        store.add_message(&conv, "recall", "hello recall data", &[]).unwrap();
+
+        // Default: excludes tool/recall
+        let results = store.search_messages(&conv, "hello", None, false, 50, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].from_agent, "arya");
+
+        // include_internal: includes them
+        let results = store.search_messages(&conv, "hello", None, true, 50, None).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_search_messages_from_agent_overrides_exclusion() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-tool-from"), &["arya"]).unwrap();
+        store.add_message(&conv, "tool", "hello from tool", &[]).unwrap();
+
+        // Explicit from_agent="tool" should find it even with include_internal=false
+        let results = store.search_messages(&conv, "hello", Some("tool"), false, 50, None).unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_messages_content_truncation() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-trunc"), &["arya"]).unwrap();
+        let long_content = "a".repeat(1000);
+        store.add_message(&conv, "arya", &long_content, &[]).unwrap();
+
+        let results = store.search_messages(&conv, "aaa", None, false, 50, Some(100)).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.len() <= 100);
+        assert!(results[0].content.ends_with("..."));
+    }
+
+    #[test]
+    fn test_search_messages_limit() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-limit"), &["arya"]).unwrap();
+        for i in 0..10 {
+            store.add_message(&conv, "arya", &format!("msg {}", i), &[]).unwrap();
+        }
+
+        let results = store.search_messages(&conv, "msg", None, false, 3, None).unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[test]
+    fn test_search_messages_no_results() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-none"), &["arya"]).unwrap();
+        store.add_message(&conv, "arya", "hello world", &[]).unwrap();
+
+        let results = store.search_messages(&conv, "xyz_not_found", None, false, 50, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_messages_chronological_order() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("search-order"), &["arya"]).unwrap();
+        store.add_message(&conv, "arya", "first match", &[]).unwrap();
+        store.add_message(&conv, "arya", "second match", &[]).unwrap();
+        store.add_message(&conv, "arya", "third match", &[]).unwrap();
+
+        let results = store.search_messages(&conv, "match", None, false, 50, None).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results[0].created_at <= results[1].created_at);
+        assert!(results[1].created_at <= results[2].created_at);
     }
 }

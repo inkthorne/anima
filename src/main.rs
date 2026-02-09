@@ -621,6 +621,15 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "echo" => {
             args.get("message").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
         }
+        "search_conversation" => {
+            let keyword = args.get("keyword").and_then(|v| v.as_str()).unwrap_or("?");
+            let conv = args.get("conversation").and_then(|v| v.as_str()).unwrap_or("?");
+            let from = args.get("from").and_then(|v| v.as_str());
+            match from {
+                Some(f) => Some(format!("'{}' from={} in={}", keyword, f, conv)),
+                None => Some(format!("'{}' in={}", keyword, conv)),
+            }
+        }
         _ => None,
     };
 
@@ -1059,7 +1068,29 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
 
                 last_seen_id.store(user_msg_id, Ordering::SeqCst);
 
-                println!();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                let user_msg = anima::conversation::ConversationMessage {
+                    id: user_msg_id,
+                    conv_name: conv_name.to_string(),
+                    from_agent: "user".to_string(),
+                    content: line.to_string(),
+                    mentions: expanded_mentions.clone(),
+                    created_at: now,
+                    expires_at: 0,
+                    duration_ms: None,
+                    tool_calls: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    num_ctx: None,
+                    triggered_by: None,
+                    pinned: false,
+                    prompt_eval_ns: None,
+                };
+                // Overwrite the prompt line with the formatted message
+                print!("\x1b[A\x1b[2K{}", format_message_display(&user_msg));
 
                 // Notify mentioned agents (initial notifications only)
                 // The daemon handles all follow-up @mention chains autonomously

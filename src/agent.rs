@@ -107,6 +107,17 @@ fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) 
             };
             Some(format!("'{}'", preview))
         }
+        "search_conversation" => {
+            let keyword = params.get("keyword").and_then(|v| v.as_str()).unwrap_or("?");
+            let conv = params.get("conversation").and_then(|v| v.as_str()).unwrap_or("?");
+            let from = params.get("from").and_then(|v| v.as_str());
+            let count = result.and_then(|r| r.get("count")).and_then(|v| v.as_u64());
+            match (from, count) {
+                (Some(f), Some(c)) => Some(format!("'{}' from={} in={} count={}", keyword, f, conv, c)),
+                (None, Some(c)) => Some(format!("'{}' in={} count={}", keyword, conv, c)),
+                _ => Some(format!("'{}' in={}", keyword, conv)),
+            }
+        }
         _ => None, // No special summary for other tools
     }
 }

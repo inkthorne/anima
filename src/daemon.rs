@@ -122,8 +122,8 @@ use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::spawn_child::DaemonSpawnChildTool;
 use crate::tools::wait_for_child::DaemonWaitForChildrenTool;
 use crate::tools::{
-    AddTool, DaemonRememberTool, EchoTool, HttpTool, ReadFileTool, SafeShellTool, ShellTool,
-    WriteFileTool,
+    AddTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool, HttpTool, ReadFileTool,
+    SafeShellTool, ShellTool, WriteFileTool,
 };
 
 /// Work items that are serialized through the agent worker.
@@ -887,6 +887,19 @@ async fn execute_tool_call(
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
+        "search_conversation" => {
+            let tool = DaemonSearchConversationTool;
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(summary) = result.get("summary").and_then(|s| s.as_str()) {
+                        Ok(summary.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
         "list_tools" => {
             // Load tool registry and return tool names filtered by agent's allowlist
             let tools_path = dirs::home_dir()
@@ -915,7 +928,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_children"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_children", "search_conversation"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -934,7 +947,7 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_children\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_children, search_conversation\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
@@ -1879,6 +1892,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonSpawnChildTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonWaitForChildrenTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonSearchConversationTool));
     }
 
     // Apply LLM, memory, and agent_dir
@@ -2226,6 +2240,14 @@ async fn process_message_work(
         let mut agent_guard = agent.lock().await;
         agent_guard.set_current_conversation(conv_name.map(|s| s.to_string()));
     }
+
+    // Append conversation name to system prompt so the agent knows where it is
+    let system_prompt = &conv_name
+        .map(|c| {
+            let base = system_prompt.clone().unwrap_or_default();
+            Some(format!("{}\nConversation: {}", base, c))
+        })
+        .unwrap_or_else(|| system_prompt.clone());
 
     // Load conversation history first (using append-only context cursors)
     // Also capture window message IDs for conversation recall exclusion
@@ -2887,6 +2909,12 @@ async fn handle_notify(
         let mut agent_guard = agent.lock().await;
         agent_guard.set_current_conversation(Some(conv_id.to_string()));
     }
+
+    // Append conversation name to system prompt so the agent knows where it is
+    let system_prompt = &{
+        let base = system_prompt.clone().unwrap_or_default();
+        Some(format!("{}\nConversation: {}", base, conv_id))
+    };
 
     // Open conversation store
     let store = match ConversationStore::init() {
