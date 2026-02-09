@@ -639,12 +639,12 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-/// Format a Unix timestamp as "YYYY-MM-DD HH:MM" for pretty display.
+/// Format a Unix timestamp as "YYYY-MM-DD HH:MM:SS" for pretty display.
 fn format_timestamp_pretty(timestamp: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
     let datetime: chrono::DateTime<chrono::Local> = datetime.into();
-    datetime.format("%Y-%m-%d %H:%M").to_string()
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 /// Format a duration in milliseconds as human-readable (e.g., "1m 32s", "450ms").
