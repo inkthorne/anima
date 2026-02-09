@@ -1,6 +1,7 @@
 pub mod add;
 pub mod claude_code;
 pub mod echo;
+pub mod edit_file;
 pub mod http;
 pub mod list_agents;
 pub mod read_file;
@@ -18,6 +19,7 @@ pub use claude_code::{
     ClaudeCodeTask, ClaudeCodeTool, TaskError, TaskStatus, TaskStore, is_process_running,
 };
 pub use echo::EchoTool;
+pub use edit_file::EditFileTool;
 pub use http::HttpTool;
 pub use list_agents::DaemonListAgentsTool;
 pub use read_file::ReadFileTool;
