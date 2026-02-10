@@ -90,9 +90,22 @@ impl Tool for EditFileTool {
         let match_count = content.matches(old_text).count();
 
         if match_count == 0 {
+            // Include first 50 lines so the agent can see what's actually in the file
+            let preview: String = content
+                .lines()
+                .take(50)
+                .enumerate()
+                .map(|(i, line)| format!("{:>4}| {}", i + 1, line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let total_lines = content.lines().count();
+            let shown = total_lines.min(50);
             return Err(ToolError::ExecutionFailed(format!(
-                "old_text not found in '{}'",
-                path.display()
+                "old_text not found in '{}'. File contents ({}/{} lines):\n{}",
+                path.display(),
+                shown,
+                total_lines,
+                preview
             )));
         }
 
@@ -114,9 +127,43 @@ impl Tool for EditFileTool {
             ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e))
         })?;
 
+        // Build context around the replacement site(s)
+        let context_lines = 3;
+        let new_lines: Vec<&str> = new_content.lines().collect();
+        let new_text_lines: Vec<&str> = new_text.lines().collect();
+        let mut context_snippets = Vec::new();
+
+        for (i, line) in new_lines.iter().enumerate() {
+            // Find lines that contain the first line of new_text
+            if let Some(first_new_line) = new_text_lines.first() {
+                if line.contains(first_new_line) {
+                    let start = i.saturating_sub(context_lines);
+                    let end = (i + new_text_lines.len() + context_lines).min(new_lines.len());
+                    let snippet: String = new_lines[start..end]
+                        .iter()
+                        .enumerate()
+                        .map(|(j, l)| format!("{:>4}| {}", start + j + 1, l))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    context_snippets.push(snippet);
+                    if !replace_all {
+                        break;
+                    }
+                }
+            }
+        }
+
+        let context_str = context_snippets.join("\n---\n");
+        let message = format!(
+            "Replaced {} occurrence(s) in '{}'. Context:\n{}",
+            match_count,
+            path.display(),
+            context_str
+        );
+
         Ok(serde_json::json!({
             "success": true,
-            "message": format!("Replaced {} occurrence(s) in '{}'", match_count, path.display()),
+            "message": message,
             "replacements": match_count
         }))
     }
@@ -208,7 +255,12 @@ mod tests {
             }))
             .await;
 
-        assert!(matches!(result, Err(ToolError::ExecutionFailed(msg)) if msg.contains("not found")));
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(ref msg)) if msg.contains("not found")));
+        // Should include file preview
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("hello world"), "Error should include file contents");
+            assert!(msg.contains("1/1 lines"), "Error should show line count");
+        }
     }
 
     #[tokio::test]
@@ -268,6 +320,58 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "line1\nreplaced2\nreplaced3\nreplaced4\n"
         );
+    }
+
+    #[tokio::test]
+    async fn test_basic_replacement_includes_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(
+            &path,
+            "line1\nline2\nline3\ntarget\nline5\nline6\nline7\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "target",
+                "new_text": "replaced"
+            }))
+            .await
+            .unwrap();
+
+        let msg = result["message"].as_str().unwrap();
+        assert!(msg.contains("Context:"), "Should include context header");
+        assert!(msg.contains("replaced"), "Should show the new text");
+        assert!(msg.contains("line2") || msg.contains("line3"), "Should show surrounding lines");
+    }
+
+    #[tokio::test]
+    async fn test_not_found_shows_file_preview() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        let content: String = (1..=60).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, &content).unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "nonexistent text",
+                "new_text": "replacement"
+            }))
+            .await;
+
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("50/60 lines"), "Should show 50 of 60 lines");
+            assert!(msg.contains("line 1"), "Should include first line");
+            assert!(msg.contains("line 50"), "Should include line 50");
+            assert!(!msg.contains("line 51"), "Should not include line 51");
+        } else {
+            panic!("Expected ExecutionFailed error");
+        }
     }
 
     #[tokio::test]

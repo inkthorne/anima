@@ -123,7 +123,7 @@ use crate::tools::spawn_child::DaemonSpawnChildTool;
 use crate::tools::wait_for_child::DaemonWaitForChildrenTool;
 use crate::tools::{
     AddTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool, EditFileTool, HttpTool,
-    ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
+    ListFilesTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
 };
 
 /// Work items that are serialized through the agent worker.
@@ -223,7 +223,8 @@ fn expand_inject_directives(
 /// Injection behavior:
 /// - If base_recall contains directives (`<!-- @inject:tools -->`, `<!-- @inject:memories -->`),
 ///   tools and memories are expanded in-place at those positions.
-/// - If base_recall exists but has no directives, it's used as-is (user opted out of injection).
+/// - If base_recall exists but has no directives, recall.md content comes first,
+///   then tools/memories/conversation are appended after it.
 /// - If base_recall is None, tools and memories are injected as sensible defaults.
 fn build_recall_content(
     tools_injection: &str,
@@ -242,12 +243,11 @@ fn build_recall_content(
     if let Some(expanded) = expanded_base {
         // Directives were found and expanded — use the expanded content
         parts.push(expanded);
-    } else if let Some(base) = base_recall {
-        // recall.md exists but has no directives — user opted out of auto-injection
-        // Just use the recall.md content as-is
-        parts.push(base.clone());
     } else {
-        // No recall.md at all — inject tools/memories/conversation as sensible defaults
+        // No directives — include recall.md content first (if any), then auto-inject
+        if let Some(base) = base_recall {
+            parts.push(base.clone());
+        }
         if !tools_injection.is_empty() {
             parts.push(tools_injection.to_string());
         }
@@ -743,6 +743,20 @@ async fn execute_tool_call(
                 Ok(result) => {
                     if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
                         Ok(msg.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "list_files" => {
+            let tool = ListFilesTool;
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(listing) = result.get("listing").and_then(|l| l.as_str()) {
+                        let entries = result.get("entries").and_then(|e| e.as_u64()).unwrap_or(0);
+                        Ok(format!("{} entries:\n{}", entries, listing))
                     } else {
                         Ok(result.to_string())
                     }
@@ -5036,16 +5050,20 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_build_recall_content_without_directives_no_injection() {
-        // If always.md exists but has no directives, user opted out of injection
+    fn test_build_recall_content_without_directives_still_injects() {
+        // If recall.md exists but has no directives, auto-inject after recall content
         let base = Some("Just content, no directives".to_string());
         let result = build_recall_content("TOOLS", "MEMORIES", "", &base, &None);
         assert!(result.is_some());
         let effective = result.unwrap();
-        // Should NOT contain tools or memories - user opted out
-        assert!(!effective.contains("TOOLS"));
-        assert!(!effective.contains("MEMORIES"));
+        // Should contain recall.md content AND auto-injected tools/memories
         assert!(effective.contains("Just content"));
+        assert!(effective.contains("TOOLS"));
+        assert!(effective.contains("MEMORIES"));
+        // recall.md content should come before injections
+        let content_pos = effective.find("Just content").unwrap();
+        let tools_pos = effective.find("TOOLS").unwrap();
+        assert!(content_pos < tools_pos);
     }
 
     #[test]

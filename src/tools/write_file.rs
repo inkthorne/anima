@@ -76,9 +76,21 @@ impl Tool for WriteFileTool {
             ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e))
         })?;
 
-        Ok(
-            serde_json::json!({ "success": true, "message": format!("Successfully wrote to '{}'", path.display()) }),
-        )
+        let line_count = content.lines().count();
+        let byte_len = content.len();
+        let size_str = if byte_len >= 1024 {
+            format!("{:.1} KB", byte_len as f64 / 1024.0)
+        } else {
+            format!("{} bytes", byte_len)
+        };
+        let message = format!(
+            "Wrote {} lines ({}) to '{}'",
+            line_count,
+            size_str,
+            path.display()
+        );
+
+        Ok(serde_json::json!({ "success": true, "message": message }))
     }
 }
 
@@ -133,6 +145,9 @@ mod tests {
             .await
             .unwrap();
         assert!(result["success"].as_bool().unwrap());
+        let msg = result["message"].as_str().unwrap();
+        assert!(msg.contains("1 lines"), "Should report line count");
+        assert!(msg.contains("11 bytes"), "Should report byte size");
 
         let contents = std::fs::read_to_string(&path).unwrap();
         assert_eq!(contents, "hello world");
@@ -184,6 +199,23 @@ mod tests {
         let tool = WriteFileTool;
         let result = tool.execute(json!({"path": "/tmp/test.txt"})).await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_write_reports_kb_for_large_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        let path_str = path.to_str().unwrap();
+        let content: String = (1..=100).map(|i| format!("line number {}\n", i)).collect();
+
+        let tool = WriteFileTool;
+        let result = tool
+            .execute(json!({"path": path_str, "content": content}))
+            .await
+            .unwrap();
+        let msg = result["message"].as_str().unwrap();
+        assert!(msg.contains("100 lines"), "Should report 100 lines");
+        assert!(msg.contains("KB"), "Should use KB for larger files");
     }
 
     #[tokio::test]
