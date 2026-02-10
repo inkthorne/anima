@@ -753,14 +753,7 @@ async fn execute_tool_call(
         "list_files" => {
             let tool = ListFilesTool;
             match tool.execute(tool_call.params.clone()).await {
-                Ok(result) => {
-                    if let Some(listing) = result.get("listing").and_then(|l| l.as_str()) {
-                        let entries = result.get("entries").and_then(|e| e.as_u64()).unwrap_or(0);
-                        Ok(format!("{} entries:\n{}", entries, listing))
-                    } else {
-                        Ok(result.to_string())
-                    }
-                }
+                Ok(result) => Ok(result.to_string()),
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
@@ -1925,6 +1918,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(ReadFileTool));
         agent.register_tool(Arc::new(WriteFileTool));
         agent.register_tool(Arc::new(EditFileTool));
+        agent.register_tool(Arc::new(ListFilesTool));
         agent.register_tool(Arc::new(HttpTool::new()));
         agent.register_tool(Arc::new(ShellTool::new()));
         agent.register_tool(Arc::new(SafeShellTool::new()));

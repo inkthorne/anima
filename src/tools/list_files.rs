@@ -86,13 +86,12 @@ impl Tool for ListFilesTool {
             ))
         })?;
 
-        let output = entries.join("\n");
         let total = entries.len();
 
         Ok(serde_json::json!({
             "success": true,
             "entries": total,
-            "listing": output
+            "listing": entries
         }))
     }
 }
@@ -103,7 +102,7 @@ fn list_dir(
     recursive: bool,
     max_depth: usize,
     current_depth: usize,
-    entries: &mut Vec<String>,
+    entries: &mut Vec<Value>,
 ) -> std::io::Result<()> {
     let mut items: Vec<_> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok())
@@ -115,7 +114,14 @@ fn list_dir(
         let relative = path.strip_prefix(base).unwrap_or(&path);
         let is_dir = path.is_dir();
         let suffix = if is_dir { "/" } else { "" };
-        entries.push(format!("{}{}", relative.display(), suffix));
+        let name = format!("{}{}", relative.display(), suffix);
+
+        if is_dir {
+            entries.push(serde_json::json!({"name": name, "type": "dir", "size": null}));
+        } else {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            entries.push(serde_json::json!({"name": name, "type": "file", "size": size}));
+        }
 
         if is_dir && recursive && current_depth < max_depth {
             list_dir(base, &path, recursive, max_depth, current_depth + 1, entries)?;
@@ -150,8 +156,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_flat() {
         let dir = tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("b.rs"), "fn main() {}").unwrap();
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let tool = ListFilesTool;
@@ -164,10 +170,21 @@ mod tests {
 
         assert!(result["success"].as_bool().unwrap());
         assert_eq!(result["entries"].as_u64().unwrap(), 3);
-        let listing = result["listing"].as_str().unwrap();
-        assert!(listing.contains("a.txt"));
-        assert!(listing.contains("b.rs"));
-        assert!(listing.contains("subdir/"));
+        let listing = result["listing"].as_array().unwrap();
+        assert_eq!(listing.len(), 3);
+
+        // Entries are sorted by name
+        assert_eq!(listing[0]["name"], "a.txt");
+        assert_eq!(listing[0]["type"], "file");
+        assert_eq!(listing[0]["size"], 5); // "hello"
+
+        assert_eq!(listing[1]["name"], "b.rs");
+        assert_eq!(listing[1]["type"], "file");
+        assert_eq!(listing[1]["size"], 12); // "fn main() {}"
+
+        assert_eq!(listing[2]["name"], "subdir/");
+        assert_eq!(listing[2]["type"], "dir");
+        assert!(listing[2]["size"].is_null());
     }
 
     #[tokio::test]
@@ -175,7 +192,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("top.txt"), "").unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
-        std::fs::write(dir.path().join("sub/nested.txt"), "").unwrap();
+        std::fs::write(dir.path().join("sub/nested.txt"), "data").unwrap();
 
         let tool = ListFilesTool;
         let result = tool
@@ -187,10 +204,16 @@ mod tests {
             .unwrap();
 
         assert!(result["success"].as_bool().unwrap());
-        let listing = result["listing"].as_str().unwrap();
-        assert!(listing.contains("top.txt"));
-        assert!(listing.contains("sub/"));
-        assert!(listing.contains("nested.txt"));
+        let listing = result["listing"].as_array().unwrap();
+        let names: Vec<&str> = listing.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"top.txt"));
+        assert!(names.contains(&"sub/"));
+        assert!(names.contains(&"sub/nested.txt"));
+
+        // Check nested file has correct size
+        let nested = listing.iter().find(|e| e["name"] == "sub/nested.txt").unwrap();
+        assert_eq!(nested["type"], "file");
+        assert_eq!(nested["size"], 4); // "data"
     }
 
     #[tokio::test]
@@ -209,11 +232,12 @@ mod tests {
             .await
             .unwrap();
 
-        let listing = result["listing"].as_str().unwrap();
-        assert!(listing.contains("a/"));
-        assert!(listing.contains("b/"));
+        let listing = result["listing"].as_array().unwrap();
+        let names: Vec<&str> = listing.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"a/"));
+        assert!(names.contains(&"a/b/"));
         // c/ is at depth 2, should not be listed with max_depth=1
-        assert!(!listing.contains("deep.txt"));
+        assert!(!names.iter().any(|n| n.contains("deep.txt")));
     }
 
     #[tokio::test]

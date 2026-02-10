@@ -63,6 +63,16 @@ impl Tool for WriteFileTool {
 
         let path = expand_tilde(path_str);
 
+        let existed = path.exists();
+        let old_line_count = if existed {
+            tokio::fs::read_to_string(&path)
+                .await
+                .ok()
+                .map(|s| s.lines().count())
+        } else {
+            None
+        };
+
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -83,12 +93,19 @@ impl Tool for WriteFileTool {
         } else {
             format!("{} bytes", byte_len)
         };
-        let message = format!(
+        let mut message = format!(
             "Wrote {} lines ({}) to '{}'",
             line_count,
             size_str,
             path.display()
         );
+
+        if let Some(old_lines) = old_line_count {
+            message.push_str(&format!(
+                "\nNote: overwrote existing file ({} lines). For targeted changes, prefer edit_file.",
+                old_lines
+            ));
+        }
 
         Ok(serde_json::json!({ "success": true, "message": message }))
     }
@@ -162,12 +179,42 @@ mod tests {
         tool.execute(json!({"path": path, "content": "original"}))
             .await
             .unwrap();
-        tool.execute(json!({"path": path, "content": "updated"}))
+        let result = tool
+            .execute(json!({"path": path, "content": "updated"}))
             .await
             .unwrap();
 
         let contents = std::fs::read_to_string(file.path()).unwrap();
         assert_eq!(contents, "updated");
+
+        let msg = result["message"].as_str().unwrap();
+        assert!(
+            msg.contains("overwrote existing file"),
+            "Should warn about overwriting"
+        );
+        assert!(
+            msg.contains("edit_file"),
+            "Should suggest edit_file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_file_no_overwrite_warning() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("brand_new.txt");
+        let path_str = path.to_str().unwrap();
+
+        let tool = WriteFileTool;
+        let result = tool
+            .execute(json!({"path": path_str, "content": "fresh content"}))
+            .await
+            .unwrap();
+
+        let msg = result["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("overwrote"),
+            "New file should not have overwrite warning"
+        );
     }
 
     #[tokio::test]
