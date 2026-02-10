@@ -885,6 +885,21 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Unpin all pinned tool result messages in a conversation whose content contains the given text.
+    /// Used to release spawn_child tool results after wait_for_children collects the result.
+    pub fn unpin_tool_results_for(
+        &self,
+        conv_name: &str,
+        content_match: &str,
+    ) -> Result<usize, ConversationError> {
+        let pattern = format!("%{}%", content_match);
+        let rows = self.conn.execute(
+            "UPDATE messages SET pinned = 0 WHERE conv_name = ?1 AND pinned = 1 AND from_agent = 'tool' AND content LIKE ?2",
+            params![conv_name, pattern],
+        )?;
+        Ok(rows)
+    }
+
     /// Get messages with pinned messages always included, regardless of the limit window.
     ///
     /// When `limit` is Some(n): fetches pinned messages + last N messages, merging them

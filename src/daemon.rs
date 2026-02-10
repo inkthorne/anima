@@ -688,8 +688,16 @@ fn spawn_tool_trace_persister(
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
             let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            if let Err(e) = store.add_tool_result(&cname, &tool_result_msg, &agent_name) {
-                logger.log(&format!("[trace] Failed to store tool result: {}", e));
+            match store.add_tool_result(&cname, &tool_result_msg, &agent_name) {
+                Ok(result_id) => {
+                    // Pin spawn_child tool results so parent retains child_ids in context
+                    if exec.call.name == "spawn_child" {
+                        let _ = store.pin_message(&cname, result_id, true);
+                    }
+                }
+                Err(e) => {
+                    logger.log(&format!("[trace] Failed to store tool result: {}", e));
+                }
             }
         }
     })
@@ -1001,6 +1009,20 @@ async fn execute_tool_call(
                                 } else {
                                     let msg = r.get("message").and_then(|s| s.as_str()).unwrap_or("Not completed");
                                     lines.push(format!("[{}] (status: {}) {}", child_id, child_status, msg));
+                                }
+                            }
+                        }
+                        // Unpin spawn_child tool results for completed children
+                        if let Some(conv_id) = &ctx.conv_id {
+                            if let Ok(store) = ConversationStore::init() {
+                                if let Some(results) = result.get("results").and_then(|r| r.as_array()) {
+                                    for r in results {
+                                        if r.get("status").and_then(|s| s.as_str()) == Some("completed") {
+                                            if let Some(cid) = r.get("child_id").and_then(|s| s.as_str()) {
+                                                let _ = store.unpin_tool_results_for(conv_id, cid);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

@@ -26,13 +26,17 @@ async fn poll_for_child_result(
         })?;
 
         // Look for a completed response: must be from the child agent (not ourselves,
-        // not a tool result, not recall injection) AND must have duration_ms set,
-        // which indicates a final LLM response rather than an intermediate message.
-        for msg in &messages {
+        // not a tool result, not recall injection), must have duration_ms set (LLM response),
+        // and must have NO tool_calls (no pending tool invocations).
+        // During a tool loop, intermediate LLM messages have both duration_ms and tool_calls.
+        // The final response has duration_ms but no tool_calls — that's what exits the loop.
+        // Iterate in reverse to get the latest matching message.
+        for msg in messages.iter().rev() {
             if msg.from_agent != parent_agent
                 && msg.from_agent != "tool"
                 && msg.from_agent != "recall"
                 && msg.duration_ms.is_some()
+                && msg.tool_calls.is_none()
             {
                 return Ok(serde_json::json!({
                     "status": "completed",

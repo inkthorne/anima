@@ -228,9 +228,11 @@ pub fn start_agent_daemon(agent_name: &str) -> Result<u32, String> {
         }
     }
 
-    // Find our own executable
+    // Find our own executable; fall back to PATH lookup if the binary was replaced (e.g. cargo install)
     let exe = std::env::current_exe()
-        .map_err(|e| format!("Failed to find executable: {}", e))?;
+        .ok()
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("anima"));
 
     // Spawn: anima run <name> --daemon
     let child = std::process::Command::new(exe)
