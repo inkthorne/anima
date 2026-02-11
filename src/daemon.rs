@@ -2604,21 +2604,20 @@ async fn process_native_tool_mode(
     };
 
     let (result, tool_calls, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns) = if let Some(tx) = token_tx {
-        // Streaming mode - now returns ThinkResult with tool_calls
-        let agent_clone = agent.clone();
-        let content_clone = content.to_string();
-
-        let handle = tokio::spawn(async move {
-            let mut agent_guard = agent_clone.lock().await;
-            agent_guard
-                .think_streaming_with_options(&content_clone, options, tx)
-                .await
-        });
-
-        match handle.await {
-            Ok(Ok(result)) => (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
-            Ok(Err(e)) => (format!("Error: {}", e), None, None, None, None, None),
-            Err(e) => (format!("Error: task panicked: {}", e), None, None, None, None, None),
+        // Streaming mode - call directly (not spawned) so dropping the future cancels the LLM call
+        let mut agent_guard = agent.lock().await;
+        match agent_guard
+            .think_streaming_with_options(content, options, tx)
+            .await
+        {
+            Ok(result) => {
+                drop(agent_guard);
+                (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+            }
+            Err(e) => {
+                drop(agent_guard);
+                (format!("Error: {}", e), None, None, None, None, None)
+            }
         }
     } else {
         // Non-streaming mode - can capture tool_calls
@@ -2646,6 +2645,25 @@ async fn process_native_tool_mode(
         tokens_in,
         tokens_out,
         prompt_eval_duration_ns,
+    }
+}
+
+/// Guard that aborts a spawned task when dropped, ensuring the LLM call
+/// is cancelled on shutdown instead of running to completion in the background.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
+        self.0.take().expect("join called twice").await
+    }
+}
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
     }
 }
 
@@ -2696,12 +2714,12 @@ async fn process_json_block_mode(
             let agent_clone = agent.clone();
             let current_message_clone = current_message.clone();
 
-            let handle = tokio::spawn(async move {
+            let mut handle = AbortOnDrop::new(tokio::spawn(async move {
                 let mut agent_guard = agent_clone.lock().await;
                 agent_guard
                     .think_streaming_with_options(&current_message_clone, options, internal_tx)
                     .await
-            });
+            }));
 
             // Forward tokens, suppressing tool call blocks
             let tx_clone = tx.clone();
@@ -2746,7 +2764,7 @@ async fn process_json_block_mode(
                 let _ = tx_clone.send(code_block_buffer).await;
             }
 
-            match handle.await {
+            match handle.join().await {
                 Ok(Ok(result)) => {
                     last_duration_ms = result.duration_ms;
                     last_tokens_in = result.tokens_in;
