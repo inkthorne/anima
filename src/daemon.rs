@@ -2234,6 +2234,7 @@ async fn agent_worker(
                         mentions_enabled,
                         &shutdown,
                         max_iterations,
+                        num_ctx,
                     )
                     .await;
                 } else {
@@ -2292,7 +2293,7 @@ async fn process_message_work(
     let (mut conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match load_agent_context(&store, cname, agent_name, history_limit, &logger) {
+                Ok(store) => match load_agent_context(&store, cname, agent_name, history_limit, &logger, num_ctx) {
                     Ok(msgs) if !msgs.is_empty() => {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
@@ -2788,7 +2789,7 @@ async fn process_json_block_mode(
 const MAX_MENTION_DEPTH: u32 = 100;
 
 /// Context fill threshold — if (tokens_in + tokens_out) / num_ctx >= this, reset the cursor
-const CONTEXT_FILL_THRESHOLD: f64 = 0.80;
+const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
 
 /// Load agent context using append-only cursors for KV cache stability.
 ///
@@ -2801,7 +2802,22 @@ fn load_agent_context(
     agent_name: &str,
     history_limit: usize,
     logger: &AgentLogger,
+    num_ctx: Option<u32>,
 ) -> Result<Vec<ConversationMessage>, ConversationError> {
+    // Cold start: use token budget (30% of num_ctx) when available, else fall back to message count
+    let cold_start = |store: &ConversationStore| -> Result<Vec<ConversationMessage>, ConversationError> {
+        if let Some(ctx) = num_ctx {
+            let budget = ctx as usize * 30 / 100;
+            logger.log(&format!(
+                "[context] Cold start with token budget {} (30% of {}) for {} in {}",
+                budget, ctx, agent_name, conv_name
+            ));
+            store.get_messages_by_token_budget(conv_name, budget)
+        } else {
+            store.get_messages_with_pinned(conv_name, Some(history_limit))
+        }
+    };
+
     match store.get_context_cursor(conv_name, agent_name)? {
         Some(cursor_id) => {
             let count = store.count_messages_from(conv_name, cursor_id)?;
@@ -2812,7 +2828,7 @@ fn load_agent_context(
                     count, agent_name, conv_name, history_limit * 5
                 ));
                 store.clear_context_cursor(conv_name, agent_name)?;
-                let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+                let msgs = cold_start(store)?;
                 set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
                 Ok(msgs)
             } else if count == 0 {
@@ -2822,7 +2838,7 @@ fn load_agent_context(
                     agent_name, conv_name
                 ));
                 store.clear_context_cursor(conv_name, agent_name)?;
-                let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+                let msgs = cold_start(store)?;
                 set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
                 Ok(msgs)
             } else {
@@ -2840,7 +2856,7 @@ fn load_agent_context(
                 "[context] Cold start for {} in {} (no cursor)",
                 agent_name, conv_name
             ));
-            let msgs = store.get_messages_with_pinned(conv_name, Some(history_limit))?;
+            let msgs = cold_start(store)?;
             set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
             Ok(msgs)
         }
@@ -2961,7 +2977,7 @@ async fn handle_notify(
     };
 
     // First fetch: get messages using append-only context cursors
-    let context_messages = match load_agent_context(&store, conv_id, agent_name, history_limit, logger) {
+    let context_messages = match load_agent_context(&store, conv_id, agent_name, history_limit, logger, num_ctx) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -3587,6 +3603,7 @@ async fn run_heartbeat(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     max_iterations: Option<usize>,
+    num_ctx: Option<u32>,
 ) {
     // Set current conversation for debug file naming
     {
@@ -3637,7 +3654,7 @@ async fn run_heartbeat(
     // 3. Get conversation context using append-only cursors
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
-    let context_messages = load_agent_context(&store, &conv_name, agent_name, history_limit, logger)
+    let context_messages = load_agent_context(&store, &conv_name, agent_name, history_limit, logger, num_ctx)
         .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
@@ -5167,7 +5184,7 @@ api_key = "sk-test"
         store.add_message(&conv, "user", "how are you?", &[]).unwrap();
 
         // No cursor set → cold start → should get last N messages
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
 
         // Cursor should be set to anchor (oldest non-pinned msg)
@@ -5193,7 +5210,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", anchor_id).unwrap();
 
         // Should get all messages from anchor (inclusive) — full window + new
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
         assert_eq!(msgs[1].content, "response 1");
@@ -5218,7 +5235,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", 99999).unwrap();
 
         // count == 0 → falls back to cold start with new anchor
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
 
@@ -5246,7 +5263,7 @@ api_key = "sk-test"
         }
 
         // history_limit=3, count from cursor = 17 (1 + 16) > 3*5=15 → falls back to sliding window
-        let msgs = load_agent_context(&store, &conv, "arya", 3, &logger).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", 3, &logger, None).unwrap();
         // Sliding window returns last 3
         assert_eq!(msgs.len(), 3);
 

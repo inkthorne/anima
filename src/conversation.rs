@@ -951,6 +951,65 @@ impl ConversationStore {
         Ok(result)
     }
 
+    /// Get messages by token budget, walking backward from newest.
+    ///
+    /// Estimates tokens per message as `content.len() / 4 + tool_calls.len() / 4`.
+    /// Stops when accumulated tokens exceed `token_budget`.
+    /// Merges with pinned messages (pinned outside the window go first).
+    /// Returns messages in chronological order.
+    pub fn get_messages_by_token_budget(
+        &self,
+        conv_name: &str,
+        token_budget: usize,
+    ) -> Result<Vec<ConversationMessage>, ConversationError> {
+        let now = current_timestamp();
+
+        // 1. Fetch pinned messages (chronological)
+        let pinned_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 AND pinned = 1 ORDER BY created_at ASC",
+            MESSAGE_COLUMNS
+        );
+        let mut pinned_stmt = self.conn.prepare(&pinned_query)?;
+        let pinned: Vec<ConversationMessage> = pinned_stmt
+            .query_map(params![conv_name, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 2. Fetch non-pinned messages newest-first (no limit — we'll stop by budget)
+        let recent_query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND expires_at > ?2 AND pinned = 0 ORDER BY created_at DESC",
+            MESSAGE_COLUMNS
+        );
+        let mut recent_stmt = self.conn.prepare(&recent_query)?;
+        let rows: Vec<ConversationMessage> = recent_stmt
+            .query_map(params![conv_name, now], row_to_message)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // 3. Walk backward, accumulating estimated tokens
+        let mut accumulated: usize = 0;
+        let mut selected: Vec<ConversationMessage> = Vec::new();
+        for msg in rows {
+            let est = msg.content.len() / 4
+                + msg.tool_calls.as_ref().map_or(0, |tc| tc.len() / 4);
+            if !selected.is_empty() && accumulated + est > token_budget {
+                break;
+            }
+            accumulated += est;
+            selected.push(msg);
+        }
+        selected.reverse(); // chronological order
+
+        // 4. Merge: pinned messages outside the window go first, then budget-selected
+        let selected_ids: std::collections::HashSet<i64> =
+            selected.iter().map(|m| m.id).collect();
+        let mut result: Vec<ConversationMessage> = pinned
+            .into_iter()
+            .filter(|m| !selected_ids.contains(&m.id))
+            .collect();
+        result.extend(selected);
+
+        Ok(result)
+    }
+
     /// Get the context cursor for an agent in a conversation.
     /// Returns None if no cursor is set (cold start needed).
     pub fn get_context_cursor(
@@ -3364,5 +3423,56 @@ mod tests {
         assert_eq!(results.len(), 3);
         assert!(results[0].created_at <= results[1].created_at);
         assert!(results[1].created_at <= results[2].created_at);
+    }
+
+    #[test]
+    fn test_get_messages_by_token_budget() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("budget-test"), &["arya"]).unwrap();
+
+        // Each "a]...[" message is 40 chars → ~10 tokens estimated (40/4)
+        let msg_40 = "a]".to_string() + &"x".repeat(36) + "[z"; // 40 chars
+        store.add_message(&conv, "user", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "arya", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "user", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "arya", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "user", &msg_40, &[]).unwrap();
+
+        // Budget of 25 tokens → should fit 2 messages (10+10=20), 3rd would exceed (30>25)
+        let msgs = store.get_messages_by_token_budget(&conv, 25).unwrap();
+        assert_eq!(msgs.len(), 2, "expected 2 messages within budget of 25 tokens");
+        // Should be the last 2 (newest) in chronological order
+        assert_eq!(msgs[0].content, msg_40);
+        assert_eq!(msgs[1].content, msg_40);
+
+        // Budget of 100 → should fit all 5
+        let msgs = store.get_messages_by_token_budget(&conv, 100).unwrap();
+        assert_eq!(msgs.len(), 5, "expected all 5 messages within budget of 100 tokens");
+
+        // Budget of 0 → should still include at least 1 message (first is always included)
+        let msgs = store.get_messages_by_token_budget(&conv, 0).unwrap();
+        assert_eq!(msgs.len(), 1, "expected 1 message even with 0 budget");
+    }
+
+    #[test]
+    fn test_get_messages_by_token_budget_includes_pinned() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("budget-pin"), &["arya"]).unwrap();
+
+        let pinned_id = store.add_message(&conv, "user", "pinned task", &[]).unwrap();
+        store.pin_message(&conv, pinned_id, true).unwrap();
+
+        // Add several messages after the pinned one
+        let msg_40 = "x".repeat(40); // ~10 tokens each
+        store.add_message(&conv, "arya", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "user", &msg_40, &[]).unwrap();
+        store.add_message(&conv, "arya", &msg_40, &[]).unwrap();
+
+        // Budget of 15 → 1 non-pinned message by budget + the pinned message
+        let msgs = store.get_messages_by_token_budget(&conv, 15).unwrap();
+        assert!(msgs.iter().any(|m| m.content == "pinned task"), "pinned message must be included");
+        // Pinned message should come first (it's older and outside the budget window)
+        assert_eq!(msgs[0].content, "pinned task");
+        assert_eq!(msgs.len(), 2); // 1 pinned + 1 budget-selected
     }
 }
