@@ -329,8 +329,56 @@ pub fn summarize_tool_params(tool_name: &str, params: &Value) -> String {
 
 /// Context fill threshold for mid-loop dump (80%)
 const CONTEXT_FILL_THRESHOLD: f64 = 0.80;
-/// Messages to keep after context dump (system prompt + this many recent messages)
-const CONTEXT_DUMP_KEEP_RECENT: usize = 20;
+/// Target fill after hard trim — keep newest messages up to this fraction of num_ctx
+const CONTEXT_TRIM_TARGET: f64 = 0.30;
+
+/// Replace older read_file results with stubs when the same file was read again later.
+fn dedup_read_file_results(messages: &mut [ChatMessage]) {
+    use std::collections::HashMap;
+
+    // Pass 1: map tool_call_id -> file_path for read_file calls
+    let mut read_paths: HashMap<String, String> = HashMap::new();
+    for msg in messages.iter() {
+        if let Some(ref tcs) = msg.tool_calls {
+            for tc in tcs {
+                if tc.name == "read_file" {
+                    if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                        read_paths.insert(tc.id.clone(), path.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if read_paths.is_empty() {
+        return;
+    }
+
+    // Pass 2: find tool results for read_file, track latest index per path
+    let mut latest_per_path: HashMap<String, usize> = HashMap::new();
+    let mut result_path: Vec<Option<String>> = vec![None; messages.len()];
+
+    for (i, msg) in messages.iter().enumerate() {
+        if let Some(ref tcid) = msg.tool_call_id {
+            if let Some(path) = read_paths.get(tcid) {
+                latest_per_path.insert(path.clone(), i);
+                result_path[i] = Some(path.clone());
+            }
+        }
+    }
+
+    // Pass 3: replace older reads with stubs
+    for i in 0..messages.len() {
+        if let Some(ref path) = result_path[i] {
+            if latest_per_path.get(path) != Some(&i) {
+                messages[i].content = Some(format!(
+                    "[Earlier read_file of '{}' — superseded by later read]",
+                    path
+                ));
+            }
+        }
+    }
+}
 
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
@@ -1432,12 +1480,36 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        let keep = CONTEXT_DUMP_KEEP_RECENT.min(messages.len().saturating_sub(1));
-                        if messages.len() > keep + 1 {
-                            let mut trimmed = vec![messages[0].clone()];
-                            trimmed.extend_from_slice(&messages[messages.len() - keep..]);
-                            messages = trimmed;
-                            self.history.clear();
+                        // First resort: dedup stale read_file results
+                        dedup_read_file_results(&mut messages);
+
+                        // Re-estimate fill after dedup (chars/4 as rough token proxy)
+                        let est_tokens: usize = messages
+                            .iter()
+                            .map(|m| m.content.as_ref().map_or(0, |c| c.len()) / 4)
+                            .sum();
+                        let est_fill = est_tokens as f64 / ctx as f64;
+
+                        // Hard trim only if dedup wasn't enough
+                        if est_fill >= CONTEXT_FILL_THRESHOLD {
+                            let target_tokens = (ctx as f64 * CONTEXT_TRIM_TARGET) as usize;
+                            let mut budget = 0usize;
+                            let mut keep_from = messages.len();
+                            for i in (1..messages.len()).rev() {
+                                let msg_tokens =
+                                    messages[i].content.as_ref().map_or(0, |c| c.len()) / 4;
+                                if budget + msg_tokens > target_tokens {
+                                    break;
+                                }
+                                budget += msg_tokens;
+                                keep_from = i;
+                            }
+                            if keep_from > 1 {
+                                let mut trimmed = vec![messages[0].clone()];
+                                trimmed.extend_from_slice(&messages[keep_from..]);
+                                messages = trimmed;
+                                self.history.clear();
+                            }
                         }
                     }
                 }
@@ -1667,12 +1739,36 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        let keep = CONTEXT_DUMP_KEEP_RECENT.min(messages.len().saturating_sub(1));
-                        if messages.len() > keep + 1 {
-                            let mut trimmed = vec![messages[0].clone()];
-                            trimmed.extend_from_slice(&messages[messages.len() - keep..]);
-                            messages = trimmed;
-                            self.history.clear();
+                        // First resort: dedup stale read_file results
+                        dedup_read_file_results(&mut messages);
+
+                        // Re-estimate fill after dedup (chars/4 as rough token proxy)
+                        let est_tokens: usize = messages
+                            .iter()
+                            .map(|m| m.content.as_ref().map_or(0, |c| c.len()) / 4)
+                            .sum();
+                        let est_fill = est_tokens as f64 / ctx as f64;
+
+                        // Hard trim only if dedup wasn't enough
+                        if est_fill >= CONTEXT_FILL_THRESHOLD {
+                            let target_tokens = (ctx as f64 * CONTEXT_TRIM_TARGET) as usize;
+                            let mut budget = 0usize;
+                            let mut keep_from = messages.len();
+                            for i in (1..messages.len()).rev() {
+                                let msg_tokens =
+                                    messages[i].content.as_ref().map_or(0, |c| c.len()) / 4;
+                                if budget + msg_tokens > target_tokens {
+                                    break;
+                                }
+                                budget += msg_tokens;
+                                keep_from = i;
+                            }
+                            if keep_from > 1 {
+                                let mut trimmed = vec![messages[0].clone()];
+                                trimmed.extend_from_slice(&messages[keep_from..]);
+                                messages = trimmed;
+                                self.history.clear();
+                            }
                         }
                     }
                 }
@@ -3109,6 +3205,150 @@ mod tests {
         ];
         let paths = extract_modified_file_paths(&calls);
         assert!(paths.is_empty());
+    }
+
+    // =========================================================================
+    // dedup_read_file_results tests
+    // =========================================================================
+
+    #[test]
+    fn test_dedup_read_file_results_replaces_older_reads() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // System prompt
+            ChatMessage {
+                role: "system".into(),
+                content: Some("You are an agent.".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            // First read_file call for /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Reading file.".into()),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs"}),
+                }]),
+            },
+            // First result
+            ChatMessage {
+                role: "user".into(),
+                content: Some("fn main() { old version }".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Second read_file call for /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Re-reading file.".into()),
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs"}),
+                }]),
+            },
+            // Second result
+            ChatMessage {
+                role: "user".into(),
+                content: Some("fn main() { new version }".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_read_file_results(&mut messages);
+
+        // System prompt untouched
+        assert_eq!(messages[0].content.as_ref().unwrap(), "You are an agent.");
+        // First read result replaced with stub
+        assert!(messages[2].content.as_ref().unwrap().contains("superseded"));
+        assert!(messages[2].content.as_ref().unwrap().contains("/a.rs"));
+        // Second read result kept
+        assert_eq!(
+            messages[4].content.as_ref().unwrap(),
+            "fn main() { new version }"
+        );
+    }
+
+    #[test]
+    fn test_dedup_read_file_results_different_paths_untouched() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("contents of a".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/b.rs"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("contents of b".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_read_file_results(&mut messages);
+
+        // Different paths — both kept
+        assert_eq!(messages[1].content.as_ref().unwrap(), "contents of a");
+        assert_eq!(messages[3].content.as_ref().unwrap(), "contents of b");
+    }
+
+    #[test]
+    fn test_dedup_read_file_results_no_reads() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "ls"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("file1.rs file2.rs".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+        ];
+
+        let original_content = messages[1].content.clone();
+        dedup_read_file_results(&mut messages);
+
+        // No read_file calls — nothing changed
+        assert_eq!(messages[1].content, original_content);
     }
 
 }

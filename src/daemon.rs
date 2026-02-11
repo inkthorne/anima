@@ -306,6 +306,49 @@ fn format_conversation_history(
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut pending_user_batch: Vec<String> = Vec::new();
 
+    // Pre-scan: identify superseded read_file results for dedup
+    let tool_result_paths: std::collections::HashMap<i64, String>;
+    let latest_reads: std::collections::HashMap<String, i64>;
+    {
+        use std::collections::{HashMap, VecDeque};
+        let mut pending_read_paths: VecDeque<String> = VecDeque::new();
+        let mut lr: HashMap<String, i64> = HashMap::new();
+        let mut trp: HashMap<i64, String> = HashMap::new();
+
+        for msg in messages {
+            if msg.from_agent == current_agent {
+                if let Some(ref tc_json) = msg.tool_calls {
+                    if let Ok(tcs) =
+                        serde_json::from_str::<Vec<crate::llm::ToolCall>>(tc_json)
+                    {
+                        for tc in &tcs {
+                            if tc.name == "read_file" {
+                                if let Some(path) =
+                                    tc.arguments.get("path").and_then(|v| v.as_str())
+                                {
+                                    pending_read_paths.push_back(path.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if msg.from_agent == "tool" {
+                match &msg.triggered_by {
+                    Some(owner) if owner != current_agent => continue,
+                    _ => {}
+                }
+                if msg.content.starts_with("[Tool Result for read_file]") {
+                    if let Some(path) = pending_read_paths.pop_front() {
+                        lr.insert(path.clone(), msg.id);
+                        trp.insert(msg.id, path);
+                    }
+                }
+            }
+        }
+        latest_reads = lr;
+        tool_result_paths = trp;
+    }
+
     // Helper to flush pending user messages into a single ChatMessage
     let flush_user_batch = |batch: &mut Vec<String>, hist: &mut Vec<ChatMessage>| {
         if !batch.is_empty() {
@@ -357,6 +400,22 @@ fn format_conversation_history(
             match &msg.triggered_by {
                 Some(owner) if owner != current_agent => continue,
                 _ => {}
+            }
+            // Dedup: replace superseded read_file results with stubs
+            if let Some(path) = tool_result_paths.get(&msg.id) {
+                if latest_reads.get(path) != Some(&msg.id) {
+                    flush_user_batch(&mut pending_user_batch, &mut history);
+                    history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(format!(
+                            "[Earlier read_file of '{}' — superseded by later read]",
+                            path
+                        )),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                    continue;
+                }
             }
             // Tool results/errors should NOT be batched with user messages.
             // Flush any pending user messages first, then add tool message as its own user message.
@@ -5062,6 +5121,145 @@ api_key = "sk-test"
         // Unattributed tool result should be included
         assert_eq!(history.len(), 3);
         assert!(history[2].content.as_ref().unwrap().contains("old data"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_read_file() {
+        // Agent reads /a.rs twice — first result should be replaced with a stub.
+        let read_a_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+        let read_a_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_agent1 = make_conv_msg("arya", "Reading file.");
+        msg_agent1.id = 10;
+        msg_agent1.tool_calls = Some(read_a_tc);
+
+        let mut msg_tool1 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { old version }",
+            Some("arya"),
+        );
+        msg_tool1.id = 11;
+
+        let mut msg_agent2 = make_conv_msg("arya", "Re-reading file.");
+        msg_agent2.id = 12;
+        msg_agent2.tool_calls = Some(read_a_tc2);
+
+        let mut msg_tool2 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { new version }",
+            Some("arya"),
+        );
+        msg_tool2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "read /a.rs"),
+            msg_agent1,
+            msg_tool1,
+            make_conv_msg("user", "read it again"),
+            msg_agent2,
+            msg_tool2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+
+        // Find the two tool result messages in history
+        let tool_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_ref()
+                        .map_or(false, |c| c.contains("read_file"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(tool_results.len(), 2, "Should have two read_file entries");
+        // First should be the stub
+        assert!(
+            tool_results[0].contains("superseded"),
+            "First read should be stubbed: {}",
+            tool_results[0]
+        );
+        // Second should be the actual content
+        assert!(
+            tool_results[1].contains("new version"),
+            "Second read should be kept: {}",
+            tool_results[1]
+        );
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_different_paths_untouched() {
+        // Agent reads /a.rs then /b.rs — both should be kept.
+        let read_a_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+        let read_b_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/b.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_agent1 = make_conv_msg("arya", "Reading a.");
+        msg_agent1.id = 10;
+        msg_agent1.tool_calls = Some(read_a_tc);
+
+        let mut msg_tool1 = make_tool_msg(
+            "[Tool Result for read_file]\ncontents of a",
+            Some("arya"),
+        );
+        msg_tool1.id = 11;
+
+        let mut msg_agent2 = make_conv_msg("arya", "Reading b.");
+        msg_agent2.id = 12;
+        msg_agent2.tool_calls = Some(read_b_tc);
+
+        let mut msg_tool2 = make_tool_msg(
+            "[Tool Result for read_file]\ncontents of b",
+            Some("arya"),
+        );
+        msg_tool2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "read both"),
+            msg_agent1,
+            msg_tool1,
+            msg_agent2,
+            msg_tool2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Both should be present (different paths, no dedup)
+        let tool_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_ref()
+                        .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(tool_results.len(), 2, "Both reads should be kept");
+        assert!(tool_results[0].contains("contents of a"));
+        assert!(tool_results[1].contains("contents of b"));
     }
 
     // Tests for expand_inject_directives
