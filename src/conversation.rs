@@ -1053,6 +1053,16 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Clear all context cursors for a given agent across all conversations.
+    /// Used on daemon startup to prevent stale cursors from causing context overfill.
+    pub fn clear_all_cursors_for_agent(&self, agent: &str) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET context_cursor = NULL WHERE agent = ?1",
+            params![agent],
+        )?;
+        Ok(())
+    }
+
     /// Count messages in a conversation from a given message ID (inclusive).
     pub fn count_messages_from(
         &self,

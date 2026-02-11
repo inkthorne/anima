@@ -1544,6 +1544,15 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         shutdown_clone.notify_waiters();
     });
 
+    // Clear stale context cursors from previous sessions
+    if let Ok(store) = ConversationStore::init() {
+        if let Err(e) = store.clear_all_cursors_for_agent(&config.name) {
+            logger.log(&format!("Failed to clear stale cursors: {}", e));
+        } else {
+            logger.log("Cleared stale context cursors from previous session");
+        }
+    }
+
     // Process pending notifications (queued while agent was offline)
     if let Ok(conv_store) = ConversationStore::init() {
         match conv_store.get_pending_notifications(&config.name) {
@@ -2817,6 +2826,13 @@ fn load_agent_context(
                 ));
                 store.clear_context_cursor(conv_name, agent_name)?;
                 let msgs = cold_start(store)?;
+                logger.log(&format!(
+                    "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
+                    msgs.len(),
+                    msgs.first().map(|m| m.id).unwrap_or(0),
+                    msgs.last().map(|m| m.id).unwrap_or(0),
+                    agent_name, conv_name
+                ));
                 set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
                 Ok(msgs)
             } else {
@@ -2825,7 +2841,15 @@ fn load_agent_context(
                     "[context] Append mode for {} in {}: {} messages from cursor {}",
                     agent_name, conv_name, count, cursor_id
                 ));
-                store.get_messages_from_with_pinned(conv_name, cursor_id)
+                let msgs = store.get_messages_from_with_pinned(conv_name, cursor_id)?;
+                logger.log(&format!(
+                    "[context] Append loaded {} messages (id {}..{}) for {} in {}",
+                    msgs.len(),
+                    msgs.first().map(|m| m.id).unwrap_or(0),
+                    msgs.last().map(|m| m.id).unwrap_or(0),
+                    agent_name, conv_name
+                ));
+                Ok(msgs)
             }
         }
         None => {
@@ -2835,6 +2859,13 @@ fn load_agent_context(
                 agent_name, conv_name
             ));
             let msgs = cold_start(store)?;
+            logger.log(&format!(
+                "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
+                msgs.len(),
+                msgs.first().map(|m| m.id).unwrap_or(0),
+                msgs.last().map(|m| m.id).unwrap_or(0),
+                agent_name, conv_name
+            ));
             set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
             Ok(msgs)
         }
