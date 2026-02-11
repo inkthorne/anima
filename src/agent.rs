@@ -118,6 +118,16 @@ fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) 
                 _ => Some(format!("'{}' in={}", keyword, conv)),
             }
         }
+        "list_files" => {
+            let path = params.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let entries = result
+                .and_then(|r| r.get("entries"))
+                .and_then(|v| v.as_u64());
+            match entries {
+                Some(e) => Some(format!("path={} entries={}", path, e)),
+                None => Some(format!("path={}", path)),
+            }
+        }
         _ => None, // No special summary for other tools
     }
 }

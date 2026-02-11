@@ -630,6 +630,9 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
                 None => Some(format!("'{}' in={}", keyword, conv)),
             }
         }
+        "list_files" => {
+            args.get("path").and_then(|v| v.as_str()).map(String::from)
+        }
         _ => None,
     };
 
