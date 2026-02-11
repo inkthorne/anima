@@ -1417,6 +1417,16 @@ impl Agent {
                 }
             }
 
+            // If spawn_child was called this iteration, nudge the LLM to wait for results
+            if response.tool_calls.iter().any(|tc| tc.name == "spawn_child") {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("[System: You have pending child tasks. Call wait_for_children to collect results before responding.]".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
+
             // Check context fill and dump if approaching capacity
             if let Some(ctx) = options.num_ctx {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
@@ -1640,6 +1650,16 @@ impl Agent {
                         }
                     }
                 }
+            }
+
+            // If spawn_child was called this iteration, nudge the LLM to wait for results
+            if response.tool_calls.iter().any(|tc| tc.name == "spawn_child") {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some("[System: You have pending child tasks. Call wait_for_children to collect results before responding.]".to_string()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
             }
 
             // Check context fill and dump if approaching capacity
