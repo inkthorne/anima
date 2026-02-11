@@ -187,6 +187,12 @@ pub struct ThinkSection {
     /// Parsed as a duration string: "5m", "10m", "1h", etc.
     #[serde(default)]
     pub max_response_time: Option<String>,
+    /// Shell command to run after file-modifying tools for build verification.
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// Timeout in seconds for verify_command (default: 30).
+    #[serde(default)]
+    pub verify_timeout: Option<u64>,
 }
 
 impl Default for ThinkSection {
@@ -197,6 +203,8 @@ impl Default for ThinkSection {
             max_memory_entries: default_mem_entries(),
             reflection: false,
             max_response_time: None,
+            verify_command: None,
+            verify_timeout: None,
         }
     }
 }

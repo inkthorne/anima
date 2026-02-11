@@ -181,6 +181,11 @@ pub struct ThinkSection {
     pub max_iterations: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h").
     pub max_response_time: Option<String>,
+    /// Shell command to run after file-modifying tools (write_file, edit_file) for build verification.
+    /// Result is injected into LLM context as ephemeral feedback. Example: "cd /project && cargo check 2>&1"
+    pub verify_command: Option<String>,
+    /// Timeout in seconds for verify_command (default: 30)
+    pub verify_timeout: Option<u64>,
 }
 
 fn default_mentions_enabled() -> bool {

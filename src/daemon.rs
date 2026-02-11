@@ -1141,6 +1141,10 @@ pub struct DaemonConfig {
     pub max_response_time: Option<String>,
     /// Whether outbound @mention forwarding is enabled (default: true)
     pub mentions: bool,
+    /// Optional shell command to run after file-modifying tools for build verification
+    pub verify_command: Option<String>,
+    /// Timeout in seconds for verify_command (default: 30)
+    pub verify_timeout_secs: u64,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1241,6 +1245,8 @@ impl DaemonConfig {
             max_iterations: agent_dir.config.think.max_iterations,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             mentions: agent_dir.config.agent.mentions,
+            verify_command: agent_dir.config.think.verify_command.clone(),
+            verify_timeout_secs: agent_dir.config.think.verify_timeout.unwrap_or(30),
         })
     }
 }
@@ -1591,6 +1597,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.mentions,
                             &shutdown,
                             config.semantic_memory.conversation_recall_limit,
+                            config.verify_command.as_deref(),
+                            config.verify_timeout_secs,
                         )
                         .await;
 
@@ -1652,6 +1660,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
+        let worker_verify_command = config.verify_command.clone();
+        let worker_verify_timeout_secs = config.verify_timeout_secs;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1675,6 +1685,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_mentions,
                 worker_shutdown,
                 worker_conversation_recall_limit,
+                worker_verify_command,
+                worker_verify_timeout_secs,
             )
             .await
         })
@@ -2119,6 +2131,8 @@ async fn agent_worker(
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
+    verify_command: Option<String>,
+    verify_timeout_secs: u64,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2173,6 +2187,8 @@ async fn agent_worker(
                     conversation_recall_limit,
                     max_iterations,
                     num_ctx,
+                    verify_command.as_deref(),
+                    verify_timeout_secs,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2209,6 +2225,8 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
+                    verify_command.as_deref(),
+                    verify_timeout_secs,
                 )
                 .await;
             }
@@ -2270,6 +2288,8 @@ async fn process_message_work(
     conversation_recall_limit: usize,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
+    verify_command: Option<&str>,
+    verify_timeout_secs: u64,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -2392,6 +2412,8 @@ async fn process_message_work(
                 Some(trace_tx.clone()),
                 max_iterations,
                 num_ctx,
+                verify_command,
+                verify_timeout_secs,
             )
             .await;
             (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
@@ -2410,6 +2432,8 @@ async fn process_message_work(
                 &tool_context,
                 conversation_history,
                 max_iterations,
+                verify_command,
+                verify_timeout_secs,
             )
             .await;
             (response, None, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
@@ -2552,6 +2576,8 @@ async fn process_native_tool_mode(
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
+    verify_command: Option<&str>,
+    verify_timeout_secs: u64,
 ) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
@@ -2564,6 +2590,8 @@ async fn process_native_tool_mode(
         tool_trace_tx,
         max_iterations: max_iterations.unwrap_or(25),
         num_ctx,
+        verify_command: verify_command.map(|s| s.to_string()),
+        verify_timeout_secs,
         ..Default::default()
     };
 
@@ -2625,6 +2653,8 @@ async fn process_json_block_mode(
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
     max_iterations: Option<usize>,
+    verify_command: Option<&str>,
+    verify_timeout_secs: u64,
 ) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
     let mut current_message = content.to_string();
     let max_tool_calls = max_iterations.unwrap_or(25);
@@ -2770,6 +2800,15 @@ async fn process_json_block_mode(
                 Err(e) => {
                     logger.tool(&format!("[worker] Error: {}", e));
                     current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
+                }
+            }
+
+            // Run verify command after file-modifying tools
+            if let Some(verify_cmd) = verify_command {
+                if tc.tool == "write_file" || tc.tool == "edit_file" {
+                    let vr = crate::agent::run_verify_command(verify_cmd, verify_timeout_secs).await;
+                    logger.log(&format!("[worker] Verify: {}", vr.lines().next().unwrap_or(&vr)));
+                    current_message.push_str(&format!("\n\n{}", vr));
                 }
             }
 
@@ -2954,6 +2993,8 @@ async fn handle_notify(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
+    verify_command: Option<&str>,
+    verify_timeout_secs: u64,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -3135,6 +3176,8 @@ async fn handle_notify(
             tool_trace_tx: Some(tool_trace_tx.clone()),
             cancel: Some(cancel_flag.clone()),
             num_ctx,
+            verify_command: verify_command.map(|s| s.to_string()),
+            verify_timeout_secs,
             ..Default::default()
         };
 
@@ -3299,6 +3342,15 @@ async fn handle_notify(
                             format_conversation_history(&msgs, agent_name);
                         conversation_history = refreshed_history;
                         current_message = refreshed_final;
+                    }
+
+                    // Run verify command after file-modifying tools
+                    if let Some(verify_cmd) = verify_command {
+                        if tc.tool == "write_file" || tc.tool == "edit_file" {
+                            let vr = crate::agent::run_verify_command(verify_cmd, verify_timeout_secs).await;
+                            logger.log(&format!("[notify] Verify: {}", vr.lines().next().unwrap_or(&vr)));
+                            current_message.push_str(&format!("\n\n{}", vr));
+                        }
                     }
 
                     if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, json_block_budget) {

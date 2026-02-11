@@ -2631,6 +2631,8 @@ async fn run_agent_task(
         tool_trace_tx: None,
         cancel: None,
         num_ctx: None,
+        verify_command: config.think.verify_command.clone(),
+        verify_timeout_secs: config.think.verify_timeout.unwrap_or(30),
     };
 
     if stream {

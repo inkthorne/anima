@@ -52,6 +52,55 @@ pub fn tool_budget_nudge(iteration: usize, max: usize) -> Option<String> {
     }
 }
 
+/// Run a verification command (e.g. `cargo check`) and return a formatted result string.
+/// Used to inject build feedback into LLM context after file-modifying tools.
+pub async fn run_verify_command(command: &str, timeout_secs: u64) -> String {
+    use tokio::process::Command;
+
+    let start = Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .output(),
+    )
+    .await;
+
+    let elapsed = start.elapsed().as_secs_f64();
+
+    match result {
+        Err(_) => {
+            // Timeout
+            format!("[Verify: TIMEOUT] `{}` timed out after {}s", command, timeout_secs)
+        }
+        Ok(Err(e)) => {
+            // Failed to spawn
+            format!("[Verify: ERROR] `{}` failed to execute: {} ({:.1}s)", command, e, elapsed)
+        }
+        Ok(Ok(output)) => {
+            let code = output.status.code().unwrap_or(-1);
+            if output.status.success() {
+                format!("[Verify: PASS] `{}` exited 0 ({:.1}s)", command, elapsed)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Prefer stderr; fall back to stdout
+                let out = if stderr.trim().is_empty() {
+                    stdout.to_string()
+                } else {
+                    stderr.to_string()
+                };
+                let truncated = truncate(out.trim(), 2000);
+                format!(
+                    "[Verify: FAIL] `{}` exited {} ({:.1}s)\n--- output ---\n{}",
+                    command, code, elapsed, truncated
+                )
+            }
+        }
+    }
+}
+
 /// Generate a brief summary of a tool result for logging.
 /// Extracts key metadata based on tool type.
 fn tool_result_summary(tool_name: &str, params: &Value, result: Option<&Value>) -> Option<String> {
@@ -195,6 +244,11 @@ pub struct ThinkOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Context window size (tokens). When set, the tool loop will trim context at 80% fill.
     pub num_ctx: Option<u32>,
+    /// Optional shell command to run after file-modifying tools (write_file, edit_file).
+    /// Result is injected as ephemeral feedback into LLM context.
+    pub verify_command: Option<String>,
+    /// Timeout in seconds for verify_command (default: 30).
+    pub verify_timeout_secs: u64,
 }
 
 impl Default for ThinkOptions {
@@ -211,6 +265,8 @@ impl Default for ThinkOptions {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
+            verify_command: None,
+            verify_timeout_secs: 30,
         }
     }
 }
@@ -1214,6 +1270,23 @@ impl Agent {
             )
             .await;
 
+            // Run verify command if any tool was write_file or edit_file
+            if let Some(ref verify_cmd) = options.verify_command {
+                let has_file_modify = response.tool_calls.iter().any(|tc| {
+                    tc.name == "write_file" || tc.name == "edit_file"
+                });
+                if has_file_modify {
+                    let result = run_verify_command(verify_cmd, options.verify_timeout_secs).await;
+                    eprintln!("[verify] {}", result.lines().next().unwrap_or(&result));
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(result),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
+            }
+
             // Check context fill and dump if approaching capacity
             if let Some(ctx) = options.num_ctx {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
@@ -1419,6 +1492,23 @@ impl Agent {
             )
             .await;
 
+            // Run verify command if any tool was write_file or edit_file
+            if let Some(ref verify_cmd) = options.verify_command {
+                let has_file_modify = response.tool_calls.iter().any(|tc| {
+                    tc.name == "write_file" || tc.name == "edit_file"
+                });
+                if has_file_modify {
+                    let result = run_verify_command(verify_cmd, options.verify_timeout_secs).await;
+                    eprintln!("[verify] {}", result.lines().next().unwrap_or(&result));
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: Some(result),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
+                }
+            }
+
             // Check context fill and dump if approaching capacity
             if let Some(ctx) = options.num_ctx {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
@@ -1513,6 +1603,8 @@ impl Agent {
                 tool_trace_tx: None,
                 cancel: options.cancel.clone(),
                 num_ctx: options.num_ctx,
+                verify_command: options.verify_command.clone(),
+                verify_timeout_secs: options.verify_timeout_secs,
             };
 
             current_response = self
@@ -1918,6 +2010,8 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
+            verify_command: None,
+            verify_timeout_secs: 30,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2606,6 +2700,8 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
+            verify_command: None,
+            verify_timeout_secs: 30,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();
@@ -2682,6 +2778,37 @@ mod tests {
         let params = json!({"key": "value"});
         let result = summarize_tool_params("unknown_tool", &params);
         assert!(result.contains("key"));
+    }
+
+    // =========================================================================
+    // run_verify_command tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_verify_command_pass() {
+        let result = run_verify_command("true", 5).await;
+        assert!(result.contains("[Verify: PASS]"), "got: {}", result);
+        assert!(result.contains("exited 0"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_command_fail() {
+        let result = run_verify_command("false", 5).await;
+        assert!(result.contains("[Verify: FAIL]"), "got: {}", result);
+        assert!(result.contains("exited 1"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_command_timeout() {
+        let result = run_verify_command("sleep 10", 1).await;
+        assert!(result.contains("[Verify: TIMEOUT]"), "got: {}", result);
+    }
+
+    #[tokio::test]
+    async fn test_verify_command_with_output() {
+        let result = run_verify_command("echo 'build error' >&2; exit 1", 5).await;
+        assert!(result.contains("[Verify: FAIL]"), "got: {}", result);
+        assert!(result.contains("build error"), "got: {}", result);
     }
 
 }
