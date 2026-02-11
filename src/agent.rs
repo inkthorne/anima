@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -52,50 +52,167 @@ pub fn tool_budget_nudge(iteration: usize, max: usize) -> Option<String> {
     }
 }
 
-/// Run a verification command (e.g. `cargo check`) and return a formatted result string.
+/// Result of running a verify command — distinguishes pass/fail/timeout/error.
+#[derive(Debug)]
+pub enum VerifyResult {
+    Pass { command: String, elapsed: f64 },
+    Fail { command: String, exit_code: i32, elapsed: f64, output: String },
+    Timeout { command: String, timeout_secs: u64 },
+    Error { command: String, error: String, elapsed: f64 },
+}
+
+impl VerifyResult {
+    /// True for Fail, Timeout, and Error — the cases that need LLM attention.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self, VerifyResult::Pass { .. })
+    }
+
+    /// One-line summary for logging (always printed).
+    pub fn summary_line(&self) -> String {
+        match self {
+            VerifyResult::Pass { command, elapsed } =>
+                format!("[Verify: PASS] `{}` exited 0 ({:.1}s)", command, elapsed),
+            VerifyResult::Fail { command, exit_code, elapsed, .. } =>
+                format!("[Verify: FAIL] `{}` exited {} ({:.1}s)", command, exit_code, elapsed),
+            VerifyResult::Timeout { command, timeout_secs } =>
+                format!("[Verify: TIMEOUT] `{}` timed out after {}s", command, timeout_secs),
+            VerifyResult::Error { command, error, elapsed } =>
+                format!("[Verify: ERROR] `{}` failed to execute: {} ({:.1}s)", command, error, elapsed),
+        }
+    }
+
+    /// Full message for LLM context injection (only used on failure).
+    pub fn to_context_message(&self) -> String {
+        match self {
+            VerifyResult::Pass { .. } => self.summary_line(),
+            VerifyResult::Fail { command, exit_code, elapsed, output } =>
+                format!(
+                    "[Verify: FAIL] `{}` exited {} ({:.1}s)\n--- output ---\n{}",
+                    command, exit_code, elapsed, output
+                ),
+            VerifyResult::Timeout { .. } => self.summary_line(),
+            VerifyResult::Error { .. } => self.summary_line(),
+        }
+    }
+}
+
+/// Expand tilde (~) in path to home directory.
+pub fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(suffix) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(suffix);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Walk up from a file path looking for project root markers.
+/// Returns the first ancestor directory containing a marker file.
+pub fn detect_project_root(file_path: &str) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &[
+        "Cargo.toml", "package.json", "go.mod", "pyproject.toml", "Makefile", ".git",
+    ];
+    let expanded = expand_tilde(file_path);
+    let mut dir = expanded.parent()?;
+    loop {
+        for marker in MARKERS {
+            if dir.join(marker).exists() {
+                return Some(dir.to_path_buf());
+            }
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return None,
+        }
+    }
+}
+
+/// Runtime verification config (resolved from config VerifyEntry with default timeout).
+#[derive(Debug, Clone)]
+pub struct VerifyConfig {
+    pub command: String,
+    pub extensions: Vec<String>,
+    pub timeout_secs: u64,
+}
+
+/// Return verify configs whose extensions match any of the given file paths.
+pub fn matching_verify_configs<'a>(configs: &'a [VerifyConfig], paths: &[String]) -> Vec<&'a VerifyConfig> {
+    configs
+        .iter()
+        .filter(|cfg| {
+            cfg.extensions.iter().any(|ext| {
+                paths.iter().any(|p| p.ends_with(ext.as_str()))
+            })
+        })
+        .collect()
+}
+
+/// Extract file paths from tool calls that modify files (write_file, edit_file).
+pub fn extract_modified_file_paths(tool_calls: &[crate::llm::ToolCall]) -> Vec<String> {
+    tool_calls
+        .iter()
+        .filter(|tc| tc.name == "write_file" || tc.name == "edit_file")
+        .filter_map(|tc| tc.arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()))
+        .collect()
+}
+
+/// Run a verification command (e.g. `cargo check`) and return a structured result.
 /// Used to inject build feedback into LLM context after file-modifying tools.
-pub async fn run_verify_command(command: &str, timeout_secs: u64) -> String {
+/// When `cwd` is provided, the command runs in that directory.
+pub async fn run_verify_command(command: &str, timeout_secs: u64, cwd: Option<&Path>) -> VerifyResult {
     use tokio::process::Command;
 
     let start = Instant::now();
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output(),
+        cmd.output(),
     )
     .await;
 
     let elapsed = start.elapsed().as_secs_f64();
 
     match result {
-        Err(_) => {
-            // Timeout
-            format!("[Verify: TIMEOUT] `{}` timed out after {}s", command, timeout_secs)
-        }
-        Ok(Err(e)) => {
-            // Failed to spawn
-            format!("[Verify: ERROR] `{}` failed to execute: {} ({:.1}s)", command, e, elapsed)
-        }
+        Err(_) => VerifyResult::Timeout {
+            command: command.to_string(),
+            timeout_secs,
+        },
+        Ok(Err(e)) => VerifyResult::Error {
+            command: command.to_string(),
+            error: e.to_string(),
+            elapsed,
+        },
         Ok(Ok(output)) => {
             let code = output.status.code().unwrap_or(-1);
             if output.status.success() {
-                format!("[Verify: PASS] `{}` exited 0 ({:.1}s)", command, elapsed)
+                VerifyResult::Pass {
+                    command: command.to_string(),
+                    elapsed,
+                }
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // Prefer stderr; fall back to stdout
                 let out = if stderr.trim().is_empty() {
                     stdout.to_string()
                 } else {
                     stderr.to_string()
                 };
                 let truncated = truncate(out.trim(), 2000);
-                format!(
-                    "[Verify: FAIL] `{}` exited {} ({:.1}s)\n--- output ---\n{}",
-                    command, code, elapsed, truncated
-                )
+                VerifyResult::Fail {
+                    command: command.to_string(),
+                    exit_code: code,
+                    elapsed,
+                    output: truncated,
+                }
             }
         }
     }
@@ -244,11 +361,12 @@ pub struct ThinkOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Context window size (tokens). When set, the tool loop will trim context at 80% fill.
     pub num_ctx: Option<u32>,
-    /// Optional shell command to run after file-modifying tools (write_file, edit_file).
-    /// Result is injected as ephemeral feedback into LLM context.
-    pub verify_command: Option<String>,
-    /// Timeout in seconds for verify_command (default: 30).
-    pub verify_timeout_secs: u64,
+    /// Verification configs to run after file-modifying tools.
+    /// Each config has a command, file extensions, and timeout.
+    pub verify: Vec<VerifyConfig>,
+    /// Optional channel to forward log messages (e.g. verify output) to the daemon logger.
+    /// When None, falls back to eprintln.
+    pub log_tx: Option<mpsc::Sender<String>>,
 }
 
 impl Default for ThinkOptions {
@@ -265,9 +383,18 @@ impl Default for ThinkOptions {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify_command: None,
-            verify_timeout_secs: 30,
+            verify: vec![],
+            log_tx: None,
         }
+    }
+}
+
+/// Send a log message through the channel if available, otherwise eprintln.
+async fn log_or_eprint(tx: &Option<mpsc::Sender<String>>, msg: String) {
+    if let Some(tx) = tx {
+        let _ = tx.send(msg).await;
+    } else {
+        eprintln!("{}", msg);
     }
 }
 
@@ -1270,20 +1397,23 @@ impl Agent {
             )
             .await;
 
-            // Run verify command if any tool was write_file or edit_file
-            if let Some(ref verify_cmd) = options.verify_command {
-                let has_file_modify = response.tool_calls.iter().any(|tc| {
-                    tc.name == "write_file" || tc.name == "edit_file"
-                });
-                if has_file_modify {
-                    let result = run_verify_command(verify_cmd, options.verify_timeout_secs).await;
-                    eprintln!("[verify] {}", result.lines().next().unwrap_or(&result));
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: Some(result),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
+            // Run matching verify commands after file-modifying tools
+            if !options.verify.is_empty() {
+                let modified_paths = extract_modified_file_paths(&response.tool_calls);
+                if !modified_paths.is_empty() {
+                    let cwd = modified_paths.first().and_then(|p| detect_project_root(p));
+                    for cfg in matching_verify_configs(&options.verify, &modified_paths) {
+                        let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
+                        log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
+                        if vr.is_failure() {
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: Some(vr.to_context_message()),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1492,20 +1622,23 @@ impl Agent {
             )
             .await;
 
-            // Run verify command if any tool was write_file or edit_file
-            if let Some(ref verify_cmd) = options.verify_command {
-                let has_file_modify = response.tool_calls.iter().any(|tc| {
-                    tc.name == "write_file" || tc.name == "edit_file"
-                });
-                if has_file_modify {
-                    let result = run_verify_command(verify_cmd, options.verify_timeout_secs).await;
-                    eprintln!("[verify] {}", result.lines().next().unwrap_or(&result));
-                    messages.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: Some(result),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
+            // Run matching verify commands after file-modifying tools
+            if !options.verify.is_empty() {
+                let modified_paths = extract_modified_file_paths(&response.tool_calls);
+                if !modified_paths.is_empty() {
+                    let cwd = modified_paths.first().and_then(|p| detect_project_root(p));
+                    for cfg in matching_verify_configs(&options.verify, &modified_paths) {
+                        let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
+                        log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
+                        if vr.is_failure() {
+                            messages.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: Some(vr.to_context_message()),
+                                tool_call_id: None,
+                                tool_calls: None,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1603,8 +1736,8 @@ impl Agent {
                 tool_trace_tx: None,
                 cancel: options.cancel.clone(),
                 num_ctx: options.num_ctx,
-                verify_command: options.verify_command.clone(),
-                verify_timeout_secs: options.verify_timeout_secs,
+                verify: options.verify.clone(),
+                log_tx: options.log_tx.clone(),
             };
 
             current_response = self
@@ -2010,8 +2143,8 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify_command: None,
-            verify_timeout_secs: 30,
+            verify: vec![],
+            log_tx: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2700,8 +2833,8 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify_command: None,
-            verify_timeout_secs: 30,
+            verify: vec![],
+            log_tx: None,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();
@@ -2786,29 +2919,176 @@ mod tests {
 
     #[tokio::test]
     async fn test_verify_command_pass() {
-        let result = run_verify_command("true", 5).await;
-        assert!(result.contains("[Verify: PASS]"), "got: {}", result);
-        assert!(result.contains("exited 0"), "got: {}", result);
+        let result = run_verify_command("true", 5, None).await;
+        assert!(matches!(result, VerifyResult::Pass { .. }));
+        assert!(!result.is_failure());
+        assert!(result.summary_line().contains("[Verify: PASS]"));
     }
 
     #[tokio::test]
     async fn test_verify_command_fail() {
-        let result = run_verify_command("false", 5).await;
-        assert!(result.contains("[Verify: FAIL]"), "got: {}", result);
-        assert!(result.contains("exited 1"), "got: {}", result);
+        let result = run_verify_command("false", 5, None).await;
+        assert!(matches!(result, VerifyResult::Fail { exit_code: 1, .. }));
+        assert!(result.is_failure());
+        assert!(result.summary_line().contains("[Verify: FAIL]"));
     }
 
     #[tokio::test]
     async fn test_verify_command_timeout() {
-        let result = run_verify_command("sleep 10", 1).await;
-        assert!(result.contains("[Verify: TIMEOUT]"), "got: {}", result);
+        let result = run_verify_command("sleep 10", 1, None).await;
+        assert!(matches!(result, VerifyResult::Timeout { .. }));
+        assert!(result.is_failure());
+        assert!(result.summary_line().contains("[Verify: TIMEOUT]"));
     }
 
     #[tokio::test]
     async fn test_verify_command_with_output() {
-        let result = run_verify_command("echo 'build error' >&2; exit 1", 5).await;
-        assert!(result.contains("[Verify: FAIL]"), "got: {}", result);
-        assert!(result.contains("build error"), "got: {}", result);
+        let result = run_verify_command("echo 'build error' >&2; exit 1", 5, None).await;
+        assert!(result.is_failure());
+        let ctx = result.to_context_message();
+        assert!(ctx.contains("[Verify: FAIL]"), "got: {}", ctx);
+        assert!(ctx.contains("build error"), "got: {}", ctx);
+    }
+
+    #[tokio::test]
+    async fn test_verify_command_with_cwd() {
+        let result = run_verify_command("pwd", 5, Some(std::path::Path::new("/tmp"))).await;
+        assert!(matches!(result, VerifyResult::Pass { .. }));
+    }
+
+    // =========================================================================
+    // matching_verify_configs tests
+    // =========================================================================
+
+    #[test]
+    fn test_matching_verify_configs_matches_extension() {
+        let configs = vec![
+            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into(), ".toml".into()], timeout_secs: 30 },
+            VerifyConfig { command: "make".into(), extensions: vec![".cpp".into(), ".h".into()], timeout_secs: 60 },
+        ];
+        let paths = vec!["src/main.rs".to_string()];
+        let matched = matching_verify_configs(&configs, &paths);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].command, "cargo check");
+    }
+
+    #[test]
+    fn test_matching_verify_configs_no_match() {
+        let configs = vec![
+            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into()], timeout_secs: 30 },
+        ];
+        let paths = vec!["README.md".to_string()];
+        let matched = matching_verify_configs(&configs, &paths);
+        assert!(matched.is_empty());
+    }
+
+    #[test]
+    fn test_matching_verify_configs_multiple_matches() {
+        let configs = vec![
+            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into(), ".toml".into()], timeout_secs: 30 },
+            VerifyConfig { command: "cargo test".into(), extensions: vec![".rs".into()], timeout_secs: 120 },
+        ];
+        let paths = vec!["src/lib.rs".to_string()];
+        let matched = matching_verify_configs(&configs, &paths);
+        assert_eq!(matched.len(), 2);
+    }
+
+    #[test]
+    fn test_matching_verify_configs_empty_configs() {
+        let configs: Vec<VerifyConfig> = vec![];
+        let paths = vec!["src/main.rs".to_string()];
+        let matched = matching_verify_configs(&configs, &paths);
+        assert!(matched.is_empty());
+    }
+
+    // =========================================================================
+    // expand_tilde tests
+    // =========================================================================
+
+    #[test]
+    fn test_expand_tilde_with_prefix() {
+        let result = expand_tilde("~/foo/bar");
+        assert!(result.ends_with("foo/bar"), "got: {:?}", result);
+        assert!(!result.to_string_lossy().contains('~'));
+    }
+
+    #[test]
+    fn test_expand_tilde_bare() {
+        let result = expand_tilde("~");
+        assert!(!result.to_string_lossy().contains('~'));
+    }
+
+    #[test]
+    fn test_expand_tilde_absolute() {
+        let result = expand_tilde("/usr/local/bin");
+        assert_eq!(result, PathBuf::from("/usr/local/bin"));
+    }
+
+    #[test]
+    fn test_expand_tilde_relative() {
+        let result = expand_tilde("src/main.rs");
+        assert_eq!(result, PathBuf::from("src/main.rs"));
+    }
+
+    // =========================================================================
+    // detect_project_root tests
+    // =========================================================================
+
+    #[test]
+    fn test_detect_project_root_cargo() {
+        // This file is inside the anima project which has Cargo.toml
+        let root = detect_project_root(file!());
+        assert!(root.is_some());
+        let root = root.unwrap();
+        assert!(root.join("Cargo.toml").exists(), "got: {:?}", root);
+    }
+
+    #[test]
+    fn test_detect_project_root_none() {
+        let root = detect_project_root("/");
+        assert!(root.is_none());
+    }
+
+    // =========================================================================
+    // extract_modified_file_paths tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_modified_file_paths() {
+        use crate::llm::ToolCall;
+        let calls = vec![
+            ToolCall {
+                id: "1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/a.rs", "content": "x"}),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+            ToolCall {
+                id: "3".into(),
+                name: "edit_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/b.rs", "old": "x", "new": "y"}),
+            },
+        ];
+        let paths = extract_modified_file_paths(&calls);
+        assert_eq!(paths, vec!["/tmp/a.rs", "/tmp/b.rs"]);
+    }
+
+    #[test]
+    fn test_extract_modified_file_paths_empty() {
+        use crate::llm::ToolCall;
+        let calls = vec![
+            ToolCall {
+                id: "1".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        ];
+        let paths = extract_modified_file_paths(&calls);
+        assert!(paths.is_empty());
     }
 
 }

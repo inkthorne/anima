@@ -4,8 +4,8 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.9.4
-**Tests:** 574 passing
+**Version:** v3.10.1
+**Tests:** 639 passing
 **Repo:** github.com/inkthorne/anima
 
 ## Quick Context
