@@ -695,10 +695,10 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
     }
 }
 
-/// Format token count as short string (e.g., 2048 -> "2k", 32768 -> "33k", 500 -> "500")
+/// Format token count as short string (e.g., 2048 -> "2k", 65536 -> "64k", 500 -> "500")
 fn format_tokens_short(tokens: i64) -> String {
-    if tokens >= 1000 {
-        let k = (tokens + 500) / 1000;
+    if tokens >= 1024 {
+        let k = (tokens + 512) / 1024;
         format!("{}k", k)
     } else {
         format!("{}", tokens)
