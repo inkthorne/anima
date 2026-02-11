@@ -1464,10 +1464,9 @@ async fn stop_agent_impl(
                 }
             }
         }
-        Err(e) => {
-            if !quiet {
-                eprintln!("Warning: Could not connect to agent socket: {}", e);
-            }
+        Err(_) => {
+            // Socket unavailable (daemon still initializing, or socket already cleaned up).
+            // Fall through to SIGTERM, which handles this cleanly.
         }
     }
 
