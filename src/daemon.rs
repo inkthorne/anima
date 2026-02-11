@@ -1519,83 +1519,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // Process pending notifications (queued while agent was offline)
-    if let Ok(conv_store) = ConversationStore::init() {
-        match conv_store.get_pending_notifications(&config.name) {
-            Ok(pending) => {
-                if !pending.is_empty() {
-                    logger.log(&format!(
-                        "Processing {} pending notifications...",
-                        pending.len()
-                    ));
-                    for notification in &pending {
-                        logger.log(&format!(
-                            "  Processing notification: conv={} msg_id={}",
-                            notification.conv_name, notification.message_id
-                        ));
-
-                        // Startup processing — no shutdown signal yet
-                        let startup_shutdown = Arc::new(tokio::sync::Notify::new());
-                        let response = handle_notify(
-                            &notification.conv_name,
-                            notification.message_id,
-                            0, // Start at depth 0 for pending notifications
-                            &agent,
-                            &config.name,
-                            &config.system_prompt,
-                            &config.recall,
-                            &config.model_recall,
-                            &config.allowed_tools,
-                            &semantic_memory_store,
-                            &embedding_client,
-                            &tool_registry,
-                            use_native_tools,
-                            &logger,
-                            config.semantic_memory.recall_limit,
-                            &task_store,
-                            config.num_ctx,
-                            config.max_iterations,
-                            config.max_response_time.as_deref(),
-                            config.mentions,
-                            &startup_shutdown,
-                            config.semantic_memory.conversation_recall_limit,
-                        )
-                        .await;
-
-                        match response {
-                            Response::Notified {
-                                response_message_id,
-                            } => {
-                                logger.log(&format!(
-                                    "  Responded with msg_id={}",
-                                    response_message_id
-                                ));
-                            }
-                            Response::Error { message } => {
-                                logger.log(&format!("  Failed: {}", message));
-                            }
-                            _ => {}
-                        }
-                    }
-                    // Clear processed notifications
-                    if let Err(e) = conv_store.clear_pending_notifications(&config.name) {
-                        logger.log(&format!("Failed to clear pending notifications: {}", e));
-                    } else {
-                        logger.log("Pending notifications cleared");
-                    }
-                }
-            }
-            Err(e) => {
-                logger.log(&format!("Failed to get pending notifications: {}", e));
-            }
-        }
-    }
-
-    // Create Unix socket listener
-    let listener = UnixListener::bind(&config.socket_path)?;
-    logger.log(&format!("Listening on {}", config.socket_path.display()));
-
-    // Set up signal handling for graceful shutdown
+    // Set up signal handling for graceful shutdown (before pending notification processing
+    // so SIGTERM/SIGINT can abort in-flight LLM calls during startup)
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_clone = shutdown.clone();
 
@@ -1618,6 +1543,79 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
         shutdown_clone.notify_waiters();
     });
+
+    // Process pending notifications (queued while agent was offline)
+    if let Ok(conv_store) = ConversationStore::init() {
+        match conv_store.get_pending_notifications(&config.name) {
+            Ok(pending) => {
+                if !pending.is_empty() {
+                    logger.log(&format!(
+                        "Processing {} pending notifications...",
+                        pending.len()
+                    ));
+                    for notification in &pending {
+                        logger.log(&format!(
+                            "  Processing notification: conv={} msg_id={}",
+                            notification.conv_name, notification.message_id
+                        ));
+
+                        let response = handle_notify(
+                            &notification.conv_name,
+                            notification.message_id,
+                            0, // Start at depth 0 for pending notifications
+                            &agent,
+                            &config.name,
+                            &config.system_prompt,
+                            &config.recall,
+                            &config.model_recall,
+                            &config.allowed_tools,
+                            &semantic_memory_store,
+                            &embedding_client,
+                            &tool_registry,
+                            use_native_tools,
+                            &logger,
+                            config.semantic_memory.recall_limit,
+                            &task_store,
+                            config.num_ctx,
+                            config.max_iterations,
+                            config.max_response_time.as_deref(),
+                            config.mentions,
+                            &shutdown,
+                            config.semantic_memory.conversation_recall_limit,
+                        )
+                        .await;
+
+                        match response {
+                            Response::Notified {
+                                response_message_id,
+                            } => {
+                                logger.log(&format!(
+                                    "  Responded with msg_id={}",
+                                    response_message_id
+                                ));
+                            }
+                            Response::Error { message } => {
+                                logger.log(&format!("  Failed: {}", message));
+                            }
+                            _ => {}
+                        }
+
+                        // Clear this notification immediately so it won't replay on restart
+                        if let Err(e) = conv_store.delete_pending_notification(notification.id) {
+                            logger.log(&format!("Failed to clear notification {}: {}", notification.id, e));
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("Failed to get pending notifications: {}", e));
+            }
+        }
+    }
+
+    // Create Unix socket listener
+    let listener = UnixListener::bind(&config.socket_path)?;
+    logger.log(&format!("Listening on {}", config.socket_path.display()));
 
     // Create mpsc channel for serializing agent work
     // All Message, Notify, and Heartbeat work goes through this channel to prevent race conditions
