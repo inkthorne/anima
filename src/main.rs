@@ -252,6 +252,9 @@ enum ChatCommands {
         /// Output raw pipe-delimited format for scripts (ID|TIMESTAMP|FROM|CONTENT)
         #[arg(long)]
         raw: bool,
+        /// Output messages as JSON array
+        #[arg(long)]
+        json: bool,
     },
     /// Pause a conversation (notifications will be queued). Supports glob patterns (*, ?).
     Pause {
@@ -2041,6 +2044,7 @@ async fn handle_chat_command(
             limit,
             since,
             raw,
+            json,
         }) => {
             if store.find_by_name(&conv)?.is_none() {
                 return Err(format!("Conversation '{}' not found", conv).into());
@@ -2053,7 +2057,33 @@ async fn handle_chat_command(
                 .filter(|m| m.from_agent != "tool" && m.from_agent != "recall")
                 .collect();
 
-            if raw {
+            if json {
+                let json_messages: Vec<serde_json::Value> = messages
+                    .iter()
+                    .map(|msg| {
+                        let tool_calls_val = msg.tool_calls.as_ref()
+                            .and_then(|tc| serde_json::from_str::<serde_json::Value>(tc).ok());
+                        serde_json::json!({
+                            "id": msg.id,
+                            "conv_name": msg.conv_name,
+                            "from_agent": msg.from_agent,
+                            "content": msg.content,
+                            "mentions": msg.mentions,
+                            "created_at": msg.created_at,
+                            "expires_at": msg.expires_at,
+                            "duration_ms": msg.duration_ms,
+                            "tool_calls": tool_calls_val,
+                            "tokens_in": msg.tokens_in,
+                            "tokens_out": msg.tokens_out,
+                            "num_ctx": msg.num_ctx,
+                            "triggered_by": msg.triggered_by,
+                            "pinned": msg.pinned,
+                            "prompt_eval_ns": msg.prompt_eval_ns,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&json_messages)?);
+            } else if raw {
                 for msg in messages {
                     let escaped_content = msg
                         .content
@@ -2601,6 +2631,7 @@ async fn run_agent_task(
         external_tools: None,
         tool_trace_tx: None,
         cancel: None,
+        num_ctx: None,
     };
 
     if stream {

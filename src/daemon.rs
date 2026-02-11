@@ -2393,6 +2393,7 @@ async fn process_message_work(
                 conversation_history,
                 Some(trace_tx.clone()),
                 max_iterations,
+                num_ctx,
             )
             .await;
             (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
@@ -2552,6 +2553,7 @@ async fn process_native_tool_mode(
     conversation_history: Vec<ChatMessage>,
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
     max_iterations: Option<usize>,
+    num_ctx: Option<u32>,
 ) -> NativeToolModeResult {
     let options = ThinkOptions {
         system_prompt: system_prompt.clone(),
@@ -2563,6 +2565,7 @@ async fn process_native_tool_mode(
         external_tools,
         tool_trace_tx,
         max_iterations: max_iterations.unwrap_or(25),
+        num_ctx,
         ..Default::default()
     };
 
@@ -3107,6 +3110,7 @@ async fn handle_notify(
             max_iterations: max_iterations.unwrap_or(25),
             tool_trace_tx: Some(tool_trace_tx.clone()),
             cancel: Some(cancel_flag.clone()),
+            num_ctx,
             ..Default::default()
         };
 

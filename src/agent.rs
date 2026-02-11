@@ -161,6 +161,11 @@ pub fn summarize_tool_params(tool_name: &str, params: &Value) -> String {
 }
 
 
+/// Context fill threshold for mid-loop dump (80%)
+const CONTEXT_FILL_THRESHOLD: f64 = 0.80;
+/// Messages to keep after context dump (system prompt + this many recent messages)
+const CONTEXT_DUMP_KEEP_RECENT: usize = 20;
+
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
     /// Maximum iterations before giving up (default: 10)
@@ -188,6 +193,8 @@ pub struct ThinkOptions {
     /// Optional cancellation flag. When set to true, the agent stops the tool loop
     /// at the next iteration boundary and returns a Cancelled error.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Context window size (tokens). When set, the tool loop will trim context at 80% fill.
+    pub num_ctx: Option<u32>,
 }
 
 impl Default for ThinkOptions {
@@ -203,6 +210,7 @@ impl Default for ThinkOptions {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            num_ctx: None,
         }
     }
 }
@@ -1206,6 +1214,22 @@ impl Agent {
             )
             .await;
 
+            // Check context fill and dump if approaching capacity
+            if let Some(ctx) = options.num_ctx {
+                if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
+                    let fill = (t_in + t_out) as f64 / ctx as f64;
+                    if fill >= CONTEXT_FILL_THRESHOLD {
+                        let keep = CONTEXT_DUMP_KEEP_RECENT.min(messages.len().saturating_sub(1));
+                        if messages.len() > keep + 1 {
+                            let mut trimmed = vec![messages[0].clone()];
+                            trimmed.extend_from_slice(&messages[messages.len() - keep..]);
+                            messages = trimmed;
+                            self.history.clear();
+                        }
+                    }
+                }
+            }
+
             // Inject tool budget nudge
             if let Some(nudge) = tool_budget_nudge(_iteration + 1, options.max_iterations) {
                 messages.push(ChatMessage {
@@ -1395,6 +1419,22 @@ impl Agent {
             )
             .await;
 
+            // Check context fill and dump if approaching capacity
+            if let Some(ctx) = options.num_ctx {
+                if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
+                    let fill = (t_in + t_out) as f64 / ctx as f64;
+                    if fill >= CONTEXT_FILL_THRESHOLD {
+                        let keep = CONTEXT_DUMP_KEEP_RECENT.min(messages.len().saturating_sub(1));
+                        if messages.len() > keep + 1 {
+                            let mut trimmed = vec![messages[0].clone()];
+                            trimmed.extend_from_slice(&messages[messages.len() - keep..]);
+                            messages = trimmed;
+                            self.history.clear();
+                        }
+                    }
+                }
+            }
+
             let _ = token_tx.send("\n".to_string()).await;
         }
 
@@ -1472,6 +1512,7 @@ impl Agent {
                 external_tools: options.external_tools.clone(),
                 tool_trace_tx: None,
                 cancel: options.cancel.clone(),
+                num_ctx: options.num_ctx,
             };
 
             current_response = self
@@ -1876,6 +1917,7 @@ mod tests {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            num_ctx: None,
         };
         assert!(opts.auto_memory.is_some());
         assert_eq!(opts.auto_memory.as_ref().unwrap().max_entries, 10);
@@ -2563,6 +2605,7 @@ mod tests {
             external_tools: None,
             tool_trace_tx: None,
             cancel: None,
+            num_ctx: None,
         };
         assert!(opts.conversation_history.is_some());
         let history = opts.conversation_history.as_ref().unwrap();
