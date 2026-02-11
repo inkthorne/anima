@@ -1552,7 +1552,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             use_native_tools,
                             &logger,
                             config.semantic_memory.recall_limit,
-                            config.semantic_memory.history_limit,
                             &task_store,
                             config.num_ctx,
                             config.max_iterations,
@@ -1637,7 +1636,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_tool_registry = tool_registry.clone();
         let worker_logger = logger.clone();
         let worker_recall_limit = config.semantic_memory.recall_limit;
-        let worker_history_limit = config.semantic_memory.history_limit;
         let worker_task_store = task_store.clone();
         let worker_heartbeat_config = config.heartbeat.clone();
 
@@ -1662,7 +1660,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 use_native_tools,
                 worker_logger,
                 worker_recall_limit,
-                worker_history_limit,
                 worker_task_store,
                 worker_heartbeat_config,
                 worker_num_ctx,
@@ -1805,7 +1802,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_work_tx = work_tx.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
-                        let history_limit = config.semantic_memory.history_limit;
                         let conn_max_iterations = config.max_iterations;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
@@ -1824,7 +1820,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 shutdown_clone,
                                 conn_logger,
                                 recall_limit,
-                                history_limit,
                                 conn_heartbeat_config,
                                 conn_task_store,
                                 conn_work_tx,
@@ -2109,7 +2104,6 @@ async fn agent_worker(
     use_native_tools: bool,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
-    history_limit: usize,
     task_store: Option<Arc<Mutex<TaskStore>>>,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
@@ -2166,7 +2160,6 @@ async fn agent_worker(
                     use_native_tools,
                     &logger,
                     recall_limit,
-                    history_limit,
                     &task_store,
                     mentions_enabled,
                     &shutdown,
@@ -2202,7 +2195,6 @@ async fn agent_worker(
                     use_native_tools,
                     &logger,
                     recall_limit,
-                    history_limit,
                     &task_store,
                     num_ctx,
                     max_iterations,
@@ -2230,7 +2222,6 @@ async fn agent_worker(
                         use_native_tools,
                         &logger,
                         recall_limit,
-                        history_limit,
                         mentions_enabled,
                         &shutdown,
                         max_iterations,
@@ -2266,7 +2257,6 @@ async fn process_message_work(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
-    history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
@@ -2293,7 +2283,7 @@ async fn process_message_work(
     let (mut conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match load_agent_context(&store, cname, agent_name, history_limit, &logger, num_ctx) {
+                Ok(store) => match load_agent_context(&store, cname, agent_name, &logger, num_ctx) {
                     Ok(msgs) if !msgs.is_empty() => {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
@@ -2795,12 +2785,11 @@ const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
 ///
 /// - If cursor is NULL (cold start): load last N messages + pins (sliding window).
 /// - If cursor is set: load messages since cursor + pins (append mode).
-/// - If too many messages since cursor (> history_limit) or zero messages: fall back to cold start.
+/// - If zero messages from cursor: fall back to cold start.
 fn load_agent_context(
     store: &ConversationStore,
     conv_name: &str,
     agent_name: &str,
-    history_limit: usize,
     logger: &AgentLogger,
     num_ctx: Option<u32>,
 ) -> Result<Vec<ConversationMessage>, ConversationError> {
@@ -2814,24 +2803,15 @@ fn load_agent_context(
             ));
             store.get_messages_by_token_budget(conv_name, budget)
         } else {
-            store.get_messages_with_pinned(conv_name, Some(history_limit))
+            // No num_ctx available — use a conservative default token budget
+            store.get_messages_by_token_budget(conv_name, 2048)
         }
     };
 
     match store.get_context_cursor(conv_name, agent_name)? {
         Some(cursor_id) => {
             let count = store.count_messages_from(conv_name, cursor_id)?;
-            if count > (history_limit * 5) as i64 {
-                // Too many messages accumulated — cold start with new anchor
-                logger.log(&format!(
-                    "[context] {} messages from cursor for {} in {} (> {}), falling back to cold start",
-                    count, agent_name, conv_name, history_limit * 5
-                ));
-                store.clear_context_cursor(conv_name, agent_name)?;
-                let msgs = cold_start(store)?;
-                set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
-                Ok(msgs)
-            } else if count == 0 {
+            if count == 0 {
                 // Stale cursor or conversation cleared — cold start with new anchor
                 logger.log(&format!(
                     "[context] No messages from cursor for {} in {}, falling back to cold start",
@@ -2938,7 +2918,6 @@ async fn handle_notify(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
-    history_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
     max_iterations: Option<usize>,
@@ -2977,7 +2956,7 @@ async fn handle_notify(
     };
 
     // First fetch: get messages using append-only context cursors
-    let context_messages = match load_agent_context(&store, conv_id, agent_name, history_limit, logger, num_ctx) {
+    let context_messages = match load_agent_context(&store, conv_id, agent_name, logger, num_ctx) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -3285,7 +3264,8 @@ async fn handle_notify(
                     // Also update current_message from refreshed_final to avoid passing
                     // the tool result twice (once in history, once as the task).
                     current_message = tool_message;
-                    if let Ok(msgs) = store.get_messages_with_pinned(conv_id, Some(history_limit)) {
+                    let mid_turn_budget = num_ctx.map_or(2048, |c| c as usize * 30 / 100);
+                    if let Ok(msgs) = store.get_messages_by_token_budget(conv_id, mid_turn_budget) {
                         let (refreshed_history, refreshed_final) =
                             format_conversation_history(&msgs, agent_name);
                         conversation_history = refreshed_history;
@@ -3599,7 +3579,6 @@ async fn run_heartbeat(
     use_native_tools: bool,
     logger: &Arc<AgentLogger>,
     recall_limit: usize,
-    history_limit: usize,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     max_iterations: Option<usize>,
@@ -3654,7 +3633,7 @@ async fn run_heartbeat(
     // 3. Get conversation context using append-only cursors
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
-    let context_messages = load_agent_context(&store, &conv_name, agent_name, history_limit, logger, num_ctx)
+    let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
@@ -3993,7 +3972,6 @@ async fn handle_connection(
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
     recall_limit: usize,
-    _history_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
@@ -5184,7 +5162,7 @@ api_key = "sk-test"
         store.add_message(&conv, "user", "how are you?", &[]).unwrap();
 
         // No cursor set → cold start → should get last N messages
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
 
         // Cursor should be set to anchor (oldest non-pinned msg)
@@ -5210,7 +5188,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", anchor_id).unwrap();
 
         // Should get all messages from anchor (inclusive) — full window + new
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
         assert_eq!(msgs[1].content, "response 1");
@@ -5235,7 +5213,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", 99999).unwrap();
 
         // count == 0 → falls back to cold start with new anchor
-        let msgs = load_agent_context(&store, &conv, "arya", 20, &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
 
@@ -5245,30 +5223,25 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_load_agent_context_too_many_messages() {
+    fn test_load_agent_context_many_messages_append() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let store = ConversationStore::open(&db_path).unwrap();
         let logger = test_logger();
 
         let conv = store
-            .create_conversation(Some("ctx-overflow"), &["arya"])
+            .create_conversation(Some("ctx-many"), &["arya"])
             .unwrap();
         let cursor_id = store.add_message(&conv, "arya", "old response", &[]).unwrap();
         store.set_context_cursor(&conv, "arya", cursor_id).unwrap();
 
-        // Add more messages than history_limit * 5
+        // Add many messages — append mode should return all from cursor
         for i in 0..16 {
             store.add_message(&conv, "user", &format!("msg {}", i), &[]).unwrap();
         }
 
-        // history_limit=3, count from cursor = 17 (1 + 16) > 3*5=15 → falls back to sliding window
-        let msgs = load_agent_context(&store, &conv, "arya", 3, &logger, None).unwrap();
-        // Sliding window returns last 3
-        assert_eq!(msgs.len(), 3);
-
-        // Cursor should be set to new anchor (oldest msg in window)
-        let cursor = store.get_context_cursor(&conv, "arya").unwrap();
-        assert!(cursor.is_some());
+        // No overflow guard — append mode returns all 17 messages from cursor
+        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
+        assert_eq!(msgs.len(), 17); // 1 (old response) + 16 new
     }
 }
