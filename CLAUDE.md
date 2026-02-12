@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.10.5
+**Version:** v3.10.6
 **Tests:** 651 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -134,7 +134,7 @@ anima chat new [name]   # Create conversation + enter interactive mode
 anima chat create [name]# Create conversation (no interactive mode)
 anima chat join <name>  # Join existing conversation
 anima chat send <conv> "msg"  # Send message (fire-and-forget, @mentions notify agents)
-anima chat view <conv>  # View messages (--limit, --since, --raw)
+anima chat view <conv>  # View messages (--limit, --since, --json)
 anima chat pause <conv> # Pause conversation (queues notifications)
 anima chat stop <conv>  # Stop paused conversation (drops queued notifications)
 anima chat resume <conv># Resume paused conversation

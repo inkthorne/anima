@@ -249,9 +249,6 @@ enum ChatCommands {
         /// Show only messages with ID greater than this value
         #[arg(long)]
         since: Option<i64>,
-        /// Output raw pipe-delimited format for scripts (ID|TIMESTAMP|FROM|CONTENT)
-        #[arg(long)]
-        raw: bool,
         /// Output messages as JSON array
         #[arg(long)]
         json: bool,
@@ -2042,7 +2039,6 @@ async fn handle_chat_command(
             conv,
             limit,
             since,
-            raw,
             json,
         }) => {
             if store.find_by_name(&conv)?.is_none() {
@@ -2082,18 +2078,6 @@ async fn handle_chat_command(
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&json_messages)?);
-            } else if raw {
-                for msg in messages {
-                    let escaped_content = msg
-                        .content
-                        .replace('\\', "\\\\")
-                        .replace('\n', "\\n")
-                        .replace('|', "\\|");
-                    println!(
-                        "{}|{}|{}|{}",
-                        msg.id, msg.created_at, msg.from_agent, escaped_content
-                    );
-                }
             } else {
                 for msg in &messages {
                     print!("{}", format_message_display(msg));
