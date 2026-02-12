@@ -94,6 +94,50 @@ impl VerifyResult {
             VerifyResult::Error { .. } => self.summary_line(),
         }
     }
+
+    /// Extract the raw output from a Fail variant (for diffing across iterations).
+    pub fn output(&self) -> Option<&str> {
+        match self {
+            VerifyResult::Fail { output, .. } => Some(output),
+            _ => None,
+        }
+    }
+
+    /// Like `to_context_message`, but diffs against previous output to reduce context bloat.
+    /// Shows only new/changed error lines when previous output is available.
+    pub fn to_diff_context_message(&self, previous_output: Option<&str>) -> String {
+        match self {
+            VerifyResult::Fail { command, exit_code, elapsed, output } => {
+                let prev = match previous_output {
+                    Some(p) => p,
+                    None => return self.to_context_message(),
+                };
+                let prev_lines: std::collections::HashSet<&str> = prev.lines().collect();
+                let new_lines: Vec<&str> = output
+                    .lines()
+                    .filter(|line| !prev_lines.contains(line))
+                    .collect();
+
+                if new_lines.is_empty() {
+                    format!(
+                        "[Verify: FAIL] `{}` exited {} ({:.1}s) — same errors as previous run",
+                        command, exit_code, elapsed
+                    )
+                } else if new_lines.len() == output.lines().count() {
+                    self.to_context_message()
+                } else {
+                    format!(
+                        "[Verify: FAIL] `{}` exited {} ({:.1}s) — {} new error(s), {} unchanged\n--- new errors ---\n{}",
+                        command, exit_code, elapsed,
+                        new_lines.len(),
+                        output.lines().count() - new_lines.len(),
+                        new_lines.join("\n")
+                    )
+                }
+            }
+            _ => self.to_context_message(),
+        }
+    }
 }
 
 /// Expand tilde (~) in path to home directory.
@@ -374,6 +418,49 @@ fn dedup_read_file_results(messages: &mut [ChatMessage]) {
                 messages[i].content = Some(format!(
                     "[Earlier read_file of '{}' — superseded by later read]",
                     path
+                ));
+            }
+        }
+    }
+}
+
+/// Consecutive verify failures before injecting coaching message.
+pub const VERIFY_SPIN_THRESHOLD: u32 = 3;
+
+/// Extract the verify command name from a verify context message.
+/// Matches `[Verify: FAIL] \`<command>\`` and similar prefixes.
+fn extract_verify_command(content: &str) -> Option<String> {
+    let start = content.find("[Verify: ")? + 9;
+    let after_type = content[start..].find(']')?;
+    let after_bracket = start + after_type + 1;
+    let backtick_start = content[after_bracket..].find('`')? + after_bracket + 1;
+    let backtick_end = content[backtick_start..].find('`')? + backtick_start;
+    Some(content[backtick_start..backtick_end].to_string())
+}
+
+/// Replace older verify failure messages with stubs when the same command was run again later.
+/// Keeps only the most recent failure per verify command.
+fn dedup_verify_failures(messages: &mut [ChatMessage]) {
+    use std::collections::HashMap;
+    let mut latest_per_command: HashMap<String, usize> = HashMap::new();
+    let mut msg_command: Vec<Option<String>> = vec![None; messages.len()];
+
+    for (i, msg) in messages.iter().enumerate() {
+        if msg.role == "user" && msg.tool_call_id.is_none() {
+            if let Some(ref content) = msg.content {
+                if let Some(cmd) = extract_verify_command(content) {
+                    latest_per_command.insert(cmd.clone(), i);
+                    msg_command[i] = Some(cmd);
+                }
+            }
+        }
+    }
+
+    for i in 0..messages.len() {
+        if let Some(ref cmd) = msg_command[i] {
+            if latest_per_command.get(cmd) != Some(&i) {
+                messages[i].content = Some(format!(
+                    "[Earlier verify failure for `{}` — superseded by later run]", cmd
                 ));
             }
         }
@@ -1353,6 +1440,8 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
+        let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut consecutive_verify_fails: u32 = 0;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1446,6 +1535,8 @@ impl Agent {
             .await;
 
             // Run matching verify commands after file-modifying tools
+            let mut any_verify_failed = false;
+            let mut any_verify_ran = false;
             if !options.verify.is_empty() {
                 let modified_paths = extract_modified_file_paths(&response.tool_calls);
                 if !modified_paths.is_empty() {
@@ -1453,16 +1544,48 @@ impl Agent {
                     for cfg in matching_verify_configs(&options.verify, &modified_paths) {
                         let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
                         log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
+                        any_verify_ran = true;
                         if vr.is_failure() {
+                            any_verify_failed = true;
+                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
+                            let msg = vr.to_diff_context_message(prev);
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
-                                content: Some(vr.to_context_message()),
+                                content: Some(msg),
                                 tool_call_id: None,
                                 tool_calls: None,
                             });
+                            if let Some(output) = vr.output() {
+                                last_verify_output.insert(cfg.command.clone(), output.to_string());
+                            }
+                        } else {
+                            last_verify_output.remove(&cfg.command);
                         }
                     }
                 }
+            }
+            if any_verify_failed {
+                consecutive_verify_fails += 1;
+                dedup_verify_failures(&mut messages);
+            } else if any_verify_ran {
+                consecutive_verify_fails = 0;
+            }
+            if consecutive_verify_fails >= VERIFY_SPIN_THRESHOLD
+                && consecutive_verify_fails % VERIFY_SPIN_THRESHOLD == 0
+            {
+                let coaching = format!(
+                    "[System: You have failed verification {} times in a row. \
+                     STOP making edits and re-read the file(s) you are modifying. \
+                     Focus on the FIRST error in the output — fix that one before addressing others. \
+                     If you have been trying the same fix repeatedly, try a different approach.]",
+                    consecutive_verify_fails
+                );
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(coaching),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
             }
 
             // If spawn_child was called this iteration, nudge the LLM to wait for results
@@ -1480,8 +1603,9 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        // First resort: dedup stale read_file results
+                        // First resort: dedup stale read_file and verify results
                         dedup_read_file_results(&mut messages);
+                        dedup_verify_failures(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -1620,6 +1744,8 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
+        let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut consecutive_verify_fails: u32 = 0;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1705,6 +1831,8 @@ impl Agent {
             .await;
 
             // Run matching verify commands after file-modifying tools
+            let mut any_verify_failed = false;
+            let mut any_verify_ran = false;
             if !options.verify.is_empty() {
                 let modified_paths = extract_modified_file_paths(&response.tool_calls);
                 if !modified_paths.is_empty() {
@@ -1712,16 +1840,48 @@ impl Agent {
                     for cfg in matching_verify_configs(&options.verify, &modified_paths) {
                         let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
                         log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
+                        any_verify_ran = true;
                         if vr.is_failure() {
+                            any_verify_failed = true;
+                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
+                            let msg = vr.to_diff_context_message(prev);
                             messages.push(ChatMessage {
                                 role: "user".to_string(),
-                                content: Some(vr.to_context_message()),
+                                content: Some(msg),
                                 tool_call_id: None,
                                 tool_calls: None,
                             });
+                            if let Some(output) = vr.output() {
+                                last_verify_output.insert(cfg.command.clone(), output.to_string());
+                            }
+                        } else {
+                            last_verify_output.remove(&cfg.command);
                         }
                     }
                 }
+            }
+            if any_verify_failed {
+                consecutive_verify_fails += 1;
+                dedup_verify_failures(&mut messages);
+            } else if any_verify_ran {
+                consecutive_verify_fails = 0;
+            }
+            if consecutive_verify_fails >= VERIFY_SPIN_THRESHOLD
+                && consecutive_verify_fails % VERIFY_SPIN_THRESHOLD == 0
+            {
+                let coaching = format!(
+                    "[System: You have failed verification {} times in a row. \
+                     STOP making edits and re-read the file(s) you are modifying. \
+                     Focus on the FIRST error in the output — fix that one before addressing others. \
+                     If you have been trying the same fix repeatedly, try a different approach.]",
+                    consecutive_verify_fails
+                );
+                messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(coaching),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
             }
 
             // If spawn_child was called this iteration, nudge the LLM to wait for results
@@ -1739,8 +1899,9 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        // First resort: dedup stale read_file results
+                        // First resort: dedup stale read_file and verify results
                         dedup_read_file_results(&mut messages);
+                        dedup_verify_failures(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -3349,6 +3510,197 @@ mod tests {
 
         // No read_file calls — nothing changed
         assert_eq!(messages[1].content, original_content);
+    }
+
+    // =========================================================================
+    // VerifyResult diff tests
+    // =========================================================================
+
+    #[test]
+    fn test_verify_diff_no_previous() {
+        let vr = VerifyResult::Fail {
+            command: "cargo check".into(),
+            exit_code: 1,
+            elapsed: 2.5,
+            output: "error[E0308]: mismatched types".into(),
+        };
+        let msg = vr.to_diff_context_message(None);
+        // No previous output — should produce full context message
+        assert!(msg.contains("--- output ---"));
+        assert!(msg.contains("error[E0308]"));
+    }
+
+    #[test]
+    fn test_verify_diff_same_output() {
+        let vr = VerifyResult::Fail {
+            command: "cargo check".into(),
+            exit_code: 1,
+            elapsed: 2.5,
+            output: "error[E0308]: mismatched types\n  --> src/main.rs:10:5".into(),
+        };
+        let prev = "error[E0308]: mismatched types\n  --> src/main.rs:10:5";
+        let msg = vr.to_diff_context_message(Some(prev));
+        assert!(msg.contains("same errors as previous run"));
+        assert!(!msg.contains("--- output ---"));
+        assert!(!msg.contains("--- new errors ---"));
+    }
+
+    #[test]
+    fn test_verify_diff_partial_new() {
+        let vr = VerifyResult::Fail {
+            command: "cargo check".into(),
+            exit_code: 1,
+            elapsed: 3.0,
+            output: "error[E0308]: mismatched types\nerror[E0599]: no method named `foo`".into(),
+        };
+        let prev = "error[E0308]: mismatched types";
+        let msg = vr.to_diff_context_message(Some(prev));
+        assert!(msg.contains("1 new error(s)"));
+        assert!(msg.contains("1 unchanged"));
+        assert!(msg.contains("--- new errors ---"));
+        assert!(msg.contains("error[E0599]"));
+        assert!(!msg.contains("error[E0308]"));
+    }
+
+    #[test]
+    fn test_verify_diff_pass_ignores_previous() {
+        let vr = VerifyResult::Pass { command: "cargo check".into(), elapsed: 1.0 };
+        let msg = vr.to_diff_context_message(Some("old errors"));
+        assert!(msg.contains("[Verify: PASS]"));
+    }
+
+    #[test]
+    fn test_verify_output_method() {
+        let fail = VerifyResult::Fail {
+            command: "cargo check".into(),
+            exit_code: 1,
+            elapsed: 1.0,
+            output: "some errors".into(),
+        };
+        assert_eq!(fail.output(), Some("some errors"));
+
+        let pass = VerifyResult::Pass { command: "cargo check".into(), elapsed: 1.0 };
+        assert_eq!(pass.output(), None);
+    }
+
+    // =========================================================================
+    // extract_verify_command tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_verify_command() {
+        assert_eq!(
+            extract_verify_command("[Verify: FAIL] `cargo check` exited 1 (2.5s)"),
+            Some("cargo check".into())
+        );
+        assert_eq!(
+            extract_verify_command("[Verify: FAIL] `cargo check` exited 1 (2.5s) — same errors as previous run"),
+            Some("cargo check".into())
+        );
+        assert_eq!(
+            extract_verify_command("[Verify: ERROR] `make test` failed to execute: not found (0.1s)"),
+            Some("make test".into())
+        );
+        assert_eq!(
+            extract_verify_command("[Verify: TIMEOUT] `cargo build` timed out after 30s"),
+            Some("cargo build".into())
+        );
+        assert_eq!(
+            extract_verify_command("[Earlier verify failure for `cargo check` — superseded by later run]"),
+            None  // Different format, not a verify message
+        );
+        assert_eq!(
+            extract_verify_command("No verify prefix here"),
+            None
+        );
+    }
+
+    // =========================================================================
+    // dedup_verify_failures tests
+    // =========================================================================
+
+    #[test]
+    fn test_dedup_verify_failures_keeps_latest() {
+        use crate::llm::ChatMessage;
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("[Verify: FAIL] `cargo check` exited 1 (2.5s)\n--- output ---\nerror[E0308]: old".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("Let me fix that.".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("[Verify: FAIL] `cargo check` exited 1 (3.0s)\n--- output ---\nerror[E0308]: new".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        dedup_verify_failures(&mut messages);
+
+        // First verify failure replaced with stub
+        assert!(messages[0].content.as_ref().unwrap().contains("superseded"));
+        assert!(messages[0].content.as_ref().unwrap().contains("cargo check"));
+        // Assistant message untouched
+        assert_eq!(messages[1].content.as_ref().unwrap(), "Let me fix that.");
+        // Latest verify failure kept
+        assert!(messages[2].content.as_ref().unwrap().contains("error[E0308]: new"));
+    }
+
+    #[test]
+    fn test_dedup_verify_failures_different_commands() {
+        use crate::llm::ChatMessage;
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("[Verify: FAIL] `cargo check` exited 1 (2.5s)\n--- output ---\nerrors".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("[Verify: FAIL] `cargo test` exited 1 (5.0s)\n--- output ---\ntest failures".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        dedup_verify_failures(&mut messages);
+
+        // Different commands — both kept
+        assert!(messages[0].content.as_ref().unwrap().contains("cargo check"));
+        assert!(messages[0].content.as_ref().unwrap().contains("errors"));
+        assert!(messages[1].content.as_ref().unwrap().contains("cargo test"));
+        assert!(messages[1].content.as_ref().unwrap().contains("test failures"));
+    }
+
+    #[test]
+    fn test_dedup_verify_failures_skips_tool_results() {
+        use crate::llm::ChatMessage;
+
+        // A message with tool_call_id that happens to contain verify text should be ignored
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: Some("[Verify: FAIL] `cargo check` exited 1 (1.0s)\n--- output ---\nerror".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_verify_failures(&mut messages);
+
+        // Not touched because it has a tool_call_id
+        assert!(messages[0].content.as_ref().unwrap().contains("error"));
     }
 
 }

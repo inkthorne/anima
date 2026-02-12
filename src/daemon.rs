@@ -2754,6 +2754,8 @@ async fn process_json_block_mode(
     let mut last_tokens_out: Option<u32> = None;
     #[allow(unused_assignments)]
     let mut last_prompt_eval_ns: Option<u64> = None;
+    let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut consecutive_verify_fails: u32 = 0;
 
     loop {
         let options = ThinkOptions {
@@ -2891,6 +2893,8 @@ async fn process_json_block_mode(
             }
 
             // Run matching verify commands after file-modifying tools
+            let mut any_verify_failed = false;
+            let mut any_verify_ran = false;
             if !verify.is_empty() && (tc.tool == "write_file" || tc.tool == "edit_file") {
                 if let Some(file_path) = tc.params.get("path").and_then(|v| v.as_str()) {
                     let paths = vec![file_path.to_string()];
@@ -2898,11 +2902,36 @@ async fn process_json_block_mode(
                     for cfg in crate::agent::matching_verify_configs(verify, &paths) {
                         let vr = crate::agent::run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
                         logger.log(&format!("[worker] Verify: {}", vr.summary_line()));
+                        any_verify_ran = true;
                         if vr.is_failure() {
-                            current_message.push_str(&format!("\n\n{}", vr.to_context_message()));
+                            any_verify_failed = true;
+                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
+                            let msg = vr.to_diff_context_message(prev);
+                            current_message.push_str(&format!("\n\n{}", msg));
+                            if let Some(output) = vr.output() {
+                                last_verify_output.insert(cfg.command.clone(), output.to_string());
+                            }
+                        } else {
+                            last_verify_output.remove(&cfg.command);
                         }
                     }
                 }
+            }
+            if any_verify_failed {
+                consecutive_verify_fails += 1;
+            } else if any_verify_ran {
+                consecutive_verify_fails = 0;
+            }
+            if consecutive_verify_fails >= crate::agent::VERIFY_SPIN_THRESHOLD
+                && consecutive_verify_fails % crate::agent::VERIFY_SPIN_THRESHOLD == 0
+            {
+                current_message.push_str(&format!(
+                    "\n\n[System: You have failed verification {} times in a row. \
+                     STOP making edits and re-read the file(s) you are modifying. \
+                     Focus on the FIRST error in the output — fix that one before addressing others. \
+                     If you have been trying the same fix repeatedly, try a different approach.]",
+                    consecutive_verify_fails
+                ));
             }
 
             if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_tool_calls) {
@@ -3200,6 +3229,8 @@ async fn handle_notify(
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_duration_ms: Option<u64> = None;
     let mut agent_error: Option<String> = None;
+    let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut consecutive_verify_fails: u32 = 0;
 
     // Channel for incremental tool trace persistence (native tool mode)
     let (tool_trace_tx, trace_rx) =
@@ -3440,6 +3471,8 @@ async fn handle_notify(
                     }
 
                     // Run matching verify commands after file-modifying tools
+                    let mut any_verify_failed = false;
+                    let mut any_verify_ran = false;
                     if !verify.is_empty() && (tc.tool == "write_file" || tc.tool == "edit_file") {
                         if let Some(file_path) = tc.params.get("path").and_then(|v| v.as_str()) {
                             let paths = vec![file_path.to_string()];
@@ -3447,11 +3480,36 @@ async fn handle_notify(
                             for cfg in crate::agent::matching_verify_configs(verify, &paths) {
                                 let vr = crate::agent::run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
                                 logger.log(&format!("[notify] Verify: {}", vr.summary_line()));
+                                any_verify_ran = true;
                                 if vr.is_failure() {
-                                    current_message.push_str(&format!("\n\n{}", vr.to_context_message()));
+                                    any_verify_failed = true;
+                                    let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
+                                    let msg = vr.to_diff_context_message(prev);
+                                    current_message.push_str(&format!("\n\n{}", msg));
+                                    if let Some(output) = vr.output() {
+                                        last_verify_output.insert(cfg.command.clone(), output.to_string());
+                                    }
+                                } else {
+                                    last_verify_output.remove(&cfg.command);
                                 }
                             }
                         }
+                    }
+                    if any_verify_failed {
+                        consecutive_verify_fails += 1;
+                    } else if any_verify_ran {
+                        consecutive_verify_fails = 0;
+                    }
+                    if consecutive_verify_fails >= crate::agent::VERIFY_SPIN_THRESHOLD
+                        && consecutive_verify_fails % crate::agent::VERIFY_SPIN_THRESHOLD == 0
+                    {
+                        current_message.push_str(&format!(
+                            "\n\n[System: You have failed verification {} times in a row. \
+                             STOP making edits and re-read the file(s) you are modifying. \
+                             Focus on the FIRST error in the output — fix that one before addressing others. \
+                             If you have been trying the same fix repeatedly, try a different approach.]",
+                            consecutive_verify_fails
+                        ));
                     }
 
                     if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, json_block_budget) {
