@@ -2615,11 +2615,6 @@ async fn run_agent_task(
         tool_trace_tx: None,
         cancel: None,
         num_ctx: None,
-        verify: config.think.verify.iter().map(|e| anima::agent::VerifyConfig {
-            command: e.command.clone(),
-            extensions: e.extensions.clone(),
-            timeout_secs: e.timeout.unwrap_or(30),
-        }).collect(),
         log_tx: None,
     };
 

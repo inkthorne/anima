@@ -1216,8 +1216,6 @@ pub struct DaemonConfig {
     pub max_response_time: Option<String>,
     /// Whether outbound @mention forwarding is enabled (default: true)
     pub mentions: bool,
-    /// Verification configs to run after file-modifying tools
-    pub verify: Vec<crate::agent::VerifyConfig>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1318,11 +1316,6 @@ impl DaemonConfig {
             max_iterations: agent_dir.config.think.max_iterations,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             mentions: agent_dir.config.agent.mentions,
-            verify: agent_dir.config.think.verify.iter().map(|e| crate::agent::VerifyConfig {
-                command: e.command.clone(),
-                extensions: e.extensions.clone(),
-                timeout_secs: e.timeout.unwrap_or(30),
-            }).collect(),
         })
     }
 }
@@ -1673,7 +1666,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.mentions,
                             &shutdown,
                             config.semantic_memory.conversation_recall_limit,
-                            &config.verify,
                         )
                         .await;
 
@@ -1735,7 +1727,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
-        let worker_verify = config.verify.clone();
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1759,7 +1750,6 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_mentions,
                 worker_shutdown,
                 worker_conversation_recall_limit,
-                worker_verify,
             )
             .await
         })
@@ -2204,7 +2194,6 @@ async fn agent_worker(
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
-    verify: Vec<crate::agent::VerifyConfig>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2259,7 +2248,6 @@ async fn agent_worker(
                     conversation_recall_limit,
                     max_iterations,
                     num_ctx,
-                    &verify,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2296,7 +2284,6 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
-                    &verify,
                 )
                 .await;
             }
@@ -2358,7 +2345,6 @@ async fn process_message_work(
     conversation_recall_limit: usize,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
-    verify: &[crate::agent::VerifyConfig],
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -2481,7 +2467,6 @@ async fn process_message_work(
                 Some(trace_tx.clone()),
                 max_iterations,
                 num_ctx,
-                verify,
             )
             .await;
             (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
@@ -2500,7 +2485,6 @@ async fn process_message_work(
                 &tool_context,
                 conversation_history,
                 max_iterations,
-                verify,
             )
             .await;
             (response, None, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
@@ -2643,7 +2627,6 @@ async fn process_native_tool_mode(
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
-    verify: &[crate::agent::VerifyConfig],
 ) -> NativeToolModeResult {
     let (log_tx, log_handle) = spawn_log_forwarder(logger.clone());
     let options = ThinkOptions {
@@ -2657,7 +2640,6 @@ async fn process_native_tool_mode(
         tool_trace_tx,
         max_iterations: max_iterations.unwrap_or(25),
         num_ctx,
-        verify: verify.to_vec(),
         log_tx: Some(log_tx),
         ..Default::default()
     };
@@ -2741,7 +2723,6 @@ async fn process_json_block_mode(
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
     max_iterations: Option<usize>,
-    verify: &[crate::agent::VerifyConfig],
 ) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
     let mut current_message = content.to_string();
     let max_tool_calls = max_iterations.unwrap_or(25);
@@ -2754,8 +2735,6 @@ async fn process_json_block_mode(
     let mut last_tokens_out: Option<u32> = None;
     #[allow(unused_assignments)]
     let mut last_prompt_eval_ns: Option<u64> = None;
-    let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut consecutive_verify_fails: u32 = 0;
 
     loop {
         let options = ThinkOptions {
@@ -2890,48 +2869,6 @@ async fn process_json_block_mode(
                     logger.tool(&format!("[worker] Error: {}", e));
                     current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
                 }
-            }
-
-            // Run matching verify commands after file-modifying tools
-            let mut any_verify_failed = false;
-            let mut any_verify_ran = false;
-            if !verify.is_empty() && (tc.tool == "write_file" || tc.tool == "edit_file") {
-                if let Some(file_path) = tc.params.get("path").and_then(|v| v.as_str()) {
-                    let paths = vec![file_path.to_string()];
-                    let cwd = crate::agent::detect_project_root(file_path);
-                    for cfg in crate::agent::matching_verify_configs(verify, &paths) {
-                        let vr = crate::agent::run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
-                        logger.log(&format!("[worker] Verify: {}", vr.summary_line()));
-                        any_verify_ran = true;
-                        if vr.is_failure() {
-                            any_verify_failed = true;
-                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
-                            let msg = vr.to_diff_context_message(prev);
-                            current_message.push_str(&format!("\n\n{}", msg));
-                            if let Some(output) = vr.output() {
-                                last_verify_output.insert(cfg.command.clone(), output.to_string());
-                            }
-                        } else {
-                            last_verify_output.remove(&cfg.command);
-                        }
-                    }
-                }
-            }
-            if any_verify_failed {
-                consecutive_verify_fails += 1;
-            } else if any_verify_ran {
-                consecutive_verify_fails = 0;
-            }
-            if consecutive_verify_fails >= crate::agent::VERIFY_SPIN_THRESHOLD
-                && consecutive_verify_fails % crate::agent::VERIFY_SPIN_THRESHOLD == 0
-            {
-                current_message.push_str(&format!(
-                    "\n\n[System: You have failed verification {} times in a row. \
-                     STOP making edits and re-read the file(s) you are modifying. \
-                     Focus on the FIRST error in the output — fix that one before addressing others. \
-                     If you have been trying the same fix repeatedly, try a different approach.]",
-                    consecutive_verify_fails
-                ));
             }
 
             if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_tool_calls) {
@@ -3115,7 +3052,6 @@ async fn handle_notify(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
-    verify: &[crate::agent::VerifyConfig],
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -3229,8 +3165,6 @@ async fn handle_notify(
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_duration_ms: Option<u64> = None;
     let mut agent_error: Option<String> = None;
-    let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut consecutive_verify_fails: u32 = 0;
 
     // Channel for incremental tool trace persistence (native tool mode)
     let (tool_trace_tx, trace_rx) =
@@ -3243,7 +3177,7 @@ async fn handle_notify(
         trace_rx,
     );
 
-    // Channel for forwarding log messages (e.g. verify output) to the daemon logger
+    // Channel for forwarding log messages to the daemon logger
     let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
 
     // Cancellation flag for native tool mode — checked by agent.rs at each iteration boundary
@@ -3302,7 +3236,6 @@ async fn handle_notify(
             tool_trace_tx: Some(tool_trace_tx.clone()),
             cancel: Some(cancel_flag.clone()),
             num_ctx,
-            verify: verify.to_vec(),
             log_tx: Some(log_tx.clone()),
             ..Default::default()
         };
@@ -3468,48 +3401,6 @@ async fn handle_notify(
                             format_conversation_history(&msgs, agent_name);
                         conversation_history = refreshed_history;
                         current_message = refreshed_final;
-                    }
-
-                    // Run matching verify commands after file-modifying tools
-                    let mut any_verify_failed = false;
-                    let mut any_verify_ran = false;
-                    if !verify.is_empty() && (tc.tool == "write_file" || tc.tool == "edit_file") {
-                        if let Some(file_path) = tc.params.get("path").and_then(|v| v.as_str()) {
-                            let paths = vec![file_path.to_string()];
-                            let cwd = crate::agent::detect_project_root(file_path);
-                            for cfg in crate::agent::matching_verify_configs(verify, &paths) {
-                                let vr = crate::agent::run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
-                                logger.log(&format!("[notify] Verify: {}", vr.summary_line()));
-                                any_verify_ran = true;
-                                if vr.is_failure() {
-                                    any_verify_failed = true;
-                                    let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
-                                    let msg = vr.to_diff_context_message(prev);
-                                    current_message.push_str(&format!("\n\n{}", msg));
-                                    if let Some(output) = vr.output() {
-                                        last_verify_output.insert(cfg.command.clone(), output.to_string());
-                                    }
-                                } else {
-                                    last_verify_output.remove(&cfg.command);
-                                }
-                            }
-                        }
-                    }
-                    if any_verify_failed {
-                        consecutive_verify_fails += 1;
-                    } else if any_verify_ran {
-                        consecutive_verify_fails = 0;
-                    }
-                    if consecutive_verify_fails >= crate::agent::VERIFY_SPIN_THRESHOLD
-                        && consecutive_verify_fails % crate::agent::VERIFY_SPIN_THRESHOLD == 0
-                    {
-                        current_message.push_str(&format!(
-                            "\n\n[System: You have failed verification {} times in a row. \
-                             STOP making edits and re-read the file(s) you are modifying. \
-                             Focus on the FIRST error in the output — fix that one before addressing others. \
-                             If you have been trying the same fix repeatedly, try a different approach.]",
-                            consecutive_verify_fails
-                        ));
                     }
 
                     if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, json_block_budget) {

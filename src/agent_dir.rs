@@ -181,9 +181,6 @@ pub struct ThinkSection {
     pub max_iterations: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h").
     pub max_response_time: Option<String>,
-    /// Array of verification commands to run after file-modifying tools.
-    #[serde(default)]
-    pub verify: Vec<crate::config::VerifyEntry>,
 }
 
 fn default_mentions_enabled() -> bool {

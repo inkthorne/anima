@@ -187,21 +187,6 @@ pub struct ThinkSection {
     /// Parsed as a duration string: "5m", "10m", "1h", etc.
     #[serde(default)]
     pub max_response_time: Option<String>,
-    /// Array of verification commands to run after file-modifying tools.
-    /// Each entry specifies a command, file extensions it applies to, and optional timeout.
-    #[serde(default)]
-    pub verify: Vec<VerifyEntry>,
-}
-
-/// A single verification entry from config: command + file extensions + optional timeout.
-#[derive(Debug, Deserialize, Clone)]
-pub struct VerifyEntry {
-    /// Shell command to run (e.g. "cargo check 2>&1")
-    pub command: String,
-    /// File extensions this verifier applies to (e.g. [".rs", ".toml"])
-    pub extensions: Vec<String>,
-    /// Timeout in seconds (default: 30)
-    pub timeout: Option<u64>,
 }
 
 impl Default for ThinkSection {
@@ -212,7 +197,6 @@ impl Default for ThinkSection {
             max_memory_entries: default_mem_entries(),
             reflection: false,
             max_response_time: None,
-            verify: vec![],
         }
     }
 }

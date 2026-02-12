@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -52,94 +52,6 @@ pub fn tool_budget_nudge(iteration: usize, max: usize) -> Option<String> {
     }
 }
 
-/// Result of running a verify command — distinguishes pass/fail/timeout/error.
-#[derive(Debug)]
-pub enum VerifyResult {
-    Pass { command: String, elapsed: f64 },
-    Fail { command: String, exit_code: i32, elapsed: f64, output: String },
-    Timeout { command: String, timeout_secs: u64 },
-    Error { command: String, error: String, elapsed: f64 },
-}
-
-impl VerifyResult {
-    /// True for Fail, Timeout, and Error — the cases that need LLM attention.
-    pub fn is_failure(&self) -> bool {
-        !matches!(self, VerifyResult::Pass { .. })
-    }
-
-    /// One-line summary for logging (always printed).
-    pub fn summary_line(&self) -> String {
-        match self {
-            VerifyResult::Pass { command, elapsed } =>
-                format!("[Verify: PASS] `{}` exited 0 ({:.1}s)", command, elapsed),
-            VerifyResult::Fail { command, exit_code, elapsed, .. } =>
-                format!("[Verify: FAIL] `{}` exited {} ({:.1}s)", command, exit_code, elapsed),
-            VerifyResult::Timeout { command, timeout_secs } =>
-                format!("[Verify: TIMEOUT] `{}` timed out after {}s", command, timeout_secs),
-            VerifyResult::Error { command, error, elapsed } =>
-                format!("[Verify: ERROR] `{}` failed to execute: {} ({:.1}s)", command, error, elapsed),
-        }
-    }
-
-    /// Full message for LLM context injection (only used on failure).
-    pub fn to_context_message(&self) -> String {
-        match self {
-            VerifyResult::Pass { .. } => self.summary_line(),
-            VerifyResult::Fail { command, exit_code, elapsed, output } =>
-                format!(
-                    "[Verify: FAIL] `{}` exited {} ({:.1}s)\n--- output ---\n{}",
-                    command, exit_code, elapsed, output
-                ),
-            VerifyResult::Timeout { .. } => self.summary_line(),
-            VerifyResult::Error { .. } => self.summary_line(),
-        }
-    }
-
-    /// Extract the raw output from a Fail variant (for diffing across iterations).
-    pub fn output(&self) -> Option<&str> {
-        match self {
-            VerifyResult::Fail { output, .. } => Some(output),
-            _ => None,
-        }
-    }
-
-    /// Like `to_context_message`, but diffs against previous output to reduce context bloat.
-    /// Shows only new/changed error lines when previous output is available.
-    pub fn to_diff_context_message(&self, previous_output: Option<&str>) -> String {
-        match self {
-            VerifyResult::Fail { command, exit_code, elapsed, output } => {
-                let prev = match previous_output {
-                    Some(p) => p,
-                    None => return self.to_context_message(),
-                };
-                let prev_lines: std::collections::HashSet<&str> = prev.lines().collect();
-                let new_lines: Vec<&str> = output
-                    .lines()
-                    .filter(|line| !prev_lines.contains(line))
-                    .collect();
-
-                if new_lines.is_empty() {
-                    format!(
-                        "[Verify: FAIL] `{}` exited {} ({:.1}s) — same errors as previous run",
-                        command, exit_code, elapsed
-                    )
-                } else if new_lines.len() == output.lines().count() {
-                    self.to_context_message()
-                } else {
-                    format!(
-                        "[Verify: FAIL] `{}` exited {} ({:.1}s) — {} new error(s), {} unchanged\n--- new errors ---\n{}",
-                        command, exit_code, elapsed,
-                        new_lines.len(),
-                        output.lines().count() - new_lines.len(),
-                        new_lines.join("\n")
-                    )
-                }
-            }
-            _ => self.to_context_message(),
-        }
-    }
-}
-
 /// Expand tilde (~) in path to home directory.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(suffix) = path.strip_prefix("~/") {
@@ -171,93 +83,6 @@ pub fn detect_project_root(file_path: &str) -> Option<PathBuf> {
         match dir.parent() {
             Some(parent) => dir = parent,
             None => return None,
-        }
-    }
-}
-
-/// Runtime verification config (resolved from config VerifyEntry with default timeout).
-#[derive(Debug, Clone)]
-pub struct VerifyConfig {
-    pub command: String,
-    pub extensions: Vec<String>,
-    pub timeout_secs: u64,
-}
-
-/// Return verify configs whose extensions match any of the given file paths.
-pub fn matching_verify_configs<'a>(configs: &'a [VerifyConfig], paths: &[String]) -> Vec<&'a VerifyConfig> {
-    configs
-        .iter()
-        .filter(|cfg| {
-            cfg.extensions.iter().any(|ext| {
-                paths.iter().any(|p| p.ends_with(ext.as_str()))
-            })
-        })
-        .collect()
-}
-
-/// Extract file paths from tool calls that modify files (write_file, edit_file).
-pub fn extract_modified_file_paths(tool_calls: &[crate::llm::ToolCall]) -> Vec<String> {
-    tool_calls
-        .iter()
-        .filter(|tc| tc.name == "write_file" || tc.name == "edit_file")
-        .filter_map(|tc| tc.arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string()))
-        .collect()
-}
-
-/// Run a verification command (e.g. `cargo check`) and return a structured result.
-/// Used to inject build feedback into LLM context after file-modifying tools.
-/// When `cwd` is provided, the command runs in that directory.
-pub async fn run_verify_command(command: &str, timeout_secs: u64, cwd: Option<&Path>) -> VerifyResult {
-    use tokio::process::Command;
-
-    let start = Instant::now();
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c").arg(command);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await;
-
-    let elapsed = start.elapsed().as_secs_f64();
-
-    match result {
-        Err(_) => VerifyResult::Timeout {
-            command: command.to_string(),
-            timeout_secs,
-        },
-        Ok(Err(e)) => VerifyResult::Error {
-            command: command.to_string(),
-            error: e.to_string(),
-            elapsed,
-        },
-        Ok(Ok(output)) => {
-            let code = output.status.code().unwrap_or(-1);
-            if output.status.success() {
-                VerifyResult::Pass {
-                    command: command.to_string(),
-                    elapsed,
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let out = if stderr.trim().is_empty() {
-                    stdout.to_string()
-                } else {
-                    stderr.to_string()
-                };
-                let truncated = truncate(out.trim(), 2000);
-                VerifyResult::Fail {
-                    command: command.to_string(),
-                    exit_code: code,
-                    elapsed,
-                    output: truncated,
-                }
-            }
         }
     }
 }
@@ -424,49 +249,6 @@ fn dedup_read_file_results(messages: &mut [ChatMessage]) {
     }
 }
 
-/// Consecutive verify failures before injecting coaching message.
-pub const VERIFY_SPIN_THRESHOLD: u32 = 3;
-
-/// Extract the verify command name from a verify context message.
-/// Matches `[Verify: FAIL] \`<command>\`` and similar prefixes.
-fn extract_verify_command(content: &str) -> Option<String> {
-    let start = content.find("[Verify: ")? + 9;
-    let after_type = content[start..].find(']')?;
-    let after_bracket = start + after_type + 1;
-    let backtick_start = content[after_bracket..].find('`')? + after_bracket + 1;
-    let backtick_end = content[backtick_start..].find('`')? + backtick_start;
-    Some(content[backtick_start..backtick_end].to_string())
-}
-
-/// Replace older verify failure messages with stubs when the same command was run again later.
-/// Keeps only the most recent failure per verify command.
-fn dedup_verify_failures(messages: &mut [ChatMessage]) {
-    use std::collections::HashMap;
-    let mut latest_per_command: HashMap<String, usize> = HashMap::new();
-    let mut msg_command: Vec<Option<String>> = vec![None; messages.len()];
-
-    for (i, msg) in messages.iter().enumerate() {
-        if msg.role == "user" && msg.tool_call_id.is_none() {
-            if let Some(ref content) = msg.content {
-                if let Some(cmd) = extract_verify_command(content) {
-                    latest_per_command.insert(cmd.clone(), i);
-                    msg_command[i] = Some(cmd);
-                }
-            }
-        }
-    }
-
-    for i in 0..messages.len() {
-        if let Some(ref cmd) = msg_command[i] {
-            if latest_per_command.get(cmd) != Some(&i) {
-                messages[i].content = Some(format!(
-                    "[Earlier verify failure for `{}` — superseded by later run]", cmd
-                ));
-            }
-        }
-    }
-}
-
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
     /// Maximum iterations before giving up (default: 10)
@@ -496,10 +278,7 @@ pub struct ThinkOptions {
     pub cancel: Option<Arc<AtomicBool>>,
     /// Context window size (tokens). When set, the tool loop will trim context at 80% fill.
     pub num_ctx: Option<u32>,
-    /// Verification configs to run after file-modifying tools.
-    /// Each config has a command, file extensions, and timeout.
-    pub verify: Vec<VerifyConfig>,
-    /// Optional channel to forward log messages (e.g. verify output) to the daemon logger.
+    /// Optional channel to forward log messages to the daemon logger.
     /// When None, falls back to eprintln.
     pub log_tx: Option<mpsc::Sender<String>>,
 }
@@ -518,18 +297,8 @@ impl Default for ThinkOptions {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify: vec![],
             log_tx: None,
         }
-    }
-}
-
-/// Send a log message through the channel if available, otherwise eprintln.
-async fn log_or_eprint(tx: &Option<mpsc::Sender<String>>, msg: String) {
-    if let Some(tx) = tx {
-        let _ = tx.send(msg).await;
-    } else {
-        eprintln!("{}", msg);
     }
 }
 
@@ -1440,8 +1209,6 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
-        let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut consecutive_verify_fails: u32 = 0;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1534,60 +1301,6 @@ impl Agent {
             )
             .await;
 
-            // Run matching verify commands after file-modifying tools
-            let mut any_verify_failed = false;
-            let mut any_verify_ran = false;
-            if !options.verify.is_empty() {
-                let modified_paths = extract_modified_file_paths(&response.tool_calls);
-                if !modified_paths.is_empty() {
-                    let cwd = modified_paths.first().and_then(|p| detect_project_root(p));
-                    for cfg in matching_verify_configs(&options.verify, &modified_paths) {
-                        let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
-                        log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
-                        any_verify_ran = true;
-                        if vr.is_failure() {
-                            any_verify_failed = true;
-                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
-                            let msg = vr.to_diff_context_message(prev);
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: Some(msg),
-                                tool_call_id: None,
-                                tool_calls: None,
-                            });
-                            if let Some(output) = vr.output() {
-                                last_verify_output.insert(cfg.command.clone(), output.to_string());
-                            }
-                        } else {
-                            last_verify_output.remove(&cfg.command);
-                        }
-                    }
-                }
-            }
-            if any_verify_failed {
-                consecutive_verify_fails += 1;
-                dedup_verify_failures(&mut messages);
-            } else if any_verify_ran {
-                consecutive_verify_fails = 0;
-            }
-            if consecutive_verify_fails >= VERIFY_SPIN_THRESHOLD
-                && consecutive_verify_fails % VERIFY_SPIN_THRESHOLD == 0
-            {
-                let coaching = format!(
-                    "[System: You have failed verification {} times in a row. \
-                     STOP making edits and re-read the file(s) you are modifying. \
-                     Focus on the FIRST error in the output — fix that one before addressing others. \
-                     If you have been trying the same fix repeatedly, try a different approach.]",
-                    consecutive_verify_fails
-                );
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: Some(coaching),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
-            }
-
             // If spawn_child was called this iteration, nudge the LLM to wait for results
             if response.tool_calls.iter().any(|tc| tc.name == "spawn_child") {
                 messages.push(ChatMessage {
@@ -1603,9 +1316,8 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        // First resort: dedup stale read_file and verify results
+                        // First resort: dedup stale read_file results
                         dedup_read_file_results(&mut messages);
-                        dedup_verify_failures(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -1744,8 +1456,6 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
-        let mut last_verify_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut consecutive_verify_fails: u32 = 0;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1830,60 +1540,6 @@ impl Agent {
             )
             .await;
 
-            // Run matching verify commands after file-modifying tools
-            let mut any_verify_failed = false;
-            let mut any_verify_ran = false;
-            if !options.verify.is_empty() {
-                let modified_paths = extract_modified_file_paths(&response.tool_calls);
-                if !modified_paths.is_empty() {
-                    let cwd = modified_paths.first().and_then(|p| detect_project_root(p));
-                    for cfg in matching_verify_configs(&options.verify, &modified_paths) {
-                        let vr = run_verify_command(&cfg.command, cfg.timeout_secs, cwd.as_deref()).await;
-                        log_or_eprint(&options.log_tx, format!("[verify] {}", vr.summary_line())).await;
-                        any_verify_ran = true;
-                        if vr.is_failure() {
-                            any_verify_failed = true;
-                            let prev = last_verify_output.get(&cfg.command).map(|s| s.as_str());
-                            let msg = vr.to_diff_context_message(prev);
-                            messages.push(ChatMessage {
-                                role: "user".to_string(),
-                                content: Some(msg),
-                                tool_call_id: None,
-                                tool_calls: None,
-                            });
-                            if let Some(output) = vr.output() {
-                                last_verify_output.insert(cfg.command.clone(), output.to_string());
-                            }
-                        } else {
-                            last_verify_output.remove(&cfg.command);
-                        }
-                    }
-                }
-            }
-            if any_verify_failed {
-                consecutive_verify_fails += 1;
-                dedup_verify_failures(&mut messages);
-            } else if any_verify_ran {
-                consecutive_verify_fails = 0;
-            }
-            if consecutive_verify_fails >= VERIFY_SPIN_THRESHOLD
-                && consecutive_verify_fails % VERIFY_SPIN_THRESHOLD == 0
-            {
-                let coaching = format!(
-                    "[System: You have failed verification {} times in a row. \
-                     STOP making edits and re-read the file(s) you are modifying. \
-                     Focus on the FIRST error in the output — fix that one before addressing others. \
-                     If you have been trying the same fix repeatedly, try a different approach.]",
-                    consecutive_verify_fails
-                );
-                messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: Some(coaching),
-                    tool_call_id: None,
-                    tool_calls: None,
-                });
-            }
-
             // If spawn_child was called this iteration, nudge the LLM to wait for results
             if response.tool_calls.iter().any(|tc| tc.name == "spawn_child") {
                 messages.push(ChatMessage {
@@ -1899,9 +1555,8 @@ impl Agent {
                 if let (Some(t_in), Some(t_out)) = (last_tokens_in, last_tokens_out) {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
-                        // First resort: dedup stale read_file and verify results
+                        // First resort: dedup stale read_file results
                         dedup_read_file_results(&mut messages);
-                        dedup_verify_failures(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -2013,7 +1668,6 @@ impl Agent {
                 tool_trace_tx: None,
                 cancel: options.cancel.clone(),
                 num_ctx: options.num_ctx,
-                verify: options.verify.clone(),
                 log_tx: options.log_tx.clone(),
             };
 
@@ -2420,7 +2074,6 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify: vec![],
             log_tx: None,
         };
         assert!(opts.auto_memory.is_some());
@@ -3110,7 +2763,6 @@ mod tests {
             tool_trace_tx: None,
             cancel: None,
             num_ctx: None,
-            verify: vec![],
             log_tx: None,
         };
         assert!(opts.conversation_history.is_some());
@@ -3191,94 +2843,6 @@ mod tests {
     }
 
     // =========================================================================
-    // run_verify_command tests
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_verify_command_pass() {
-        let result = run_verify_command("true", 5, None).await;
-        assert!(matches!(result, VerifyResult::Pass { .. }));
-        assert!(!result.is_failure());
-        assert!(result.summary_line().contains("[Verify: PASS]"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_command_fail() {
-        let result = run_verify_command("false", 5, None).await;
-        assert!(matches!(result, VerifyResult::Fail { exit_code: 1, .. }));
-        assert!(result.is_failure());
-        assert!(result.summary_line().contains("[Verify: FAIL]"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_command_timeout() {
-        let result = run_verify_command("sleep 10", 1, None).await;
-        assert!(matches!(result, VerifyResult::Timeout { .. }));
-        assert!(result.is_failure());
-        assert!(result.summary_line().contains("[Verify: TIMEOUT]"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_command_with_output() {
-        let result = run_verify_command("echo 'build error' >&2; exit 1", 5, None).await;
-        assert!(result.is_failure());
-        let ctx = result.to_context_message();
-        assert!(ctx.contains("[Verify: FAIL]"), "got: {}", ctx);
-        assert!(ctx.contains("build error"), "got: {}", ctx);
-    }
-
-    #[tokio::test]
-    async fn test_verify_command_with_cwd() {
-        let result = run_verify_command("pwd", 5, Some(std::path::Path::new("/tmp"))).await;
-        assert!(matches!(result, VerifyResult::Pass { .. }));
-    }
-
-    // =========================================================================
-    // matching_verify_configs tests
-    // =========================================================================
-
-    #[test]
-    fn test_matching_verify_configs_matches_extension() {
-        let configs = vec![
-            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into(), ".toml".into()], timeout_secs: 30 },
-            VerifyConfig { command: "make".into(), extensions: vec![".cpp".into(), ".h".into()], timeout_secs: 60 },
-        ];
-        let paths = vec!["src/main.rs".to_string()];
-        let matched = matching_verify_configs(&configs, &paths);
-        assert_eq!(matched.len(), 1);
-        assert_eq!(matched[0].command, "cargo check");
-    }
-
-    #[test]
-    fn test_matching_verify_configs_no_match() {
-        let configs = vec![
-            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into()], timeout_secs: 30 },
-        ];
-        let paths = vec!["README.md".to_string()];
-        let matched = matching_verify_configs(&configs, &paths);
-        assert!(matched.is_empty());
-    }
-
-    #[test]
-    fn test_matching_verify_configs_multiple_matches() {
-        let configs = vec![
-            VerifyConfig { command: "cargo check".into(), extensions: vec![".rs".into(), ".toml".into()], timeout_secs: 30 },
-            VerifyConfig { command: "cargo test".into(), extensions: vec![".rs".into()], timeout_secs: 120 },
-        ];
-        let paths = vec!["src/lib.rs".to_string()];
-        let matched = matching_verify_configs(&configs, &paths);
-        assert_eq!(matched.len(), 2);
-    }
-
-    #[test]
-    fn test_matching_verify_configs_empty_configs() {
-        let configs: Vec<VerifyConfig> = vec![];
-        let paths = vec!["src/main.rs".to_string()];
-        let matched = matching_verify_configs(&configs, &paths);
-        assert!(matched.is_empty());
-    }
-
-    // =========================================================================
     // expand_tilde tests
     // =========================================================================
 
@@ -3324,48 +2888,6 @@ mod tests {
     fn test_detect_project_root_none() {
         let root = detect_project_root("/");
         assert!(root.is_none());
-    }
-
-    // =========================================================================
-    // extract_modified_file_paths tests
-    // =========================================================================
-
-    #[test]
-    fn test_extract_modified_file_paths() {
-        use crate::llm::ToolCall;
-        let calls = vec![
-            ToolCall {
-                id: "1".into(),
-                name: "write_file".into(),
-                arguments: serde_json::json!({"path": "/tmp/a.rs", "content": "x"}),
-            },
-            ToolCall {
-                id: "2".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            },
-            ToolCall {
-                id: "3".into(),
-                name: "edit_file".into(),
-                arguments: serde_json::json!({"path": "/tmp/b.rs", "old": "x", "new": "y"}),
-            },
-        ];
-        let paths = extract_modified_file_paths(&calls);
-        assert_eq!(paths, vec!["/tmp/a.rs", "/tmp/b.rs"]);
-    }
-
-    #[test]
-    fn test_extract_modified_file_paths_empty() {
-        use crate::llm::ToolCall;
-        let calls = vec![
-            ToolCall {
-                id: "1".into(),
-                name: "shell".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            },
-        ];
-        let paths = extract_modified_file_paths(&calls);
-        assert!(paths.is_empty());
     }
 
     // =========================================================================
@@ -3510,197 +3032,6 @@ mod tests {
 
         // No read_file calls — nothing changed
         assert_eq!(messages[1].content, original_content);
-    }
-
-    // =========================================================================
-    // VerifyResult diff tests
-    // =========================================================================
-
-    #[test]
-    fn test_verify_diff_no_previous() {
-        let vr = VerifyResult::Fail {
-            command: "cargo check".into(),
-            exit_code: 1,
-            elapsed: 2.5,
-            output: "error[E0308]: mismatched types".into(),
-        };
-        let msg = vr.to_diff_context_message(None);
-        // No previous output — should produce full context message
-        assert!(msg.contains("--- output ---"));
-        assert!(msg.contains("error[E0308]"));
-    }
-
-    #[test]
-    fn test_verify_diff_same_output() {
-        let vr = VerifyResult::Fail {
-            command: "cargo check".into(),
-            exit_code: 1,
-            elapsed: 2.5,
-            output: "error[E0308]: mismatched types\n  --> src/main.rs:10:5".into(),
-        };
-        let prev = "error[E0308]: mismatched types\n  --> src/main.rs:10:5";
-        let msg = vr.to_diff_context_message(Some(prev));
-        assert!(msg.contains("same errors as previous run"));
-        assert!(!msg.contains("--- output ---"));
-        assert!(!msg.contains("--- new errors ---"));
-    }
-
-    #[test]
-    fn test_verify_diff_partial_new() {
-        let vr = VerifyResult::Fail {
-            command: "cargo check".into(),
-            exit_code: 1,
-            elapsed: 3.0,
-            output: "error[E0308]: mismatched types\nerror[E0599]: no method named `foo`".into(),
-        };
-        let prev = "error[E0308]: mismatched types";
-        let msg = vr.to_diff_context_message(Some(prev));
-        assert!(msg.contains("1 new error(s)"));
-        assert!(msg.contains("1 unchanged"));
-        assert!(msg.contains("--- new errors ---"));
-        assert!(msg.contains("error[E0599]"));
-        assert!(!msg.contains("error[E0308]"));
-    }
-
-    #[test]
-    fn test_verify_diff_pass_ignores_previous() {
-        let vr = VerifyResult::Pass { command: "cargo check".into(), elapsed: 1.0 };
-        let msg = vr.to_diff_context_message(Some("old errors"));
-        assert!(msg.contains("[Verify: PASS]"));
-    }
-
-    #[test]
-    fn test_verify_output_method() {
-        let fail = VerifyResult::Fail {
-            command: "cargo check".into(),
-            exit_code: 1,
-            elapsed: 1.0,
-            output: "some errors".into(),
-        };
-        assert_eq!(fail.output(), Some("some errors"));
-
-        let pass = VerifyResult::Pass { command: "cargo check".into(), elapsed: 1.0 };
-        assert_eq!(pass.output(), None);
-    }
-
-    // =========================================================================
-    // extract_verify_command tests
-    // =========================================================================
-
-    #[test]
-    fn test_extract_verify_command() {
-        assert_eq!(
-            extract_verify_command("[Verify: FAIL] `cargo check` exited 1 (2.5s)"),
-            Some("cargo check".into())
-        );
-        assert_eq!(
-            extract_verify_command("[Verify: FAIL] `cargo check` exited 1 (2.5s) — same errors as previous run"),
-            Some("cargo check".into())
-        );
-        assert_eq!(
-            extract_verify_command("[Verify: ERROR] `make test` failed to execute: not found (0.1s)"),
-            Some("make test".into())
-        );
-        assert_eq!(
-            extract_verify_command("[Verify: TIMEOUT] `cargo build` timed out after 30s"),
-            Some("cargo build".into())
-        );
-        assert_eq!(
-            extract_verify_command("[Earlier verify failure for `cargo check` — superseded by later run]"),
-            None  // Different format, not a verify message
-        );
-        assert_eq!(
-            extract_verify_command("No verify prefix here"),
-            None
-        );
-    }
-
-    // =========================================================================
-    // dedup_verify_failures tests
-    // =========================================================================
-
-    #[test]
-    fn test_dedup_verify_failures_keeps_latest() {
-        use crate::llm::ChatMessage;
-
-        let mut messages = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: Some("[Verify: FAIL] `cargo check` exited 1 (2.5s)\n--- output ---\nerror[E0308]: old".into()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "assistant".into(),
-                content: Some("Let me fix that.".into()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: Some("[Verify: FAIL] `cargo check` exited 1 (3.0s)\n--- output ---\nerror[E0308]: new".into()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ];
-
-        dedup_verify_failures(&mut messages);
-
-        // First verify failure replaced with stub
-        assert!(messages[0].content.as_ref().unwrap().contains("superseded"));
-        assert!(messages[0].content.as_ref().unwrap().contains("cargo check"));
-        // Assistant message untouched
-        assert_eq!(messages[1].content.as_ref().unwrap(), "Let me fix that.");
-        // Latest verify failure kept
-        assert!(messages[2].content.as_ref().unwrap().contains("error[E0308]: new"));
-    }
-
-    #[test]
-    fn test_dedup_verify_failures_different_commands() {
-        use crate::llm::ChatMessage;
-
-        let mut messages = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: Some("[Verify: FAIL] `cargo check` exited 1 (2.5s)\n--- output ---\nerrors".into()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: Some("[Verify: FAIL] `cargo test` exited 1 (5.0s)\n--- output ---\ntest failures".into()),
-                tool_call_id: None,
-                tool_calls: None,
-            },
-        ];
-
-        dedup_verify_failures(&mut messages);
-
-        // Different commands — both kept
-        assert!(messages[0].content.as_ref().unwrap().contains("cargo check"));
-        assert!(messages[0].content.as_ref().unwrap().contains("errors"));
-        assert!(messages[1].content.as_ref().unwrap().contains("cargo test"));
-        assert!(messages[1].content.as_ref().unwrap().contains("test failures"));
-    }
-
-    #[test]
-    fn test_dedup_verify_failures_skips_tool_results() {
-        use crate::llm::ChatMessage;
-
-        // A message with tool_call_id that happens to contain verify text should be ignored
-        let mut messages = vec![
-            ChatMessage {
-                role: "user".into(),
-                content: Some("[Verify: FAIL] `cargo check` exited 1 (1.0s)\n--- output ---\nerror".into()),
-                tool_call_id: Some("tc1".into()),
-                tool_calls: None,
-            },
-        ];
-
-        dedup_verify_failures(&mut messages);
-
-        // Not touched because it has a tool_call_id
-        assert!(messages[0].content.as_ref().unwrap().contains("error"));
     }
 
 }
