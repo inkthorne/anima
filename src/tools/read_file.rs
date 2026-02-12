@@ -18,6 +18,13 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Parse a JSON value as usize, with float fallback for Ollama models that send integers as floats.
+fn json_to_usize(v: &Value) -> Option<usize> {
+    v.as_u64()
+        .or_else(|| v.as_f64().map(|f| f as u64))
+        .map(|n| n as usize)
+}
+
 /// Tool for reading file contents from the filesystem.
 #[derive(Debug, Default)]
 pub struct ReadFileTool;
@@ -39,6 +46,14 @@ impl Tool for ReadFileTool {
                 "path": {
                     "type": "string",
                     "description": "The path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-based)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to return"
                 }
             },
             "required": ["path"]
@@ -56,7 +71,23 @@ impl Tool for ReadFileTool {
             ToolError::ExecutionFailed(format!("Failed to read file '{}': {}", path.display(), e))
         })?;
 
-        Ok(serde_json::json!({ "contents": contents }))
+        let offset = input.get("offset").and_then(json_to_usize);
+        let limit = input.get("limit").and_then(json_to_usize);
+
+        let result = if offset.is_some() || limit.is_some() {
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = offset.map(|o| o.saturating_sub(1)).unwrap_or(0).min(lines.len());
+            let end = if let Some(lim) = limit {
+                (start + lim).min(lines.len())
+            } else {
+                lines.len()
+            };
+            lines[start..end].join("\n")
+        } else {
+            contents
+        };
+
+        Ok(serde_json::json!({ "contents": result }))
     }
 }
 
@@ -151,5 +182,75 @@ mod tests {
         assert!(contents.contains("line 1"));
         assert!(contents.contains("line 2"));
         assert!(contents.contains("line 3"));
+    }
+
+    #[tokio::test]
+    async fn test_read_with_offset() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "offset": 3})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        assert_eq!(contents, "line 3\nline 4\nline 5");
+    }
+
+    #[tokio::test]
+    async fn test_read_with_limit() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "limit": 2})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        assert_eq!(contents, "line 1\nline 2");
+    }
+
+    #[tokio::test]
+    async fn test_read_with_offset_and_limit() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=10 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "offset": 3, "limit": 4})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        assert_eq!(contents, "line 3\nline 4\nline 5\nline 6");
+    }
+
+    #[tokio::test]
+    async fn test_read_offset_beyond_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "offset": 100})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        assert_eq!(contents, "");
+    }
+
+    #[tokio::test]
+    async fn test_read_offset_as_float() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=5 {
+            writeln!(file, "line {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "offset": 3.0, "limit": 2.0})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        assert_eq!(contents, "line 3\nline 4");
     }
 }

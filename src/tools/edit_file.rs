@@ -18,6 +18,20 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+fn format_diff_summary(added: usize, removed: usize) -> String {
+    let a = if added == 1 {
+        "Added 1 line".to_string()
+    } else {
+        format!("Added {} lines", added)
+    };
+    let r = if removed == 1 {
+        "removed 1 line".to_string()
+    } else {
+        format!("removed {} lines", removed)
+    };
+    format!("{}, {}", a, r)
+}
+
 /// Tool for replacing exact text in a file. Faster than write_file for small edits.
 #[derive(Debug, Default)]
 pub struct EditFileTool;
@@ -90,22 +104,11 @@ impl Tool for EditFileTool {
         let match_count = content.matches(old_text).count();
 
         if match_count == 0 {
-            // Include first 50 lines so the agent can see what's actually in the file
-            let preview: String = content
-                .lines()
-                .take(50)
-                .enumerate()
-                .map(|(i, line)| format!("{:>4}| {}", i + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
             let total_lines = content.lines().count();
-            let shown = total_lines.min(50);
             return Err(ToolError::ExecutionFailed(format!(
-                "old_text not found in '{}'. File contents ({}/{} lines):\n{}",
+                "old_text not found in '{}' ({} lines). Use read_file to check the file contents.",
                 path.display(),
-                shown,
                 total_lines,
-                preview
             )));
         }
 
@@ -127,39 +130,68 @@ impl Tool for EditFileTool {
             ToolError::ExecutionFailed(format!("Failed to write file '{}': {}", path.display(), e))
         })?;
 
-        // Build context around the replacement site(s)
+        // Build unified diff around each replacement site
         let context_lines = 3;
-        let new_lines: Vec<&str> = new_content.lines().collect();
+        let old_lines_all: Vec<&str> = content.lines().collect();
+        let old_text_lines: Vec<&str> = old_text.lines().collect();
         let new_text_lines: Vec<&str> = new_text.lines().collect();
-        let mut context_snippets = Vec::new();
+        let old_count = old_text_lines.len();
+        let new_count = new_text_lines.len();
+        let line_shift = new_count as isize - old_count as isize;
+        let mut diff_snippets = Vec::new();
+        let mut total_added = 0usize;
+        let mut total_removed = 0usize;
+        let mut cumulative_shift: isize = 0;
 
-        for (i, line) in new_lines.iter().enumerate() {
-            // Find lines that contain the first line of new_text
-            if let Some(first_new_line) = new_text_lines.first() {
-                if line.contains(first_new_line) {
-                    let start = i.saturating_sub(context_lines);
-                    let end = (i + new_text_lines.len() + context_lines).min(new_lines.len());
-                    let snippet: String = new_lines[start..end]
-                        .iter()
-                        .enumerate()
-                        .map(|(j, l)| format!("{:>4}| {}", start + j + 1, l))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    context_snippets.push(snippet);
-                    if !replace_all {
-                        break;
+        let mut search_from = 0;
+        let match_limit = if replace_all { match_count } else { 1 };
+        for _ in 0..match_limit {
+            if let Some(byte_pos) = content[search_from..].find(old_text) {
+                let abs_byte_pos = search_from + byte_pos;
+                let start_line = content[..abs_byte_pos].matches('\n').count();
+
+                let ctx_start = start_line.saturating_sub(context_lines);
+                let ctx_end =
+                    (start_line + old_count + context_lines).min(old_lines_all.len());
+                let new_start = start_line as isize + cumulative_shift;
+
+                let mut snippet = String::new();
+                // Context lines before
+                for i in ctx_start..start_line {
+                    let num = (i as isize + 1 + cumulative_shift) as usize;
+                    snippet.push_str(&format!("{:>8}  {}\n", num, old_lines_all[i]));
+                }
+                // Old lines (removed)
+                for i in 0..old_count {
+                    let line_idx = start_line + i;
+                    if line_idx < old_lines_all.len() {
+                        let num = (new_start + i as isize + 1) as usize;
+                        snippet.push_str(&format!("{:>8} -{}\n", num, old_lines_all[line_idx]));
                     }
                 }
+                total_removed += old_count;
+                // New lines (added)
+                for (i, line) in new_text_lines.iter().enumerate() {
+                    let num = (new_start + i as isize + 1) as usize;
+                    snippet.push_str(&format!("{:>8} +{}\n", num, line));
+                }
+                total_added += new_count;
+                // Context lines after
+                cumulative_shift += line_shift;
+                let after_start = start_line + old_count;
+                for i in after_start..ctx_end {
+                    let num = (i as isize + 1 + cumulative_shift) as usize;
+                    snippet.push_str(&format!("{:>8}  {}\n", num, old_lines_all[i]));
+                }
+
+                diff_snippets.push(snippet.trim_end().to_string());
+                search_from = abs_byte_pos + old_text.len();
             }
         }
 
-        let context_str = context_snippets.join("\n---\n");
-        let message = format!(
-            "Replaced {} occurrence(s) in '{}'. Context:\n{}",
-            match_count,
-            path.display(),
-            context_str
-        );
+        let diff_str = diff_snippets.join("\n...\n");
+        let summary = format_diff_summary(total_added, total_removed);
+        let message = format!("{} in '{}'\n{}", summary, path.display(), diff_str);
 
         Ok(serde_json::json!({
             "success": true,
@@ -256,10 +288,9 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolError::ExecutionFailed(ref msg)) if msg.contains("not found")));
-        // Should include file preview
         if let Err(ToolError::ExecutionFailed(msg)) = result {
-            assert!(msg.contains("hello world"), "Error should include file contents");
-            assert!(msg.contains("1/1 lines"), "Error should show line count");
+            assert!(msg.contains("1 lines"), "Error should show line count");
+            assert!(!msg.contains("hello world"), "Error should not include file contents");
         }
     }
 
@@ -343,13 +374,14 @@ mod tests {
             .unwrap();
 
         let msg = result["message"].as_str().unwrap();
-        assert!(msg.contains("Context:"), "Should include context header");
-        assert!(msg.contains("replaced"), "Should show the new text");
+        assert!(msg.contains("Added 1 line, removed 1 line"), "Should include summary");
+        assert!(msg.contains(" +replaced"), "Should show added line");
+        assert!(msg.contains(" -target"), "Should show removed line");
         assert!(msg.contains("line2") || msg.contains("line3"), "Should show surrounding lines");
     }
 
     #[tokio::test]
-    async fn test_not_found_shows_file_preview() {
+    async fn test_not_found_shows_line_count() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.txt");
         let content: String = (1..=60).map(|i| format!("line {}\n", i)).collect();
@@ -365,10 +397,9 @@ mod tests {
             .await;
 
         if let Err(ToolError::ExecutionFailed(msg)) = result {
-            assert!(msg.contains("50/60 lines"), "Should show 50 of 60 lines");
-            assert!(msg.contains("line 1"), "Should include first line");
-            assert!(msg.contains("line 50"), "Should include line 50");
-            assert!(!msg.contains("line 51"), "Should not include line 51");
+            assert!(msg.contains("60 lines"), "Should show line count");
+            assert!(msg.contains("read_file"), "Should suggest read_file");
+            assert!(!msg.contains("line 1\n"), "Should not dump file contents");
         } else {
             panic!("Expected ExecutionFailed error");
         }
