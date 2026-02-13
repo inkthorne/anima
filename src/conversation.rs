@@ -901,6 +901,39 @@ impl ConversationStore {
                 msg_id, conv_name
             )));
         }
+
+        // Cascade pin/unpin between tool calls and tool results
+        let (tool_calls_json, tool_call_id): (Option<String>, Option<String>) = self
+            .conn
+            .query_row(
+                "SELECT tool_calls, tool_call_id FROM messages WHERE id = ?1 AND conv_name = ?2",
+                params![msg_id, conv_name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+
+        // Path A: tool call → pin/unpin matching tool results
+        if let Some(ref tc_json) = tool_calls_json {
+            if let Ok(tcs) = serde_json::from_str::<Vec<serde_json::Value>>(tc_json) {
+                for tc in &tcs {
+                    if let Some(tc_id) = tc.get("id").and_then(|v| v.as_str()) {
+                        self.conn.execute(
+                            "UPDATE messages SET pinned = ?1 WHERE conv_name = ?2 AND tool_call_id = ?3",
+                            params![pinned as i64, conv_name, tc_id],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // Path B: tool result → pin/unpin the parent tool call message
+        if let Some(ref tc_id) = tool_call_id {
+            let pattern = format!("%\"id\":\"{}\"%" , tc_id);
+            self.conn.execute(
+                "UPDATE messages SET pinned = ?1 WHERE conv_name = ?2 AND tool_calls LIKE ?3",
+                params![pinned as i64, conv_name, pattern],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -2953,6 +2986,118 @@ mod tests {
 
         let result = store.pin_message(&conv, 999, true);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pin_tool_call_cascades_to_results() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("pin-cascade-call"), &["arya"])
+            .unwrap();
+
+        // Insert assistant message with tool_calls
+        let call_id = store
+            .add_message_full(
+                &conv,
+                "arya",
+                "Let me read that file.",
+                &[],
+                None,
+                Some(r#"[{"id":"tc1","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Insert tool result with matching tool_call_id
+        let result_id = store
+            .add_message_full(
+                &conv,
+                "tool",
+                "file contents here",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("arya"),
+                None,
+                Some("tc1"),
+            )
+            .unwrap();
+
+        // Pin the tool call → both should be pinned
+        store.pin_message(&conv, call_id, true).unwrap();
+        let msgs = store.get_messages(&conv, None).unwrap();
+        assert!(msgs.iter().find(|m| m.id == call_id).unwrap().pinned);
+        assert!(msgs.iter().find(|m| m.id == result_id).unwrap().pinned);
+
+        // Unpin the tool call → both should be unpinned
+        store.pin_message(&conv, call_id, false).unwrap();
+        let msgs = store.get_messages(&conv, None).unwrap();
+        assert!(!msgs.iter().find(|m| m.id == call_id).unwrap().pinned);
+        assert!(!msgs.iter().find(|m| m.id == result_id).unwrap().pinned);
+    }
+
+    #[test]
+    fn test_pin_tool_result_cascades_to_call() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("pin-cascade-result"), &["arya"])
+            .unwrap();
+
+        // Insert assistant message with tool_calls
+        let call_id = store
+            .add_message_full(
+                &conv,
+                "arya",
+                "Let me read that file.",
+                &[],
+                None,
+                Some(r#"[{"id":"tc1","type":"function","function":{"name":"read_file","arguments":"{}"}}]"#),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        // Insert tool result with matching tool_call_id
+        let result_id = store
+            .add_message_full(
+                &conv,
+                "tool",
+                "file contents here",
+                &[],
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("arya"),
+                None,
+                Some("tc1"),
+            )
+            .unwrap();
+
+        // Pin the tool result → both should be pinned
+        store.pin_message(&conv, result_id, true).unwrap();
+        let msgs = store.get_messages(&conv, None).unwrap();
+        assert!(msgs.iter().find(|m| m.id == call_id).unwrap().pinned);
+        assert!(msgs.iter().find(|m| m.id == result_id).unwrap().pinned);
+
+        // Unpin the tool result → both should be unpinned
+        store.pin_message(&conv, result_id, false).unwrap();
+        let msgs = store.get_messages(&conv, None).unwrap();
+        assert!(!msgs.iter().find(|m| m.id == call_id).unwrap().pinned);
+        assert!(!msgs.iter().find(|m| m.id == result_id).unwrap().pinned);
     }
 
     #[test]
