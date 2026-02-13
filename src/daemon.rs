@@ -305,13 +305,13 @@ fn format_conversation_history(
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut pending_user_batch: Vec<String> = Vec::new();
 
-    // Pre-scan: identify superseded tool pairs for dedup.
-    // Collects (assistant_msg_id, tool_result_msg_id) pairs for read_file, write_file,
-    // edit_file, and cargo check/build — then applies dedup rules to build a set of
-    // message IDs to drop entirely from context.
+    // Pre-scan: identify superseded tool pairs for dedup using tool_call_id matching.
+    // Since v3.10.9, every tool result has a tool_call_id linking to its tool call.
+    // This replaces the old VecDeque positional matching and naturally handles
+    // [Tool Error for ...] messages (which also have tool_call_id).
     let drop_ids: std::collections::HashSet<i64>;
     {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use std::collections::{HashMap, HashSet};
 
         #[derive(Clone)]
         struct ToolPair {
@@ -319,141 +319,97 @@ fn format_conversation_history(
             tool_result_msg_id: i64,
         }
 
-        // Pending queues: assistant tool_calls waiting for their tool result
-        // Each entry is (path, assistant_msg_id)
-        let mut pending_read_full: VecDeque<(String, i64)> = VecDeque::new();
-        let mut pending_read_range: VecDeque<(String, i64)> = VecDeque::new();
-        let mut pending_write: VecDeque<(String, i64)> = VecDeque::new();
-        let mut pending_edit: VecDeque<(String, i64)> = VecDeque::new();
-        let mut pending_cargo: VecDeque<i64> = VecDeque::new();
-        let mut pending_shell_other: VecDeque<i64> = VecDeque::new();
+        // Pass 1: scan assistant messages, build tool_call_id → (kind, path, assistant_msg_id)
+        #[derive(Clone)]
+        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Cargo }
 
-        // Collected pairs
+        let mut tc_index: HashMap<String, (DedupKind, Option<String>, i64)> = HashMap::new();
+        let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
+
+        for msg in messages.iter() {
+            if msg.from_agent != current_agent { continue; }
+            if let Some(ref tc_json) = msg.tool_calls {
+                if let Ok(tcs) = serde_json::from_str::<Vec<crate::llm::ToolCall>>(tc_json) {
+                    assistant_tc_count.insert(msg.id, tcs.len());
+                    for tc in &tcs {
+                        match tc.name.as_str() {
+                            "read_file" => {
+                                if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                                    let has_range = tc.arguments.get("start_line")
+                                        .or_else(|| tc.arguments.get("end_line"))
+                                        .is_some();
+                                    let kind = if has_range { DedupKind::ReadRange } else { DedupKind::ReadFull };
+                                    tc_index.insert(tc.id.clone(), (kind, Some(path.to_string()), msg.id));
+                                }
+                            }
+                            "write_file" => {
+                                if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                                    tc_index.insert(tc.id.clone(), (DedupKind::Write, Some(path.to_string()), msg.id));
+                                }
+                            }
+                            "edit_file" => {
+                                if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                                    tc_index.insert(tc.id.clone(), (DedupKind::EditFile, Some(path.to_string()), msg.id));
+                                }
+                            }
+                            "shell" | "safe_shell" => {
+                                let is_cargo = tc.arguments.get("command")
+                                    .and_then(|v| v.as_str())
+                                    .map(|cmd| crate::agent::is_cargo_dedup_command(cmd.trim()))
+                                    .unwrap_or(false);
+                                if is_cargo {
+                                    tc_index.insert(tc.id.clone(), (DedupKind::Cargo, None, msg.id));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        // Pass 2: scan tool result messages, pair via tool_call_id
         let mut read_file_full: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut read_file_range: Vec<(String, ToolPair)> = Vec::new();
         let mut write_file_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
         let mut cargo_check_pairs: Vec<ToolPair> = Vec::new();
 
-        // Track how many tool_calls each assistant message has, and how many are dedup-dropped
-        let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
-
-        for msg in messages {
-            if msg.from_agent == current_agent {
-                if let Some(ref tc_json) = msg.tool_calls {
-                    if let Ok(tcs) =
-                        serde_json::from_str::<Vec<crate::llm::ToolCall>>(tc_json)
-                    {
-                        assistant_tc_count.insert(msg.id, tcs.len());
-                        for tc in &tcs {
-                            match tc.name.as_str() {
-                                "read_file" => {
-                                    if let Some(path) =
-                                        tc.arguments.get("path").and_then(|v| v.as_str())
-                                    {
-                                        let has_range = tc
-                                            .arguments
-                                            .get("start_line")
-                                            .or_else(|| tc.arguments.get("end_line"))
-                                            .is_some();
-                                        if has_range {
-                                            pending_read_range
-                                                .push_back((path.to_string(), msg.id));
-                                        } else {
-                                            pending_read_full
-                                                .push_back((path.to_string(), msg.id));
-                                        }
-                                    }
-                                }
-                                "write_file" => {
-                                    if let Some(path) =
-                                        tc.arguments.get("path").and_then(|v| v.as_str())
-                                    {
-                                        pending_write.push_back((path.to_string(), msg.id));
-                                    }
-                                }
-                                "edit_file" => {
-                                    if let Some(path) =
-                                        tc.arguments.get("path").and_then(|v| v.as_str())
-                                    {
-                                        pending_edit.push_back((path.to_string(), msg.id));
-                                    }
-                                }
-                                "shell" => {
-                                    let is_cargo = tc
-                                        .arguments
-                                        .get("command")
-                                        .and_then(|v| v.as_str())
-                                        .map(|cmd| {
-                                            crate::agent::is_cargo_check_command(cmd.trim())
-                                        })
-                                        .unwrap_or(false);
-                                    if is_cargo {
-                                        pending_cargo.push_back(msg.id);
-                                    } else {
-                                        pending_shell_other.push_back(msg.id);
-                                    }
-                                }
-                                _ => {}
-                            }
+        for msg in messages.iter() {
+            if msg.from_agent != "tool" { continue; }
+            match &msg.triggered_by {
+                Some(owner) if owner != current_agent => continue,
+                _ => {}
+            }
+            if let Some(ref tcid) = msg.tool_call_id {
+                if let Some((kind, path, asst_id)) = tc_index.get(tcid) {
+                    // Skip error results — they're small and useful to keep, but their
+                    // pairing no longer shifts other results (the whole point of ID matching)
+                    if msg.content.starts_with("[Tool Error") { continue; }
+                    let pair = ToolPair { assistant_msg_id: *asst_id, tool_result_msg_id: msg.id };
+                    match kind {
+                        DedupKind::ReadFull => {
+                            if let Some(p) = path { read_file_full.entry(p.clone()).or_default().push(pair); }
                         }
-                    }
-                }
-            } else if msg.from_agent == "tool" {
-                match &msg.triggered_by {
-                    Some(owner) if owner != current_agent => continue,
-                    _ => {}
-                }
-                if msg.content.starts_with("[Tool Result for read_file]") {
-                    // Try full reads first, then range reads
-                    if let Some((path, asst_id)) = pending_read_full.pop_front() {
-                        read_file_full.entry(path).or_default().push(ToolPair {
-                            assistant_msg_id: asst_id,
-                            tool_result_msg_id: msg.id,
-                        });
-                    } else if let Some((path, asst_id)) = pending_read_range.pop_front() {
-                        read_file_range.push((
-                            path,
-                            ToolPair {
-                                assistant_msg_id: asst_id,
-                                tool_result_msg_id: msg.id,
-                            },
-                        ));
-                    }
-                } else if msg.content.starts_with("[Tool Result for write_file]") {
-                    if let Some((path, asst_id)) = pending_write.pop_front() {
-                        write_file_pairs.entry(path).or_default().push(ToolPair {
-                            assistant_msg_id: asst_id,
-                            tool_result_msg_id: msg.id,
-                        });
-                    }
-                } else if msg.content.starts_with("[Tool Result for edit_file]") {
-                    if let Some((path, asst_id)) = pending_edit.pop_front() {
-                        edit_file_pairs.push((
-                            path,
-                            ToolPair {
-                                assistant_msg_id: asst_id,
-                                tool_result_msg_id: msg.id,
-                            },
-                        ));
-                    }
-                } else if msg.content.starts_with("[Tool Result for shell]") {
-                    if let Some(asst_id) = pending_cargo.pop_front() {
-                        cargo_check_pairs.push(ToolPair {
-                            assistant_msg_id: asst_id,
-                            tool_result_msg_id: msg.id,
-                        });
-                    } else {
-                        // Consume non-cargo shell pending entry to keep queues aligned
-                        pending_shell_other.pop_front();
+                        DedupKind::ReadRange => {
+                            if let Some(p) = path { read_file_range.push((p.clone(), pair)); }
+                        }
+                        DedupKind::Write => {
+                            if let Some(p) = path { write_file_pairs.entry(p.clone()).or_default().push(pair); }
+                        }
+                        DedupKind::EditFile => {
+                            if let Some(p) = path { edit_file_pairs.push((p.clone(), pair)); }
+                        }
+                        DedupKind::Cargo => {
+                            cargo_check_pairs.push(pair);
+                        }
                     }
                 }
             }
         }
 
-        // Apply dedup rules — collect tool_result IDs and assistant IDs to drop
+        // Pass 3: apply dedup rules — collect tool_result IDs and assistant IDs to drop
         let mut dropped_tool_results: HashSet<i64> = HashSet::new();
-        // Track per-assistant-msg which tool_calls are dropped
         let mut asst_dropped: HashMap<i64, usize> = HashMap::new();
 
         let mark_drop = |pair: &ToolPair, dropped: &mut HashSet<i64>, ad: &mut HashMap<i64, usize>| {
@@ -475,24 +431,18 @@ fn format_conversation_history(
             }
         }
 
-        // Build a set of paths that have a full-read or write at or after a given msg ID
-        // For edit_file and read_file_range dedup, we need to know if a later
-        // full-read or write exists for the same path.
+        // Build latest "fresh view" per path: last full-read or write
         let mut latest_fresh_view: HashMap<&str, i64> = HashMap::new();
         for (path, pairs) in &read_file_full {
             if let Some(last) = pairs.last() {
                 let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
-                if last.tool_result_msg_id > *entry {
-                    *entry = last.tool_result_msg_id;
-                }
+                if last.tool_result_msg_id > *entry { *entry = last.tool_result_msg_id; }
             }
         }
         for (path, pairs) in &write_file_pairs {
             if let Some(last) = pairs.last() {
                 let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
-                if last.tool_result_msg_id > *entry {
-                    *entry = last.tool_result_msg_id;
-                }
+                if last.tool_result_msg_id > *entry { *entry = last.tool_result_msg_id; }
             }
         }
 
@@ -514,7 +464,7 @@ fn format_conversation_history(
             }
         }
 
-        // cargo check/build: keep only the last pair
+        // cargo check/build/test/run: keep only the last pair
         for pair in cargo_check_pairs.iter().rev().skip(1) {
             mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
         }
@@ -5502,6 +5452,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool1.id = 11;
+        msg_tool1.tool_call_id = Some("tc1".into());
 
         let mut msg_agent2 = make_conv_msg("arya", "Re-reading file.");
         msg_agent2.id = 12;
@@ -5512,6 +5463,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool2.id = 13;
+        msg_tool2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "read /a.rs"),
@@ -5529,7 +5481,7 @@ api_key = "sk-test"
         let tool_results: Vec<&str> = history
             .iter()
             .filter(|m| {
-                m.role == "user"
+                m.role == "tool"
                     && m.content
                         .as_ref()
                         .map_or(false, |c| c.contains("read_file"))
@@ -5589,6 +5541,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool1.id = 11;
+        msg_tool1.tool_call_id = Some("tc1".into());
 
         let mut msg_agent2 = make_conv_msg("arya", "Reading b.");
         msg_agent2.id = 12;
@@ -5599,6 +5552,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool2.id = 13;
+        msg_tool2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "read both"),
@@ -5615,7 +5569,7 @@ api_key = "sk-test"
         let tool_results: Vec<&str> = history
             .iter()
             .filter(|m| {
-                m.role == "user"
+                m.role == "tool"
                     && m.content
                         .as_ref()
                         .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
@@ -5653,6 +5607,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool1.id = 11;
+        msg_tool1.tool_call_id = Some("tc1".into());
 
         let mut msg_agent2 = make_conv_msg("arya", "Writing v2.");
         msg_agent2.id = 12;
@@ -5663,6 +5618,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_tool2.id = 13;
+        msg_tool2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "write /a.rs"),
@@ -5678,7 +5634,7 @@ api_key = "sk-test"
         let tool_results: Vec<&str> = history
             .iter()
             .filter(|m| {
-                m.role == "user"
+                m.role == "tool"
                     && m.content
                         .as_ref()
                         .map_or(false, |c| c.starts_with("[Tool Result for write_file]"))
@@ -5718,6 +5674,7 @@ api_key = "sk-test"
         let mut msg_t1 =
             make_tool_msg("[Tool Result for edit_file]\ndiff1", Some("arya"));
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Edit 2.");
         msg_a2.id = 12;
@@ -5725,6 +5682,7 @@ api_key = "sk-test"
         let mut msg_t2 =
             make_tool_msg("[Tool Result for edit_file]\ndiff2", Some("arya"));
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let mut msg_a3 = make_conv_msg("arya", "Reading file.");
         msg_a3.id = 14;
@@ -5734,6 +5692,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t3.id = 15;
+        msg_t3.tool_call_id = Some("tc3".into());
 
         let msgs = vec![
             make_conv_msg("user", "fix /a.rs"),
@@ -5792,6 +5751,7 @@ api_key = "sk-test"
         let mut msg_t1 =
             make_tool_msg("[Tool Result for edit_file]\ndiff1", Some("arya"));
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Edit 2.");
         msg_a2.id = 12;
@@ -5799,6 +5759,7 @@ api_key = "sk-test"
         let mut msg_t2 =
             make_tool_msg("[Tool Result for edit_file]\ndiff2", Some("arya"));
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "fix /a.rs"),
@@ -5844,6 +5805,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Re-checking.");
         msg_a2.id = 12;
@@ -5853,6 +5815,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "fix it"),
@@ -5898,6 +5861,7 @@ api_key = "sk-test"
         let mut msg_t1 =
             make_tool_msg("[Tool Result for shell]\nfile1.rs", Some("arya"));
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Listing again.");
         msg_a2.id = 12;
@@ -5905,6 +5869,7 @@ api_key = "sk-test"
         let mut msg_t2 =
             make_tool_msg("[Tool Result for shell]\nfile1.rs file2.rs", Some("arya"));
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "list files"),
@@ -5950,6 +5915,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Full read.");
         msg_a2.id = 12;
@@ -5959,6 +5925,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "read /a.rs"),
@@ -6006,6 +5973,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Writing file.");
         msg_a2.id = 12;
@@ -6015,6 +5983,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "update /a.rs"),
@@ -6069,6 +6038,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Writing.");
         msg_a2.id = 12;
@@ -6078,6 +6048,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
 
         let msgs = vec![
             make_conv_msg("user", "update /a.rs"),
@@ -6146,11 +6117,13 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
         let mut msg_t_shell = make_tool_msg(
             "[Tool Result for shell]\nfile1.rs",
             Some("arya"),
         );
         msg_t_shell.id = 12;
+        msg_t_shell.tool_call_id = Some("tc2".into());
 
         let mut msg_a2 = make_conv_msg("arya", "Re-reading.");
         msg_a2.id = 13;
@@ -6160,6 +6133,7 @@ api_key = "sk-test"
             Some("arya"),
         );
         msg_t2.id = 14;
+        msg_t2.tool_call_id = Some("tc3".into());
 
         let msgs = vec![
             make_conv_msg("user", "check /a.rs"),

@@ -217,12 +217,13 @@ enum DedupToolKind {
 /// Rules:
 /// - read_file (full): keep only the last result per path
 /// - read_file (range): drop if a later full-read or write exists for same path
-/// Check if a shell command contains cargo check/build (possibly after cd, &&, etc.)
-pub(crate) fn is_cargo_check_command(cmd: &str) -> bool {
-    cmd.split("&&").any(|segment| {
-        let segment = segment.trim();
-        segment.starts_with("cargo check") || segment.starts_with("cargo build") || segment.starts_with("cargo test")
-    })
+/// Check if a shell command contains cargo check/build/test/run (for dedup).
+/// Uses `contains()` so timeout prefixes, cd prefixes, etc. all match naturally.
+pub(crate) fn is_cargo_dedup_command(cmd: &str) -> bool {
+    cmd.contains("cargo check")
+        || cmd.contains("cargo build")
+        || cmd.contains("cargo test")
+        || cmd.contains("cargo run")
 }
 
 /// - write_file: keep only the last result per path
@@ -272,7 +273,7 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                             .get("command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if is_cargo_check_command(cmd) {
+                        if is_cargo_dedup_command(cmd) {
                             tool_info.insert(tc.id.clone(), (DedupToolKind::CargoCheck, None));
                         }
                     }
@@ -3708,23 +3709,32 @@ mod tests {
     }
 
     #[test]
-    fn test_is_cargo_check_command() {
+    fn test_is_cargo_dedup_command() {
         // Plain commands
-        assert!(is_cargo_check_command("cargo check"));
-        assert!(is_cargo_check_command("cargo check 2>&1"));
-        assert!(is_cargo_check_command("cargo build --release"));
-        assert!(is_cargo_check_command("cargo test"));
-        assert!(is_cargo_check_command("cargo test -- --nocapture"));
+        assert!(is_cargo_dedup_command("cargo check"));
+        assert!(is_cargo_dedup_command("cargo check 2>&1"));
+        assert!(is_cargo_dedup_command("cargo build --release"));
+        assert!(is_cargo_dedup_command("cargo test"));
+        assert!(is_cargo_dedup_command("cargo test -- --nocapture"));
+
+        // cargo run
+        assert!(is_cargo_dedup_command("cargo run -- args"));
+        assert!(is_cargo_dedup_command("cargo run --bin demo"));
 
         // cd-prefixed (real LLM output)
-        assert!(is_cargo_check_command("cd ~/dev/minilang && cargo check 2>&1"));
-        assert!(is_cargo_check_command("cd /tmp && cargo build 2>&1"));
-        assert!(is_cargo_check_command("cd ~/dev && cargo test 2>&1"));
+        assert!(is_cargo_dedup_command("cd ~/dev/minilang && cargo check 2>&1"));
+        assert!(is_cargo_dedup_command("cd /tmp && cargo build 2>&1"));
+        assert!(is_cargo_dedup_command("cd ~/dev && cargo test 2>&1"));
+
+        // timeout-prefixed (real LLM output)
+        assert!(is_cargo_dedup_command("timeout 10 cargo test test_something"));
+        assert!(is_cargo_dedup_command("timeout 5 cargo run -- examples/demo.mini"));
+        assert!(is_cargo_dedup_command("cd ~/dev && timeout 10 cargo test 2>&1"));
 
         // Non-cargo commands
-        assert!(!is_cargo_check_command("git status"));
-        assert!(!is_cargo_check_command("ls -la"));
-        assert!(!is_cargo_check_command("cd ~/dev && ls"));
+        assert!(!is_cargo_dedup_command("git status"));
+        assert!(!is_cargo_dedup_command("ls -la"));
+        assert!(!is_cargo_dedup_command("cd ~/dev && ls"));
     }
 
     #[test]
