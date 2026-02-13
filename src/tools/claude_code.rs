@@ -287,7 +287,7 @@ fn current_timestamp() -> i64 {
 
 /// Generate a short task ID (8 hex characters).
 fn generate_task_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let id: u32 = rng.random();
     format!("{:08x}", id)

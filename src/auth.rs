@@ -62,7 +62,7 @@ pub fn clear_tokens() {
 // ---------------------------------------------------------------------------
 
 pub fn generate_code_verifier() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let bytes: Vec<u8> = (0..96).map(|_| rng.random::<u8>()).collect();
     URL_SAFE_NO_PAD.encode(&bytes)
@@ -81,7 +81,7 @@ pub fn build_auth_url() -> (String, String, String) {
     let verifier = generate_code_verifier();
     let challenge = generate_code_challenge(&verifier);
 
-    use rand::Rng;
+    use rand::RngExt;
     let state_bytes: Vec<u8> = (0..32).map(|_| rand::rng().random::<u8>()).collect();
     let state = URL_SAFE_NO_PAD.encode(&state_bytes);
 

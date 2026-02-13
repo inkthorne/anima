@@ -1695,7 +1695,7 @@ pub fn generate_fun_name() -> String {
 
 /// Generate a unique conversation ID.
 fn generate_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut rng = rand::rng();
     let bytes: [u8; 8] = rng.random();
     bytes.iter().map(|b| format!("{:02x}", b)).collect()

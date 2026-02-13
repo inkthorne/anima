@@ -98,7 +98,7 @@ impl Tool for DaemonSpawnChildTool {
         use crate::conversation::ConversationStore;
         use crate::discovery;
         use crate::socket_api::{Request, SocketApi};
-        use rand::Rng;
+        use rand::RngExt;
         use tokio::net::UnixStream;
 
         let agent = input
