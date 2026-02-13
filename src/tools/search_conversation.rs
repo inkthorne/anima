@@ -72,7 +72,7 @@ impl Tool for DaemonSearchConversationTool {
         let from_agent = input.get("from").and_then(|v| v.as_str());
         let include_internal = input
             .get("include_internal")
-            .and_then(|v| v.as_bool())
+            .and_then(super::json_to_bool)
             .unwrap_or(false);
         let limit = input
             .get("limit")

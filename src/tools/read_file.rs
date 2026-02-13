@@ -82,7 +82,12 @@ impl Tool for ReadFileTool {
             } else {
                 lines.len()
             };
-            lines[start..end].join("\n")
+            lines[start..end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{:>8}  {}", start + i + 1, line))
+                .collect::<Vec<_>>()
+                .join("\n")
         } else {
             contents
         };
@@ -195,7 +200,7 @@ mod tests {
         let tool = ReadFileTool;
         let result = tool.execute(json!({"path": path, "offset": 3})).await.unwrap();
         let contents = result["contents"].as_str().unwrap();
-        assert_eq!(contents, "line 3\nline 4\nline 5");
+        assert_eq!(contents, "       3  line 3\n       4  line 4\n       5  line 5");
     }
 
     #[tokio::test]
@@ -209,7 +214,7 @@ mod tests {
         let tool = ReadFileTool;
         let result = tool.execute(json!({"path": path, "limit": 2})).await.unwrap();
         let contents = result["contents"].as_str().unwrap();
-        assert_eq!(contents, "line 1\nline 2");
+        assert_eq!(contents, "       1  line 1\n       2  line 2");
     }
 
     #[tokio::test]
@@ -223,7 +228,7 @@ mod tests {
         let tool = ReadFileTool;
         let result = tool.execute(json!({"path": path, "offset": 3, "limit": 4})).await.unwrap();
         let contents = result["contents"].as_str().unwrap();
-        assert_eq!(contents, "line 3\nline 4\nline 5\nline 6");
+        assert_eq!(contents, "       3  line 3\n       4  line 4\n       5  line 5\n       6  line 6");
     }
 
     #[tokio::test]
@@ -251,6 +256,21 @@ mod tests {
         let tool = ReadFileTool;
         let result = tool.execute(json!({"path": path, "offset": 3.0, "limit": 2.0})).await.unwrap();
         let contents = result["contents"].as_str().unwrap();
-        assert_eq!(contents, "line 3\nline 4");
+        assert_eq!(contents, "       3  line 3\n       4  line 4");
+    }
+
+    #[tokio::test]
+    async fn test_read_with_offset_has_line_numbers() {
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 1..=100 {
+            writeln!(file, "content {}", i).unwrap();
+        }
+        let path = file.path().to_str().unwrap();
+
+        let tool = ReadFileTool;
+        let result = tool.execute(json!({"path": path, "offset": 98, "limit": 3})).await.unwrap();
+        let contents = result["contents"].as_str().unwrap();
+        // Verify 1-based numbering and {:>8} format with double-digit and triple-digit line numbers
+        assert_eq!(contents, "      98  content 98\n      99  content 99\n     100  content 100");
     }
 }

@@ -92,7 +92,7 @@ impl Tool for EditFileTool {
 
         let replace_all = input
             .get("replace_all")
-            .and_then(|v| v.as_bool())
+            .and_then(super::json_to_bool)
             .unwrap_or(false);
 
         let path = expand_tilde(path_str);
@@ -113,10 +113,24 @@ impl Tool for EditFileTool {
         }
 
         if !replace_all && match_count > 1 {
+            // Collect line numbers for the error message
+            let mut line_nums = Vec::new();
+            let mut search_from = 0;
+            for _ in 0..match_count {
+                if let Some(pos) = content[search_from..].find(old_text) {
+                    let abs = search_from + pos;
+                    line_nums.push(content[..abs].matches('\n').count() + 1);
+                    search_from = abs + old_text.len();
+                }
+            }
+            let lines_str = line_nums
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(ToolError::ExecutionFailed(format!(
-                "old_text found {} times in '{}'. Include more surrounding context to make the match unique, or set replace_all to true.",
-                match_count,
-                path.display()
+                "old_text found {} times in '{}' (lines {}). Include more surrounding context to make the match unique, or set replace_all to true.",
+                match_count, path.display(), lines_str
             )));
         }
 
@@ -314,6 +328,51 @@ mod tests {
         );
         // File should be unchanged
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo bar foo baz");
+    }
+
+    #[tokio::test]
+    async fn test_not_unique_shows_line_numbers() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "aaa\nbbb\naaa\nccc\nddd\naaa\n").unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "aaa",
+                "new_text": "zzz"
+            }))
+            .await;
+
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("3 times"), "Should report match count");
+            assert!(msg.contains("lines 1, 3, 6"), "Should list line numbers, got: {}", msg);
+        } else {
+            panic!("Expected ExecutionFailed error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_replace_all_string_true() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "aaa bbb aaa ccc aaa").unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "aaa",
+                "new_text": "xxx",
+                "replace_all": "True"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result["success"].as_bool().unwrap());
+        assert_eq!(result["replacements"], 3);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "xxx bbb xxx ccc xxx");
     }
 
     #[tokio::test]

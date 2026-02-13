@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.10.9
+**Version:** v3.10.10
 **Tests:** 660 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -42,13 +42,16 @@ src/
 └── tools/
     ├── mod.rs
     ├── read_file.rs    # ReadFileTool
+    ├── edit_file.rs    # EditFileTool
     ├── write_file.rs   # WriteFileTool
+    ├── list_files.rs   # ListFilesTool
     ├── shell.rs        # ShellTool
     ├── safe_shell.rs   # SafeShellTool (command allowlist filtering)
     ├── http.rs         # HttpTool
     ├── send_message.rs # SendMessageTool, DaemonSendMessageTool
     ├── list_agents.rs  # ListAgentsTool, DaemonListAgentsTool
     ├── remember.rs     # RememberTool, DaemonRememberTool
+    ├── search_conversation.rs # DaemonSearchConversationTool
     ├── claude_code.rs  # ClaudeCodeTool (delegate tasks to Claude Code)
     ├── spawn_child.rs  # SpawnChildTool
     ├── wait_for_child.rs # WaitForChildTool, WaitForChildrenTool
@@ -87,7 +90,7 @@ src/
 - `tools = true` in model config: Native tool calling — LLM gets ToolSpecs
 - `tools = false`: JSON-block — Model outputs `{"tool": "x", "params": {...}}`, daemon parses and executes
 
-**Available Tools:** `read_file`, `write_file`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `claude_code`, `spawn_child`, `wait_for_children`
+**Available Tools:** `read_file`, `edit_file`, `write_file`, `list_files`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `search_conversation`, `claude_code`, `spawn_child`, `wait_for_children`
 
 **Safe Shell:** `SafeShellTool` has a command allowlist — only approved commands can be executed, including in pipelines.
 
@@ -171,7 +174,7 @@ anima task <config> "task" [--stream] [-v] # One-shot with config file
 cargo check           # Type check
 cargo build --release # Build
 cargo install --path . # Install to PATH
-cargo test            # Run tests (370 tests)
+cargo test            # Run tests (660 tests)
 ```
 
 ## Key Design Decisions

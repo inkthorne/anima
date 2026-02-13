@@ -2872,9 +2872,17 @@ async fn run_tool_loop(
                     }
                 }
 
-                // Refresh context from DB (both modes)
-                let mid_turn_budget = num_ctx.map_or(2048, |c| c as usize * 30 / 100);
-                if let Ok(msgs) = store.get_messages_by_token_budget(conv_name, mid_turn_budget) {
+                // Refresh context from DB using cursor-based append system
+                check_fill_and_maybe_reset(
+                    &store,
+                    conv_name,
+                    agent_name,
+                    last_tokens_in.map(|t| t as i64),
+                    last_tokens_out.map(|t| t as i64),
+                    num_ctx.map(|n| n as i64),
+                    logger,
+                );
+                if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, logger, num_ctx) {
                     let (refreshed_history, refreshed_final) =
                         format_conversation_history(&msgs, agent_name);
                     conversation_history = refreshed_history;

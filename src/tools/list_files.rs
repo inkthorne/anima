@@ -60,7 +60,7 @@ impl Tool for ListFilesTool {
 
         let recursive = input
             .get("recursive")
-            .and_then(|v| v.as_bool())
+            .and_then(super::json_to_bool)
             .unwrap_or(false);
 
         let max_depth = input

@@ -1,3 +1,5 @@
+use serde_json::Value;
+
 pub mod add;
 pub mod claude_code;
 pub mod echo;
@@ -14,6 +16,15 @@ pub mod shell;
 pub mod spawn_child;
 pub mod wait_for_child;
 pub mod write_file;
+
+/// Parse a JSON value as bool, with string fallback for Ollama models that send bools as strings.
+pub fn json_to_bool(v: &Value) -> Option<bool> {
+    v.as_bool().or_else(|| match v.as_str()? {
+        "true" | "True" | "1" => Some(true),
+        "false" | "False" | "0" => Some(false),
+        _ => None,
+    })
+}
 
 pub use add::AddTool;
 pub use claude_code::{
