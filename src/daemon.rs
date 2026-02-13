@@ -3,6 +3,7 @@
 //! This module provides the infrastructure for running agents as background daemons,
 //! with Unix socket API for communication and timer trigger support.
 
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2463,6 +2464,7 @@ async fn execute_native_tool_calls(
         };
         let tool_result = match execute_tool_call(&daemon_tc, tool_def, Some(tool_context)).await {
             Ok(result) => {
+                let result = truncate_tool_result(&result, MAX_TOOL_RESULT_BYTES);
                 logger.tool(&format!("[loop] {} → {} bytes", tc.name, result.len()));
                 format!("[Tool Result for {}]\n{}", tc.name, result)
             }
@@ -2776,6 +2778,7 @@ async fn run_tool_loop(
                         let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
                         let tool_message = match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                             Ok(tool_result) => {
+                                let tool_result = truncate_tool_result(&tool_result, MAX_TOOL_RESULT_BYTES);
                                 logger.tool(&format!("[loop] Result: {} bytes", tool_result.len()));
                                 format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                             }
@@ -3435,6 +3438,7 @@ async fn process_json_block_mode(
 
             match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                 Ok(tool_result) => {
+                    let tool_result = truncate_tool_result(&tool_result, MAX_TOOL_RESULT_BYTES);
                     logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
                     current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
                 }
@@ -3456,8 +3460,36 @@ async fn process_json_block_mode(
 /// Maximum depth for @mention chains to prevent infinite loops
 const MAX_MENTION_DEPTH: u32 = 100;
 
+/// Maximum tool result size in bytes before truncation (128 KB).
+const MAX_TOOL_RESULT_BYTES: usize = 131_072;
+
 /// Context fill threshold — if (tokens_in + tokens_out) / num_ctx >= this, reset the cursor
 const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
+
+/// Truncate a tool result string if it exceeds `max_bytes`.
+/// Keeps the beginning and appends a notice with the original size.
+fn truncate_tool_result(result: &str, max_bytes: usize) -> Cow<'_, str> {
+    if result.len() <= max_bytes {
+        return Cow::Borrowed(result);
+    }
+    let total = result.len();
+    let cut = result.floor_char_boundary(max_bytes);
+    let truncated = &result[..cut];
+    Cow::Owned(format!(
+        "{}\n\n[output truncated: {}, showing first {}]",
+        truncated,
+        format_byte_size(total),
+        format_byte_size(cut),
+    ))
+}
+
+fn format_byte_size(bytes: usize) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    }
+}
 
 /// Load agent context using append-only cursors for KV cache stability.
 ///
@@ -6661,5 +6693,45 @@ api_key = "sk-test"
         assert_eq!(history[0].role, "assistant");
         assert_eq!(history[1].role, "user");
         assert!(history[1].tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_truncate_tool_result() {
+        // Under limit — returned unchanged
+        let small = "hello world";
+        let result = truncate_tool_result(small, 100);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, small);
+
+        // Exactly at limit — returned unchanged
+        let exact = "a".repeat(100);
+        let result = truncate_tool_result(&exact, 100);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, exact);
+
+        // Over limit — truncated with notice
+        let big = "x".repeat(200);
+        let result = truncate_tool_result(&big, 100);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert!(result.starts_with(&"x".repeat(100)));
+        assert!(result.contains("[output truncated:"));
+        assert!(result.contains("showing first"));
+        // Must be valid UTF-8 (it's a String, so guaranteed)
+        assert!(result.len() > 100);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_multibyte() {
+        // Multi-byte chars: 'é' is 2 bytes, cutting mid-char should truncate at boundary
+        let multi = "é".repeat(100); // 200 bytes
+        let result = truncate_tool_result(&multi, 150);
+        assert!(matches!(result, Cow::Owned(_)));
+        // Should not panic and should be valid UTF-8
+        assert!(result.contains("[output truncated:"));
+        // The kept portion should be valid — floor_char_boundary ensures this
+        let kept = result.split("\n\n[output truncated:").next().unwrap();
+        assert!(kept.len() <= 150);
+        // Should be a whole number of 'é' chars (each 2 bytes)
+        assert_eq!(kept.len() % 2, 0);
     }
 }

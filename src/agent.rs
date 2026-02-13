@@ -586,6 +586,31 @@ pub struct ThinkResult {
 /// When exceeded, oldest messages are removed.
 const MAX_HISTORY_LEN: usize = 50;
 
+/// Maximum tool result size in bytes before truncation (128 KB).
+const MAX_TOOL_RESULT_BYTES: usize = 131_072;
+
+/// Truncate a tool result if it exceeds `max_bytes`, keeping the beginning.
+fn truncate_tool_result(result: String, max_bytes: usize) -> String {
+    if result.len() <= max_bytes {
+        return result;
+    }
+    let total = result.len();
+    let cut = result.floor_char_boundary(max_bytes);
+    let size = |b: usize| -> String {
+        if b >= 1_048_576 {
+            format!("{:.1} MB", b as f64 / 1_048_576.0)
+        } else {
+            format!("{:.1} KB", b as f64 / 1024.0)
+        }
+    };
+    format!(
+        "{}\n\n[output truncated: {}, showing first {}]",
+        &result[..cut],
+        size(total),
+        size(cut),
+    )
+}
+
 pub struct Agent {
     pub id: String,
     tools: HashMap<String, Arc<dyn Tool>>,
@@ -1111,6 +1136,7 @@ impl Agent {
                 .call_tool(&tool_call.name, &tool_call.arguments.to_string())
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e));
+            let result = truncate_tool_result(result, MAX_TOOL_RESULT_BYTES);
 
             // Only attach assistant content to the first tool call to avoid duplication
             // Only attach iter stats to the first tool call (one LLM call → one set of stats)
@@ -2028,6 +2054,7 @@ impl Agent {
                     .call_tool(&tool_call.name, &tool_call.arguments.to_string())
                     .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
+                let result = truncate_tool_result(result, MAX_TOOL_RESULT_BYTES);
 
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
