@@ -1585,6 +1585,127 @@ impl Agent {
         result
     }
 
+    /// Make exactly one LLM call and return without executing tools or looping.
+    /// Returns ThinkResult with `last_tool_calls` populated if the LLM requested tools.
+    /// The caller (daemon's run_tool_loop) is responsible for tool execution and iteration.
+    pub async fn think_single_turn(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+    ) -> Result<ThinkResult, crate::error::AgentError> {
+        let effective_task = self.build_effective_task(task);
+        let llm = self
+            .llm
+            .clone()
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let tools = self.resolve_tools(&options.external_tools);
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+        let effective_system_prompt =
+            Self::combine_prompts(&memory_context, &options.system_prompt);
+
+        let user_content = if effective_task.is_empty() {
+            None
+        } else {
+            Some(effective_task.as_str())
+        };
+        let messages =
+            self.build_messages(&effective_system_prompt, &options.conversation_history, user_content);
+
+        self.dump_context(&tools, &messages);
+
+        let llm_start = Instant::now();
+        let response = self
+            .call_llm(&llm, &messages, &tools, &options.retry_policy)
+            .await?;
+        let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+
+        let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
+        let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
+        let prompt_eval_ns = response.usage.as_ref().and_then(|u| u.prompt_eval_duration_ns);
+
+        let last_tool_calls = if response.tool_calls.is_empty() {
+            None
+        } else {
+            Some(response.tool_calls)
+        };
+
+        Ok(ThinkResult {
+            response: response.content.unwrap_or_default(),
+            tools_used: last_tool_calls.is_some(),
+            tool_names: last_tool_calls
+                .as_ref()
+                .map(|tcs| tcs.iter().map(|tc| tc.name.clone()).collect())
+                .unwrap_or_default(),
+            last_tool_calls,
+            tool_trace: Vec::new(),
+            tokens_in,
+            tokens_out,
+            prompt_eval_duration_ns: prompt_eval_ns,
+            duration_ms: Some(llm_duration_ms),
+        })
+    }
+
+    /// Streaming variant of think_single_turn.
+    /// Makes exactly one streaming LLM call, sends tokens through channel, returns without
+    /// executing tools or looping.
+    pub async fn think_single_turn_streaming(
+        &mut self,
+        task: &str,
+        options: ThinkOptions,
+        token_tx: mpsc::Sender<String>,
+    ) -> Result<ThinkResult, crate::error::AgentError> {
+        let effective_task = self.build_effective_task(task);
+        let llm = self
+            .llm
+            .clone()
+            .ok_or_else(|| crate::error::AgentError::LlmError("No LLM attached".to_string()))?;
+        let tools = self.resolve_tools(&options.external_tools);
+        let memory_context = self.build_memory_context(&options.auto_memory).await;
+        let effective_system_prompt =
+            Self::combine_prompts(&memory_context, &options.system_prompt);
+
+        let user_content = if effective_task.is_empty() {
+            None
+        } else {
+            Some(effective_task.as_str())
+        };
+        let messages =
+            self.build_messages(&effective_system_prompt, &options.conversation_history, user_content);
+
+        self.dump_context(&tools, &messages);
+
+        let llm_start = Instant::now();
+        let response = self
+            .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
+            .await?;
+        let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+
+        let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
+        let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
+        let prompt_eval_ns = response.usage.as_ref().and_then(|u| u.prompt_eval_duration_ns);
+
+        let last_tool_calls = if response.tool_calls.is_empty() {
+            None
+        } else {
+            Some(response.tool_calls)
+        };
+
+        Ok(ThinkResult {
+            response: response.content.unwrap_or_default(),
+            tools_used: last_tool_calls.is_some(),
+            tool_names: last_tool_calls
+                .as_ref()
+                .map(|tcs| tcs.iter().map(|tc| tc.name.clone()).collect())
+                .unwrap_or_default(),
+            last_tool_calls,
+            tool_trace: Vec::new(),
+            tokens_in,
+            tokens_out,
+            prompt_eval_duration_ns: prompt_eval_ns,
+            duration_ms: Some(llm_duration_ms),
+        })
+    }
+
     /// Inner implementation of streaming think (without event wrapper).
     async fn think_streaming_with_options_inner(
         &mut self,

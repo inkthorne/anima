@@ -155,10 +155,9 @@ pub struct MessageWorkResult {
     pub error: Option<String>,
 }
 
-/// Result from processing in native tool mode, includes tool_calls for persistence
+/// Result from processing in native tool mode (standalone, no conversation)
 struct NativeToolModeResult {
     response: String,
-    tool_calls: Option<Vec<crate::llm::ToolCall>>,
     duration_ms: Option<u64>,
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
@@ -306,14 +305,38 @@ fn format_conversation_history(
     let mut history: Vec<ChatMessage> = Vec::new();
     let mut pending_user_batch: Vec<String> = Vec::new();
 
-    // Pre-scan: identify superseded read_file results for dedup
-    let tool_result_paths: std::collections::HashMap<i64, String>;
-    let latest_reads: std::collections::HashMap<String, i64>;
+    // Pre-scan: identify superseded tool pairs for dedup.
+    // Collects (assistant_msg_id, tool_result_msg_id) pairs for read_file, write_file,
+    // edit_file, and cargo check/build — then applies dedup rules to build a set of
+    // message IDs to drop entirely from context.
+    let drop_ids: std::collections::HashSet<i64>;
     {
-        use std::collections::{HashMap, VecDeque};
-        let mut pending_read_paths: VecDeque<String> = VecDeque::new();
-        let mut lr: HashMap<String, i64> = HashMap::new();
-        let mut trp: HashMap<i64, String> = HashMap::new();
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        #[derive(Clone)]
+        struct ToolPair {
+            assistant_msg_id: i64,
+            tool_result_msg_id: i64,
+        }
+
+        // Pending queues: assistant tool_calls waiting for their tool result
+        // Each entry is (path, assistant_msg_id)
+        let mut pending_read_full: VecDeque<(String, i64)> = VecDeque::new();
+        let mut pending_read_range: VecDeque<(String, i64)> = VecDeque::new();
+        let mut pending_write: VecDeque<(String, i64)> = VecDeque::new();
+        let mut pending_edit: VecDeque<(String, i64)> = VecDeque::new();
+        let mut pending_cargo: VecDeque<i64> = VecDeque::new();
+        let mut pending_shell_other: VecDeque<i64> = VecDeque::new();
+
+        // Collected pairs
+        let mut read_file_full: HashMap<String, Vec<ToolPair>> = HashMap::new();
+        let mut read_file_range: Vec<(String, ToolPair)> = Vec::new();
+        let mut write_file_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
+        let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
+        let mut cargo_check_pairs: Vec<ToolPair> = Vec::new();
+
+        // Track how many tool_calls each assistant message has, and how many are dedup-dropped
+        let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
 
         for msg in messages {
             if msg.from_agent == current_agent {
@@ -321,13 +344,59 @@ fn format_conversation_history(
                     if let Ok(tcs) =
                         serde_json::from_str::<Vec<crate::llm::ToolCall>>(tc_json)
                     {
+                        assistant_tc_count.insert(msg.id, tcs.len());
                         for tc in &tcs {
-                            if tc.name == "read_file" {
-                                if let Some(path) =
-                                    tc.arguments.get("path").and_then(|v| v.as_str())
-                                {
-                                    pending_read_paths.push_back(path.to_string());
+                            match tc.name.as_str() {
+                                "read_file" => {
+                                    if let Some(path) =
+                                        tc.arguments.get("path").and_then(|v| v.as_str())
+                                    {
+                                        let has_range = tc
+                                            .arguments
+                                            .get("start_line")
+                                            .or_else(|| tc.arguments.get("end_line"))
+                                            .is_some();
+                                        if has_range {
+                                            pending_read_range
+                                                .push_back((path.to_string(), msg.id));
+                                        } else {
+                                            pending_read_full
+                                                .push_back((path.to_string(), msg.id));
+                                        }
+                                    }
                                 }
+                                "write_file" => {
+                                    if let Some(path) =
+                                        tc.arguments.get("path").and_then(|v| v.as_str())
+                                    {
+                                        pending_write.push_back((path.to_string(), msg.id));
+                                    }
+                                }
+                                "edit_file" => {
+                                    if let Some(path) =
+                                        tc.arguments.get("path").and_then(|v| v.as_str())
+                                    {
+                                        pending_edit.push_back((path.to_string(), msg.id));
+                                    }
+                                }
+                                "shell" => {
+                                    let is_cargo = tc
+                                        .arguments
+                                        .get("command")
+                                        .and_then(|v| v.as_str())
+                                        .map(|cmd| {
+                                            let cmd = cmd.trim();
+                                            cmd.starts_with("cargo check")
+                                                || cmd.starts_with("cargo build")
+                                        })
+                                        .unwrap_or(false);
+                                    if is_cargo {
+                                        pending_cargo.push_back(msg.id);
+                                    } else {
+                                        pending_shell_other.push_back(msg.id);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -338,15 +407,132 @@ fn format_conversation_history(
                     _ => {}
                 }
                 if msg.content.starts_with("[Tool Result for read_file]") {
-                    if let Some(path) = pending_read_paths.pop_front() {
-                        lr.insert(path.clone(), msg.id);
-                        trp.insert(msg.id, path);
+                    // Try full reads first, then range reads
+                    if let Some((path, asst_id)) = pending_read_full.pop_front() {
+                        read_file_full.entry(path).or_default().push(ToolPair {
+                            assistant_msg_id: asst_id,
+                            tool_result_msg_id: msg.id,
+                        });
+                    } else if let Some((path, asst_id)) = pending_read_range.pop_front() {
+                        read_file_range.push((
+                            path,
+                            ToolPair {
+                                assistant_msg_id: asst_id,
+                                tool_result_msg_id: msg.id,
+                            },
+                        ));
+                    }
+                } else if msg.content.starts_with("[Tool Result for write_file]") {
+                    if let Some((path, asst_id)) = pending_write.pop_front() {
+                        write_file_pairs.entry(path).or_default().push(ToolPair {
+                            assistant_msg_id: asst_id,
+                            tool_result_msg_id: msg.id,
+                        });
+                    }
+                } else if msg.content.starts_with("[Tool Result for edit_file]") {
+                    if let Some((path, asst_id)) = pending_edit.pop_front() {
+                        edit_file_pairs.push((
+                            path,
+                            ToolPair {
+                                assistant_msg_id: asst_id,
+                                tool_result_msg_id: msg.id,
+                            },
+                        ));
+                    }
+                } else if msg.content.starts_with("[Tool Result for shell]") {
+                    if let Some(asst_id) = pending_cargo.pop_front() {
+                        cargo_check_pairs.push(ToolPair {
+                            assistant_msg_id: asst_id,
+                            tool_result_msg_id: msg.id,
+                        });
+                    } else {
+                        // Consume non-cargo shell pending entry to keep queues aligned
+                        pending_shell_other.pop_front();
                     }
                 }
             }
         }
-        latest_reads = lr;
-        tool_result_paths = trp;
+
+        // Apply dedup rules — collect tool_result IDs and assistant IDs to drop
+        let mut dropped_tool_results: HashSet<i64> = HashSet::new();
+        // Track per-assistant-msg which tool_calls are dropped
+        let mut asst_dropped: HashMap<i64, usize> = HashMap::new();
+
+        let mark_drop = |pair: &ToolPair, dropped: &mut HashSet<i64>, ad: &mut HashMap<i64, usize>| {
+            dropped.insert(pair.tool_result_msg_id);
+            *ad.entry(pair.assistant_msg_id).or_insert(0) += 1;
+        };
+
+        // read_file_full: keep only the last pair per path
+        for (_path, pairs) in &read_file_full {
+            for pair in pairs.iter().rev().skip(1) {
+                mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+            }
+        }
+
+        // write_file: keep only the last pair per path
+        for (_path, pairs) in &write_file_pairs {
+            for pair in pairs.iter().rev().skip(1) {
+                mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+            }
+        }
+
+        // Build a set of paths that have a full-read or write at or after a given msg ID
+        // For edit_file and read_file_range dedup, we need to know if a later
+        // full-read or write exists for the same path.
+        let mut latest_fresh_view: HashMap<&str, i64> = HashMap::new();
+        for (path, pairs) in &read_file_full {
+            if let Some(last) = pairs.last() {
+                let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
+                if last.tool_result_msg_id > *entry {
+                    *entry = last.tool_result_msg_id;
+                }
+            }
+        }
+        for (path, pairs) in &write_file_pairs {
+            if let Some(last) = pairs.last() {
+                let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
+                if last.tool_result_msg_id > *entry {
+                    *entry = last.tool_result_msg_id;
+                }
+            }
+        }
+
+        // read_file_range: drop if a later full-read or write_file exists for same path
+        for (path, pair) in &read_file_range {
+            if let Some(&latest_id) = latest_fresh_view.get(path.as_str()) {
+                if latest_id > pair.tool_result_msg_id {
+                    mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+                }
+            }
+        }
+
+        // edit_file: drop if a later full-read or write_file exists for same path
+        for (path, pair) in &edit_file_pairs {
+            if let Some(&latest_id) = latest_fresh_view.get(path.as_str()) {
+                if latest_id > pair.tool_result_msg_id {
+                    mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+                }
+            }
+        }
+
+        // cargo check/build: keep only the last pair
+        for pair in cargo_check_pairs.iter().rev().skip(1) {
+            mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+        }
+
+        // Build final drop_ids: always drop superseded tool results,
+        // only drop assistant messages if ALL their tool_calls are dropped
+        let mut ids: HashSet<i64> = HashSet::new();
+        ids.extend(&dropped_tool_results);
+        for (&asst_id, &drop_count) in &asst_dropped {
+            if let Some(&total) = assistant_tc_count.get(&asst_id) {
+                if drop_count >= total {
+                    ids.insert(asst_id);
+                }
+            }
+        }
+        drop_ids = ids;
     }
 
     // Helper to flush pending user messages into a single ChatMessage
@@ -364,6 +550,9 @@ fn format_conversation_history(
 
     // Process all messages
     for msg in messages {
+        if drop_ids.contains(&msg.id) {
+            continue;
+        }
         if msg.from_agent == "recall" {
             // Skip recall injected by other agents — they're irrelevant noise.
             // Unattributed (triggered_by = None) are included for backward compatibility.
@@ -401,31 +590,26 @@ fn format_conversation_history(
                 Some(owner) if owner != current_agent => continue,
                 _ => {}
             }
-            // Dedup: replace superseded read_file results with stubs
-            if let Some(path) = tool_result_paths.get(&msg.id) {
-                if latest_reads.get(path) != Some(&msg.id) {
-                    flush_user_batch(&mut pending_user_batch, &mut history);
-                    history.push(ChatMessage {
-                        role: "user".to_string(),
-                        content: Some(format!(
-                            "[Earlier read_file of '{}' — superseded by later read]",
-                            path
-                        )),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    });
-                    continue;
-                }
-            }
             // Tool results/errors should NOT be batched with user messages.
-            // Flush any pending user messages first, then add tool message as its own user message.
+            // Flush any pending user messages first, then add tool result.
             flush_user_batch(&mut pending_user_batch, &mut history);
-            history.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(msg.content.clone()), // Raw content, not JSON-wrapped
-                tool_call_id: None,
-                tool_calls: None,
-            });
+            if msg.tool_call_id.is_some() {
+                // Native tool result — emit with role "tool" and tool_call_id for API compatibility
+                history.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(msg.content.clone()),
+                    tool_call_id: msg.tool_call_id.clone(),
+                    tool_calls: None,
+                });
+            } else {
+                // Legacy/JSON-block tool result — emit as role "user"
+                history.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(msg.content.clone()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+            }
         } else {
             // Other speaker → accumulate for user batch with JSON wrapper
             let escaped = msg
@@ -763,7 +947,7 @@ fn spawn_tool_trace_persister(
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
             let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            match store.add_tool_result(&cname, &tool_result_msg, &agent_name) {
+            match store.add_native_tool_result(&cname, &exec.call.id, &tool_result_msg, &agent_name) {
                 Ok(result_id) => {
                     // Pin spawn_child tool results so parent retains child_ids in context
                     if exec.call.name == "spawn_child" {
@@ -2320,6 +2504,427 @@ async fn agent_worker(
     logger.log("[worker] Agent worker stopped");
 }
 
+/// Execute a batch of native tool calls, storing each result to the DB with tool_call_id.
+/// Returns a list of (tool_name, was_spawn_child) for post-processing.
+#[allow(clippy::too_many_arguments)]
+async fn execute_native_tool_calls(
+    tool_calls: &[crate::llm::ToolCall],
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    tool_context: &ToolExecutionContext,
+    conv_name: &str,
+    agent_name: &str,
+    logger: &Arc<AgentLogger>,
+) -> Vec<(String, bool)> {
+    let store = match ConversationStore::init() {
+        Ok(s) => s,
+        Err(e) => {
+            logger.log(&format!("[loop] Failed to init store for tool results: {}", e));
+            return Vec::new();
+        }
+    };
+    let mut results = Vec::new();
+    for tc in tool_calls {
+        let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.name));
+        // Convert llm::ToolCall to daemon::ToolCall for execute_tool_call
+        let daemon_tc = ToolCall {
+            tool: tc.name.clone(),
+            params: tc.arguments.clone(),
+        };
+        let tool_result = match execute_tool_call(&daemon_tc, tool_def, Some(tool_context)).await {
+            Ok(result) => {
+                logger.tool(&format!("[loop] {} → {} bytes", tc.name, result.len()));
+                format!("[Tool Result for {}]\n{}", tc.name, result)
+            }
+            Err(e) => {
+                logger.tool(&format!("[loop] {} → error: {}", tc.name, e));
+                format!("[Tool Error for {}]\n{}", tc.name, e)
+            }
+        };
+        // Store tool result with tool_call_id for native protocol round-trip
+        match store.add_native_tool_result(conv_name, &tc.id, &tool_result, agent_name) {
+            Ok(result_id) => {
+                // Pin spawn_child tool results so parent retains child_ids in context
+                if tc.name == "spawn_child" {
+                    let _ = store.pin_message(conv_name, result_id, true);
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("[loop] Failed to store tool result: {}", e));
+            }
+        }
+        results.push((tc.name.clone(), tc.name == "spawn_child"));
+    }
+    results
+}
+
+/// Result from the unified tool loop.
+struct ToolLoopResult {
+    /// Final response text (thinking stripped, memories extracted).
+    response: String,
+    /// Duration of the last LLM call in milliseconds.
+    duration_ms: Option<u64>,
+    /// Token usage from the last LLM call.
+    tokens_in: Option<u32>,
+    tokens_out: Option<u32>,
+    prompt_eval_duration_ns: Option<u64>,
+}
+
+/// Unified tool loop for both native and JSON-block modes.
+///
+/// Makes single-turn LLM calls (via `think_single_turn_streaming`), stores results to DB,
+/// and refreshes context from DB between iterations. The daemon owns the loop; agent.rs
+/// only provides the single LLM call.
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_loop(
+    // Initial state
+    initial_message: &str,
+    conversation_history: Vec<ChatMessage>,
+    // Agent & config
+    agent: &Arc<Mutex<Agent>>,
+    agent_name: &str,
+    system_prompt: &Option<String>,
+    external_tools: Option<Vec<ToolSpec>>,
+    use_native_tools: bool,
+    max_iterations: usize,
+    num_ctx: Option<u32>,
+    // Tool execution
+    tool_registry: &Option<Arc<ToolRegistry>>,
+    tool_context: &ToolExecutionContext,
+    // Memory
+    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
+    embedding_client: &Option<Arc<EmbeddingClient>>,
+    // DB
+    conv_name: &str,
+    // Streaming
+    token_tx: Option<mpsc::Sender<String>>,
+    // Control
+    cancel: Option<Arc<AtomicBool>>,
+    response_deadline: Option<Duration>,
+    start_time: std::time::Instant,
+    shutdown: &Arc<tokio::sync::Notify>,
+    logger: &Arc<AgentLogger>,
+    log_tx: mpsc::Sender<String>,
+) -> ToolLoopResult {
+    // Open a store for DB operations (pause checks, message storage, context refresh).
+    // Each tool batch opens its own store (via execute_native_tool_calls) for isolation.
+    let store = match ConversationStore::init() {
+        Ok(s) => s,
+        Err(e) => {
+            logger.log(&format!("[loop] Failed to init store: {}", e));
+            return ToolLoopResult {
+                response: format!("[Error: failed to init conversation store: {}]", e),
+                duration_ms: None,
+                tokens_in: None,
+                tokens_out: None,
+                prompt_eval_duration_ns: None,
+            };
+        }
+    };
+
+    let mut conversation_history = conversation_history;
+    let mut current_message = initial_message.to_string();
+    let mut tool_call_count = 0usize;
+    let mut last_duration_ms: Option<u64> = None;
+    let mut last_tokens_in: Option<u32> = None;
+    let mut last_tokens_out: Option<u32> = None;
+    let mut last_prompt_eval_ns: Option<u64> = None;
+
+    for _iteration in 0..max_iterations {
+        // Check wall-clock time limit
+        if let Some(deadline) = response_deadline {
+            if start_time.elapsed() >= deadline {
+                logger.log(&format!("[loop] Response time limit exceeded ({:?})", deadline));
+                return ToolLoopResult {
+                    response: format!("[Response terminated: exceeded time limit of {:?}]", deadline),
+                    duration_ms: last_duration_ms,
+                    tokens_in: last_tokens_in,
+                    tokens_out: last_tokens_out,
+                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                };
+            }
+        }
+
+        // Check cancellation (pause)
+        if let Some(ref flag) = cancel {
+            if flag.load(Ordering::Relaxed) {
+                return ToolLoopResult {
+                    response: "[Paused]".to_string(),
+                    duration_ms: last_duration_ms,
+                    tokens_in: last_tokens_in,
+                    tokens_out: last_tokens_out,
+                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                };
+            }
+        }
+
+        // Clear agent's internal history to avoid duplication with DB-backed history
+        agent.lock().await.clear_history();
+
+        let options = ThinkOptions {
+            system_prompt: system_prompt.clone(),
+            conversation_history: if conversation_history.is_empty() {
+                None
+            } else {
+                Some(conversation_history.clone())
+            },
+            external_tools: external_tools.clone(),
+            num_ctx,
+            log_tx: Some(log_tx.clone()),
+            ..Default::default()
+        };
+
+        // Make a single LLM call via streaming (avoids Ollama non-streaming issues)
+        let (iter_token_tx, mut iter_token_rx) = mpsc::channel::<String>(100);
+        let outer_tx = token_tx.clone();
+        let drain_handle = tokio::spawn(async move {
+            while let Some(tok) = iter_token_rx.recv().await {
+                // Forward tokens to the outer stream if present (REPL streaming)
+                if let Some(ref tx) = outer_tx {
+                    let _ = tx.send(tok).await;
+                }
+            }
+        });
+
+        let llm_future = async {
+            if let Some(deadline) = response_deadline {
+                let remaining = deadline.saturating_sub(start_time.elapsed());
+                let mut agent_guard = agent.lock().await;
+                match tokio::time::timeout(
+                    remaining,
+                    agent_guard.think_single_turn_streaming(&current_message, options, iter_token_tx),
+                ).await {
+                    Ok(r) => { drop(agent_guard); Ok(r) }
+                    Err(_elapsed) => {
+                        drop(agent_guard);
+                        Err(format!("[Response terminated: exceeded time limit of {:?}]", deadline))
+                    }
+                }
+            } else {
+                let mut agent_guard = agent.lock().await;
+                let r = agent_guard
+                    .think_single_turn_streaming(&current_message, options, iter_token_tx)
+                    .await;
+                drop(agent_guard);
+                Ok(r)
+            }
+        };
+
+        let result = tokio::select! {
+            r = llm_future => {
+                match r {
+                    Ok(think_result) => think_result,
+                    Err(timeout_msg) => {
+                        let _ = drain_handle.await;
+                        return ToolLoopResult {
+                            response: timeout_msg,
+                            duration_ms: last_duration_ms,
+                            tokens_in: last_tokens_in,
+                            tokens_out: last_tokens_out,
+                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                        };
+                    }
+                }
+            }
+            _ = shutdown.notified() => {
+                let _ = drain_handle.await;
+                logger.log("[loop] Shutdown during LLM call, aborting");
+                return ToolLoopResult {
+                    response: String::new(),
+                    duration_ms: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    prompt_eval_duration_ns: None,
+                };
+            }
+        };
+
+        let _ = drain_handle.await;
+
+        match result {
+            Ok(think_result) => {
+                last_duration_ms = think_result.duration_ms;
+                last_tokens_in = think_result.tokens_in;
+                last_tokens_out = think_result.tokens_out;
+                last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
+
+                let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
+                let iter_tokens_out = think_result.tokens_out.map(|t| t as i64);
+                let iter_eval_ns = think_result.prompt_eval_duration_ns.map(|t| t as i64);
+                let num_ctx_i64 = num_ctx.map(|n| n as i64);
+
+                // Strip thinking tags and extract [REMEMBER:...] tags
+                let without_thinking = strip_thinking_tags(&think_result.response);
+                let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+
+                // Save memories
+                save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
+
+                if use_native_tools {
+                    // === Native tool mode ===
+                    if let Some(ref tool_calls) = think_result.last_tool_calls {
+                        // Check pause before executing tools
+                        if store.is_paused(conv_name).unwrap_or(false) {
+                            logger.log("[loop] Conversation paused, skipping tool execution");
+                            return ToolLoopResult {
+                                response: after_remember,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                            };
+                        }
+
+                        tool_call_count += tool_calls.len();
+
+                        // Store assistant message with tool_calls
+                        let tool_calls_json = serde_json::to_string(tool_calls).ok();
+                        if let Err(e) = store.add_message_with_tokens(
+                            conv_name, agent_name, &after_remember, &[],
+                            think_result.duration_ms.map(|d| d as i64),
+                            tool_calls_json.as_deref(),
+                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
+                        ) {
+                            logger.log(&format!("[loop] Failed to store assistant message: {}", e));
+                        }
+
+                        // Execute all tool calls in the batch
+                        let results = execute_native_tool_calls(
+                            tool_calls, tool_registry, tool_context,
+                            conv_name, agent_name, logger,
+                        ).await;
+
+                        // If spawn_child was in this batch, set the message for next iteration
+                        let had_spawn = results.iter().any(|(_, is_spawn)| *is_spawn);
+                        if had_spawn {
+                            current_message = "[System: You have pending child tasks. Call wait_for_children to collect results before responding.]".to_string();
+                        } else {
+                            current_message = String::new();
+                        }
+                    } else {
+                        // No tool calls — final response
+                        return ToolLoopResult {
+                            response: after_remember,
+                            duration_ms: last_duration_ms,
+                            tokens_in: last_tokens_in,
+                            tokens_out: last_tokens_out,
+                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                        };
+                    }
+                } else {
+                    // === JSON-block mode ===
+                    let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+
+                    if let Some(tc) = tool_call {
+                        // Check pause before executing tools
+                        if store.is_paused(conv_name).unwrap_or(false) {
+                            logger.log("[loop] Conversation paused, skipping tool execution");
+                            return ToolLoopResult {
+                                response: after_remember,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                            };
+                        }
+
+                        tool_call_count += 1;
+
+                        // Store intermediate response (preserving tool call JSON block)
+                        if !after_remember.trim().is_empty() {
+                            if let Err(e) = store.add_message_with_tokens(
+                                conv_name, agent_name, &after_remember, &[],
+                                think_result.duration_ms.map(|d| d as i64), None,
+                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
+                            ) {
+                                logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
+                            }
+                        }
+
+                        logger.tool(&format!("[loop] Executing: {} with params {}", tc.tool, tc.params));
+
+                        let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
+                        let tool_message = match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
+                            Ok(tool_result) => {
+                                logger.tool(&format!("[loop] Result: {} bytes", tool_result.len()));
+                                format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
+                            }
+                            Err(e) => {
+                                logger.tool(&format!("[loop] Error: {}", e));
+                                format!("[Tool Error for {}]\n{}", tc.tool, e)
+                            }
+                        };
+
+                        // Store tool result
+                        if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
+                            logger.log(&format!("[loop] Failed to store tool message: {}", e));
+                        }
+
+                        current_message = tool_message;
+                    } else {
+                        // No tool call — final response
+                        return ToolLoopResult {
+                            response: cleaned_response,
+                            duration_ms: last_duration_ms,
+                            tokens_in: last_tokens_in,
+                            tokens_out: last_tokens_out,
+                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                        };
+                    }
+                }
+
+                // Refresh context from DB (both modes)
+                let mid_turn_budget = num_ctx.map_or(2048, |c| c as usize * 30 / 100);
+                if let Ok(msgs) = store.get_messages_by_token_budget(conv_name, mid_turn_budget) {
+                    let (refreshed_history, refreshed_final) =
+                        format_conversation_history(&msgs, agent_name);
+                    conversation_history = refreshed_history;
+                    if !current_message.is_empty() {
+                        // Keep current_message (spawn_child nudge) if already set
+                    } else {
+                        current_message = refreshed_final;
+                    }
+                }
+
+                // Inject tool budget nudge
+                if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_iterations) {
+                    current_message.push_str(&format!("\n\n---\n{}", nudge));
+                }
+            }
+            Err(crate::error::AgentError::Cancelled) => {
+                logger.log("[loop] Agent cancelled (conversation paused)");
+                return ToolLoopResult {
+                    response: "[Paused]".to_string(),
+                    duration_ms: last_duration_ms,
+                    tokens_in: last_tokens_in,
+                    tokens_out: last_tokens_out,
+                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                };
+            }
+            Err(e) => {
+                logger.log(&format!("[loop] Agent error: {}", e));
+                let error_msg = format!("[Error: {}]", e);
+                let _ = store.add_message(conv_name, agent_name, &error_msg, &[]);
+                return ToolLoopResult {
+                    response: error_msg,
+                    duration_ms: last_duration_ms,
+                    tokens_in: last_tokens_in,
+                    tokens_out: last_tokens_out,
+                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                };
+            }
+        }
+    }
+
+    logger.log(&format!("[loop] Max iterations reached: {}", max_iterations));
+    ToolLoopResult {
+        response: format!("[Max iterations reached: {}]", max_iterations),
+        duration_ms: last_duration_ms,
+        tokens_in: last_tokens_in,
+        tokens_out: last_tokens_out,
+        prompt_eval_duration_ns: last_prompt_eval_ns,
+    }
+}
+
 /// Process a Message work item: handle memory/tools injection, streaming, and tool execution.
 /// Returns the final response (or error) for the oneshot channel.
 #[allow(clippy::too_many_arguments)]
@@ -2439,72 +3044,105 @@ async fn process_message_work(
         allowed_tools: allowed_tools.clone(),
     };
 
-    // Create channel for incremental tool trace persistence
-    let (trace_tx, trace_rx) =
-        tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
-    let trace_handle = spawn_tool_trace_persister(
-        conv_name.map(|s| s.to_string()),
-        agent_name.to_string(),
-        num_ctx,
-        logger.clone(),
-        trace_rx,
-    );
+    // With conversation: use unified tool loop (DB-backed context management)
+    // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
+    let (final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = if let Some(cname) = conv_name {
+        let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
+        let start_time = std::time::Instant::now();
+        let loop_budget = max_iterations.unwrap_or(25);
 
-    // Process with or without streaming, with shutdown awareness
-    let llm_future = async {
-        if use_native_tools {
-            // Native tool mode with optional streaming
-            let result = process_native_tool_mode(
-                &final_user_content,
-                recall_result.external_tools,
-                token_tx,
-                agent,
-                system_prompt,
-                semantic_memory,
-                embedding_client,
-                logger,
-                conversation_history,
-                Some(trace_tx.clone()),
-                max_iterations,
-                num_ctx,
-            )
-            .await;
-            (result.response, result.tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
-        } else {
-            // JSON-block mode with optional streaming (no native tool_calls)
-            let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns) = process_json_block_mode(
-                &final_user_content,
-                &recall_result.relevant_tools,
-                token_tx,
-                agent,
-                system_prompt,
-                semantic_memory,
-                embedding_client,
-                tool_registry,
-                logger,
-                &tool_context,
-                conversation_history,
-                max_iterations,
-            )
-            .await;
-            (response, None, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
-        }
+        let loop_result = run_tool_loop(
+            &final_user_content,
+            conversation_history,
+            agent,
+            agent_name,
+            system_prompt,
+            recall_result.external_tools,
+            use_native_tools,
+            loop_budget,
+            num_ctx,
+            tool_registry,
+            &tool_context,
+            semantic_memory,
+            embedding_client,
+            cname,
+            token_tx,
+            None, // no cancellation for REPL messages
+            None, // no response deadline for REPL messages
+            start_time,
+            shutdown,
+            logger,
+            log_tx.clone(),
+        ).await;
+
+        drop(log_tx);
+        let _ = log_fwd_handle.await;
+
+        (loop_result.response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns)
+    } else {
+        // No conversation — use agent.rs tool loop directly (standalone mode)
+        let (trace_tx, trace_rx) =
+            tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
+        let trace_handle = spawn_tool_trace_persister(
+            None,
+            agent_name.to_string(),
+            num_ctx,
+            logger.clone(),
+            trace_rx,
+        );
+
+        let llm_future = async {
+            if use_native_tools {
+                let result = process_native_tool_mode(
+                    &final_user_content,
+                    recall_result.external_tools,
+                    token_tx,
+                    agent,
+                    system_prompt,
+                    semantic_memory,
+                    embedding_client,
+                    logger,
+                    conversation_history,
+                    Some(trace_tx.clone()),
+                    max_iterations,
+                    num_ctx,
+                ).await;
+                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+            } else {
+                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns) = process_json_block_mode(
+                    &final_user_content,
+                    &recall_result.relevant_tools,
+                    token_tx,
+                    agent,
+                    system_prompt,
+                    semantic_memory,
+                    embedding_client,
+                    tool_registry,
+                    logger,
+                    &tool_context,
+                    conversation_history,
+                    max_iterations,
+                ).await;
+                (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
+            }
+        };
+
+        let result = tokio::select! {
+            r = llm_future => r,
+            _ = shutdown.notified() => {
+                logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
+                return MessageWorkResult {
+                    response: String::new(),
+                    error: Some("Shutdown during LLM call".to_string()),
+                };
+            }
+        };
+
+        drop(trace_tx);
+        let _ = trace_handle.await;
+
+        result
     };
-
-    let (final_response, _tool_calls, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = tokio::select! {
-        result = llm_future => result,
-        _ = shutdown.notified() => {
-            logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
-            return MessageWorkResult {
-                response: String::new(),
-                error: Some("Shutdown during LLM call".to_string()),
-            };
-        }
-    };
-
-    // Wait for incremental tool trace storage to complete
-    drop(trace_tx);
-    let _ = trace_handle.await;
 
     // Store response in conversation if conv_name was provided
     if let Some(cname) = conv_name {
@@ -2515,8 +3153,7 @@ async fn process_message_work(
         let prompt_eval_ns = last_prompt_eval_ns.map(|t| t as i64);
         match ConversationStore::init() {
             Ok(store) => {
-                // Store recall AFTER response for persistence (but recall was already injected in memory)
-                // This positions recall in DB right before the response, preserving context for future turns
+                // Store recall AFTER response for persistence
                 if let Some(ref recall_text) = recall_content_for_storage {
                     if !recall_text.is_empty() {
                         if let Err(e) = store.add_recall_message(cname, recall_text, &agent_name) {
@@ -2534,7 +3171,7 @@ async fn process_message_work(
                     &final_response,
                     &[],
                     duration_ms,
-                    None,
+                    None, // tool_calls stored by run_tool_loop during iterations
                     tokens_in,
                     tokens_out,
                     num_ctx_i64,
@@ -2574,9 +3211,7 @@ async fn process_message_work(
                                 ));
 
                                 for mention in valid_mentions {
-                                    // Add mentioned agent as participant
                                     let _ = store.add_participant(cname, &mention);
-
                                     forward_notify_to_agent(
                                         &mention,
                                         cname,
@@ -2644,7 +3279,7 @@ async fn process_native_tool_mode(
         ..Default::default()
     };
 
-    let (result, tool_calls, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns) = if let Some(tx) = token_tx {
+    let (result, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns) = if let Some(tx) = token_tx {
         // Streaming mode - call directly (not spawned) so dropping the future cancels the LLM call
         let mut agent_guard = agent.lock().await;
         match agent_guard
@@ -2653,19 +3288,19 @@ async fn process_native_tool_mode(
         {
             Ok(result) => {
                 drop(agent_guard);
-                (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
             }
             Err(e) => {
                 drop(agent_guard);
-                (format!("Error: {}", e), None, None, None, None, None)
+                (format!("Error: {}", e), None, None, None, None)
             }
         }
     } else {
-        // Non-streaming mode - can capture tool_calls
+        // Non-streaming mode
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.last_tool_calls, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
-            Err(e) => (format!("Error: {}", e), None, None, None, None, None),
+            Ok(result) => (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
+            Err(e) => (format!("Error: {}", e), None, None, None, None),
         }
     };
 
@@ -2681,7 +3316,6 @@ async fn process_native_tool_mode(
 
     NativeToolModeResult {
         response: after_remember,
-        tool_calls,
         duration_ms,
         tokens_in,
         tokens_out,
@@ -3142,6 +3776,8 @@ async fn handle_notify(
         conversation_history.len()
     ));
 
+    let external_tools = recall_result.external_tools;
+
     // Create tool execution context for tools that need daemon state
     let tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
@@ -3152,35 +3788,10 @@ async fn handle_notify(
         allowed_tools: allowed_tools.clone(),
     };
 
-    let external_tools = recall_result.external_tools;
-
-    let json_block_budget = max_iterations.unwrap_or(25);
-    let mut tool_call_count = 0;
-    let mut current_message = final_user_content.clone();
-    #[allow(unused_assignments)]
-    let mut final_response: Option<String> = None;
-    // last_tool_calls no longer needed — trace persister handles tool call persistence
-    let mut last_tokens_in: Option<u32> = None;
-    let mut last_tokens_out: Option<u32> = None;
-    let mut last_prompt_eval_ns: Option<u64> = None;
-    let mut last_duration_ms: Option<u64> = None;
-    let mut agent_error: Option<String> = None;
-
-    // Channel for incremental tool trace persistence (native tool mode)
-    let (tool_trace_tx, trace_rx) =
-        tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
-    let trace_handle = spawn_tool_trace_persister(
-        Some(conv_id.to_string()),
-        agent_name.to_string(),
-        num_ctx,
-        logger.clone(),
-        trace_rx,
-    );
-
     // Channel for forwarding log messages to the daemon logger
     let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
 
-    // Cancellation flag for native tool mode — checked by agent.rs at each iteration boundary
+    // Cancellation flag — checked by run_tool_loop at each iteration boundary
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     // Spawn a watcher that polls is_paused every 500ms and sets the cancel flag
@@ -3200,266 +3811,52 @@ async fn handle_notify(
 
     // Parse max_response_time from config
     let response_deadline = max_response_time.and_then(parse_duration);
+    let loop_budget = max_iterations.unwrap_or(25);
 
-    loop {
-        // Check wall-clock time limit at each iteration boundary
-        if let Some(deadline) = response_deadline {
-            if start_time.elapsed() >= deadline {
-                logger.log(&format!(
-                    "[notify] Response time limit exceeded ({:?})", deadline
-                ));
-                final_response = Some(format!(
-                    "[Response terminated: exceeded time limit of {:?}]", deadline
-                ));
-                break;
-            }
-        }
-
-        // Clear agent's internal history EACH iteration to avoid duplication.
-        // think_with_options adds to self.history, and agent.rs injects self.history
-        // BEFORE options.conversation_history (lines 655-660). Without clearing each
-        // iteration, the growing internal history appears before DB-backed history.
-        agent.lock().await.clear_history();
-
-        // No fresh recall injection - recall was injected in the initial conversation_history
-        // on first iteration. After tool execution, we refresh from DB which won't include
-        // recall (stored after response), but that's fine - LLM has already seen it.
-        let options = ThinkOptions {
-            system_prompt: system_prompt.clone(),
-            conversation_history: if conversation_history.is_empty() {
-                None
-            } else {
-                Some(conversation_history.clone())
-            },
-            external_tools: external_tools.clone(),
-            max_iterations: max_iterations.unwrap_or(25),
-            tool_trace_tx: Some(tool_trace_tx.clone()),
-            cancel: Some(cancel_flag.clone()),
-            num_ctx,
-            log_tx: Some(log_tx.clone()),
-            ..Default::default()
-        };
-
-        // Generate response (use streaming to avoid Ollama non-streaming issues)
-        let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
-        let drain_handle = tokio::spawn(async move {
-            while token_rx.recv().await.is_some() {}
-        });
-
-        // Apply per-LLM-call timeout if response deadline is set, with shutdown awareness
-        let llm_future = async {
-            if let Some(deadline) = response_deadline {
-                let remaining = deadline.saturating_sub(start_time.elapsed());
-                let mut agent_guard = agent.lock().await;
-                match tokio::time::timeout(
-                    remaining,
-                    agent_guard.think_streaming_with_options(&current_message, options, token_tx),
-                ).await {
-                    Ok(r) => { drop(agent_guard); Ok(r) }
-                    Err(_elapsed) => {
-                        drop(agent_guard);
-                        Err(format!("[Response terminated: exceeded time limit of {:?}]", deadline))
-                    }
-                }
-            } else {
-                let mut agent_guard = agent.lock().await;
-                let r = agent_guard
-                    .think_streaming_with_options(&current_message, options, token_tx)
-                    .await;
-                drop(agent_guard);
-                Ok(r)
-            }
-        };
-
-        let result = tokio::select! {
-            r = llm_future => {
-                match r {
-                    Ok(think_result) => think_result,
-                    Err(timeout_msg) => {
-                        let _ = drain_handle.await;
-                        logger.log(&format!("[notify] Response time limit exceeded"));
-                        final_response = Some(timeout_msg);
-                        break;
-                    }
-                }
-            }
-            _ = shutdown.notified() => {
-                logger.log("[worker] Shutdown during LLM call in handle_notify, aborting");
-                let _ = drain_handle.await;
-                return Response::Error {
-                    message: "Shutdown during LLM call".to_string(),
-                };
-            }
-        };
-
-        // Drain completes when token_tx is dropped
-        let _ = drain_handle.await;
-
-        match result {
-            Ok(think_result) => {
-                // Capture tool_calls from native tool mode for persistence
-                // Tool calls persisted by spawn_tool_trace_persister — no need to capture here
-
-                last_duration_ms = think_result.duration_ms;
-
-                // Capture last-call token usage
-                last_tokens_in = think_result.tokens_in;
-                last_tokens_out = think_result.tokens_out;
-                last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
-
-                // Per-iteration stats for JSON-block intermediate messages
-                let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
-                let iter_tokens_out = think_result.tokens_out.map(|t| t as i64);
-                let iter_eval_ns = think_result.prompt_eval_duration_ns.map(|t| t as i64);
-                let num_ctx_i64 = num_ctx.map(|n| n as i64);
-
-                // Strip thinking tags and extract [REMEMBER: ...] tags
-                let without_thinking = strip_thinking_tags(&think_result.response);
-                let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-
-                // Save memories
-                save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
-
-                // Check for tool calls (JSON-block parsing)
-                let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
-
-                if let Some(tc) = tool_call {
-                    // Check if conversation is paused - skip tool execution if so
-                    if store.is_paused(conv_id).unwrap_or(false) {
-                        logger.log("[notify] Conversation paused, skipping tool execution");
-                        // Store the FULL response (including tool call block) so it can be
-                        // re-extracted and executed during catchup on resume
-                        final_response = Some(after_remember.clone());
-                        break;
-                    }
-
-                    tool_call_count += 1;
-
-                    if tool_call_count > json_block_budget {
-                        logger.tool("[notify] Max tool calls reached, stopping");
-                        final_response = Some(after_remember.clone());
-                        break;
-                    }
-
-                    // Store this assistant response before executing the tool
-                    // Use after_remember (not cleaned_response) to preserve the tool call JSON block
-                    // so the model can see what it called in conversation history
-                    if !after_remember.trim().is_empty() {
-                        if let Err(e) = store.add_message_with_tokens(
-                            conv_id, agent_name, &after_remember, &[],
-                            think_result.duration_ms.map(|d| d as i64), None,
-                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
-                        ) {
-                            logger.log(&format!(
-                                "[notify] Failed to store intermediate response: {}",
-                                e
-                            ));
-                        } else {
-                            logger.log(&format!(
-                                "[notify] Stored intermediate response: {} bytes",
-                                after_remember.len()
-                            ));
-                        }
-                    }
-
-                    logger.tool(&format!(
-                        "[notify] Executing: {} with params {}",
-                        tc.tool, tc.params
-                    ));
-
-                    // Look up the tool definition to get allowed_commands
-                    let tool_def = tool_registry
-                        .as_ref()
-                        .and_then(|r| r.find_by_name(&tc.tool));
-
-                    // Execute tool and format result message
-                    let tool_message = match execute_tool_call(&tc, tool_def, Some(&tool_context)).await {
-                        Ok(tool_result) => {
-                            logger.tool(&format!("[notify] Result: {} bytes", tool_result.len()));
-                            format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
-                        }
-                        Err(e) => {
-                            logger.tool(&format!("[notify] Error: {}", e));
-                            format!("[Tool Error for {}]\n{}", tc.tool, e)
-                        }
-                    };
-
-                    // Store tool result/error in conversation (attributed to this agent)
-                    if let Err(e) = store.add_tool_result(conv_id, &tool_message, agent_name) {
-                        logger.log(&format!("[notify] Failed to store tool message: {}", e));
-                    }
-
-                    // Refresh conversation_history from DB to include the tool result we just stored.
-                    // This ensures we use ONLY DB-backed history and avoids duplication with agent's
-                    // internal history (which we cleared at the start of each iteration).
-                    // Also update current_message from refreshed_final to avoid passing
-                    // the tool result twice (once in history, once as the task).
-                    current_message = tool_message;
-                    let mid_turn_budget = num_ctx.map_or(2048, |c| c as usize * 30 / 100);
-                    if let Ok(msgs) = store.get_messages_by_token_budget(conv_id, mid_turn_budget) {
-                        let (refreshed_history, refreshed_final) =
-                            format_conversation_history(&msgs, agent_name);
-                        conversation_history = refreshed_history;
-                        current_message = refreshed_final;
-                    }
-
-                    if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, json_block_budget) {
-                        current_message.push_str(&format!("\n\n---\n{}", nudge));
-                    }
-                } else {
-                    // No more tool calls - done
-                    final_response = Some(cleaned_response);
-                    break;
-                }
-            }
-            Err(crate::error::AgentError::Cancelled) => {
-                logger.log("[notify] Agent cancelled (conversation paused)");
-                final_response = Some("[Paused]".to_string());
-                break;
-            }
-            Err(e) => {
-                logger.log(&format!("[notify] Agent error: {}", e));
-                // Store error in conversation so user can see it via chat view
-                let error_msg = format!("[Error: {}]", e);
-                let _ = store.add_message(conv_id, agent_name, &error_msg, &[]);
-                agent_error = Some(e.to_string());
-                break;
-            }
-        }
-    }
+    // Run unified tool loop
+    let loop_result = run_tool_loop(
+        &final_user_content,
+        conversation_history,
+        agent,
+        agent_name,
+        system_prompt,
+        external_tools,
+        use_native_tools,
+        loop_budget,
+        num_ctx,
+        tool_registry,
+        &tool_context,
+        semantic_memory,
+        embedding_client,
+        conv_id,
+        None, // no streaming for daemon notifications
+        Some(cancel_flag),
+        response_deadline,
+        start_time,
+        shutdown,
+        logger,
+        log_tx.clone(),
+    ).await;
 
     // Clean up pause watcher
     pause_watcher.abort();
-
-    // Store final response in conversation with duration, tool_calls, and token usage
-    let cleaned_response = final_response.unwrap_or_default();
-    let duration_ms = last_duration_ms.map(|d| d as i64);
-    // Tool calls already persisted by spawn_tool_trace_persister — don't duplicate on final response
-    let tool_calls_json: Option<String> = None;
-    let tokens_in = last_tokens_in.map(|t| t as i64);
-    let tokens_out = last_tokens_out.map(|t| t as i64);
-    let num_ctx_i64 = num_ctx.map(|n| n as i64);
-    let prompt_eval_ns_i64 = last_prompt_eval_ns.map(|t| t as i64);
-
-    // Flush tool trace channel — drop sender so consumer finishes
-    drop(tool_trace_tx);
-    let _ = trace_handle.await;
 
     // Flush log forwarder
     drop(log_tx);
     let _ = log_fwd_handle.await;
 
-    // Stamp stats on intermediate messages now that persister has flushed
+    let cleaned_response = loop_result.response;
+    let duration_ms = loop_result.duration_ms.map(|d| d as i64);
+    let tokens_in = loop_result.tokens_in.map(|t| t as i64);
+    let tokens_out = loop_result.tokens_out.map(|t| t as i64);
+    let num_ctx_i64 = num_ctx.map(|n| n as i64);
+    let prompt_eval_ns_i64 = loop_result.prompt_eval_duration_ns.map(|t| t as i64);
+
+    // Stamp stats on intermediate messages
     if tokens_in.is_some() || tokens_out.is_some() {
         let _ = store.stamp_unstamped_messages(
             conv_id, agent_name, tokens_in, tokens_out, num_ctx_i64, prompt_eval_ns_i64,
         );
-    }
-
-    // If we broke out due to an error, return after flushing persister + stamping
-    if let Some(err_msg) = agent_error {
-        pause_watcher.abort();
-        return Response::Error { message: err_msg };
     }
 
     // Store recall AFTER response for persistence (but recall was already injected in memory)
@@ -3481,7 +3878,7 @@ async fn handle_notify(
         &cleaned_response,
         &[],
         duration_ms,
-        tool_calls_json.as_deref(),
+        None, // tool_calls stored by run_tool_loop during iterations
         tokens_in,
         tokens_out,
         num_ctx_i64,
@@ -4767,6 +5164,7 @@ api_key = "sk-test"
             triggered_by: None,
             pinned: false,
             prompt_eval_ns: None,
+            tool_call_id: None,
         }
     }
 
@@ -4787,6 +5185,7 @@ api_key = "sk-test"
             triggered_by: triggered_by.map(|s| s.to_string()),
             pinned: false,
             prompt_eval_ns: None,
+            tool_call_id: None,
         }
     }
 
@@ -5074,7 +5473,7 @@ api_key = "sk-test"
 
     #[test]
     fn test_format_conversation_history_dedup_read_file() {
-        // Agent reads /a.rs twice — first result should be replaced with a stub.
+        // Agent reads /a.rs twice — first pair (assistant + tool result) should be dropped entirely.
         let read_a_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "read_file".into(),
@@ -5120,7 +5519,7 @@ api_key = "sk-test"
 
         let (history, _final_content) = format_conversation_history(&msgs, "arya");
 
-        // Find the two tool result messages in history
+        // First pair should be dropped entirely — only one read_file result in output
         let tool_results: Vec<&str> = history
             .iter()
             .filter(|m| {
@@ -5132,18 +5531,30 @@ api_key = "sk-test"
             .map(|m| m.content.as_ref().unwrap().as_str())
             .collect();
 
-        assert_eq!(tool_results.len(), 2, "Should have two read_file entries");
-        // First should be the stub
+        assert_eq!(
+            tool_results.len(),
+            1,
+            "Should have only one read_file result (first pair dropped)"
+        );
         assert!(
-            tool_results[0].contains("superseded"),
-            "First read should be stubbed: {}",
+            tool_results[0].contains("new version"),
+            "Kept result should be the latest: {}",
             tool_results[0]
         );
-        // Second should be the actual content
+
+        // The first assistant message (id=10) should also be dropped
+        let assistant_msgs: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
         assert!(
-            tool_results[1].contains("new version"),
-            "Second read should be kept: {}",
-            tool_results[1]
+            !assistant_msgs.contains(&"Reading file."),
+            "First assistant tool_call message should be dropped"
+        );
+        assert!(
+            assistant_msgs.contains(&"Re-reading file."),
+            "Second assistant tool_call message should be kept"
         );
     }
 
@@ -5209,6 +5620,582 @@ api_key = "sk-test"
         assert_eq!(tool_results.len(), 2, "Both reads should be kept");
         assert!(tool_results[0].contains("contents of a"));
         assert!(tool_results[1].contains("contents of b"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_write_file() {
+        // Two writes to same path — first pair dropped, second kept.
+        let write_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "content": "v1"}),
+        }])
+        .unwrap();
+        let write_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "content": "v2"}),
+        }])
+        .unwrap();
+
+        let mut msg_agent1 = make_conv_msg("arya", "Writing v1.");
+        msg_agent1.id = 10;
+        msg_agent1.tool_calls = Some(write_tc1);
+
+        let mut msg_tool1 = make_tool_msg(
+            "[Tool Result for write_file]\nWrote 1 lines to /a.rs",
+            Some("arya"),
+        );
+        msg_tool1.id = 11;
+
+        let mut msg_agent2 = make_conv_msg("arya", "Writing v2.");
+        msg_agent2.id = 12;
+        msg_agent2.tool_calls = Some(write_tc2);
+
+        let mut msg_tool2 = make_tool_msg(
+            "[Tool Result for write_file]\nWrote 2 lines to /a.rs",
+            Some("arya"),
+        );
+        msg_tool2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "write /a.rs"),
+            msg_agent1,
+            msg_tool1,
+            msg_agent2,
+            msg_tool2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let tool_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.role == "user"
+                    && m.content
+                        .as_ref()
+                        .map_or(false, |c| c.starts_with("[Tool Result for write_file]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(tool_results.len(), 1, "First write pair should be dropped");
+        assert!(tool_results[0].contains("2 lines"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_edit_file_dropped_after_read() {
+        // edit → edit → full read of same path → both edit pairs dropped
+        let edit_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "old_str": "a", "new_str": "b"}),
+        }])
+        .unwrap();
+        let edit_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "old_str": "b", "new_str": "c"}),
+        }])
+        .unwrap();
+        let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc3".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Edit 1.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(edit_tc1);
+        let mut msg_t1 =
+            make_tool_msg("[Tool Result for edit_file]\ndiff1", Some("arya"));
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Edit 2.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(edit_tc2);
+        let mut msg_t2 =
+            make_tool_msg("[Tool Result for edit_file]\ndiff2", Some("arya"));
+        msg_t2.id = 13;
+
+        let mut msg_a3 = make_conv_msg("arya", "Reading file.");
+        msg_a3.id = 14;
+        msg_a3.tool_calls = Some(read_tc);
+        let mut msg_t3 = make_tool_msg(
+            "[Tool Result for read_file]\nfinal contents",
+            Some("arya"),
+        );
+        msg_t3.id = 15;
+
+        let msgs = vec![
+            make_conv_msg("user", "fix /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2, msg_a3, msg_t3,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Both edit pairs dropped; read kept
+        let edit_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.contains("edit_file"))
+            })
+            .collect();
+        assert_eq!(edit_results.len(), 0, "Both edit pairs should be dropped");
+
+        let read_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.contains("read_file"))
+            })
+            .collect();
+        assert_eq!(read_results.len(), 1, "Read should be kept");
+        assert!(read_results[0]
+            .content
+            .as_ref()
+            .unwrap()
+            .contains("final contents"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_edit_file_kept_when_no_later_read() {
+        // edit → edit → no read → both edits kept
+        let edit_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "old_str": "a", "new_str": "b"}),
+        }])
+        .unwrap();
+        let edit_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "old_str": "b", "new_str": "c"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Edit 1.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(edit_tc1);
+        let mut msg_t1 =
+            make_tool_msg("[Tool Result for edit_file]\ndiff1", Some("arya"));
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Edit 2.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(edit_tc2);
+        let mut msg_t2 =
+            make_tool_msg("[Tool Result for edit_file]\ndiff2", Some("arya"));
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "fix /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let edit_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.contains("edit_file"))
+            })
+            .collect();
+        assert_eq!(edit_results.len(), 2, "Both edits should be kept (no later read)");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_cargo_check() {
+        // Two cargo checks — first pair dropped, second kept.
+        let cargo_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "cargo check"}),
+        }])
+        .unwrap();
+        let cargo_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "cargo check"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Checking.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(cargo_tc1);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for shell]\nerror[E0308]: mismatched types",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Re-checking.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(cargo_tc2);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for shell]\nCompiling OK",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "fix it"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let shell_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for shell]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(shell_results.len(), 1, "First cargo check pair should be dropped");
+        assert!(shell_results[0].contains("Compiling OK"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_non_cargo_shell_kept() {
+        // Non-cargo shell commands should never be deduped.
+        let ls_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }])
+        .unwrap();
+        let ls_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Listing.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(ls_tc1);
+        let mut msg_t1 =
+            make_tool_msg("[Tool Result for shell]\nfile1.rs", Some("arya"));
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Listing again.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(ls_tc2);
+        let mut msg_t2 =
+            make_tool_msg("[Tool Result for shell]\nfile1.rs file2.rs", Some("arya"));
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "list files"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let shell_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for shell]"))
+            })
+            .collect();
+
+        assert_eq!(shell_results.len(), 2, "Non-cargo shell calls should not be deduped");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_read_range_superseded_by_full() {
+        // Range read → full read of same path → range pair dropped.
+        let range_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "start_line": 1, "end_line": 10}),
+        }])
+        .unwrap();
+        let full_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Range read.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(range_tc);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for read_file]\nlines 1-10",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Full read.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(full_tc);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for read_file]\nfull contents",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "read /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let read_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(read_results.len(), 1, "Range read should be dropped");
+        assert!(read_results[0].contains("full contents"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_write_supersedes_range_read() {
+        // Range read → write_file to same path → range pair dropped.
+        let range_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "start_line": 5}),
+        }])
+        .unwrap();
+        let write_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Range read.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(range_tc);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for read_file]\npartial contents",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Writing file.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(write_tc);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for write_file]\nWrote 1 lines to /a.rs",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "update /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let read_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .collect();
+        assert_eq!(read_results.len(), 0, "Range read should be dropped (superseded by write)");
+
+        let write_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for write_file]"))
+            })
+            .collect();
+        assert_eq!(write_results.len(), 1, "Write should be kept");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_write_supersedes_read() {
+        // write_file to path X supersedes earlier read_file of path X.
+        let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+        let write_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Reading.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(read_tc);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for read_file]\nold contents",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+
+        let mut msg_a2 = make_conv_msg("arya", "Writing.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(write_tc);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for write_file]\nWrote 1 lines",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+
+        let msgs = vec![
+            make_conv_msg("user", "update /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // The read_file_full dedup: write_file doesn't directly supersede a full read via the
+        // "keep only latest per path" rule (they're different tool types). But the read IS the
+        // only full read of /a.rs, so it's kept as the latest. That's correct — a read before
+        // a write is still useful context for the model to understand what was there.
+        // However, if there were TWO reads and then a write, the first read would be dropped.
+        let read_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .collect();
+        assert_eq!(read_results.len(), 1, "Single read before write is kept");
+
+        let write_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for write_file]"))
+            })
+            .collect();
+        assert_eq!(write_results.len(), 1, "Write should be kept");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_multi_tool_call_partial_keep() {
+        // Assistant message with 2 tool_calls: one read_file superseded, one shell (ls) kept.
+        // Entire assistant message should be kept because not ALL tool_calls are dropped.
+        let multi_tc = serde_json::to_string(&vec![
+            crate::llm::ToolCall {
+                id: "tc1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/a.rs"}),
+            },
+            crate::llm::ToolCall {
+                id: "tc2".into(),
+                name: "shell".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            },
+        ])
+        .unwrap();
+        let read_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc3".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Multi-tool.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(multi_tc);
+
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for read_file]\nold version",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+        let mut msg_t_shell = make_tool_msg(
+            "[Tool Result for shell]\nfile1.rs",
+            Some("arya"),
+        );
+        msg_t_shell.id = 12;
+
+        let mut msg_a2 = make_conv_msg("arya", "Re-reading.");
+        msg_a2.id = 13;
+        msg_a2.tool_calls = Some(read_tc2);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for read_file]\nnew version",
+            Some("arya"),
+        );
+        msg_t2.id = 14;
+
+        let msgs = vec![
+            make_conv_msg("user", "check /a.rs"),
+            msg_a1, msg_t1, msg_t_shell, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // The multi-tool assistant message (id=10) should be kept (not all tool_calls dropped)
+        let assistant_msgs: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(
+            assistant_msgs.contains(&"Multi-tool."),
+            "Multi-tool assistant message should be kept"
+        );
+
+        // The old read_file tool result (id=11) IS dropped
+        let read_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+        assert_eq!(read_results.len(), 1, "Only latest read kept");
+        assert!(read_results[0].contains("new version"));
+
+        // The shell result (id=12) is kept
+        let shell_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for shell]"))
+            })
+            .collect();
+        assert_eq!(shell_results.len(), 1, "Shell result should be kept");
     }
 
     // Tests for expand_inject_directives
@@ -5517,5 +6504,114 @@ api_key = "sk-test"
         // No overflow guard — append mode returns all 17 messages from cursor
         let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
         assert_eq!(msgs.len(), 17); // 1 (old response) + 16 new
+    }
+
+    #[test]
+    fn test_tool_call_id_round_trip() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+
+        let conv = store.create_conversation(Some("tcid-test"), &["dash"]).unwrap();
+
+        // Store a native tool result with tool_call_id
+        let id = store
+            .add_native_tool_result(&conv, "call_abc123", "[Tool Result for read_file]\ncontents here", "dash")
+            .unwrap();
+        assert!(id > 0);
+
+        // Read it back
+        let msgs = store.get_messages(&conv, None).unwrap();
+        let tool_msg = msgs.iter().find(|m| m.from_agent == "tool").unwrap();
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_abc123"));
+        assert_eq!(tool_msg.triggered_by.as_deref(), Some("dash"));
+    }
+
+    #[test]
+    fn test_tool_call_id_null_backward_compat() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = ConversationStore::open(&db_path).unwrap();
+
+        let conv = store.create_conversation(Some("tcid-compat"), &["dash"]).unwrap();
+
+        // Store a legacy tool result (no tool_call_id)
+        store.add_tool_result(&conv, "[Tool Result for shell]\nok", "dash").unwrap();
+
+        // Read it back — tool_call_id should be None
+        let msgs = store.get_messages(&conv, None).unwrap();
+        let tool_msg = msgs.iter().find(|m| m.from_agent == "tool").unwrap();
+        assert!(tool_msg.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn test_format_conversation_history_native_tool_result() {
+        // Native tool result (with tool_call_id) should become role "tool"
+        let mut msg = make_tool_msg("[Tool Result for read_file]\nfile contents", Some("dash"));
+        msg.tool_call_id = Some("call_xyz".to_string());
+
+        let msgs = vec![
+            {
+                let mut m = make_conv_msg("dash", "reading file");
+                m.id = 1;
+                m.tool_calls = Some(
+                    serde_json::to_string(&vec![crate::llm::ToolCall {
+                        id: "call_xyz".to_string(),
+                        name: "read_file".to_string(),
+                        arguments: serde_json::json!({"path": "test.rs"}),
+                    }])
+                    .unwrap(),
+                );
+                m
+            },
+            {
+                let mut m = msg;
+                m.id = 2;
+                m
+            },
+            {
+                let mut m = make_conv_msg("user", "thanks");
+                m.id = 3;
+                m
+            },
+        ];
+
+        let (history, _final_content) = format_conversation_history(&msgs, "dash");
+
+        // Should have: assistant (with tool_calls), tool (role="tool" with tool_call_id)
+        assert!(history.len() >= 2);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[1].role, "tool");
+        assert_eq!(history[1].tool_call_id.as_deref(), Some("call_xyz"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_legacy_tool_result() {
+        // Legacy tool result (no tool_call_id) should become role "user"
+        let msgs = vec![
+            {
+                let mut m = make_conv_msg("dash", "calling tool");
+                m.id = 1;
+                m
+            },
+            {
+                let mut m = make_tool_msg("[Tool Result for shell]\nok", Some("dash"));
+                m.id = 2;
+                m
+            },
+            {
+                let mut m = make_conv_msg("user", "great");
+                m.id = 3;
+                m
+            },
+        ];
+
+        let (history, _final_content) = format_conversation_history(&msgs, "dash");
+
+        // Legacy tool result should use role "user"
+        assert!(history.len() >= 2);
+        assert_eq!(history[0].role, "assistant");
+        assert_eq!(history[1].role, "user");
+        assert!(history[1].tool_call_id.is_none());
     }
 }

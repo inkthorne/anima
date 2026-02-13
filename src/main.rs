@@ -1091,6 +1091,7 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
                     triggered_by: None,
                     pinned: false,
                     prompt_eval_ns: None,
+                    tool_call_id: None,
                 };
                 // Overwrite the prompt line with the formatted message
                 print!("\x1b[A\x1b[2K{}", format_message_display(&user_msg));
