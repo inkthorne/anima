@@ -126,7 +126,7 @@ use crate::tools::spawn_child::DaemonSpawnChildTool;
 use crate::tools::wait_for_child::DaemonWaitForChildrenTool;
 use crate::tools::{
     AddTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool, EditFileTool, HttpTool,
-    ListFilesTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
+    ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
 };
 
 /// Work items that are serialized through the agent worker.
@@ -336,11 +336,12 @@ fn format_conversation_history(
                         match tc.name.as_str() {
                             "read_file" => {
                                 if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
-                                    let has_range = tc.arguments.get("start_line")
-                                        .or_else(|| tc.arguments.get("end_line"))
-                                        .is_some();
-                                    let kind = if has_range { DedupKind::ReadRange } else { DedupKind::ReadFull };
-                                    tc_index.insert(tc.id.clone(), (kind, Some(path.to_string()), msg.id));
+                                    tc_index.insert(tc.id.clone(), (DedupKind::ReadFull, Some(path.to_string()), msg.id));
+                                }
+                            }
+                            "peek_file" => {
+                                if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                                    tc_index.insert(tc.id.clone(), (DedupKind::ReadRange, Some(path.to_string()), msg.id));
                                 }
                             }
                             "write_file" => {
@@ -904,6 +905,19 @@ async fn execute_tool_call(
     match tool_call.tool.as_str() {
         "read_file" => {
             let tool = ReadFileTool;
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
+                        Ok(contents.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "peek_file" => {
+            let tool = PeekFileTool;
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
                     if let Some(contents) = result.get("contents").and_then(|c| c.as_str()) {
@@ -2109,6 +2123,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(AddTool));
         agent.register_tool(Arc::new(EchoTool));
         agent.register_tool(Arc::new(ReadFileTool));
+        agent.register_tool(Arc::new(PeekFileTool));
         agent.register_tool(Arc::new(WriteFileTool));
         agent.register_tool(Arc::new(EditFileTool));
         agent.register_tool(Arc::new(ListFilesTool));

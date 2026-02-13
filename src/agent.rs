@@ -179,7 +179,7 @@ pub fn truncate(s: &str, max_len: usize) -> String {
 /// Summarize tool params by type for logging.
 pub fn summarize_tool_params(tool_name: &str, params: &Value) -> String {
     match tool_name {
-        "read_file" | "write_file" => {
+        "read_file" | "peek_file" | "write_file" => {
             params.get("path").and_then(|v| v.as_str()).unwrap_or("?").to_string()
         }
         "shell" | "safe_shell" => {
@@ -244,15 +244,14 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                 match tc.name.as_str() {
                     "read_file" => {
                         if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
-                            let has_range = tc.arguments.get("start_line").is_some()
-                                || tc.arguments.get("end_line").is_some();
-                            let kind = if has_range {
-                                DedupToolKind::ReadRange
-                            } else {
-                                DedupToolKind::ReadFull
-                            };
                             tool_info
-                                .insert(tc.id.clone(), (kind, Some(path.to_string())));
+                                .insert(tc.id.clone(), (DedupToolKind::ReadFull, Some(path.to_string())));
+                        }
+                    }
+                    "peek_file" => {
+                        if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                            tool_info
+                                .insert(tc.id.clone(), (DedupToolKind::ReadRange, Some(path.to_string())));
                         }
                     }
                     "write_file" => {

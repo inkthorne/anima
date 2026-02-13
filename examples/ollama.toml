@@ -11,7 +11,7 @@ model = "qwen3-coder:30b"
 base_url = "http://100.67.222.97:11434/v1"
 
 [tools]
-enabled = ["echo", "add", "shell", "read_file", "write_file"]
+enabled = ["echo", "add", "shell", "read_file", "peek_file", "write_file"]
 
 [memory]
 backend = "in_memory"

@@ -4,7 +4,7 @@ use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
 use anima::repl::Repl;
 use anima::socket_api::{Request, Response, SocketApi};
-use anima::tools::{AddTool, EchoTool, HttpTool, ReadFileTool, ShellTool, WriteFileTool};
+use anima::tools::{AddTool, EchoTool, HttpTool, PeekFileTool, ReadFileTool, ShellTool, WriteFileTool};
 use anima::{
     AnthropicClient, AutoMemoryConfig, ConversationStore, InMemoryStore, LLM, NotifyResult,
     OpenAIClient, ReflectionConfig, Runtime, SemanticMemoryStore, SqliteMemory, ThinkOptions,
@@ -585,7 +585,7 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
                 .map(|s| s.lines().next().unwrap_or(s))
                 .map(|s| truncate(s, 60))
         }
-        "read_file" | "write_file" | "edit_file" => {
+        "read_file" | "peek_file" | "write_file" | "edit_file" => {
             args.get("path").and_then(|v| v.as_str()).map(String::from)
         }
         "http" => {
@@ -2577,6 +2577,7 @@ async fn run_agent_task(
             "add" => agent.register_tool(Arc::new(AddTool)),
             "echo" => agent.register_tool(Arc::new(EchoTool)),
             "read_file" => agent.register_tool(Arc::new(ReadFileTool)),
+            "peek_file" => agent.register_tool(Arc::new(PeekFileTool)),
             "write_file" => agent.register_tool(Arc::new(WriteFileTool)),
             "http" => agent.register_tool(Arc::new(HttpTool::new())),
             "shell" => agent.register_tool(Arc::new(ShellTool::new())),
