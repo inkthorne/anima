@@ -29,7 +29,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file's contents"
+        "Read a file's entire contents. For partial/range reads, use peek_file instead"
     }
 
     fn schema(&self) -> Value {
