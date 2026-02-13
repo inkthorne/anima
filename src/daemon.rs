@@ -385,9 +385,7 @@ fn format_conversation_history(
                                         .get("command")
                                         .and_then(|v| v.as_str())
                                         .map(|cmd| {
-                                            let cmd = cmd.trim();
-                                            cmd.starts_with("cargo check")
-                                                || cmd.starts_with("cargo build")
+                                            crate::agent::is_cargo_check_command(cmd.trim())
                                         })
                                         .unwrap_or(false);
                                     if is_cargo {
@@ -5824,16 +5822,17 @@ api_key = "sk-test"
     #[test]
     fn test_format_conversation_history_dedup_cargo_check() {
         // Two cargo checks — first pair dropped, second kept.
+        // Use cd-prefixed commands to match real LLM output.
         let cargo_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "shell".into(),
-            arguments: serde_json::json!({"command": "cargo check"}),
+            arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
         }])
         .unwrap();
         let cargo_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "shell".into(),
-            arguments: serde_json::json!({"command": "cargo check"}),
+            arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
         }])
         .unwrap();
 
