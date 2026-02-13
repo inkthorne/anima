@@ -322,7 +322,7 @@ fn format_conversation_history(
 
         // Pass 1: scan assistant messages, build tool_call_id → (kind, path, assistant_msg_id)
         #[derive(Clone)]
-        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Cargo }
+        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Cargo, UnknownTool }
 
         let mut tc_index: HashMap<String, (DedupKind, Option<String>, i64)> = HashMap::new();
         let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
@@ -363,7 +363,9 @@ fn format_conversation_history(
                                     tc_index.insert(tc.id.clone(), (DedupKind::Cargo, None, msg.id));
                                 }
                             }
-                            _ => {}
+                            _ => {
+                                tc_index.insert(tc.id.clone(), (DedupKind::UnknownTool, None, msg.id));
+                            }
                         }
                     }
                 }
@@ -375,6 +377,7 @@ fn format_conversation_history(
         let mut read_file_range: Vec<(String, ToolPair)> = Vec::new();
         let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
         let mut cargo_check_pairs: Vec<ToolPair> = Vec::new();
+        let mut unknown_tool_pairs: Vec<ToolPair> = Vec::new();
 
         for msg in messages.iter() {
             if msg.from_agent != "tool" { continue; }
@@ -384,9 +387,15 @@ fn format_conversation_history(
             }
             if let Some(ref tcid) = msg.tool_call_id {
                 if let Some((kind, path, asst_id)) = tc_index.get(tcid) {
-                    // Skip error results — they're small and useful to keep, but their
-                    // pairing no longer shifts other results (the whole point of ID matching)
-                    if msg.content.starts_with("[Tool Error") { continue; }
+                    // Error results: unknown-tool errors are collected for dedup;
+                    // all other errors are skipped (small and useful to keep).
+                    if msg.content.starts_with("[Tool Error") {
+                        if matches!(kind, DedupKind::UnknownTool) && msg.content.contains("Unknown tool:") {
+                            let pair = ToolPair { assistant_msg_id: *asst_id, tool_result_msg_id: msg.id };
+                            unknown_tool_pairs.push(pair);
+                        }
+                        continue;
+                    }
                     let pair = ToolPair { assistant_msg_id: *asst_id, tool_result_msg_id: msg.id };
                     match kind {
                         DedupKind::ReadFull | DedupKind::Write => {
@@ -401,6 +410,7 @@ fn format_conversation_history(
                         DedupKind::Cargo => {
                             cargo_check_pairs.push(pair);
                         }
+                        DedupKind::UnknownTool => {} // handled above in the error check
                     }
                 }
             }
@@ -451,6 +461,11 @@ fn format_conversation_history(
 
         // cargo check/build/test/run: keep only the last pair
         for pair in cargo_check_pairs.iter().rev().skip(1) {
+            mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+        }
+
+        // Unknown tool errors: keep only the last pair
+        for pair in unknown_tool_pairs.iter().rev().skip(1) {
             mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
         }
 
@@ -5919,6 +5934,91 @@ api_key = "sk-test"
             .collect();
 
         assert_eq!(shell_results.len(), 2, "Non-cargo shell calls should not be deduped");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_unknown_tool() {
+        // Three calls to a hallucinated "run" tool — first two pairs dropped, last kept.
+        let run_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "run".into(),
+            arguments: serde_json::json!({"command": "cargo test"}),
+        }])
+        .unwrap();
+        let run_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "run".into(),
+            arguments: serde_json::json!({"command": "cargo build"}),
+        }])
+        .unwrap();
+        let run_tc3 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc3".into(),
+            name: "run".into(),
+            arguments: serde_json::json!({"command": "cargo check"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Running tests.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(run_tc1);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Error for run]\nUnknown tool: run",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Building.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(run_tc2);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Error for run]\nUnknown tool: run",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
+
+        let mut msg_a3 = make_conv_msg("arya", "Checking.");
+        msg_a3.id = 14;
+        msg_a3.tool_calls = Some(run_tc3);
+        let mut msg_t3 = make_tool_msg(
+            "[Tool Error for run]\nUnknown tool: run",
+            Some("arya"),
+        );
+        msg_t3.id = 15;
+        msg_t3.tool_call_id = Some("tc3".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "run the tests"),
+            msg_a1, msg_t1, msg_a2, msg_t2, msg_a3, msg_t3,
+            make_conv_msg("user", "use shell instead"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Only the last unknown-tool error pair should survive
+        let error_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.contains("Unknown tool: run"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(error_results.len(), 1, "Only last unknown-tool error should survive");
+
+        // The assistant messages for the first two calls should also be dropped
+        let assistant_msgs: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+
+        assert!(!assistant_msgs.contains(&"Running tests."), "First hallucinated call should be dropped");
+        assert!(!assistant_msgs.contains(&"Building."), "Second hallucinated call should be dropped");
+        assert!(assistant_msgs.contains(&"Checking."), "Last hallucinated call should be kept");
     }
 
     #[test]

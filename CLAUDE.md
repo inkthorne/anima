@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.10.16
+**Version:** v3.10.17
 **Tests:** 672 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -192,6 +192,10 @@ cargo test            # Run tests (660 tests)
 - **OpenAI** — `OpenAIClient`, env: `OPENAI_API_KEY`
 - **Anthropic** — `AnthropicClient`, env: `ANTHROPIC_API_KEY`
 - **Ollama** — `OllamaClient`, local, supports `num_ctx`, `thinking` mode
+
+## Reference
+
+- **Claude Code tools & system prompt** — https://gist.github.com/wong2/e0f34aac66caf890a332f7b6f9e2ba8f (use for comparing Anima's approach vs Claude Code)
 
 ## Documentation
 
