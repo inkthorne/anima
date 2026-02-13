@@ -369,9 +369,8 @@ fn format_conversation_history(
         }
 
         // Pass 2: scan tool result messages, pair via tool_call_id
-        let mut read_file_full: HashMap<String, Vec<ToolPair>> = HashMap::new();
+        let mut fresh_view_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut read_file_range: Vec<(String, ToolPair)> = Vec::new();
-        let mut write_file_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
         let mut cargo_check_pairs: Vec<ToolPair> = Vec::new();
 
@@ -388,14 +387,11 @@ fn format_conversation_history(
                     if msg.content.starts_with("[Tool Error") { continue; }
                     let pair = ToolPair { assistant_msg_id: *asst_id, tool_result_msg_id: msg.id };
                     match kind {
-                        DedupKind::ReadFull => {
-                            if let Some(p) = path { read_file_full.entry(p.clone()).or_default().push(pair); }
+                        DedupKind::ReadFull | DedupKind::Write => {
+                            if let Some(p) = path { fresh_view_pairs.entry(p.clone()).or_default().push(pair); }
                         }
                         DedupKind::ReadRange => {
                             if let Some(p) = path { read_file_range.push((p.clone(), pair)); }
-                        }
-                        DedupKind::Write => {
-                            if let Some(p) = path { write_file_pairs.entry(p.clone()).or_default().push(pair); }
                         }
                         DedupKind::EditFile => {
                             if let Some(p) = path { edit_file_pairs.push((p.clone(), pair)); }
@@ -417,29 +413,16 @@ fn format_conversation_history(
             *ad.entry(pair.assistant_msg_id).or_insert(0) += 1;
         };
 
-        // read_file_full: keep only the last pair per path
-        for (_path, pairs) in &read_file_full {
+        // Fresh views (full-read + write): keep only the last per path
+        for (_path, pairs) in &fresh_view_pairs {
             for pair in pairs.iter().rev().skip(1) {
                 mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
             }
         }
 
-        // write_file: keep only the last pair per path
-        for (_path, pairs) in &write_file_pairs {
-            for pair in pairs.iter().rev().skip(1) {
-                mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
-            }
-        }
-
-        // Build latest "fresh view" per path: last full-read or write
+        // Build latest fresh view per path
         let mut latest_fresh_view: HashMap<&str, i64> = HashMap::new();
-        for (path, pairs) in &read_file_full {
-            if let Some(last) = pairs.last() {
-                let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
-                if last.tool_result_msg_id > *entry { *entry = last.tool_result_msg_id; }
-            }
-        }
-        for (path, pairs) in &write_file_pairs {
+        for (path, pairs) in &fresh_view_pairs {
             if let Some(last) = pairs.last() {
                 let entry = latest_fresh_view.entry(path.as_str()).or_insert(0);
                 if last.tool_result_msg_id > *entry { *entry = last.tool_result_msg_id; }
@@ -6017,6 +6000,7 @@ api_key = "sk-test"
     #[test]
     fn test_format_conversation_history_dedup_write_supersedes_read() {
         // write_file to path X supersedes earlier read_file of path X.
+        // Both are "fresh views" — the write is newer, so the read is dropped.
         let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "read_file".into(),
@@ -6058,11 +6042,9 @@ api_key = "sk-test"
 
         let (history, _) = format_conversation_history(&msgs, "arya");
 
-        // The read_file_full dedup: write_file doesn't directly supersede a full read via the
-        // "keep only latest per path" rule (they're different tool types). But the read IS the
-        // only full read of /a.rs, so it's kept as the latest. That's correct — a read before
-        // a write is still useful context for the model to understand what was there.
-        // However, if there were TWO reads and then a write, the first read would be dropped.
+        // Unified fresh-view dedup: read and write both provide a full view of /a.rs.
+        // The write is newer, so the earlier read is superseded and dropped.
+        // The assistant message for the read (id=10, single tool_call) is also dropped.
         let read_results: Vec<_> = history
             .iter()
             .filter(|m| {
@@ -6071,7 +6053,7 @@ api_key = "sk-test"
                     .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
             })
             .collect();
-        assert_eq!(read_results.len(), 1, "Single read before write is kept");
+        assert_eq!(read_results.len(), 0, "Read before write is superseded");
 
         let write_results: Vec<_> = history
             .iter()
@@ -6082,6 +6064,91 @@ api_key = "sk-test"
             })
             .collect();
         assert_eq!(write_results.len(), 1, "Write should be kept");
+
+        // Assistant message for the read (id=10) should also be dropped
+        let asst_contents: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(!asst_contents.contains(&"Reading."), "Read's assistant msg should be dropped");
+        assert!(asst_contents.contains(&"Writing."), "Write's assistant msg should be kept");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_read_supersedes_write() {
+        // read_file of path X supersedes earlier write_file of path X.
+        // Both are "fresh views" — the read is newer, so the write is dropped.
+        let write_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "write_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+        }])
+        .unwrap();
+        let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Writing.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(write_tc);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for write_file]\nWrote 1 lines",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Reading.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(read_tc);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for read_file]\nnew contents",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "check /a.rs"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Write is superseded by later read — both are fresh views, read is newer
+        let write_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for write_file]"))
+            })
+            .collect();
+        assert_eq!(write_results.len(), 0, "Write before read is superseded");
+
+        let read_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for read_file]"))
+            })
+            .collect();
+        assert_eq!(read_results.len(), 1, "Read should be kept");
+
+        // Assistant message for the write (id=10) should also be dropped
+        let asst_contents: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(!asst_contents.contains(&"Writing."), "Write's assistant msg should be dropped");
+        assert!(asst_contents.contains(&"Reading."), "Read's assistant msg should be kept");
     }
 
     #[test]
