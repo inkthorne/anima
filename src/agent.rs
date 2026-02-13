@@ -208,7 +208,7 @@ enum DedupToolKind {
     ReadRange,
     Write,
     EditFile,
-    CargoCheck,
+    Shell,
 }
 
 /// Replace older tool results with stubs when superseded by later results.
@@ -217,18 +217,9 @@ enum DedupToolKind {
 /// Rules:
 /// - read_file (full): keep only the last result per path
 /// - read_file (range): drop if a later full-read or write exists for same path
-/// Check if a shell command contains cargo check/build/test/run (for dedup).
-/// Uses `contains()` so timeout prefixes, cd prefixes, etc. all match naturally.
-pub(crate) fn is_cargo_dedup_command(cmd: &str) -> bool {
-    cmd.contains("cargo check")
-        || cmd.contains("cargo build")
-        || cmd.contains("cargo test")
-        || cmd.contains("cargo run")
-}
-
 /// - write_file: keep only the last result per path
 /// - edit_file: drop if a later full-read or write exists for same path
-/// - shell (cargo check/build/test only): keep only the last result globally
+/// - shell: identical commands keep only the last result
 fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
     use std::collections::{HashMap, HashSet};
 
@@ -267,13 +258,8 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                         }
                     }
                     "shell" | "safe_shell" => {
-                        let cmd = tc
-                            .arguments
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if is_cargo_dedup_command(cmd) {
-                            tool_info.insert(tc.id.clone(), (DedupToolKind::CargoCheck, None));
+                        if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
+                            tool_info.insert(tc.id.clone(), (DedupToolKind::Shell, Some(cmd.trim().to_string())));
                         }
                     }
                     _ => {}
@@ -292,7 +278,7 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
     let mut write_results: HashMap<String, Vec<usize>> = HashMap::new();
     let mut edit_results: HashMap<String, Vec<usize>> = HashMap::new();
     let mut read_range: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut cargo_results: Vec<usize> = Vec::new();
+    let mut shell_results: HashMap<String, Vec<usize>> = HashMap::new();
     let mut result_idx_to_tc_id: HashMap<usize, String> = HashMap::new();
 
     for (i, msg) in messages.iter().enumerate() {
@@ -320,8 +306,8 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                             edit_results.entry(path.clone()).or_default().push(i);
                         }
                     }
-                    DedupToolKind::CargoCheck => {
-                        cargo_results.push(i);
+                    DedupToolKind::Shell => {
+                        if let Some(ref cmd) = info.1 { shell_results.entry(cmd.clone()).or_default().push(i); }
                     }
                 }
             }
@@ -355,12 +341,14 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
         }
     }
 
-    // cargo check/build/test: keep last globally, remove earlier
-    if cargo_results.len() > 1 {
-        let last = *cargo_results.last().unwrap();
-        for &idx in &cargo_results {
-            if idx != last {
-                to_remove.insert(idx);
+    // Identical shell commands: keep last per command
+    for (_cmd, indices) in &shell_results {
+        if indices.len() > 1 {
+            let last = *indices.last().unwrap();
+            for &idx in indices {
+                if idx != last {
+                    to_remove.insert(idx);
+                }
             }
         }
     }
@@ -3495,7 +3483,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_cargo_check() {
+    fn test_dedup_identical_shell_command() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
@@ -3543,11 +3531,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_non_cargo_shell_kept() {
+    fn test_dedup_different_shell_commands_kept() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
-            // Non-cargo shell command
+            // Shell command
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3564,7 +3552,7 @@ mod tests {
                 tool_call_id: Some("tc1".into()),
                 tool_calls: None,
             },
-            // Another non-cargo shell
+            // Different shell command
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3585,7 +3573,8 @@ mod tests {
 
         dedup_tool_results(&mut messages);
 
-        // Non-cargo shell commands are never deduped
+        // Different shell commands are kept independently
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[1].content.as_ref().unwrap(), "On branch main");
         assert_eq!(messages[3].content.as_ref().unwrap(), "diff --git a/file ...");
     }
@@ -3687,11 +3676,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_cargo_build_also_deduped() {
+    fn test_dedup_different_cargo_subcommands_kept() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
-            // cargo build (cd-prefixed)
+            // cargo check
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3699,16 +3688,16 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     id: "tc1".into(),
                     name: "shell".into(),
-                    arguments: json!({"command": "cd ~/dev/minilang && cargo build 2>&1"}),
+                    arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
                 }]),
             },
             ChatMessage {
                 role: "user".into(),
-                content: Some("error: build failed".into()),
+                content: Some("error[E0308]: mismatched types".into()),
                 tool_call_id: Some("tc1".into()),
                 tool_calls: None,
             },
-            // Later cargo check (cd-prefixed)
+            // cargo test (different command string)
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3716,12 +3705,12 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     id: "tc2".into(),
                     name: "shell".into(),
-                    arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+                    arguments: json!({"command": "cd ~/dev/minilang && cargo test 2>&1"}),
                 }]),
             },
             ChatMessage {
                 role: "user".into(),
-                content: Some("Finished `dev` profile".into()),
+                content: Some("test result: 5 passed".into()),
                 tool_call_id: Some("tc2".into()),
                 tool_calls: None,
             },
@@ -3729,42 +3718,14 @@ mod tests {
 
         dedup_tool_results(&mut messages);
 
-        // Build pair removed, 2 messages remain
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
+        // Different commands survive independently
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1].content.as_ref().unwrap(), "error[E0308]: mismatched types");
+        assert_eq!(messages[3].content.as_ref().unwrap(), "test result: 5 passed");
     }
 
     #[test]
-    fn test_is_cargo_dedup_command() {
-        // Plain commands
-        assert!(is_cargo_dedup_command("cargo check"));
-        assert!(is_cargo_dedup_command("cargo check 2>&1"));
-        assert!(is_cargo_dedup_command("cargo build --release"));
-        assert!(is_cargo_dedup_command("cargo test"));
-        assert!(is_cargo_dedup_command("cargo test -- --nocapture"));
-
-        // cargo run
-        assert!(is_cargo_dedup_command("cargo run -- args"));
-        assert!(is_cargo_dedup_command("cargo run --bin demo"));
-
-        // cd-prefixed (real LLM output)
-        assert!(is_cargo_dedup_command("cd ~/dev/minilang && cargo check 2>&1"));
-        assert!(is_cargo_dedup_command("cd /tmp && cargo build 2>&1"));
-        assert!(is_cargo_dedup_command("cd ~/dev && cargo test 2>&1"));
-
-        // timeout-prefixed (real LLM output)
-        assert!(is_cargo_dedup_command("timeout 10 cargo test test_something"));
-        assert!(is_cargo_dedup_command("timeout 5 cargo run -- examples/demo.mini"));
-        assert!(is_cargo_dedup_command("cd ~/dev && timeout 10 cargo test 2>&1"));
-
-        // Non-cargo commands
-        assert!(!is_cargo_dedup_command("git status"));
-        assert!(!is_cargo_dedup_command("ls -la"));
-        assert!(!is_cargo_dedup_command("cd ~/dev && ls"));
-    }
-
-    #[test]
-    fn test_dedup_plain_cargo_check() {
+    fn test_dedup_identical_shell_plain() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
@@ -3807,54 +3768,6 @@ mod tests {
         dedup_tool_results(&mut messages);
 
         // First pair removed, 2 messages remain
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
-    }
-
-    #[test]
-    fn test_dedup_cargo_test_also_deduped() {
-        use crate::llm::{ChatMessage, ToolCall};
-
-        let mut messages = vec![
-            // cargo test
-            ChatMessage {
-                role: "assistant".into(),
-                content: None,
-                tool_call_id: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "tc1".into(),
-                    name: "shell".into(),
-                    arguments: json!({"command": "cd ~/dev/proj && cargo test 2>&1"}),
-                }]),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: Some("test result: 5 passed".into()),
-                tool_call_id: Some("tc1".into()),
-                tool_calls: None,
-            },
-            // Later cargo check
-            ChatMessage {
-                role: "assistant".into(),
-                content: None,
-                tool_call_id: None,
-                tool_calls: Some(vec![ToolCall {
-                    id: "tc2".into(),
-                    name: "shell".into(),
-                    arguments: json!({"command": "cd ~/dev/proj && cargo check 2>&1"}),
-                }]),
-            },
-            ChatMessage {
-                role: "user".into(),
-                content: Some("Finished `dev` profile".into()),
-                tool_call_id: Some("tc2".into()),
-                tool_calls: None,
-            },
-        ];
-
-        dedup_tool_results(&mut messages);
-
-        // cargo test pair removed, 2 messages remain
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
     }

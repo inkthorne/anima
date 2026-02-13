@@ -322,7 +322,7 @@ fn format_conversation_history(
 
         // Pass 1: scan assistant messages, build tool_call_id → (kind, path, assistant_msg_id)
         #[derive(Clone)]
-        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Cargo, UnknownTool }
+        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Shell, UnknownTool }
 
         let mut tc_index: HashMap<String, (DedupKind, Option<String>, i64)> = HashMap::new();
         let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
@@ -355,12 +355,8 @@ fn format_conversation_history(
                                 }
                             }
                             "shell" | "safe_shell" => {
-                                let is_cargo = tc.arguments.get("command")
-                                    .and_then(|v| v.as_str())
-                                    .map(|cmd| crate::agent::is_cargo_dedup_command(cmd.trim()))
-                                    .unwrap_or(false);
-                                if is_cargo {
-                                    tc_index.insert(tc.id.clone(), (DedupKind::Cargo, None, msg.id));
+                                if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
+                                    tc_index.insert(tc.id.clone(), (DedupKind::Shell, Some(cmd.trim().to_string()), msg.id));
                                 }
                             }
                             _ => {
@@ -376,7 +372,7 @@ fn format_conversation_history(
         let mut fresh_view_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut read_file_range: Vec<(String, ToolPair)> = Vec::new();
         let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
-        let mut cargo_check_pairs: Vec<ToolPair> = Vec::new();
+        let mut shell_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut unknown_tool_pairs: Vec<ToolPair> = Vec::new();
 
         for msg in messages.iter() {
@@ -407,8 +403,8 @@ fn format_conversation_history(
                         DedupKind::EditFile => {
                             if let Some(p) = path { edit_file_pairs.push((p.clone(), pair)); }
                         }
-                        DedupKind::Cargo => {
-                            cargo_check_pairs.push(pair);
+                        DedupKind::Shell => {
+                            if let Some(c) = path { shell_pairs.entry(c.clone()).or_default().push(pair); }
                         }
                         DedupKind::UnknownTool => {} // handled above in the error check
                     }
@@ -459,9 +455,11 @@ fn format_conversation_history(
             }
         }
 
-        // cargo check/build/test/run: keep only the last pair
-        for pair in cargo_check_pairs.iter().rev().skip(1) {
-            mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+        // Identical shell commands: keep only the last pair per command
+        for (_cmd, pairs) in &shell_pairs {
+            for pair in pairs.iter().rev().skip(1) {
+                mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
+            }
         }
 
         // Unknown tool errors: keep only the last pair
@@ -5826,9 +5824,8 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_format_conversation_history_dedup_cargo_check() {
-        // Two cargo checks — first pair dropped, second kept.
-        // Use cd-prefixed commands to match real LLM output.
+    fn test_format_conversation_history_dedup_identical_shell() {
+        // Two identical shell commands — first pair dropped, second kept.
         let cargo_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "shell".into(),
@@ -5885,8 +5882,8 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_format_conversation_history_dedup_non_cargo_shell_kept() {
-        // Non-cargo shell commands should never be deduped.
+    fn test_format_conversation_history_dedup_identical_non_cargo_shell() {
+        // Two identical non-cargo shell commands — first pair dropped, second kept.
         let ls_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "shell".into(),
@@ -5933,7 +5930,60 @@ api_key = "sk-test"
             })
             .collect();
 
-        assert_eq!(shell_results.len(), 2, "Non-cargo shell calls should not be deduped");
+        assert_eq!(shell_results.len(), 1, "Identical shell commands should be deduped to last");
+        assert!(shell_results[0].content.as_ref().unwrap().contains("file2.rs"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_different_shell_commands_kept() {
+        // Two different shell commands — both survive.
+        let ls_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }])
+        .unwrap();
+        let git_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "git status"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Listing.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(ls_tc);
+        let mut msg_t1 =
+            make_tool_msg("[Tool Result for shell]\nfile1.rs", Some("arya"));
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Checking status.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(git_tc);
+        let mut msg_t2 =
+            make_tool_msg("[Tool Result for shell]\nOn branch main", Some("arya"));
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "check things"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let shell_results: Vec<_> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for shell]"))
+            })
+            .collect();
+
+        assert_eq!(shell_results.len(), 2, "Different shell commands should both survive");
     }
 
     #[test]
