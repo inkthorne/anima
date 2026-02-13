@@ -196,56 +196,227 @@ pub fn summarize_tool_params(tool_name: &str, params: &Value) -> String {
 }
 
 
-/// Context fill threshold for mid-loop dump (80%)
-const CONTEXT_FILL_THRESHOLD: f64 = 0.80;
+/// Context fill threshold for mid-loop dump (90%)
+const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
 /// Target fill after hard trim — keep newest messages up to this fraction of num_ctx
 const CONTEXT_TRIM_TARGET: f64 = 0.30;
 
-/// Replace older read_file results with stubs when the same file was read again later.
-fn dedup_read_file_results(messages: &mut [ChatMessage]) {
+/// Tool kinds tracked for dedup.
+#[derive(Debug, Clone)]
+enum DedupToolKind {
+    ReadFull,
+    ReadRange,
+    Write,
+    EditFile,
+    CargoCheck,
+}
+
+/// Replace older tool results with stubs when superseded by later results.
+///
+/// Covers: read_file (full & range), write_file, edit_file, and cargo check/build shell commands.
+/// Rules:
+/// - read_file (full): keep only the last result per path
+/// - read_file (range): drop if a later full-read or write exists for same path
+/// - write_file: keep only the last result per path
+/// - edit_file: drop if a later full-read or write exists for same path
+/// - shell (cargo check/build only): keep only the last result globally
+fn dedup_tool_results(messages: &mut [ChatMessage]) {
     use std::collections::HashMap;
 
-    // Pass 1: map tool_call_id -> file_path for read_file calls
-    let mut read_paths: HashMap<String, String> = HashMap::new();
+    // Pass 1: scan assistant messages, build tool_call_id → (kind, path) map
+    let mut tool_info: HashMap<String, (DedupToolKind, Option<String>)> = HashMap::new();
     for msg in messages.iter() {
         if let Some(ref tcs) = msg.tool_calls {
             for tc in tcs {
-                if tc.name == "read_file" {
-                    if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
-                        read_paths.insert(tc.id.clone(), path.to_string());
+                match tc.name.as_str() {
+                    "read_file" => {
+                        if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                            let has_range = tc.arguments.get("start_line").is_some()
+                                || tc.arguments.get("end_line").is_some();
+                            let kind = if has_range {
+                                DedupToolKind::ReadRange
+                            } else {
+                                DedupToolKind::ReadFull
+                            };
+                            tool_info
+                                .insert(tc.id.clone(), (kind, Some(path.to_string())));
+                        }
+                    }
+                    "write_file" => {
+                        if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                            tool_info
+                                .insert(tc.id.clone(), (DedupToolKind::Write, Some(path.to_string())));
+                        }
+                    }
+                    "edit_file" => {
+                        if let Some(path) = tc.arguments.get("path").and_then(|v| v.as_str()) {
+                            tool_info
+                                .insert(tc.id.clone(), (DedupToolKind::EditFile, Some(path.to_string())));
+                        }
+                    }
+                    "shell" | "safe_shell" => {
+                        let cmd = tc
+                            .arguments
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if cmd.starts_with("cargo check") || cmd.starts_with("cargo build") {
+                            tool_info.insert(tc.id.clone(), (DedupToolKind::CargoCheck, None));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if tool_info.is_empty() {
+        return;
+    }
+
+    // Pass 2: scan tool result messages, collect per-path indices and cargo indices
+    // Each entry: (message_index, tool_call_id)
+    let mut read_full: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut write_results: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut edit_results: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut read_range: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut cargo_results: Vec<usize> = Vec::new();
+
+    // Also store kind+path per message index for stub generation
+    let mut msg_info: HashMap<usize, (DedupToolKind, Option<String>)> = HashMap::new();
+
+    for (i, msg) in messages.iter().enumerate() {
+        if let Some(ref tcid) = msg.tool_call_id {
+            if let Some(info) = tool_info.get(tcid) {
+                msg_info.insert(i, info.clone());
+                match info.0 {
+                    DedupToolKind::ReadFull => {
+                        if let Some(ref path) = info.1 {
+                            read_full.entry(path.clone()).or_default().push(i);
+                        }
+                    }
+                    DedupToolKind::ReadRange => {
+                        if let Some(ref path) = info.1 {
+                            read_range.entry(path.clone()).or_default().push(i);
+                        }
+                    }
+                    DedupToolKind::Write => {
+                        if let Some(ref path) = info.1 {
+                            write_results.entry(path.clone()).or_default().push(i);
+                        }
+                    }
+                    DedupToolKind::EditFile => {
+                        if let Some(ref path) = info.1 {
+                            edit_results.entry(path.clone()).or_default().push(i);
+                        }
+                    }
+                    DedupToolKind::CargoCheck => {
+                        cargo_results.push(i);
                     }
                 }
             }
         }
     }
 
-    if read_paths.is_empty() {
-        return;
-    }
+    // Pass 3: apply dedup rules, collect indices to stub
+    let mut to_stub: HashMap<usize, String> = HashMap::new();
 
-    // Pass 2: find tool results for read_file, track latest index per path
-    let mut latest_per_path: HashMap<String, usize> = HashMap::new();
-    let mut result_path: Vec<Option<String>> = vec![None; messages.len()];
-
-    for (i, msg) in messages.iter().enumerate() {
-        if let Some(ref tcid) = msg.tool_call_id {
-            if let Some(path) = read_paths.get(tcid) {
-                latest_per_path.insert(path.clone(), i);
-                result_path[i] = Some(path.clone());
+    // read_file (full): keep last per path, stub earlier
+    for (path, indices) in &read_full {
+        if indices.len() > 1 {
+            let last = *indices.last().unwrap();
+            for &idx in indices {
+                if idx != last {
+                    to_stub.insert(
+                        idx,
+                        format!("[Superseded read_file of '{}']", path),
+                    );
+                }
             }
         }
     }
 
-    // Pass 3: replace older reads with stubs
-    for i in 0..messages.len() {
-        if let Some(ref path) = result_path[i] {
-            if latest_per_path.get(path) != Some(&i) {
-                messages[i].content = Some(format!(
-                    "[Earlier read_file of '{}' — superseded by later read]",
-                    path
-                ));
+    // write_file: keep last per path, stub earlier
+    for (path, indices) in &write_results {
+        if indices.len() > 1 {
+            let last = *indices.last().unwrap();
+            for &idx in indices {
+                if idx != last {
+                    to_stub.insert(
+                        idx,
+                        format!("[Superseded write_file of '{}']", path),
+                    );
+                }
             }
         }
+    }
+
+    // cargo check/build: keep last globally, stub earlier
+    if cargo_results.len() > 1 {
+        let last = *cargo_results.last().unwrap();
+        for &idx in &cargo_results {
+            if idx != last {
+                to_stub.insert(idx, "[Superseded cargo check/build output]".to_string());
+            }
+        }
+    }
+
+    // Build latest "fresh view" per path: last full-read or write index
+    let mut latest_fresh: HashMap<String, usize> = HashMap::new();
+    for (path, indices) in &read_full {
+        let last = *indices.last().unwrap();
+        latest_fresh
+            .entry(path.clone())
+            .and_modify(|v| {
+                if last > *v {
+                    *v = last;
+                }
+            })
+            .or_insert(last);
+    }
+    for (path, indices) in &write_results {
+        let last = *indices.last().unwrap();
+        latest_fresh
+            .entry(path.clone())
+            .and_modify(|v| {
+                if last > *v {
+                    *v = last;
+                }
+            })
+            .or_insert(last);
+    }
+
+    // read_file (range): stub if a later fresh view exists for same path
+    for (path, indices) in &read_range {
+        if let Some(&fresh_idx) = latest_fresh.get(path) {
+            for &idx in indices {
+                if idx < fresh_idx {
+                    to_stub.insert(
+                        idx,
+                        format!("[Superseded read_file range of '{}']", path),
+                    );
+                }
+            }
+        }
+    }
+
+    // edit_file: stub if a later fresh view exists for same path
+    for (path, indices) in &edit_results {
+        if let Some(&fresh_idx) = latest_fresh.get(path) {
+            for &idx in indices {
+                if idx < fresh_idx {
+                    to_stub.insert(
+                        idx,
+                        format!("[Superseded edit_file of '{}']", path),
+                    );
+                }
+            }
+        }
+    }
+
+    // Apply stubs
+    for (idx, stub) in to_stub {
+        messages[idx].content = Some(stub);
     }
 }
 
@@ -1317,7 +1488,7 @@ impl Agent {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
                         // First resort: dedup stale read_file results
-                        dedup_read_file_results(&mut messages);
+                        dedup_tool_results(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -1556,7 +1727,7 @@ impl Agent {
                     let fill = (t_in + t_out) as f64 / ctx as f64;
                     if fill >= CONTEXT_FILL_THRESHOLD {
                         // First resort: dedup stale read_file results
-                        dedup_read_file_results(&mut messages);
+                        dedup_tool_results(&mut messages);
 
                         // Re-estimate fill after dedup (chars/4 as rough token proxy)
                         let est_tokens: usize = messages
@@ -2891,11 +3062,11 @@ mod tests {
     }
 
     // =========================================================================
-    // dedup_read_file_results tests
+    // dedup_tool_results tests
     // =========================================================================
 
     #[test]
-    fn test_dedup_read_file_results_replaces_older_reads() {
+    fn test_dedup_read_file_replaces_older_reads() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
@@ -2944,12 +3115,12 @@ mod tests {
             },
         ];
 
-        dedup_read_file_results(&mut messages);
+        dedup_tool_results(&mut messages);
 
         // System prompt untouched
         assert_eq!(messages[0].content.as_ref().unwrap(), "You are an agent.");
         // First read result replaced with stub
-        assert!(messages[2].content.as_ref().unwrap().contains("superseded"));
+        assert!(messages[2].content.as_ref().unwrap().contains("Superseded"));
         assert!(messages[2].content.as_ref().unwrap().contains("/a.rs"));
         // Second read result kept
         assert_eq!(
@@ -2959,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_read_file_results_different_paths_untouched() {
+    fn test_dedup_read_file_different_paths_untouched() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
@@ -2997,7 +3168,7 @@ mod tests {
             },
         ];
 
-        dedup_read_file_results(&mut messages);
+        dedup_tool_results(&mut messages);
 
         // Different paths — both kept
         assert_eq!(messages[1].content.as_ref().unwrap(), "contents of a");
@@ -3005,7 +3176,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_read_file_results_no_reads() {
+    fn test_dedup_no_tracked_tools() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
@@ -3028,10 +3199,387 @@ mod tests {
         ];
 
         let original_content = messages[1].content.clone();
-        dedup_read_file_results(&mut messages);
+        dedup_tool_results(&mut messages);
 
-        // No read_file calls — nothing changed
+        // No tracked tool calls — nothing changed
         assert_eq!(messages[1].content, original_content);
+    }
+
+    #[test]
+    fn test_dedup_write_file_results() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // First write_file to /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "/a.rs", "content": "old"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Wrote 10 lines (200 B) to '/a.rs'".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Second write_file to /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "/a.rs", "content": "new"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Wrote 15 lines (300 B) to '/a.rs'".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // First write stubbed
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded write_file"));
+        assert!(messages[1].content.as_ref().unwrap().contains("/a.rs"));
+        // Second write kept
+        assert!(messages[3].content.as_ref().unwrap().contains("Wrote 15 lines"));
+    }
+
+    #[test]
+    fn test_dedup_edit_file_superseded_by_read() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // edit_file on /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Replaced 'x' with 'y' in /a.rs\n--- context ---".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Later full read_file of /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("full file contents here".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Edit stubbed because later full read exists
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded edit_file"));
+        assert!(messages[1].content.as_ref().unwrap().contains("/a.rs"));
+        // Full read kept
+        assert_eq!(messages[3].content.as_ref().unwrap(), "full file contents here");
+    }
+
+    #[test]
+    fn test_dedup_edit_file_kept_when_no_later_read() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // edit_file on /a.rs — no later full read or write
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Replaced 'x' with 'y' in /a.rs".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Edit kept — no later fresh view
+        assert_eq!(
+            messages[1].content.as_ref().unwrap(),
+            "Replaced 'x' with 'y' in /a.rs"
+        );
+    }
+
+    #[test]
+    fn test_dedup_cargo_check() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // First cargo check
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo check 2>&1"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("error[E0308]: mismatched types\n  --> src/main.rs:10:5".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Second cargo check
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo check 2>&1"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Finished `dev` profile".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // First cargo check stubbed
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded cargo check"));
+        // Second cargo check kept
+        assert_eq!(messages[3].content.as_ref().unwrap(), "Finished `dev` profile");
+    }
+
+    #[test]
+    fn test_dedup_non_cargo_shell_kept() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // Non-cargo shell command
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "git status"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("On branch main".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Another non-cargo shell
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "git diff"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("diff --git a/file ...".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Non-cargo shell commands are never deduped
+        assert_eq!(messages[1].content.as_ref().unwrap(), "On branch main");
+        assert_eq!(messages[3].content.as_ref().unwrap(), "diff --git a/file ...");
+    }
+
+    #[test]
+    fn test_dedup_read_range_superseded_by_full_read() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // Range read of /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs", "start_line": 1, "end_line": 10}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("lines 1-10 of /a.rs".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Later full read of /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path": "/a.rs"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("full contents of /a.rs".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Range read stubbed because later full read exists
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded read_file range"));
+        // Full read kept
+        assert_eq!(messages[3].content.as_ref().unwrap(), "full contents of /a.rs");
+    }
+
+    #[test]
+    fn test_dedup_edit_file_superseded_by_write() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // edit_file on /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Replaced in /a.rs".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Later write_file to /a.rs
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "write_file".into(),
+                    arguments: json!({"path": "/a.rs", "content": "new content"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Wrote 5 lines (100 B) to '/a.rs'".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Edit stubbed because later write exists
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded edit_file"));
+        // Write kept
+        assert!(messages[3].content.as_ref().unwrap().contains("Wrote 5 lines"));
+    }
+
+    #[test]
+    fn test_dedup_cargo_build_also_deduped() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // cargo build
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo build 2>&1"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("error: build failed".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // Later cargo check
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo check 2>&1"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Finished `dev` profile".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // cargo build stubbed (same category as cargo check)
+        assert!(messages[1].content.as_ref().unwrap().contains("Superseded cargo check"));
+        // Later cargo check kept
+        assert_eq!(messages[3].content.as_ref().unwrap(), "Finished `dev` profile");
     }
 
 }
