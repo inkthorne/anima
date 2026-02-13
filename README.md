@@ -21,21 +21,23 @@ Anima is an agent runtime built from first principles. It provides the core prim
 
 ## Status
 
-🎉 **v3.4.32** — Production-ready with:
+**v3.10.13** — Production-ready with:
 
 | Feature | Description |
 |---------|-------------|
 | **Daemon architecture** | Agents run as persistent background processes |
 | **Conversations** | Shared conversation spaces with pause/resume |
 | **Multi-agent** | @mention routing, `list_agents`, `send_message` tools |
+| **Agent hierarchy** | `spawn_child` / `wait_for_children` for task delegation |
 | **Semantic memory** | Embedding-based recall with `remember` tool |
 | **Hybrid tools** | Keyword recall + native or JSON-block execution |
+| **Streaming** | Token-level streaming to REPL via Unix socket |
 | **Heartbeat** | Periodic autonomous thinking |
 | **Claude Code** | Delegate coding tasks to Claude Code |
 | **Safe shell** | Command allowlist filtering |
 | **LLM providers** | OpenAI, Anthropic, Ollama |
 
-**469 tests passing.**
+**665 tests passing.**
 
 ## Quick Start
 
@@ -50,15 +52,15 @@ anima create myagent
 # Start it as a daemon
 anima start myagent
 
-# Send a message
-anima send myagent "What can you do?"
-
-# Or one-shot query (starts, queries, stops)
+# One-shot query (no daemon required)
 anima ask myagent "Hello!"
 
 # Interactive conversation
 anima chat new myconv
 # Then @mention your agent in the chat
+
+# Or use run (starts daemon if needed + REPL)
+anima run myagent
 
 # Stop it
 anima stop myagent
@@ -78,6 +80,7 @@ anima chat pause <conv>         # Pause (queues notifications)
 anima chat resume <conv>        # Resume processing
 anima chat clear <conv>         # Clear history
 anima chat delete <conv>        # Delete conversation
+anima chat cleanup              # Delete expired/empty conversations
 ```
 
 **TUI Commands** (inside `chat join`):
@@ -87,18 +90,20 @@ anima chat delete <conv>        # Delete conversation
 
 ```
 ~/.anima/
-├── conversations.db     # Conversation history
+├── conversations.db     # Conversation history (SQLite)
 ├── models/*.toml        # Shared model definitions
 ├── tools.toml           # Tool registry for keyword recall
 └── agents/
-    ├── always.md        # Global always prompt
+    ├── recall.md        # Global recall (shared across agents)
     └── myagent/
-        ├── config.toml  # Agent config
-        ├── persona.md   # System prompt (who they are)
-        ├── always.md    # Agent-specific reminders
-        ├── heartbeat.md # Heartbeat prompt (optional)
-        ├── memory.db    # Semantic memory
-        └── last_turn.json # Debug: last LLM request
+        ├── config.toml  # Agent config (references model_file)
+        ├── system.md    # System prompt
+        ├── recall.md    # Agent-specific recall (injected each turn)
+        ├── memory.db    # Semantic memory (SQLite)
+        ├── daemon.pid   # PID (when running)
+        ├── agent.sock   # Unix socket (when running)
+        ├── agent.log    # Daemon log file
+        └── turns/       # Debug dumps of raw LLM request payloads
 ```
 
 ## CLI Reference
@@ -113,35 +118,44 @@ anima list                       # List available agents
 anima create <name>              # Scaffold new agent
 
 # Communication
-anima send <name> "msg"          # Send to running daemon
-anima ask <name> "msg"           # One-shot query
+anima ask <name> "msg"           # One-shot query (no daemon)
+anima run <name>                 # Run with REPL (starts daemon if needed)
 anima heartbeat <name>           # Trigger heartbeat
 
 # Conversations
 anima chat                       # List conversations
-anima chat new/join/send/view/pause/resume/clear/delete
+anima chat new/join/send/view/pause/resume/stop/clear/delete/cleanup
+
+# Memory management
+anima memory list <agent>        # List memories
+anima memory search <agent> "q"  # Semantic search
+anima memory add <agent> "text"  # Add memory
+anima memory delete <agent> <id> # Delete memory
+anima memory clear <agent>       # Clear all memories
 
 # Utilities
 anima system <name>              # Show assembled system prompt
-anima memory list <name>         # List agent memories
-anima memory search <name> "q"   # Search memories
+anima task <config> "task"       # One-shot with config file
 ```
 
 ## Tools
 
-Agents use tools via JSON blocks:
+Agents use tools via native function calling or JSON blocks:
 
 ```json
 {"tool": "read_file", "params": {"path": "/some/file.txt"}}
 ```
 
 **Built-in tools:**
-- `read_file`, `write_file` — File I/O
-- `safe_shell` — Run allowlisted shell commands
+- `read_file`, `write_file`, `edit_file`, `list_files` — File I/O
+- `shell`, `safe_shell` — Run shell commands (safe_shell uses allowlist)
 - `http` — Make HTTP requests
 - `list_agents` — Discover other agents
 - `send_message` — Message another agent
 - `remember` — Save to semantic memory
+- `search_conversation` — Search conversation history
+- `spawn_child` — Spawn a child agent for subtasks
+- `wait_for_children` — Wait for child agents to complete
 - `claude_code` — Delegate to Claude Code
 
 ## Multi-Agent
@@ -157,6 +171,13 @@ Agents discover and talk to each other:
 
 Or use @mentions in conversations — `@gendry` triggers a notification.
 
+Agents can also spawn child agents for subtasks:
+
+```json
+{"tool": "spawn_child", "params": {"agent": "gendry", "task": "Build the module"}}
+{"tool": "wait_for_children", "params": {}}
+```
+
 ## Heartbeat
 
 Agents can think proactively:
@@ -168,7 +189,7 @@ enabled = true
 interval = "15m"
 ```
 
-The agent wakes up, reads `heartbeat.md`, and can act autonomously.
+The agent wakes up, reads its context, and can act autonomously.
 
 ## Author
 
