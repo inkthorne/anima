@@ -320,6 +320,25 @@ fn format_conversation_history(
             tool_result_msg_id: i64,
         }
 
+        // Normalize a shell command for dedup: strip 2>&1 and trailing output filters
+        let normalize_shell_for_dedup = |cmd: &str| -> String {
+            let mut s = cmd.trim().replace(" 2>&1", "");
+            // Strip trailing pipe filter (tail/head/grep/wc/sort/tee)
+            // only if the filter segment has no further chaining (&&, ||, |)
+            if let Some(pos) = s.rfind(" | ") {
+                let after = s[pos + 3..].trim_start();
+                let filters = ["tail", "head", "grep", "wc", "sort", "tee"];
+                if filters.iter().any(|f| after.starts_with(f))
+                    && !after.contains(" | ")
+                    && !after.contains(" && ")
+                    && !after.contains(" || ")
+                {
+                    s.truncate(pos);
+                }
+            }
+            s.trim().to_string()
+        };
+
         // Pass 1: scan assistant messages, build tool_call_id → (kind, path, assistant_msg_id)
         #[derive(Clone)]
         enum DedupKind { ReadFull, ReadRange, Write, EditFile, Shell, UnknownTool }
@@ -356,7 +375,7 @@ fn format_conversation_history(
                             }
                             "shell" | "safe_shell" => {
                                 if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
-                                    tc_index.insert(tc.id.clone(), (DedupKind::Shell, Some(cmd.trim().to_string()), msg.id));
+                                    tc_index.insert(tc.id.clone(), (DedupKind::Shell, Some(normalize_shell_for_dedup(cmd)), msg.id));
                                 }
                             }
                             _ => {
@@ -5825,11 +5844,11 @@ api_key = "sk-test"
 
     #[test]
     fn test_format_conversation_history_dedup_identical_shell() {
-        // Two identical shell commands — first pair dropped, second kept.
+        // Two shell commands differing only by tail suffix — first pair dropped, second kept.
         let cargo_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc1".into(),
             name: "shell".into(),
-            arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+            arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1 | tail -5"}),
         }])
         .unwrap();
         let cargo_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
@@ -5984,6 +6003,64 @@ api_key = "sk-test"
             .collect();
 
         assert_eq!(shell_results.len(), 2, "Different shell commands should both survive");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_shell_normalization() {
+        // Two commands differing only by | head -N suffix — first pair dropped via normalization.
+        let tc1_json = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "./target/release/minilang examples/demo.mini | head -20"}),
+        }])
+        .unwrap();
+        let tc2_json = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "./target/release/minilang examples/demo.mini | head -50"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Running.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(tc1_json);
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for shell]\noutput truncated",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Running again.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(tc2_json);
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for shell]\nfull output here",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "run it"),
+            msg_a1, msg_t1, msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        let shell_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.starts_with("[Tool Result for shell]"))
+            })
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+
+        assert_eq!(shell_results.len(), 1, "Same base command with different | head should be deduped");
+        assert!(shell_results[0].contains("full output here"));
     }
 
     #[test]

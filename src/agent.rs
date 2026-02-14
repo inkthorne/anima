@@ -223,6 +223,25 @@ enum DedupToolKind {
 fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
     use std::collections::{HashMap, HashSet};
 
+    // Normalize a shell command for dedup: strip 2>&1 and trailing output filters
+    let normalize_shell_for_dedup = |cmd: &str| -> String {
+        let mut s = cmd.trim().replace(" 2>&1", "");
+        // Strip trailing pipe filter (tail/head/grep/wc/sort/tee)
+        // only if the filter segment has no further chaining (&&, ||, |)
+        if let Some(pos) = s.rfind(" | ") {
+            let after = s[pos + 3..].trim_start();
+            let filters = ["tail", "head", "grep", "wc", "sort", "tee"];
+            if filters.iter().any(|f| after.starts_with(f))
+                && !after.contains(" | ")
+                && !after.contains(" && ")
+                && !after.contains(" || ")
+            {
+                s.truncate(pos);
+            }
+        }
+        s.trim().to_string()
+    };
+
     // Pass 1: scan assistant messages, build tool_call_id → (kind, path) map
     // Also track each assistant message's index and its tool_call ids
     let mut tool_info: HashMap<String, (DedupToolKind, Option<String>)> = HashMap::new();
@@ -259,7 +278,7 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                     }
                     "shell" | "safe_shell" => {
                         if let Some(cmd) = tc.arguments.get("command").and_then(|v| v.as_str()) {
-                            tool_info.insert(tc.id.clone(), (DedupToolKind::Shell, Some(cmd.trim().to_string())));
+                            tool_info.insert(tc.id.clone(), (DedupToolKind::Shell, Some(normalize_shell_for_dedup(cmd))));
                         }
                     }
                     _ => {}
@@ -3483,11 +3502,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_identical_shell_command() {
+    fn test_dedup_shell_same_base_command() {
         use crate::llm::{ChatMessage, ToolCall};
 
         let mut messages = vec![
-            // First cargo check (cd-prefixed, matching real LLM output)
+            // First cargo check with tail filter
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3495,7 +3514,7 @@ mod tests {
                 tool_calls: Some(vec![ToolCall {
                     id: "tc1".into(),
                     name: "shell".into(),
-                    arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+                    arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1 | tail -5"}),
                 }]),
             },
             ChatMessage {
@@ -3504,7 +3523,7 @@ mod tests {
                 tool_call_id: Some("tc1".into()),
                 tool_calls: None,
             },
-            // Second cargo check (cd-prefixed)
+            // Second cargo check (no tail filter, same base command)
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
@@ -3525,7 +3544,7 @@ mod tests {
 
         dedup_tool_results(&mut messages);
 
-        // First pair removed, 2 messages remain
+        // First pair removed (same normalized base command), 2 messages remain
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
     }
@@ -3768,6 +3787,54 @@ mod tests {
         dedup_tool_results(&mut messages);
 
         // First pair removed, 2 messages remain
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
+    }
+
+    #[test]
+    fn test_dedup_shell_normalization() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            // cargo check with 2>&1 and tail -5
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo check 2>&1 | tail -5"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("error[E0308]: mismatched types".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            // cargo check with 2>&1 and tail -20 (same base, different filter)
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "shell".into(),
+                    arguments: json!({"command": "cargo check 2>&1 | tail -20"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Finished `dev` profile".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // Both normalize to "cargo check" — first pair dropped
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
     }
