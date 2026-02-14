@@ -595,13 +595,8 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "send_message" => {
             args.get("to").and_then(|v| v.as_str()).map(|to| format!("@{}", to))
         }
-        "spawn_child" => {
+        "task" => {
             args.get("agent").and_then(|v| v.as_str()).map(String::from)
-        }
-        "wait_for_children" => {
-            args.get("child_ids")
-                .and_then(|v| v.as_array())
-                .map(|arr| format!("{} children", arr.len()))
         }
         "claude_code" => {
             args.get("task").and_then(|v| v.as_str()).map(|s| truncate(s, 60))

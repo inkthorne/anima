@@ -937,19 +937,23 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Unpin all pinned tool result messages in a conversation whose content contains the given text.
-    /// Used to release spawn_child tool results after wait_for_children collects the result.
-    pub fn unpin_tool_results_for(
+    /// Get the first (oldest) pinned message in a conversation.
+    /// Used by the task relay system to find the origin metadata.
+    pub fn get_first_pinned_message(
         &self,
         conv_name: &str,
-        content_match: &str,
-    ) -> Result<usize, ConversationError> {
-        let pattern = format!("%{}%", content_match);
-        let rows = self.conn.execute(
-            "UPDATE messages SET pinned = 0 WHERE conv_name = ?1 AND pinned = 1 AND from_agent = 'tool' AND content LIKE ?2",
-            params![conv_name, pattern],
-        )?;
-        Ok(rows)
+    ) -> Result<Option<ConversationMessage>, ConversationError> {
+        let query = format!(
+            "SELECT {} FROM messages WHERE conv_name = ?1 AND pinned = 1 ORDER BY created_at ASC LIMIT 1",
+            MESSAGE_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let mut rows = stmt.query_map(params![conv_name], row_to_message)?;
+        match rows.next() {
+            Some(Ok(msg)) => Ok(Some(msg)),
+            Some(Err(e)) => Err(ConversationError::Database(e)),
+            None => Ok(None),
+        }
     }
 
     /// Get messages with pinned messages always included, regardless of the limit window.
@@ -2977,6 +2981,29 @@ mod tests {
 
         store.pin_message(&conv, id, false).unwrap();
         assert!(!store.get_messages(&conv, None).unwrap()[0].pinned);
+    }
+
+    #[test]
+    fn test_get_first_pinned_message() {
+        let store = test_store();
+        let conv = store.create_conversation(Some("first-pinned"), &["arya"]).unwrap();
+
+        // No pinned messages
+        assert!(store.get_first_pinned_message(&conv).unwrap().is_none());
+
+        // Pin a message
+        let id1 = store.add_message(&conv, "arya", "task one", &[]).unwrap();
+        store.pin_message(&conv, id1, true).unwrap();
+
+        let pinned = store.get_first_pinned_message(&conv).unwrap().unwrap();
+        assert_eq!(pinned.content, "task one");
+
+        // Pin a second — first should still be returned
+        let _id2 = store.add_message(&conv, "arya", "task two", &[]).unwrap();
+        store.pin_message(&conv, _id2, true).unwrap();
+
+        let pinned = store.get_first_pinned_message(&conv).unwrap().unwrap();
+        assert_eq!(pinned.content, "task one");
     }
 
     #[test]

@@ -3,78 +3,39 @@ use crate::tool::Tool;
 use async_trait::async_trait;
 use serde_json::Value;
 
-#[derive(Debug)]
-pub struct SpawnChildTool;
-
-#[async_trait]
-impl Tool for SpawnChildTool {
-    fn name(&self) -> &str {
-        "spawn_child"
-    }
-
-    fn description(&self) -> &str {
-        "Spawn a child agent to handle a subtask. Returns the child_id."
-    }
-
-    fn schema(&self) -> Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": "Name of the agent to delegate to"
-                },
-                "task": {
-                    "type": "string",
-                    "description": "The task for the child agent to complete"
-                }
-            },
-            "required": ["agent", "task"]
-        })
-    }
-
-    async fn execute(&self, input: Value) -> Result<Value, ToolError> {
-        // Note: actual spawning requires agent context, handled separately
-        let _agent = input
-            .get("agent")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("agent is required".to_string()))?;
-        let task = input
-            .get("task")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("task is required".to_string()))?;
-        Ok(serde_json::json!({"status": "spawn_requested", "task": task}))
-    }
-}
-
-/// Daemon-aware tool that spawns a child agent to handle a subtask.
-/// Creates a task conversation, posts the task, and notifies the child agent.
-pub struct DaemonSpawnChildTool {
+/// Daemon-aware tool that dispatches a task to an agent asynchronously.
+/// Creates a task conversation, posts the task with origin metadata, and notifies the child agent.
+/// The result is automatically relayed back to the originating conversation when the child finishes.
+pub struct DaemonTaskTool {
     agent_name: String,
+    conv_id: Option<String>,
 }
 
-impl DaemonSpawnChildTool {
-    pub fn new(agent_name: String) -> Self {
-        DaemonSpawnChildTool { agent_name }
+impl DaemonTaskTool {
+    pub fn new(agent_name: String, conv_id: Option<String>) -> Self {
+        DaemonTaskTool {
+            agent_name,
+            conv_id,
+        }
     }
 }
 
-impl std::fmt::Debug for DaemonSpawnChildTool {
+impl std::fmt::Debug for DaemonTaskTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonSpawnChildTool")
+        f.debug_struct("DaemonTaskTool")
             .field("agent_name", &self.agent_name)
             .finish()
     }
 }
 
 #[async_trait]
-impl Tool for DaemonSpawnChildTool {
+impl Tool for DaemonTaskTool {
     fn name(&self) -> &str {
-        "spawn_child"
+        "task"
     }
 
     fn description(&self) -> &str {
-        "Delegate a task to another agent. Starts the agent if needed, creates a task conversation, and sends the task. Returns a child_id to use with wait_for_children."
+        "Dispatch a task to an agent asynchronously. The agent works in a separate conversation and the result is automatically posted back here when complete. Returns immediately — do not wait for the result."
     }
 
     fn schema(&self) -> Value {
@@ -87,7 +48,7 @@ impl Tool for DaemonSpawnChildTool {
                 },
                 "task": {
                     "type": "string",
-                    "description": "The task for the child agent to complete"
+                    "description": "The task for the agent to complete"
                 }
             },
             "required": ["agent", "task"]
@@ -148,9 +109,16 @@ impl Tool for DaemonSpawnChildTool {
                 ToolError::ExecutionFailed(format!("Failed to create task conversation: {}", e))
             })?;
 
+        // Build task message with origin metadata prefix
+        let origin_conv = self.conv_id.as_deref().unwrap_or("unknown");
+        let task_content = format!(
+            "[task origin={} by={}]\n{}",
+            origin_conv, self.agent_name, task
+        );
+
         // Post task message and pin it so it stays in context
         let message_id = store
-            .add_message(&conv_name, &self.agent_name, task, &[agent])
+            .add_message(&conv_name, &self.agent_name, &task_content, &[agent])
             .map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to post task message: {}", e))
             })?;
@@ -195,11 +163,30 @@ impl Tool for DaemonSpawnChildTool {
         let _response = api.read_response().await.ok();
 
         Ok(serde_json::json!({
-            "status": "spawned",
-            "child_id": conv_name,
-            "agent": agent
+            "status": "dispatched",
+            "task_conv": conv_name,
+            "agent": agent,
+            "note": "Task dispatched. End your turn now — the result will be posted back to this conversation automatically."
         }))
     }
+}
+
+/// Parse task origin metadata from a pinned task message content.
+/// Expected format on the first line: `[task origin=<conv_id> by=<agent_name>]`
+/// Returns `(origin_conv_id, origin_agent_name)` if found.
+pub fn parse_task_origin(content: &str) -> Option<(String, String)> {
+    let first_line = content.lines().next()?;
+    // Match [task origin=<value> by=<value>]
+    let rest = first_line.strip_prefix("[task origin=")?;
+    let by_pos = rest.find(" by=")?;
+    let origin = &rest[..by_pos];
+    let after_by = &rest[by_pos + 4..]; // skip " by="
+    let end_bracket = after_by.find(']')?;
+    let agent = &after_by[..end_bracket];
+    if origin.is_empty() || agent.is_empty() {
+        return None;
+    }
+    Some((origin.to_string(), agent.to_string()))
 }
 
 #[cfg(test)]
@@ -207,44 +194,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[tokio::test]
-    async fn test_spawn_child_tool_name() {
-        let tool = SpawnChildTool;
-        assert_eq!(tool.name(), "spawn_child");
+    #[test]
+    fn test_parse_task_origin_valid() {
+        let content = "[task origin=chat-123 by=arya]\nRefactor the auth module";
+        let (origin, agent) = parse_task_origin(content).unwrap();
+        assert_eq!(origin, "chat-123");
+        assert_eq!(agent, "arya");
+    }
+
+    #[test]
+    fn test_parse_task_origin_no_body() {
+        let content = "[task origin=my-conv by=dash]";
+        let (origin, agent) = parse_task_origin(content).unwrap();
+        assert_eq!(origin, "my-conv");
+        assert_eq!(agent, "dash");
+    }
+
+    #[test]
+    fn test_parse_task_origin_complex_names() {
+        let content = "[task origin=task:arya:dash:abc1 by=arya]\nNested task";
+        let (origin, agent) = parse_task_origin(content).unwrap();
+        assert_eq!(origin, "task:arya:dash:abc1");
+        assert_eq!(agent, "arya");
+    }
+
+    #[test]
+    fn test_parse_task_origin_missing_prefix() {
+        assert!(parse_task_origin("Just some text").is_none());
+    }
+
+    #[test]
+    fn test_parse_task_origin_malformed() {
+        assert!(parse_task_origin("[task origin= by=]").is_none());
+        assert!(parse_task_origin("[task origin=x]").is_none());
+        assert!(parse_task_origin("").is_none());
     }
 
     #[tokio::test]
-    async fn test_spawn_child_schema() {
-        let tool = SpawnChildTool;
-        let schema = tool.schema();
-        assert_eq!(schema["type"], "object");
-        assert!(schema["properties"]["agent"].is_object());
-        assert!(schema["properties"]["task"].is_object());
+    async fn test_daemon_task_tool_name() {
+        let tool = DaemonTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
+        assert_eq!(tool.name(), "task");
     }
 
     #[tokio::test]
-    async fn test_spawn_child_missing_agent() {
-        let tool = SpawnChildTool;
-        let result = tool.execute(json!({"task": "do something"})).await;
-        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
-    }
-
-    #[tokio::test]
-    async fn test_spawn_child_missing_task() {
-        let tool = SpawnChildTool;
-        let result = tool.execute(json!({"agent": "test-agent"})).await;
-        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
-    }
-
-    #[tokio::test]
-    async fn test_daemon_spawn_child_tool_name() {
-        let tool = DaemonSpawnChildTool::new("parent".to_string());
-        assert_eq!(tool.name(), "spawn_child");
-    }
-
-    #[tokio::test]
-    async fn test_daemon_spawn_child_schema() {
-        let tool = DaemonSpawnChildTool::new("parent".to_string());
+    async fn test_daemon_task_schema() {
+        let tool = DaemonTaskTool::new("parent".to_string(), None);
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["agent"].is_object());
@@ -255,22 +249,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_daemon_spawn_child_missing_agent() {
-        let tool = DaemonSpawnChildTool::new("parent".to_string());
+    async fn test_daemon_task_missing_agent() {
+        let tool = DaemonTaskTool::new("parent".to_string(), None);
         let result = tool.execute(json!({"task": "do something"})).await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
 
     #[tokio::test]
-    async fn test_daemon_spawn_child_missing_task() {
-        let tool = DaemonSpawnChildTool::new("parent".to_string());
+    async fn test_daemon_task_missing_task() {
+        let tool = DaemonTaskTool::new("parent".to_string(), None);
         let result = tool.execute(json!({"agent": "test-agent"})).await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
 
     #[tokio::test]
-    async fn test_daemon_spawn_child_nonexistent_agent() {
-        let tool = DaemonSpawnChildTool::new("parent".to_string());
+    async fn test_daemon_task_nonexistent_agent() {
+        let tool = DaemonTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
         let result = tool
             .execute(json!({"agent": "nonexistent-xyz-999", "task": "hello"}))
             .await;

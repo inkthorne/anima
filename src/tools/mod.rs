@@ -14,8 +14,7 @@ pub mod safe_shell;
 pub mod search_conversation;
 pub mod send_message;
 pub mod shell;
-pub mod spawn_child;
-pub mod wait_for_child;
+pub mod task;
 pub mod write_file;
 
 /// Parse a JSON value as bool, with string fallback for Ollama models that send bools as strings.
@@ -43,6 +42,5 @@ pub use safe_shell::SafeShellTool;
 pub use search_conversation::DaemonSearchConversationTool;
 pub use send_message::{DaemonSendMessageTool, ListAgentsTool, SendMessageTool};
 pub use shell::ShellTool;
-pub use spawn_child::{DaemonSpawnChildTool, SpawnChildTool};
-pub use wait_for_child::{DaemonWaitForChildrenTool, WaitForChildrenTool};
+pub use task::{DaemonTaskTool, parse_task_origin};
 pub use write_file::WriteFileTool;

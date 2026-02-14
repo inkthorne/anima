@@ -122,8 +122,7 @@ use crate::tool_registry::{ToolDefinition, ToolRegistry};
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_process_running};
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
-use crate::tools::spawn_child::DaemonSpawnChildTool;
-use crate::tools::wait_for_child::DaemonWaitForChildrenTool;
+use crate::tools::task::DaemonTaskTool;
 use crate::tools::{
     AddTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool, EditFileTool, HttpTool,
     ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
@@ -912,16 +911,8 @@ fn spawn_tool_trace_persister(
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
             let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            match store.add_native_tool_result(&cname, &exec.call.id, &tool_result_msg, &agent_name) {
-                Ok(result_id) => {
-                    // Pin spawn_child tool results so parent retains child_ids in context
-                    if exec.call.name == "spawn_child" {
-                        let _ = store.pin_message(&cname, result_id, true);
-                    }
-                }
-                Err(e) => {
-                    logger.log(&format!("[trace] Failed to store tool result: {}", e));
-                }
+            if let Err(e) = store.add_native_tool_result(&cname, &exec.call.id, &tool_result_msg, &agent_name) {
+                logger.log(&format!("[trace] Failed to store tool result: {}", e));
             }
         }
     })
@@ -1196,7 +1187,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "spawn_child", "wait_for_children", "search_conversation"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "task", "search_conversation"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -1215,65 +1206,20 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, spawn_child, wait_for_children, search_conversation\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, task, search_conversation\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
             }
         }
-        "spawn_child" => {
-            let ctx = context.ok_or("spawn_child tool requires execution context")?;
-            let tool = DaemonSpawnChildTool::new(ctx.agent_name.clone());
+        "task" => {
+            let ctx = context.ok_or("task tool requires execution context")?;
+            let tool = DaemonTaskTool::new(ctx.agent_name.clone(), ctx.conv_id.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
-                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                    let child_id = result.get("child_id").and_then(|s| s.as_str()).unwrap_or("");
+                    let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
-                    Ok(format!("Task delegated to '{}'. child_id: {} (status: {}). Use wait_for_children with this child_id to get the result. Agent responses typically take 30-120s — use the default timeout.", agent, child_id, status))
-                }
-                Err(e) => Err(format!("Tool error: {}", e)),
-            }
-        }
-        "wait_for_children" => {
-            let ctx = context.ok_or("wait_for_children tool requires execution context")?;
-            let tool = DaemonWaitForChildrenTool::new(ctx.agent_name.clone());
-            match tool.execute(tool_call.params.clone()).await {
-                Ok(result) => {
-                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                    if status == "completed" || status == "partial" {
-                        let mut lines = Vec::new();
-                        if let Some(results) = result.get("results").and_then(|r| r.as_array()) {
-                            for r in results {
-                                let child_id = r.get("child_id").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                let child_status = r.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                if child_status == "completed" {
-                                    let from = r.get("from_agent").and_then(|s| s.as_str()).unwrap_or("unknown");
-                                    let response = r.get("result").and_then(|s| s.as_str()).unwrap_or("");
-                                    lines.push(format!("[{}] (from: {}) {}", child_id, from, response));
-                                } else {
-                                    let msg = r.get("message").and_then(|s| s.as_str()).unwrap_or("Not completed");
-                                    lines.push(format!("[{}] (status: {}) {}", child_id, child_status, msg));
-                                }
-                            }
-                        }
-                        // Unpin spawn_child tool results for completed children
-                        if let Some(conv_id) = &ctx.conv_id {
-                            if let Ok(store) = ConversationStore::init() {
-                                if let Some(results) = result.get("results").and_then(|r| r.as_array()) {
-                                    for r in results {
-                                        if r.get("status").and_then(|s| s.as_str()) == Some("completed") {
-                                            if let Some(cid) = r.get("child_id").and_then(|s| s.as_str()) {
-                                                let _ = store.unpin_tool_results_for(conv_id, cid);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(format!("Results ({}):\n{}", status, lines.join("\n\n")))
-                    } else {
-                        Err(format!("Unexpected status: {}", status))
-                    }
+                    Ok(format!("Task dispatched to '{}' ({}). Result will be posted here when complete.", agent, task_conv))
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
@@ -2167,8 +2113,7 @@ async fn create_agent_from_dir(
         // Register daemon-aware messaging tools
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
-        agent.register_tool(Arc::new(DaemonSpawnChildTool::new(agent_name.clone())));
-        agent.register_tool(Arc::new(DaemonWaitForChildrenTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonTaskTool::new(agent_name.clone(), None)));
         agent.register_tool(Arc::new(DaemonSearchConversationTool));
     }
 
@@ -2484,7 +2429,7 @@ async fn agent_worker(
 }
 
 /// Execute a batch of native tool calls, storing each result to the DB with tool_call_id.
-/// Returns a list of (tool_name, was_spawn_child) for post-processing.
+/// Returns a list of tool names executed.
 #[allow(clippy::too_many_arguments)]
 async fn execute_native_tool_calls(
     tool_calls: &[crate::llm::ToolCall],
@@ -2493,7 +2438,7 @@ async fn execute_native_tool_calls(
     conv_name: &str,
     agent_name: &str,
     logger: &Arc<AgentLogger>,
-) -> Vec<(String, bool)> {
+) -> Vec<String> {
     let store = match ConversationStore::init() {
         Ok(s) => s,
         Err(e) => {
@@ -2521,18 +2466,10 @@ async fn execute_native_tool_calls(
             }
         };
         // Store tool result with tool_call_id for native protocol round-trip
-        match store.add_native_tool_result(conv_name, &tc.id, &tool_result, agent_name) {
-            Ok(result_id) => {
-                // Pin spawn_child tool results so parent retains child_ids in context
-                if tc.name == "spawn_child" {
-                    let _ = store.pin_message(conv_name, result_id, true);
-                }
-            }
-            Err(e) => {
-                logger.log(&format!("[loop] Failed to store tool result: {}", e));
-            }
+        if let Err(e) = store.add_native_tool_result(conv_name, &tc.id, &tool_result, agent_name) {
+            logger.log(&format!("[loop] Failed to store tool result: {}", e));
         }
-        results.push((tc.name.clone(), tc.name == "spawn_child"));
+        results.push(tc.name.clone());
     }
     results
 }
@@ -2773,13 +2710,8 @@ async fn run_tool_loop(
                             conv_name, agent_name, logger,
                         ).await;
 
-                        // If spawn_child was in this batch, set the message for next iteration
-                        let had_spawn = results.iter().any(|(_, is_spawn)| *is_spawn);
-                        if had_spawn {
-                            current_message = "[System: You have pending child tasks. Call wait_for_children to collect results before responding.]".to_string();
-                        } else {
-                            current_message = String::new();
-                        }
+                        current_message = String::new();
+                        let _ = results; // consumed
                     } else {
                         // No tool calls — final response
                         return ToolLoopResult {
@@ -2867,9 +2799,7 @@ async fn run_tool_loop(
                     let (refreshed_history, refreshed_final) =
                         format_conversation_history(&msgs, agent_name);
                     conversation_history = refreshed_history;
-                    if !current_message.is_empty() {
-                        // Keep current_message (spawn_child nudge) if already set
-                    } else {
+                    if current_message.is_empty() {
                         current_message = refreshed_final;
                     }
                 }
@@ -3936,6 +3866,42 @@ async fn handle_notify(
                 }
             }
 
+            // Relay result to originating conversation if this is a task conversation
+            if conv_id.starts_with("task:") && cleaned_response != "[Paused]" {
+                if let Some((orig_conv, orig_agent)) = get_task_origin(&store, conv_id) {
+                    // Check originating conversation still exists
+                    match store.get_conversation(&orig_conv) {
+                        Ok(_) => {
+                            let relay = format!("[Task complete: {}]\n@{} {}", conv_id, orig_agent, cleaned_response);
+                            let _ = store.add_participant(&orig_conv, "anima");
+                            match store.add_message(&orig_conv, "anima", &relay, &[&orig_agent]) {
+                                Ok(relay_id) => {
+                                    logger.log(&format!(
+                                        "[notify] Relayed task result to '{}' (msg_id={})",
+                                        orig_conv, relay_id
+                                    ));
+                                    forward_notify_to_agent(
+                                        &orig_agent, &orig_conv, relay_id, 0, logger,
+                                    ).await;
+                                }
+                                Err(e) => {
+                                    logger.log(&format!(
+                                        "[notify] Failed to relay task result to '{}': {}",
+                                        orig_conv, e
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            logger.log(&format!(
+                                "[notify] Originating conversation '{}' no longer exists, skipping relay",
+                                orig_conv
+                            ));
+                        }
+                    }
+                }
+            }
+
             // Parse @mentions from our response and forward to other agents
             // Only forward if mentions enabled, not paused, and not at depth limit
             let should_forward = mentions_enabled
@@ -4001,6 +3967,14 @@ async fn handle_notify(
             }
         }
     }
+}
+
+/// Look up the task origin from the first pinned message in a task conversation.
+/// Returns `(origin_conv_id, origin_agent_name)` if the pinned message contains the
+/// `[task origin=... by=...]` header.
+fn get_task_origin(store: &ConversationStore, conv_name: &str) -> Option<(String, String)> {
+    let msg = store.get_first_pinned_message(conv_name).ok()??;
+    crate::tools::task::parse_task_origin(&msg.content)
 }
 
 /// Forward a Notify request to another agent daemon.
@@ -6975,5 +6949,71 @@ api_key = "sk-test"
         assert!(kept.len() <= 150);
         // Should be a whole number of 'é' chars (each 2 bytes)
         assert_eq!(kept.len() % 2, 0);
+    }
+
+    #[test]
+    fn test_get_task_origin_from_pinned_message() {
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:test-relay-origin-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["arya", "dash"]).unwrap();
+
+        // Post a task message with origin metadata and pin it
+        let msg_id = store.add_message(&conv, "arya", "[task origin=chat-123 by=arya]\nDo something", &["dash"]).unwrap();
+        store.pin_message(&conv, msg_id, true).unwrap();
+
+        let (origin, agent) = get_task_origin(&store, &conv).unwrap();
+        assert_eq!(origin, "chat-123");
+        assert_eq!(agent, "arya");
+
+        store.delete_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn test_get_task_origin_no_pinned_message() {
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:test-relay-no-pin-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["arya", "dash"]).unwrap();
+
+        // No pinned messages — should return None
+        assert!(get_task_origin(&store, &conv).is_none());
+
+        store.delete_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn test_relay_posts_to_originating_conv() {
+        let store = ConversationStore::init().unwrap();
+        let origin_conv = format!("test-relay-origin-conv-{}", std::process::id());
+        let task_conv = format!("task:arya:dash:{}", std::process::id());
+
+        store.create_conversation(Some(&origin_conv), &["arya"]).unwrap();
+        store.create_conversation(Some(&task_conv), &["arya", "dash"]).unwrap();
+
+        // Create and pin the task message
+        let msg_id = store.add_message(
+            &task_conv, "arya",
+            &format!("[task origin={} by=arya]\nRefactor auth", origin_conv),
+            &["dash"],
+        ).unwrap();
+        store.pin_message(&task_conv, msg_id, true).unwrap();
+
+        // Simulate relay: parse origin then post result to originating conversation
+        let (orig_conv, orig_agent) = get_task_origin(&store, &task_conv).unwrap();
+        assert_eq!(orig_conv, origin_conv);
+        assert_eq!(orig_agent, "arya");
+
+        let relay_msg = format!("[Task complete: {}]\n@{} Refactoring done.", task_conv, orig_agent);
+        let _ = store.add_participant(&orig_conv, "anima");
+        let relay_id = store.add_message(&orig_conv, "anima", &relay_msg, &["arya"]).unwrap();
+        assert!(relay_id > 0);
+
+        // Verify relay message appears in originating conversation
+        let msgs = store.get_messages(&origin_conv, None).unwrap();
+        let relay = msgs.iter().find(|m| m.content.contains("[Task complete:")).unwrap();
+        assert_eq!(relay.from_agent, "anima");
+        assert!(relay.content.contains("@arya Refactoring done."));
+
+        store.delete_conversation(&origin_conv).unwrap();
+        store.delete_conversation(&task_conv).unwrap();
     }
 }
