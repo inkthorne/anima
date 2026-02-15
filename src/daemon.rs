@@ -1432,9 +1432,12 @@ impl DaemonConfig {
 /// This gives agents self-awareness about their environment.
 fn build_runtime_context(agent: &str, model: &str, host: &str, tools_native: bool) -> String {
     let tools_mode = if tools_native { "native" } else { "json-block" };
+    let home = dirs::home_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
     format!(
-        "You are running inside Anima, a multi-agent runtime.\n\nRuntime: agent={} | model={} | host={} | tools={}",
-        agent, model, host, tools_mode
+        "You are running inside Anima, a multi-agent runtime.\n\nRuntime: agent={} | model={} | host={} | tools={} | home={}",
+        agent, model, host, tools_mode, home
     )
 }
 
@@ -3866,42 +3869,6 @@ async fn handle_notify(
                 }
             }
 
-            // Relay result to originating conversation if this is a task conversation
-            if conv_id.starts_with("task:") && cleaned_response != "[Paused]" {
-                if let Some((orig_conv, orig_agent)) = get_task_origin(&store, conv_id) {
-                    // Check originating conversation still exists
-                    match store.get_conversation(&orig_conv) {
-                        Ok(_) => {
-                            let relay = format!("[Task complete: {}]\n@{} {}", conv_id, orig_agent, cleaned_response);
-                            let _ = store.add_participant(&orig_conv, "anima");
-                            match store.add_message(&orig_conv, "anima", &relay, &[&orig_agent]) {
-                                Ok(relay_id) => {
-                                    logger.log(&format!(
-                                        "[notify] Relayed task result to '{}' (msg_id={})",
-                                        orig_conv, relay_id
-                                    ));
-                                    forward_notify_to_agent(
-                                        &orig_agent, &orig_conv, relay_id, 0, logger,
-                                    ).await;
-                                }
-                                Err(e) => {
-                                    logger.log(&format!(
-                                        "[notify] Failed to relay task result to '{}': {}",
-                                        orig_conv, e
-                                    ));
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            logger.log(&format!(
-                                "[notify] Originating conversation '{}' no longer exists, skipping relay",
-                                orig_conv
-                            ));
-                        }
-                    }
-                }
-            }
-
             // Parse @mentions from our response and forward to other agents
             // Only forward if mentions enabled, not paused, and not at depth limit
             let should_forward = mentions_enabled
@@ -3967,14 +3934,6 @@ async fn handle_notify(
             }
         }
     }
-}
-
-/// Look up the task origin from the first pinned message in a task conversation.
-/// Returns `(origin_conv_id, origin_agent_name)` if the pinned message contains the
-/// `[task origin=... by=...]` header.
-fn get_task_origin(store: &ConversationStore, conv_name: &str) -> Option<(String, String)> {
-    let msg = store.get_first_pinned_message(conv_name).ok()??;
-    crate::tools::task::parse_task_origin(&msg.content)
 }
 
 /// Forward a Notify request to another agent daemon.
@@ -6951,69 +6910,4 @@ api_key = "sk-test"
         assert_eq!(kept.len() % 2, 0);
     }
 
-    #[test]
-    fn test_get_task_origin_from_pinned_message() {
-        let store = ConversationStore::init().unwrap();
-        let conv = format!("task:test-relay-origin-{}", std::process::id());
-        store.create_conversation(Some(&conv), &["arya", "dash"]).unwrap();
-
-        // Post a task message with origin metadata and pin it
-        let msg_id = store.add_message(&conv, "arya", "[task origin=chat-123 by=arya]\nDo something", &["dash"]).unwrap();
-        store.pin_message(&conv, msg_id, true).unwrap();
-
-        let (origin, agent) = get_task_origin(&store, &conv).unwrap();
-        assert_eq!(origin, "chat-123");
-        assert_eq!(agent, "arya");
-
-        store.delete_conversation(&conv).unwrap();
-    }
-
-    #[test]
-    fn test_get_task_origin_no_pinned_message() {
-        let store = ConversationStore::init().unwrap();
-        let conv = format!("task:test-relay-no-pin-{}", std::process::id());
-        store.create_conversation(Some(&conv), &["arya", "dash"]).unwrap();
-
-        // No pinned messages — should return None
-        assert!(get_task_origin(&store, &conv).is_none());
-
-        store.delete_conversation(&conv).unwrap();
-    }
-
-    #[test]
-    fn test_relay_posts_to_originating_conv() {
-        let store = ConversationStore::init().unwrap();
-        let origin_conv = format!("test-relay-origin-conv-{}", std::process::id());
-        let task_conv = format!("task:arya:dash:{}", std::process::id());
-
-        store.create_conversation(Some(&origin_conv), &["arya"]).unwrap();
-        store.create_conversation(Some(&task_conv), &["arya", "dash"]).unwrap();
-
-        // Create and pin the task message
-        let msg_id = store.add_message(
-            &task_conv, "arya",
-            &format!("[task origin={} by=arya]\nRefactor auth", origin_conv),
-            &["dash"],
-        ).unwrap();
-        store.pin_message(&task_conv, msg_id, true).unwrap();
-
-        // Simulate relay: parse origin then post result to originating conversation
-        let (orig_conv, orig_agent) = get_task_origin(&store, &task_conv).unwrap();
-        assert_eq!(orig_conv, origin_conv);
-        assert_eq!(orig_agent, "arya");
-
-        let relay_msg = format!("[Task complete: {}]\n@{} Refactoring done.", task_conv, orig_agent);
-        let _ = store.add_participant(&orig_conv, "anima");
-        let relay_id = store.add_message(&orig_conv, "anima", &relay_msg, &["arya"]).unwrap();
-        assert!(relay_id > 0);
-
-        // Verify relay message appears in originating conversation
-        let msgs = store.get_messages(&origin_conv, None).unwrap();
-        let relay = msgs.iter().find(|m| m.content.contains("[Task complete:")).unwrap();
-        assert_eq!(relay.from_agent, "anima");
-        assert!(relay.content.contains("@arya Refactoring done."));
-
-        store.delete_conversation(&origin_conv).unwrap();
-        store.delete_conversation(&task_conv).unwrap();
-    }
 }

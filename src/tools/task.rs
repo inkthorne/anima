@@ -3,9 +3,9 @@ use crate::tool::Tool;
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// Daemon-aware tool that dispatches a task to an agent asynchronously.
-/// Creates a task conversation, posts the task with origin metadata, and notifies the child agent.
-/// The result is automatically relayed back to the originating conversation when the child finishes.
+/// Daemon-aware tool that dispatches a task to an agent and waits for the result.
+/// Creates a task conversation, posts the task with origin metadata, notifies the child agent,
+/// then polls until the child produces a final response (or timeout).
 pub struct DaemonTaskTool {
     agent_name: String,
     conv_id: Option<String>,
@@ -35,7 +35,7 @@ impl Tool for DaemonTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Dispatch a task to an agent asynchronously. The agent works in a separate conversation and the result is automatically posted back here when complete. Returns immediately — do not wait for the result."
+        "Dispatch a task to an agent and wait for the result. The agent works in a separate conversation; this tool blocks until the agent finishes, goes idle (120s inactivity), or hits the 30m hard max."
     }
 
     fn schema(&self) -> Value {
@@ -159,15 +159,85 @@ impl Tool for DaemonTaskTool {
             ToolError::ExecutionFailed(format!("Failed to notify agent '{}': {}", agent, e))
         })?;
 
-        // Read response (don't need to wait for processing, just acknowledgement)
+        // Read acknowledgement (dispatch confirmed)
         let _response = api.read_response().await.ok();
 
-        Ok(serde_json::json!({
-            "status": "dispatched",
-            "task_conv": conv_name,
-            "agent": agent,
-            "note": "Task dispatched. End your turn now — the result will be posted back to this conversation automatically."
-        }))
+        // Poll for result — wait until child agent produces a final response.
+        // Activity-based timeout: resets on every new message from the child.
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+        const HARD_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+
+        let start = tokio::time::Instant::now();
+        let mut last_activity = start;
+        let mut last_seen_id: i64 = message_id;
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            let now = tokio::time::Instant::now();
+
+            // Hard max safety net (30 min)
+            if now.duration_since(start) >= HARD_MAX {
+                return Ok(serde_json::json!({
+                    "status": "timeout",
+                    "task_conv": conv_name,
+                    "agent": agent,
+                    "message": "Hard maximum of 30m exceeded"
+                }));
+            }
+
+            // Inactivity timeout (120s since last new message)
+            if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
+                return Ok(serde_json::json!({
+                    "status": "timeout",
+                    "task_conv": conv_name,
+                    "agent": agent,
+                    "message": "No new messages for 120s"
+                }));
+            }
+
+            // Open a fresh store each poll to see latest writes
+            let poll_store = ConversationStore::init().map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to open store for polling: {}", e))
+            })?;
+
+            let messages = poll_store.get_messages(&conv_name, None).map_err(|e| {
+                ToolError::ExecutionFailed(format!("Failed to poll task conversation: {}", e))
+            })?;
+
+            // Track activity: any new message resets the inactivity timer
+            if let Some(max_id) = messages.iter().map(|m| m.id).max() {
+                if max_id > last_seen_id {
+                    last_seen_id = max_id;
+                    last_activity = now;
+                }
+            }
+
+            // Iterate in reverse — look for the latest final response
+            for msg in messages.iter().rev() {
+                // Skip tool results, recall, and our own messages
+                if msg.from_agent == "tool"
+                    || msg.from_agent == "recall"
+                    || msg.from_agent == self.agent_name
+                {
+                    continue;
+                }
+                // Must be an LLM response (has duration) with no pending tool calls
+                if msg.duration_ms.is_some() && msg.tool_calls.is_none() {
+                    return Ok(serde_json::json!({
+                        "status": "completed",
+                        "task_conv": conv_name,
+                        "from_agent": msg.from_agent,
+                        "result": msg.content,
+                    }));
+                }
+                // If we hit a message with tool_calls, the agent is still working — stop scanning
+                if msg.duration_ms.is_some() && msg.tool_calls.is_some() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -269,5 +339,107 @@ mod tests {
             .execute(json!({"agent": "nonexistent-xyz-999", "task": "hello"}))
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[test]
+    fn test_poll_detects_completed_response() {
+        use crate::conversation::ConversationStore;
+
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:poll-complete-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["parent", "child"]).unwrap();
+
+        // Post task message from parent
+        store.add_message(&conv, "parent", "[task origin=c1 by=parent]\nDo stuff", &["child"]).unwrap();
+
+        // Child responds with duration_ms (final LLM response, no tool_calls)
+        store.add_message_with_tool_calls(&conv, "child", "Task done!", &[], Some(1200), None).unwrap();
+
+        // Simulate poll: scan messages in reverse for completed response
+        let messages = store.get_messages(&conv, None).unwrap();
+        let found = messages.iter().rev().find(|msg| {
+            msg.from_agent != "parent"
+                && msg.from_agent != "tool"
+                && msg.from_agent != "recall"
+                && msg.duration_ms.is_some()
+                && msg.tool_calls.is_none()
+        });
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().content, "Task done!");
+        assert_eq!(found.unwrap().from_agent, "child");
+
+        store.delete_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn test_poll_skips_mid_loop_response() {
+        use crate::conversation::ConversationStore;
+
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:poll-midloop-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["parent", "child"]).unwrap();
+
+        store.add_message(&conv, "parent", "[task origin=c1 by=parent]\nDo stuff", &["child"]).unwrap();
+
+        // Child response with tool_calls — still working
+        store.add_message_with_tool_calls(
+            &conv, "child", "Let me read that file...",
+            &[], Some(800), Some(r#"[{"id":"tc1","function":{"name":"read_file"}}]"#),
+        ).unwrap();
+
+        // Tool result
+        store.add_native_tool_result(&conv, "tc1", "file contents here", "child").unwrap();
+
+        // No final response yet — should not find a completed message
+        let messages = store.get_messages(&conv, None).unwrap();
+        let found = messages.iter().rev().find(|msg| {
+            msg.from_agent != "parent"
+                && msg.from_agent != "tool"
+                && msg.from_agent != "recall"
+                && msg.duration_ms.is_some()
+                && msg.tool_calls.is_none()
+        });
+        assert!(found.is_none());
+
+        store.delete_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn test_poll_finds_final_after_tool_loop() {
+        use crate::conversation::ConversationStore;
+
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:poll-final-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["parent", "child"]).unwrap();
+
+        store.add_message(&conv, "parent", "[task origin=c1 by=parent]\nDo stuff", &["child"]).unwrap();
+
+        // Mid-loop response with tool calls
+        store.add_message_with_tool_calls(
+            &conv, "child", "Reading file...",
+            &[], Some(500), Some(r#"[{"id":"tc1","function":{"name":"read_file"}}]"#),
+        ).unwrap();
+
+        // Tool result
+        store.add_native_tool_result(&conv, "tc1", "contents", "child").unwrap();
+
+        // Final response — no tool_calls
+        store.add_message_with_tool_calls(
+            &conv, "child", "All done, here is the result.",
+            &[], Some(1500), None,
+        ).unwrap();
+
+        let messages = store.get_messages(&conv, None).unwrap();
+        let found = messages.iter().rev().find(|msg| {
+            msg.from_agent != "parent"
+                && msg.from_agent != "tool"
+                && msg.from_agent != "recall"
+                && msg.duration_ms.is_some()
+                && msg.tool_calls.is_none()
+        });
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().content, "All done, here is the result.");
+
+        store.delete_conversation(&conv).unwrap();
     }
 }
