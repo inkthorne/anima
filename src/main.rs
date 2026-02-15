@@ -527,19 +527,20 @@ fn format_message_header(msg: &anima::conversation::ConversationMessage) -> Stri
 /// Format a conversation message header and content for pretty display.
 fn format_message_display(msg: &anima::conversation::ConversationMessage) -> String {
     let header = format_message_header(msg);
+    let content = anima::strip_thinking_tags(&msg.content);
 
-    let display_content = if msg.content.is_empty() {
+    let display_content = if content.is_empty() {
         if let Some(names) = extract_tool_names(msg) {
             let tools = names.iter().map(|n| format!("🛠️ {}", n)).collect::<Vec<_>>().join("\n");
             format!("\x1b[90m{}\x1b[0m", tools)
         } else {
-            msg.content.clone()
+            content
         }
     } else if let Some(names) = extract_tool_names(msg) {
         let tools = names.iter().map(|n| format!("🛠️ {}", n)).collect::<Vec<_>>().join("\n");
-        format!("{}\n\x1b[90m{}\x1b[0m", msg.content, tools)
+        format!("{}\n\x1b[90m{}\x1b[0m", content, tools)
     } else {
-        msg.content.clone()
+        content
     };
 
     format!("{}\n{}\n\n", header, display_content)

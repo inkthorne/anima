@@ -543,7 +543,7 @@ fn format_conversation_history(
 
             history.push(ChatMessage {
                 role: "assistant".to_string(),
-                content: Some(msg.content.clone()),
+                content: Some(strip_thinking_tags(&msg.content)),
                 tool_call_id: None,
                 tool_calls,
             });
@@ -2481,6 +2481,8 @@ async fn execute_native_tool_calls(
 struct ToolLoopResult {
     /// Final response text (thinking stripped, memories extracted).
     response: String,
+    /// Full response for DB storage (with thinking tags, memories extracted).
+    db_response: String,
     /// Duration of the last LLM call in milliseconds.
     duration_ms: Option<u64>,
     /// Token usage from the last LLM call.
@@ -2531,8 +2533,10 @@ async fn run_tool_loop(
         Ok(s) => s,
         Err(e) => {
             logger.log(&format!("[loop] Failed to init store: {}", e));
+            let msg = format!("[Error: failed to init conversation store: {}]", e);
             return ToolLoopResult {
-                response: format!("[Error: failed to init conversation store: {}]", e),
+                response: msg.clone(),
+                db_response: msg,
                 duration_ms: None,
                 tokens_in: None,
                 tokens_out: None,
@@ -2554,8 +2558,10 @@ async fn run_tool_loop(
         if let Some(deadline) = response_deadline {
             if start_time.elapsed() >= deadline {
                 logger.log(&format!("[loop] Response time limit exceeded ({:?})", deadline));
+                let msg = format!("[Response terminated: exceeded time limit of {:?}]", deadline);
                 return ToolLoopResult {
-                    response: format!("[Response terminated: exceeded time limit of {:?}]", deadline),
+                    response: msg.clone(),
+                    db_response: msg,
                     duration_ms: last_duration_ms,
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
@@ -2567,8 +2573,10 @@ async fn run_tool_loop(
         // Check cancellation (pause)
         if let Some(ref flag) = cancel {
             if flag.load(Ordering::Relaxed) {
+                let msg = "[Paused]".to_string();
                 return ToolLoopResult {
-                    response: "[Paused]".to_string(),
+                    response: msg.clone(),
+                    db_response: msg,
                     duration_ms: last_duration_ms,
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
@@ -2636,7 +2644,8 @@ async fn run_tool_loop(
                     Err(timeout_msg) => {
                         let _ = drain_handle.await;
                         return ToolLoopResult {
-                            response: timeout_msg,
+                            response: timeout_msg.clone(),
+                            db_response: timeout_msg,
                             duration_ms: last_duration_ms,
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
@@ -2650,6 +2659,7 @@ async fn run_tool_loop(
                 logger.log("[loop] Shutdown during LLM call, aborting");
                 return ToolLoopResult {
                     response: String::new(),
+                    db_response: String::new(),
                     duration_ms: None,
                     tokens_in: None,
                     tokens_out: None,
@@ -2676,6 +2686,9 @@ async fn run_tool_loop(
                 let without_thinking = strip_thinking_tags(&think_result.response);
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
 
+                // Full response for DB: preserve thinking tags, strip REMEMBER tags
+                let (db_content, _) = extract_remember_tags(&think_result.response);
+
                 // Save memories
                 save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
@@ -2687,6 +2700,7 @@ async fn run_tool_loop(
                             logger.log("[loop] Conversation paused, skipping tool execution");
                             return ToolLoopResult {
                                 response: after_remember,
+                                db_response: db_content,
                                 duration_ms: last_duration_ms,
                                 tokens_in: last_tokens_in,
                                 tokens_out: last_tokens_out,
@@ -2696,10 +2710,10 @@ async fn run_tool_loop(
 
                         tool_call_count += tool_calls.len();
 
-                        // Store assistant message with tool_calls
+                        // Store assistant message with tool_calls (preserve thinking in DB)
                         let tool_calls_json = serde_json::to_string(tool_calls).ok();
                         if let Err(e) = store.add_message_with_tokens(
-                            conv_name, agent_name, &after_remember, &[],
+                            conv_name, agent_name, &db_content, &[],
                             think_result.duration_ms.map(|d| d as i64),
                             tool_calls_json.as_deref(),
                             iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
@@ -2719,6 +2733,7 @@ async fn run_tool_loop(
                         // No tool calls — final response
                         return ToolLoopResult {
                             response: after_remember,
+                            db_response: db_content,
                             duration_ms: last_duration_ms,
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
@@ -2735,6 +2750,7 @@ async fn run_tool_loop(
                             logger.log("[loop] Conversation paused, skipping tool execution");
                             return ToolLoopResult {
                                 response: after_remember,
+                                db_response: db_content,
                                 duration_ms: last_duration_ms,
                                 tokens_in: last_tokens_in,
                                 tokens_out: last_tokens_out,
@@ -2744,10 +2760,10 @@ async fn run_tool_loop(
 
                         tool_call_count += 1;
 
-                        // Store intermediate response (preserving tool call JSON block)
-                        if !after_remember.trim().is_empty() {
+                        // Store intermediate response (preserve thinking in DB)
+                        if !db_content.trim().is_empty() {
                             if let Err(e) = store.add_message_with_tokens(
-                                conv_name, agent_name, &after_remember, &[],
+                                conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), None,
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
                             ) {
@@ -2780,6 +2796,7 @@ async fn run_tool_loop(
                         // No tool call — final response
                         return ToolLoopResult {
                             response: cleaned_response,
+                            db_response: db_content,
                             duration_ms: last_duration_ms,
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
@@ -2814,8 +2831,10 @@ async fn run_tool_loop(
             }
             Err(crate::error::AgentError::Cancelled) => {
                 logger.log("[loop] Agent cancelled (conversation paused)");
+                let msg = "[Paused]".to_string();
                 return ToolLoopResult {
-                    response: "[Paused]".to_string(),
+                    response: msg.clone(),
+                    db_response: msg,
                     duration_ms: last_duration_ms,
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
@@ -2827,7 +2846,8 @@ async fn run_tool_loop(
                 let error_msg = format!("[Error: {}]", e);
                 let _ = store.add_message(conv_name, agent_name, &error_msg, &[]);
                 return ToolLoopResult {
-                    response: error_msg,
+                    response: error_msg.clone(),
+                    db_response: error_msg,
                     duration_ms: last_duration_ms,
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
@@ -2838,8 +2858,10 @@ async fn run_tool_loop(
     }
 
     logger.log(&format!("[loop] Max iterations reached: {}", max_iterations));
+    let msg = format!("[Max iterations reached: {}]", max_iterations);
     ToolLoopResult {
-        response: format!("[Max iterations reached: {}]", max_iterations),
+        response: msg.clone(),
+        db_response: msg,
         duration_ms: last_duration_ms,
         tokens_in: last_tokens_in,
         tokens_out: last_tokens_out,
@@ -2968,7 +2990,7 @@ async fn process_message_work(
 
     // With conversation: use unified tool loop (DB-backed context management)
     // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
-    let (final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = if let Some(cname) = conv_name {
+    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = if let Some(cname) = conv_name {
         let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
         let start_time = std::time::Instant::now();
         let loop_budget = max_iterations.unwrap_or(25);
@@ -3000,7 +3022,7 @@ async fn process_message_work(
         drop(log_tx);
         let _ = log_fwd_handle.await;
 
-        (loop_result.response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns)
     } else {
         // No conversation — use agent.rs tool loop directly (standalone mode)
         let (trace_tx, trace_rx) =
@@ -3029,7 +3051,7 @@ async fn process_message_work(
                     max_iterations,
                     num_ctx,
                 ).await;
-                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+                (result.response.clone(), result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
             } else {
                 let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns) = process_json_block_mode(
                     &final_user_content,
@@ -3045,7 +3067,7 @@ async fn process_message_work(
                     conversation_history,
                     max_iterations,
                 ).await;
-                (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
+                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
             }
         };
 
@@ -3086,11 +3108,11 @@ async fn process_message_work(
                         }
                     }
                 }
-                // Store the final response with token stats
+                // Store the final response with token stats (preserve thinking in DB)
                 match store.add_message_with_tokens(
                     cname,
                     agent_name,
-                    &final_response,
+                    &db_final_response,
                     &[],
                     duration_ms,
                     None, // tool_calls stored by run_tool_loop during iterations
@@ -3797,6 +3819,7 @@ async fn handle_notify(
     let _ = log_fwd_handle.await;
 
     let cleaned_response = loop_result.response;
+    let db_cleaned_response = loop_result.db_response;
     let duration_ms = loop_result.duration_ms.map(|d| d as i64);
     let tokens_in = loop_result.tokens_in.map(|t| t as i64);
     let tokens_out = loop_result.tokens_out.map(|t| t as i64);
@@ -3826,7 +3849,7 @@ async fn handle_notify(
     match store.add_message_with_tokens(
         conv_id,
         agent_name,
-        &cleaned_response,
+        &db_cleaned_response,
         &[],
         duration_ms,
         None, // tool_calls stored by run_tool_loop during iterations
@@ -4191,8 +4214,11 @@ async fn run_heartbeat(
     let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
     save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
-    // 7. Store response in <agent>-heartbeat conversation (just the response, not the prompt)
-    match store.add_message(&conv_name, agent_name, &cleaned_response, &[]) {
+    // Full response for DB: preserve thinking tags, strip REMEMBER tags
+    let (db_content, _) = extract_remember_tags(&result.response);
+
+    // 7. Store response in <agent>-heartbeat conversation (preserve thinking in DB)
+    match store.add_message(&conv_name, agent_name, &db_content, &[]) {
         Ok(msg_id) => {
             logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
             // Cursor is anchored at cold start; no update needed here
