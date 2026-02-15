@@ -95,6 +95,13 @@ impl Tool for EditFileTool {
             .and_then(super::json_to_bool)
             .unwrap_or(false);
 
+        // Reject no-op edits
+        if old_text == new_text {
+            return Err(ToolError::InvalidInput(
+                "old_text and new_text are identical — no edit needed.".to_string(),
+            ));
+        }
+
         let path = expand_tilde(path_str);
 
         let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
@@ -479,5 +486,19 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolError::ExecutionFailed(msg)) if msg.contains("Failed to read")));
+    }
+
+    #[tokio::test]
+    async fn test_noop_edit_rejected() {
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": "/tmp/whatever.txt",
+                "old_text": "same content",
+                "new_text": "same content"
+            }))
+            .await;
+
+        assert!(matches!(result, Err(ToolError::InvalidInput(ref msg)) if msg.contains("identical")));
     }
 }
