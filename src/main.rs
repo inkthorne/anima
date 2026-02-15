@@ -4,7 +4,7 @@ use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
 use anima::repl::Repl;
 use anima::socket_api::{Request, Response, SocketApi};
-use anima::tools::{AddTool, EchoTool, HttpTool, PeekFileTool, ReadFileTool, ShellTool, WriteFileTool};
+use anima::tools::{AddTool, CopyLinesTool, EchoTool, EditFileTool, HttpTool, ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool};
 use anima::{
     AnthropicClient, AutoMemoryConfig, ConversationStore, InMemoryStore, LLM, NotifyResult,
     OpenAIClient, ReflectionConfig, Runtime, SemanticMemoryStore, SqliteMemory, ThinkOptions,
@@ -588,6 +588,9 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         }
         "read_file" | "peek_file" | "write_file" | "edit_file" => {
             args.get("path").and_then(|v| v.as_str()).map(String::from)
+        }
+        "copy_lines" => {
+            args.get("source").and_then(|v| v.as_str()).map(String::from)
         }
         "http" => {
             let method = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
@@ -2577,6 +2580,10 @@ async fn run_agent_task(
             "write_file" => agent.register_tool(Arc::new(WriteFileTool)),
             "http" => agent.register_tool(Arc::new(HttpTool::new())),
             "shell" => agent.register_tool(Arc::new(ShellTool::new())),
+            "copy_lines" => agent.register_tool(Arc::new(CopyLinesTool)),
+            "edit_file" => agent.register_tool(Arc::new(EditFileTool)),
+            "list_files" => agent.register_tool(Arc::new(ListFilesTool)),
+            "safe_shell" => agent.register_tool(Arc::new(SafeShellTool::new())),
             unknown => eprintln!("Warning: Unknown tool '{}', skipping", unknown),
         }
     }

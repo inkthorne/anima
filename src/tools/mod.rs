@@ -2,6 +2,7 @@ use serde_json::Value;
 
 pub mod add;
 pub mod claude_code;
+pub mod copy_lines;
 pub mod echo;
 pub mod edit_file;
 pub mod http;
@@ -30,6 +31,7 @@ pub use add::AddTool;
 pub use claude_code::{
     ClaudeCodeTask, ClaudeCodeTool, TaskError, TaskStatus, TaskStore, is_process_running,
 };
+pub use copy_lines::CopyLinesTool;
 pub use echo::EchoTool;
 pub use edit_file::EditFileTool;
 pub use http::HttpTool;

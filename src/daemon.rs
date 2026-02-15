@@ -124,8 +124,9 @@ use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::task::DaemonTaskTool;
 use crate::tools::{
-    AddTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool, EditFileTool, HttpTool,
-    ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool,
+    AddTool, CopyLinesTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool,
+    EditFileTool, HttpTool, ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool,
+    WriteFileTool,
 };
 
 /// Work items that are serialized through the agent worker.
@@ -982,6 +983,19 @@ async fn execute_tool_call(
             let tool = ListFilesTool;
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => Ok(result.to_string()),
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "copy_lines" => {
+            let tool = CopyLinesTool;
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => {
+                    if let Some(msg) = result.get("message").and_then(|m| m.as_str()) {
+                        Ok(msg.to_string())
+                    } else {
+                        Ok(result.to_string())
+                    }
+                }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
@@ -2108,6 +2122,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(WriteFileTool));
         agent.register_tool(Arc::new(EditFileTool));
         agent.register_tool(Arc::new(ListFilesTool));
+        agent.register_tool(Arc::new(CopyLinesTool));
         agent.register_tool(Arc::new(HttpTool::new()));
         agent.register_tool(Arc::new(ShellTool::new()));
         agent.register_tool(Arc::new(SafeShellTool::new()));
