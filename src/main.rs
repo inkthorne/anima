@@ -632,6 +632,9 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "list_files" => {
             args.get("path").and_then(|v| v.as_str()).map(String::from)
         }
+        "notes" => {
+            args.get("content").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
+        }
         _ => None,
     };
 

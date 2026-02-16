@@ -209,6 +209,7 @@ enum DedupToolKind {
     Write,
     EditFile,
     Shell,
+    Notes,
 }
 
 /// Replace older tool results with stubs when superseded by later results.
@@ -281,6 +282,9 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                             tool_info.insert(tc.id.clone(), (DedupToolKind::Shell, Some(normalize_shell_for_dedup(cmd))));
                         }
                     }
+                    "notes" => {
+                        tool_info.insert(tc.id.clone(), (DedupToolKind::Notes, None));
+                    }
                     _ => {}
                 }
             }
@@ -298,6 +302,7 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
     let mut edit_results: HashMap<String, Vec<usize>> = HashMap::new();
     let mut read_range: HashMap<String, Vec<usize>> = HashMap::new();
     let mut shell_results: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut notes_results: Vec<usize> = Vec::new();
     let mut result_idx_to_tc_id: HashMap<usize, String> = HashMap::new();
 
     for (i, msg) in messages.iter().enumerate() {
@@ -327,6 +332,9 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                     }
                     DedupToolKind::Shell => {
                         if let Some(ref cmd) = info.1 { shell_results.entry(cmd.clone()).or_default().push(i); }
+                    }
+                    DedupToolKind::Notes => {
+                        notes_results.push(i);
                     }
                 }
             }
@@ -368,6 +376,16 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
                 if idx != last {
                     to_remove.insert(idx);
                 }
+            }
+        }
+    }
+
+    // Notes: keep only the last (each call replaces the scratchpad)
+    if notes_results.len() > 1 {
+        let last = *notes_results.last().unwrap();
+        for &idx in &notes_results {
+            if idx != last {
+                to_remove.insert(idx);
             }
         }
     }
@@ -3779,6 +3797,71 @@ mod tests {
         // First pair removed, 2 messages remain
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].content.as_ref().unwrap(), "Finished `dev` profile");
+    }
+
+    #[test]
+    fn test_dedup_notes_keeps_last() {
+        use crate::llm::{ChatMessage, ToolCall};
+
+        let mut messages = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc1".into(),
+                    name: "notes".into(),
+                    arguments: json!({"content": "first notes"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Notes updated.".into()),
+                tool_call_id: Some("tc1".into()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc2".into(),
+                    name: "notes".into(),
+                    arguments: json!({"content": "second notes"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Notes updated.".into()),
+                tool_call_id: Some("tc2".into()),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tc3".into(),
+                    name: "notes".into(),
+                    arguments: json!({"content": "third notes"}),
+                }]),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("Notes updated.".into()),
+                tool_call_id: Some("tc3".into()),
+                tool_calls: None,
+            },
+        ];
+
+        dedup_tool_results(&mut messages);
+
+        // First two pairs removed, only last pair remains (2 messages)
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0].tool_calls.as_ref().unwrap()[0].arguments["content"],
+            "third notes"
+        );
     }
 
     #[test]

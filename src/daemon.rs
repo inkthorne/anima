@@ -122,6 +122,7 @@ use crate::tool_registry::{ToolDefinition, ToolRegistry};
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_process_running};
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
+use crate::tools::notes::DaemonNotesTool;
 use crate::tools::task::DaemonTaskTool;
 use crate::tools::{
     AddTool, CopyLinesTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool,
@@ -341,7 +342,7 @@ fn format_conversation_history(
 
         // Pass 1: scan assistant messages, build tool_call_id → (kind, path, assistant_msg_id)
         #[derive(Clone)]
-        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Shell, UnknownTool }
+        enum DedupKind { ReadFull, ReadRange, Write, EditFile, Shell, Notes, UnknownTool }
 
         let mut tc_index: HashMap<String, (DedupKind, Option<String>, i64)> = HashMap::new();
         let mut assistant_tc_count: HashMap<i64, usize> = HashMap::new();
@@ -378,6 +379,9 @@ fn format_conversation_history(
                                     tc_index.insert(tc.id.clone(), (DedupKind::Shell, Some(normalize_shell_for_dedup(cmd)), msg.id));
                                 }
                             }
+                            "notes" => {
+                                tc_index.insert(tc.id.clone(), (DedupKind::Notes, None, msg.id));
+                            }
                             _ => {
                                 tc_index.insert(tc.id.clone(), (DedupKind::UnknownTool, None, msg.id));
                             }
@@ -393,6 +397,7 @@ fn format_conversation_history(
         let mut edit_file_pairs: Vec<(String, ToolPair)> = Vec::new();
         let mut shell_pairs: HashMap<String, Vec<ToolPair>> = HashMap::new();
         let mut unknown_tool_pairs: Vec<ToolPair> = Vec::new();
+        let mut notes_pairs: Vec<ToolPair> = Vec::new();
 
         for msg in messages.iter() {
             if msg.from_agent != "tool" { continue; }
@@ -424,6 +429,9 @@ fn format_conversation_history(
                         }
                         DedupKind::Shell => {
                             if let Some(c) = path { shell_pairs.entry(c.clone()).or_default().push(pair); }
+                        }
+                        DedupKind::Notes => {
+                            notes_pairs.push(pair);
                         }
                         DedupKind::UnknownTool => {} // handled above in the error check
                     }
@@ -479,6 +487,11 @@ fn format_conversation_history(
             for pair in pairs.iter().rev().skip(1) {
                 mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
             }
+        }
+
+        // Notes: keep only the last (each call replaces the scratchpad)
+        for pair in notes_pairs.iter().rev().skip(1) {
+            mark_drop(pair, &mut dropped_tool_results, &mut asst_dropped);
         }
 
         // Unknown tool errors: keep only the last pair
@@ -586,6 +599,19 @@ fn format_conversation_history(
                 "{{\"from\": \"{}\", \"text\": \"{}\"}}",
                 msg.from_agent, escaped
             ));
+        }
+    }
+
+    // Strip <working-notes> from all but the last assistant message.
+    // Notes are embedded at storage time; only the most recent copy is useful context.
+    let last_asst_idx = history.iter().rposition(|m| m.role == "assistant");
+    for (i, msg) in history.iter_mut().enumerate() {
+        if msg.role == "assistant" && Some(i) != last_asst_idx {
+            if let Some(ref content) = msg.content {
+                if let Some(stripped) = strip_working_notes(content) {
+                    msg.content = Some(stripped);
+                }
+            }
         }
     }
 
@@ -855,6 +881,94 @@ fn inject_recall_into_history(
                 tool_calls: None,
             });
         }
+    }
+}
+
+/// Inject a notes prompt when the agent has no notes yet.
+/// When notes exist, they are already embedded in stored assistant messages
+/// (via `prepend_notes()`) and stripped from all but the last by `format_conversation_history()`.
+fn inject_notes(
+    history: &mut Vec<ChatMessage>,
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+) {
+    match store.get_participant_notes(conv_name, agent_name) {
+        Ok(Some(notes)) if !notes.is_empty() => {
+            // Notes are already embedded in stored assistant messages — nothing to do
+        }
+        _ => {
+            // No notes yet — inject a prompt to encourage usage
+            history.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(
+                    "<working-notes>\n\
+                     No notes yet. Use the `notes` tool to track your plan, progress, findings, \
+                     and what you've tried. Notes persist across turns and appear here automatically.\n\
+                     </working-notes>"
+                        .to_string(),
+                ),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+    }
+}
+
+/// Prepend `<working-notes>` block to an assistant response before storing in DB.
+/// Returns content unchanged if the agent has no notes.
+fn prepend_notes(
+    content: &str,
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+) -> String {
+    let notes = match store.get_participant_notes(conv_name, agent_name) {
+        Ok(Some(n)) if !n.is_empty() => n,
+        _ => return content.to_string(),
+    };
+    format!(
+        "<working-notes>\n{}\n</working-notes>\n\n{}",
+        notes, content
+    )
+}
+
+/// Strip a `<working-notes>...</working-notes>` block (and trailing newlines) from content.
+/// Returns `None` if no block is found.
+fn strip_working_notes(content: &str) -> Option<String> {
+    let start = content.find("<working-notes>")?;
+    let end_tag = "</working-notes>";
+    let end = content.find(end_tag)? + end_tag.len();
+    let after = content[end..].trim_start_matches('\n');
+    let before = &content[..start];
+    let result = format!("{}{}", before, after);
+    Some(if result.is_empty() { String::new() } else { result })
+}
+
+/// Extract the **last** `<working-notes>` block from LLM output.
+/// Returns `(cleaned_content, Option<notes_content>)`.
+/// The LLM may emit inline notes without calling the `notes` tool — this captures them.
+fn extract_llm_working_notes(content: &str) -> (String, Option<String>) {
+    let start_tag = "<working-notes>";
+    let end_tag = "</working-notes>";
+    let start = match content.rfind(start_tag) {
+        Some(s) => s,
+        None => return (content.to_string(), None),
+    };
+    let end = match content[start..].find(end_tag) {
+        Some(e) => start + e + end_tag.len(),
+        None => return (content.to_string(), None),
+    };
+    let inner = content[start + start_tag.len()..end - end_tag.len()]
+        .trim()
+        .to_string();
+    let before = &content[..start];
+    let after = content[end..].trim_start_matches('\n');
+    let cleaned = format!("{}{}", before, after);
+    if inner.is_empty() {
+        (cleaned, None)
+    } else {
+        (cleaned, Some(inner))
     }
 }
 
@@ -1201,7 +1315,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "task", "search_conversation"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "task", "search_conversation", "notes"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -1220,7 +1334,7 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, task, search_conversation\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, task, search_conversation, notes\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
@@ -1235,6 +1349,14 @@ async fn execute_tool_call(
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
                     Ok(format!("Task dispatched to '{}' ({}). Result will be posted here when complete.", agent, task_conv))
                 }
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "notes" => {
+            let ctx = context.ok_or("notes tool requires execution context")?;
+            let tool = DaemonNotesTool::new(ctx.agent_name.clone(), ctx.conv_id.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(_) => Ok("Notes updated.".to_string()),
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
@@ -1291,6 +1413,9 @@ fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
         .collect()
 }
 
+/// Tools that bypass the allowlist and are always available to every agent.
+const ALWAYS_ALLOWED_TOOLS: &[&str] = &["notes"];
+
 /// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
 fn filter_by_allowlist<'a>(
     tools: Vec<&'a ToolDefinition>,
@@ -1299,7 +1424,10 @@ fn filter_by_allowlist<'a>(
     match allowed_tools {
         Some(allowed) => tools
             .into_iter()
-            .filter(|t| allowed.contains(&t.name))
+            .filter(|t| {
+                allowed.contains(&t.name)
+                    || ALWAYS_ALLOWED_TOOLS.contains(&t.name.as_str())
+            })
             .collect(),
         None => Vec::new(), // No allowlist = no tools
     }
@@ -2145,6 +2273,7 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonTaskTool::new(agent_name.clone(), None)));
+        agent.register_tool(Arc::new(DaemonNotesTool::new(agent_name.clone(), None)));
         agent.register_tool(Arc::new(DaemonSearchConversationTool));
     }
 
@@ -2724,9 +2853,18 @@ async fn run_tool_loop(
                 // Strip thinking tags and extract [REMEMBER:...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
+                let (after_remember, llm_notes) = extract_llm_working_notes(&after_remember);
 
                 // Full response for DB: preserve thinking tags, strip REMEMBER tags
                 let (db_content, _) = extract_remember_tags(&think_result.response);
+                let (db_content, _) = extract_llm_working_notes(&db_content);
+
+                // Save LLM-generated inline notes to DB (before prepend_notes reads them back)
+                if let Some(ref notes) = llm_notes {
+                    let _ = store.set_participant_notes(conv_name, agent_name, notes);
+                }
+
+                let db_content = prepend_notes(&db_content, &store, conv_name, agent_name);
 
                 // Save memories
                 save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
@@ -2861,6 +2999,7 @@ async fn run_tool_loop(
                     if current_message.is_empty() {
                         current_message = refreshed_final;
                     }
+                    inject_notes(&mut conversation_history, &store, conv_name, agent_name);
                 }
 
                 // Inject tool budget nudge
@@ -2986,6 +3125,13 @@ async fn process_message_work(
         } else {
             (Vec::new(), content.to_string(), Vec::new(), None)
         };
+
+    // Inject working notes at end of history (before final user turn)
+    if let Some(cname) = conv_name {
+        if let Ok(store) = ConversationStore::init() {
+            inject_notes(&mut conversation_history, &store, cname, agent_name);
+        }
+    }
 
     // Build recall (tools + memories + conversation recall) based on user message
     let recall_result = build_recall_for_query(
@@ -3149,6 +3295,7 @@ async fn process_message_work(
                     }
                 }
                 // Store the final response with token stats (preserve thinking in DB)
+                // Notes already prepended by run_tool_loop — no second prepend_notes here
                 match store.add_message_with_tokens(
                     cname,
                     agent_name,
@@ -3761,6 +3908,7 @@ async fn handle_notify(
         .map(|m| m.id);
     let (mut conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name);
+    inject_notes(&mut conversation_history, &store, conv_id, agent_name);
 
     // Build recall (tools + memories + conversation recall) based on current user message
     let recall_result = build_recall_for_query(
@@ -3893,6 +4041,7 @@ async fn handle_notify(
         }
     }
 
+    // Notes already prepended by run_tool_loop — no second prepend_notes here
     match store.add_message_with_tokens(
         conv_id,
         agent_name,
@@ -4188,7 +4337,8 @@ async fn run_heartbeat(
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
-    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+    let (mut conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+    inject_notes(&mut conversation_history, &store, &conv_name, agent_name);
 
     logger.log(&format!(
         "[heartbeat] Context: {} previous outputs",
@@ -4259,10 +4409,18 @@ async fn run_heartbeat(
     // 6. Process response: strip thinking tags, extract memories
     let without_thinking = strip_thinking_tags(&result.response);
     let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
+    let (cleaned_response, llm_notes) = extract_llm_working_notes(&cleaned_response);
     save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
+
+    // Save LLM-generated inline notes to DB
+    if let Some(ref notes) = llm_notes {
+        let _ = store.set_participant_notes(&conv_name, agent_name, notes);
+    }
 
     // Full response for DB: preserve thinking tags, strip REMEMBER tags
     let (db_content, _) = extract_remember_tags(&result.response);
+    let (db_content, _) = extract_llm_working_notes(&db_content);
+    let db_content = prepend_notes(&db_content, &store, &conv_name, agent_name);
 
     // 7. Store response in <agent>-heartbeat conversation (preserve thinking in DB)
     match store.add_message(&conv_name, agent_name, &db_content, &[]) {
@@ -6155,6 +6313,74 @@ api_key = "sk-test"
     }
 
     #[test]
+    fn test_format_conversation_history_dedup_notes() {
+        // Three notes calls — first two pairs dropped, last kept.
+        let notes_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "notes".into(),
+            arguments: serde_json::json!({"content": "first notes"}),
+        }])
+        .unwrap();
+        let notes_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "notes".into(),
+            arguments: serde_json::json!({"content": "second notes"}),
+        }])
+        .unwrap();
+        let notes_tc3 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc3".into(),
+            name: "notes".into(),
+            arguments: serde_json::json!({"content": "third notes"}),
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Saving notes 1.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(notes_tc1);
+        let mut msg_t1 = make_tool_msg("Notes updated.", Some("arya"));
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tc1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Saving notes 2.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(notes_tc2);
+        let mut msg_t2 = make_tool_msg("Notes updated.", Some("arya"));
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tc2".into());
+
+        let mut msg_a3 = make_conv_msg("arya", "Saving notes 3.");
+        msg_a3.id = 14;
+        msg_a3.tool_calls = Some(notes_tc3);
+        let mut msg_t3 = make_tool_msg("Notes updated.", Some("arya"));
+        msg_t3.id = 15;
+        msg_t3.tool_call_id = Some("tc3".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "do some work"),
+            msg_a1, msg_t1, msg_a2, msg_t2, msg_a3, msg_t3,
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Only the last notes result should survive
+        let notes_results: Vec<_> = history
+            .iter()
+            .filter(|m| m.role == "tool" && m.content.as_deref() == Some("Notes updated."))
+            .collect();
+        assert_eq!(notes_results.len(), 1, "Only last notes result should survive");
+
+        // The assistant messages for the first two calls should also be dropped
+        let assistant_msgs: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(!assistant_msgs.contains(&"Saving notes 1."), "First notes call should be dropped");
+        assert!(!assistant_msgs.contains(&"Saving notes 2."), "Second notes call should be dropped");
+        assert!(assistant_msgs.contains(&"Saving notes 3."), "Last notes call should be kept");
+    }
+
+    #[test]
     fn test_format_conversation_history_dedup_read_range_superseded_by_full() {
         // Range read → full read of same path → range pair dropped.
         let range_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
@@ -7008,6 +7234,151 @@ api_key = "sk-test"
         assert!(matches!(result, Cow::Owned(_)));
         assert!(result.contains("[output truncated:"));
         assert!(result.ends_with(&"z".repeat(131_072)));
+    }
+
+    #[test]
+    fn test_inject_notes_into_history() {
+        use crate::conversation::ConversationStore;
+
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("inject-notes-{}", std::process::id());
+        store.create_conversation(Some(&conv), &["dash"]).unwrap();
+
+        // No notes → nudge to start using notes (with XML tags)
+        let mut history = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("hello".to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        inject_notes(&mut history, &store, &conv, "dash");
+        assert_eq!(history.len(), 2);
+        let empty_content = history[1].content.as_ref().unwrap();
+        assert!(empty_content.contains("<working-notes>"));
+        assert!(empty_content.contains("No notes yet"));
+        assert!(empty_content.contains("</working-notes>"));
+
+        // Set notes → inject_notes should NOT add a message (notes are embedded in stored messages)
+        history.clear();
+        store.set_participant_notes(&conv, "dash", "bug is in parser").unwrap();
+        inject_notes(&mut history, &store, &conv, "dash");
+        assert_eq!(history.len(), 0, "inject_notes should not add a message when notes exist");
+
+        store.delete_conversation(&conv).unwrap();
+    }
+
+    #[test]
+    fn test_strip_working_notes() {
+        // Basic stripping
+        let content = "<working-notes>\nmy notes\n</working-notes>\n\nHello world";
+        let stripped = strip_working_notes(content).unwrap();
+        assert_eq!(stripped, "Hello world");
+
+        // No notes block → returns None
+        assert!(strip_working_notes("just plain text").is_none());
+
+        // Notes only (no response after)
+        let content = "<working-notes>\nmy notes\n</working-notes>";
+        let stripped = strip_working_notes(content).unwrap();
+        assert_eq!(stripped, "");
+
+        // Notes with thinking tags before
+        let content = "<think>reasoning</think>\n<working-notes>\nnotes\n</working-notes>\n\nresponse";
+        let stripped = strip_working_notes(content).unwrap();
+        assert_eq!(stripped, "<think>reasoning</think>\nresponse");
+    }
+
+    #[test]
+    fn test_extract_llm_working_notes() {
+        // Basic extraction
+        let (cleaned, notes) =
+            extract_llm_working_notes("Hello\n<working-notes>\nmy plan\n</working-notes>\n\nworld");
+        assert_eq!(cleaned, "Hello\nworld");
+        assert_eq!(notes.unwrap(), "my plan");
+
+        // No block → passthrough
+        let (cleaned, notes) = extract_llm_working_notes("just plain text");
+        assert_eq!(cleaned, "just plain text");
+        assert!(notes.is_none());
+
+        // Empty block → stripped but no notes returned
+        let (cleaned, notes) =
+            extract_llm_working_notes("before\n<working-notes>\n\n</working-notes>\nafter");
+        assert_eq!(cleaned, "before\nafter");
+        assert!(notes.is_none());
+
+        // Content after block preserved
+        let (cleaned, notes) =
+            extract_llm_working_notes("<working-notes>\ntodo list\n</working-notes>\nHere is my answer.");
+        assert_eq!(cleaned, "Here is my answer.");
+        assert_eq!(notes.unwrap(), "todo list");
+
+        // Only notes, no surrounding content
+        let (cleaned, notes) =
+            extract_llm_working_notes("<working-notes>\nsolitary\n</working-notes>");
+        assert_eq!(cleaned, "");
+        assert_eq!(notes.unwrap(), "solitary");
+    }
+
+    #[test]
+    fn test_extract_llm_working_notes_with_thinking() {
+        // Thinking tags + working notes — both extracted correctly
+        let content = "<think>reasoning here</think>\nSome text\n<working-notes>\nmy notes\n</working-notes>\n\nfinal answer";
+        let (cleaned, notes) = extract_llm_working_notes(content);
+        assert_eq!(cleaned, "<think>reasoning here</think>\nSome text\nfinal answer");
+        assert_eq!(notes.unwrap(), "my notes");
+    }
+
+    #[test]
+    fn test_prepend_then_extract_roundtrip() {
+        // prepend_notes produces a <working-notes> block at the start;
+        // extract_llm_working_notes should extract those notes and return the original content
+        let original = "Here is my response.";
+        let notes_text = "step 1: check files\nstep 2: edit code";
+        let prepended = format!(
+            "<working-notes>\n{}\n</working-notes>\n\n{}",
+            notes_text, original
+        );
+        let (cleaned, extracted) = extract_llm_working_notes(&prepended);
+        assert_eq!(cleaned, original);
+        assert_eq!(extracted.unwrap(), notes_text);
+    }
+
+    #[test]
+    fn test_format_conversation_history_strips_old_notes() {
+        // Two assistant messages with notes — only the last should keep its notes
+        let msgs = vec![
+            make_conv_msg("user", "hi"),
+            {
+                let mut m = make_conv_msg("arya", "<working-notes>\nold plan\n</working-notes>\n\nfirst response");
+                m.id = 2;
+                m
+            },
+            make_conv_msg("user", "next"),
+            {
+                let mut m = make_conv_msg("arya", "<working-notes>\nnew plan\n</working-notes>\n\nsecond response");
+                m.id = 4;
+                m
+            },
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya");
+
+        // Find assistant messages
+        let asst_msgs: Vec<&ChatMessage> = history.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(asst_msgs.len(), 2);
+
+        // First assistant message should have notes stripped
+        let first = asst_msgs[0].content.as_ref().unwrap();
+        assert!(!first.contains("<working-notes>"), "old notes should be stripped");
+        assert!(first.contains("first response"));
+
+        // Last assistant message should keep notes
+        let last = asst_msgs[1].content.as_ref().unwrap();
+        assert!(last.contains("<working-notes>"), "last notes should be kept");
+        assert!(last.contains("new plan"));
+        assert!(last.contains("second response"));
     }
 
 }

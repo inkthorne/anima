@@ -253,6 +253,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "prompt_eval_ns", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tool_call_id", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
         self.conn.execute_batch(
@@ -1086,6 +1087,35 @@ impl ConversationStore {
         self.conn.execute(
             "UPDATE participants SET context_cursor = NULL WHERE conv_name = ?1 AND agent = ?2",
             params![conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Get the working notes for an agent in a conversation.
+    pub fn get_participant_notes(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT notes FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let notes: Option<Option<String>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(notes.flatten())
+    }
+
+    /// Set the working notes for an agent in a conversation.
+    pub fn set_participant_notes(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        notes: &str,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET notes = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![notes, conv_name, agent],
         )?;
         Ok(())
     }
@@ -3634,5 +3664,37 @@ mod tests {
         // Pinned message should come first (it's older and outside the budget window)
         assert_eq!(msgs[0].content, "pinned task");
         assert_eq!(msgs.len(), 2); // 1 pinned + 1 budget-selected
+    }
+
+    #[test]
+    fn test_participant_notes_roundtrip() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("notes-test"), &["dash"])
+            .unwrap();
+
+        // Default is None
+        let notes = store.get_participant_notes(&conv, "dash").unwrap();
+        assert!(notes.is_none());
+
+        // Set notes
+        store.set_participant_notes(&conv, "dash", "hypothesis: bug in parser").unwrap();
+        let notes = store.get_participant_notes(&conv, "dash").unwrap();
+        assert_eq!(notes.as_deref(), Some("hypothesis: bug in parser"));
+
+        // Replace notes
+        store.set_participant_notes(&conv, "dash", "confirmed: line 42").unwrap();
+        let notes = store.get_participant_notes(&conv, "dash").unwrap();
+        assert_eq!(notes.as_deref(), Some("confirmed: line 42"));
+
+        // Notes are per-agent
+        store.delete_conversation(&conv).unwrap();
+        let conv2 = store
+            .create_conversation(Some("notes-multi"), &["dash", "arya"])
+            .unwrap();
+        store.set_participant_notes(&conv2, "dash", "dash notes").unwrap();
+        store.set_participant_notes(&conv2, "arya", "arya notes").unwrap();
+        assert_eq!(store.get_participant_notes(&conv2, "dash").unwrap().as_deref(), Some("dash notes"));
+        assert_eq!(store.get_participant_notes(&conv2, "arya").unwrap().as_deref(), Some("arya notes"));
     }
 }
