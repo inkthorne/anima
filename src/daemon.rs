@@ -1570,7 +1570,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Load the agent directory
     let agent_dir = AgentDir::load(&agent_path)?;
-    let config = DaemonConfig::from_agent_dir(&agent_dir)?;
+    let mut config = DaemonConfig::from_agent_dir(&agent_dir)?;
 
     // Check if already running
     if PidFile::is_running(&config.pid_path) {
@@ -1608,6 +1608,19 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             hb.interval,
             hb.heartbeat_path.display()
         ));
+    }
+
+    // Auto-detect num_ctx from OpenAI-compatible /v1/models endpoint
+    if config.num_ctx.is_none() {
+        let llm_config = agent_dir.resolve_llm_config()?;
+        if llm_config.provider == "openai" {
+            if let Some(ref base_url) = llm_config.base_url {
+                if let Some(ctx) = query_openai_model_ctx(base_url, &llm_config.model).await {
+                    logger.log(&format!("  Auto-detected num_ctx: {} from {}", ctx, base_url));
+                    config.num_ctx = Some(ctx);
+                }
+            }
+        }
     }
 
     // Create the agent
@@ -2241,6 +2254,16 @@ impl LLM for RefreshingAnthropicClient {
             .chat_complete_stream(messages, tools, tx)
             .await
     }
+}
+
+/// Query an OpenAI-compatible /v1/models/{model} endpoint for max_context_length.
+/// Returns None on any failure (network, parse, missing field).
+async fn query_openai_model_ctx(base_url: &str, model: &str) -> Option<u32> {
+    let url = format!("{}/models/{}", base_url.trim_end_matches('/'), model);
+    let client = reqwest::Client::new();
+    let resp = client.get(&url).send().await.ok()?;
+    let json: serde_json::Value = resp.json().await.ok()?;
+    json["max_context_length"].as_u64().map(|v| v as u32)
 }
 
 /// Create an LLM client from resolved configuration.
