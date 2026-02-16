@@ -2479,6 +2479,7 @@ async fn execute_native_tool_calls(
     conv_name: &str,
     agent_name: &str,
     logger: &Arc<AgentLogger>,
+    num_ctx: Option<u32>,
 ) -> Vec<String> {
     let store = match ConversationStore::init() {
         Ok(s) => s,
@@ -2497,7 +2498,7 @@ async fn execute_native_tool_calls(
         };
         let tool_result = match execute_tool_call(&daemon_tc, tool_def, Some(tool_context)).await {
             Ok(result) => {
-                let result = truncate_tool_result(&result, MAX_TOOL_RESULT_BYTES);
+                let result = truncate_tool_result(&result, num_ctx);
                 logger.tool(&format!("[loop] {} → {} bytes", tc.name, result.len()));
                 format!("[Tool Result for {}]\n{}", tc.name, result)
             }
@@ -2762,7 +2763,7 @@ async fn run_tool_loop(
                         // Execute all tool calls in the batch
                         let results = execute_native_tool_calls(
                             tool_calls, tool_registry, tool_context,
-                            conv_name, agent_name, logger,
+                            conv_name, agent_name, logger, num_ctx,
                         ).await;
 
                         current_message = String::new();
@@ -2814,7 +2815,7 @@ async fn run_tool_loop(
                         let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
                         let tool_message = match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                             Ok(tool_result) => {
-                                let tool_result = truncate_tool_result(&tool_result, MAX_TOOL_RESULT_BYTES);
+                                let tool_result = truncate_tool_result(&tool_result, num_ctx);
                                 logger.tool(&format!("[loop] Result: {} bytes", tool_result.len()));
                                 format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                             }
@@ -3104,6 +3105,7 @@ async fn process_message_work(
                     &tool_context,
                     conversation_history,
                     max_iterations,
+                    num_ctx,
                 ).await;
                 (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
             }
@@ -3339,6 +3341,7 @@ async fn process_json_block_mode(
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
     max_iterations: Option<usize>,
+    num_ctx: Option<u32>,
 ) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
     let mut current_message = content.to_string();
     let max_tool_calls = max_iterations.unwrap_or(25);
@@ -3478,7 +3481,7 @@ async fn process_json_block_mode(
 
             match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                 Ok(tool_result) => {
-                    let tool_result = truncate_tool_result(&tool_result, MAX_TOOL_RESULT_BYTES);
+                    let tool_result = truncate_tool_result(&tool_result, num_ctx);
                     logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
                     current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
                 }
@@ -3500,26 +3503,32 @@ async fn process_json_block_mode(
 /// Maximum depth for @mention chains to prevent infinite loops
 const MAX_MENTION_DEPTH: u32 = 100;
 
-/// Maximum tool result size in bytes before truncation (128 KB).
-const MAX_TOOL_RESULT_BYTES: usize = 131_072;
+/// Default maximum tool result size in bytes before truncation (128 KB).
+/// Used as fallback when num_ctx is unknown.
+const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 131_072;
 
 /// Context fill threshold — if (tokens_in + tokens_out) / num_ctx >= this, reset the cursor
 const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
 
-/// Truncate a tool result string if it exceeds `max_bytes`.
-/// Keeps the beginning and appends a notice with the original size.
-fn truncate_tool_result(result: &str, max_bytes: usize) -> Cow<'_, str> {
+/// Truncate a tool result string if it exceeds the budget.
+/// Budget = 10% of num_ctx × 4 chars/token, or DEFAULT_MAX_TOOL_RESULT_BYTES as fallback.
+/// Keeps the **tail** (where errors and results live) and prepends a truncation notice.
+fn truncate_tool_result(result: &str, num_ctx: Option<u32>) -> Cow<'_, str> {
+    let max_bytes = num_ctx
+        .map(|n| (n as usize / 10) * 4)
+        .unwrap_or(DEFAULT_MAX_TOOL_RESULT_BYTES);
     if result.len() <= max_bytes {
         return Cow::Borrowed(result);
     }
     let total = result.len();
-    let cut = result.floor_char_boundary(max_bytes);
-    let truncated = &result[..cut];
+    let start = total - max_bytes;
+    let safe_start = result.ceil_char_boundary(start);
+    let kept = &result[safe_start..];
     Cow::Owned(format!(
-        "{}\n\n[output truncated: {}, showing first {}]",
-        truncated,
+        "[output truncated: {}, showing last {}]\n\n{}",
         format_byte_size(total),
-        format_byte_size(cut),
+        format_byte_size(kept.len()),
+        kept,
     ))
 }
 
@@ -6936,42 +6945,69 @@ api_key = "sk-test"
 
     #[test]
     fn test_truncate_tool_result() {
-        // Under limit — returned unchanged
+        // Under limit — returned unchanged (no num_ctx → 128 KB default)
         let small = "hello world";
-        let result = truncate_tool_result(small, 100);
+        let result = truncate_tool_result(small, None);
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(&*result, small);
 
         // Exactly at limit — returned unchanged
+        // Use a num_ctx that gives max_bytes = 100: num_ctx/10*4 = 100 → num_ctx = 250
         let exact = "a".repeat(100);
-        let result = truncate_tool_result(&exact, 100);
+        let result = truncate_tool_result(&exact, Some(250));
         assert!(matches!(result, Cow::Borrowed(_)));
         assert_eq!(&*result, exact);
 
-        // Over limit — truncated with notice
-        let big = "x".repeat(200);
-        let result = truncate_tool_result(&big, 100);
+        // Over limit — truncated, keeps TAIL with notice at start
+        let big: String = (0..200).map(|i| char::from(b'A' + (i % 26) as u8)).collect();
+        let result = truncate_tool_result(&big, Some(250)); // max_bytes = 100
         assert!(matches!(result, Cow::Owned(_)));
-        assert!(result.starts_with(&"x".repeat(100)));
         assert!(result.contains("[output truncated:"));
-        assert!(result.contains("showing first"));
-        // Must be valid UTF-8 (it's a String, so guaranteed)
-        assert!(result.len() > 100);
+        assert!(result.contains("showing last"));
+        // The tail of the original should be present
+        assert!(result.ends_with(&big[100..]));
     }
 
     #[test]
     fn test_truncate_tool_result_multibyte() {
-        // Multi-byte chars: 'é' is 2 bytes, cutting mid-char should truncate at boundary
+        // Multi-byte chars: 'é' is 2 bytes, cutting mid-char should find safe boundary
+        // num_ctx=375 → max_bytes = 375/10*4 = 150
         let multi = "é".repeat(100); // 200 bytes
-        let result = truncate_tool_result(&multi, 150);
+        let result = truncate_tool_result(&multi, Some(375));
         assert!(matches!(result, Cow::Owned(_)));
         // Should not panic and should be valid UTF-8
         assert!(result.contains("[output truncated:"));
-        // The kept portion should be valid — floor_char_boundary ensures this
-        let kept = result.split("\n\n[output truncated:").next().unwrap();
-        assert!(kept.len() <= 150);
+        // The kept portion should be valid — ceil_char_boundary ensures this
+        let kept = result.split("[output truncated:").last().unwrap();
+        let tail_part = kept.split("\n\n").skip(1).collect::<Vec<_>>().join("\n\n");
+        assert!(tail_part.len() <= 150);
         // Should be a whole number of 'é' chars (each 2 bytes)
-        assert_eq!(kept.len() % 2, 0);
+        assert_eq!(tail_part.len() % 2, 0);
+    }
+
+    #[test]
+    fn test_truncate_tool_result_with_num_ctx() {
+        // num_ctx = 1000 → budget = 1000/10*4 = 400 bytes
+        let data = "x".repeat(500);
+        let result = truncate_tool_result(&data, Some(1000));
+        assert!(matches!(result, Cow::Owned(_)));
+        // Should keep last 400 bytes
+        assert!(result.ends_with(&"x".repeat(400)));
+        assert!(result.contains("showing last"));
+    }
+
+    #[test]
+    fn test_truncate_tool_result_no_num_ctx_fallback() {
+        // Without num_ctx, falls back to DEFAULT_MAX_TOOL_RESULT_BYTES (128 KB)
+        let small = "y".repeat(131_072); // exactly at limit
+        let result = truncate_tool_result(&small, None);
+        assert!(matches!(result, Cow::Borrowed(_)));
+
+        let big = "z".repeat(131_073); // 1 byte over
+        let result = truncate_tool_result(&big, None);
+        assert!(matches!(result, Cow::Owned(_)));
+        assert!(result.contains("[output truncated:"));
+        assert!(result.ends_with(&"z".repeat(131_072)));
     }
 
 }

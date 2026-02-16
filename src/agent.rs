@@ -592,16 +592,23 @@ pub struct ThinkResult {
 /// When exceeded, oldest messages are removed.
 const MAX_HISTORY_LEN: usize = 50;
 
-/// Maximum tool result size in bytes before truncation (128 KB).
-const MAX_TOOL_RESULT_BYTES: usize = 131_072;
+/// Default maximum tool result size in bytes before truncation (128 KB).
+/// Used as fallback when num_ctx is unknown.
+const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 131_072;
 
-/// Truncate a tool result if it exceeds `max_bytes`, keeping the beginning.
-fn truncate_tool_result(result: String, max_bytes: usize) -> String {
+/// Truncate a tool result if it exceeds the budget, keeping the **tail**.
+/// Budget = 10% of num_ctx × 4 chars/token, or DEFAULT_MAX_TOOL_RESULT_BYTES as fallback.
+fn truncate_tool_result(result: String, num_ctx: Option<u32>) -> String {
+    let max_bytes = num_ctx
+        .map(|n| (n as usize / 10) * 4)
+        .unwrap_or(DEFAULT_MAX_TOOL_RESULT_BYTES);
     if result.len() <= max_bytes {
         return result;
     }
     let total = result.len();
-    let cut = result.floor_char_boundary(max_bytes);
+    let start = total - max_bytes;
+    let safe_start = result.ceil_char_boundary(start);
+    let kept = &result[safe_start..];
     let size = |b: usize| -> String {
         if b >= 1_048_576 {
             format!("{:.1} MB", b as f64 / 1_048_576.0)
@@ -610,10 +617,10 @@ fn truncate_tool_result(result: String, max_bytes: usize) -> String {
         }
     };
     format!(
-        "{}\n\n[output truncated: {}, showing first {}]",
-        &result[..cut],
+        "[output truncated: {}, showing last {}]\n\n{}",
         size(total),
-        size(cut),
+        size(kept.len()),
+        kept,
     )
 }
 
@@ -1134,6 +1141,7 @@ impl Agent {
         messages: &mut Vec<ChatMessage>,
         iter_usage: Option<&crate::llm::UsageInfo>,
         iter_duration_ms: Option<u64>,
+        num_ctx: Option<u32>,
     ) {
         for (i, tool_call) in tool_calls.iter().enumerate() {
             tool_names_used.push(tool_call.name.clone());
@@ -1142,7 +1150,7 @@ impl Agent {
                 .call_tool(&tool_call.name, &tool_call.arguments.to_string())
                 .await
                 .unwrap_or_else(|e| format!("Error: {}", e));
-            let result = truncate_tool_result(result, MAX_TOOL_RESULT_BYTES);
+            let result = truncate_tool_result(result, num_ctx);
 
             // Only attach assistant content to the first tool call to avoid duplication
             // Only attach iter stats to the first tool call (one LLM call → one set of stats)
@@ -1516,6 +1524,7 @@ impl Agent {
                 &mut messages,
                 response.usage.as_ref(),
                 Some(llm_duration_ms),
+                options.num_ctx,
             )
             .await;
 
@@ -1866,6 +1875,7 @@ impl Agent {
                 &mut messages,
                 response.usage.as_ref(),
                 Some(llm_duration_ms),
+                options.num_ctx,
             )
             .await;
 
@@ -2040,7 +2050,7 @@ impl Agent {
                     .call_tool(&tool_call.name, &tool_call.arguments.to_string())
                     .await
                     .unwrap_or_else(|e| format!("Error: {}", e));
-                let result = truncate_tool_result(result, MAX_TOOL_RESULT_BYTES);
+                let result = truncate_tool_result(result, options.num_ctx);
 
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
