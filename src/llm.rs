@@ -496,7 +496,8 @@ impl LLM for OpenAIClient {
         let mut request_body = serde_json::json!({
             "model": self.model,
             "messages": formatted_messages,
-            "stream": true
+            "stream": true,
+            "stream_options": { "include_usage": true }
         });
 
         if let Some(tool_list) = tools {
@@ -531,6 +532,7 @@ impl LLM for OpenAIClient {
         let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new();
         let mut buffer = String::new();
+        let mut usage: Option<UsageInfo> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -578,6 +580,10 @@ impl LLM for OpenAIClient {
                             }
                         }
                     }
+
+                    if let Some(u) = parse_openai_usage(&parsed["usage"]) {
+                        usage = Some(u);
+                    }
                 }
             }
         }
@@ -585,7 +591,7 @@ impl LLM for OpenAIClient {
         Ok(LLMResponse {
             content: none_if_empty(full_content),
             tool_calls: finalize_tool_call_builders(tool_call_builders),
-            usage: None,
+            usage,
         })
     }
 }
@@ -1802,5 +1808,37 @@ mod tests {
         let (system, prompt) = format_messages_for_cli(messages);
         assert!(system.is_none());
         assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn test_parse_openai_usage_from_stream_chunk() {
+        // Simulates the final SSE chunk when stream_options.include_usage is set
+        let chunk: Value = serde_json::from_str(r#"{
+            "id": "chatcmpl-abc",
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 45,
+                "total_tokens": 165
+            }
+        }"#).unwrap();
+
+        let usage = parse_openai_usage(&chunk["usage"]);
+        assert!(usage.is_some());
+        let u = usage.unwrap();
+        assert_eq!(u.prompt_tokens, 120);
+        assert_eq!(u.completion_tokens, 45);
+    }
+
+    #[test]
+    fn test_parse_openai_usage_absent_in_stream_chunk() {
+        // Regular content chunk — no usage field
+        let chunk: Value = serde_json::from_str(r#"{
+            "id": "chatcmpl-abc",
+            "choices": [{"delta": {"content": "hi"}}]
+        }"#).unwrap();
+
+        let usage = parse_openai_usage(&chunk["usage"]);
+        assert!(usage.is_none());
     }
 }

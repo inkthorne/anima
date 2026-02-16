@@ -687,6 +687,11 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
                 used_str, ctx_str, percentage
             )
         }
+        (Some(tokens_in), Some(tokens_out), _) => {
+            let total_tokens = tokens_in + tokens_out;
+            let total_str = format_tokens_short(total_tokens);
+            format!(" \x1b[90m•\x1b[0m \x1b[35m{} tokens\x1b[0m", total_str)
+        }
         _ => String::new(),
     }
 }
