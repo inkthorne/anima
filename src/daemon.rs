@@ -602,13 +602,13 @@ fn format_conversation_history(
         }
     }
 
-    // Strip <working-notes> from all but the last assistant message.
+    // Strip <notes> from all but the last assistant message.
     // Notes are embedded at storage time; only the most recent copy is useful context.
     let last_asst_idx = history.iter().rposition(|m| m.role == "assistant");
     for (i, msg) in history.iter_mut().enumerate() {
         if msg.role == "assistant" && Some(i) != last_asst_idx {
             if let Some(ref content) = msg.content {
-                if let Some(stripped) = strip_working_notes(content) {
+                if let Some(stripped) = strip_notes(content) {
                     msg.content = Some(stripped);
                 }
             }
@@ -887,7 +887,7 @@ fn inject_recall_into_history(
 /// Inject a notes prompt when the agent has no notes yet.
 /// When notes exist, they are already embedded in stored assistant messages
 /// (via `prepend_notes()`) and stripped from all but the last by `format_conversation_history()`.
-/// Prepend `<working-notes>` block to an assistant response before storing in DB.
+/// Prepend `<notes>` block to an assistant response before storing in DB.
 /// Returns content unchanged if the agent has no notes.
 fn prepend_notes(
     content: &str,
@@ -900,16 +900,16 @@ fn prepend_notes(
         _ => return content.to_string(),
     };
     format!(
-        "<working-notes>\n{}\n</working-notes>\n\n{}",
+        "<notes>\n{}\n</notes>\n\n{}",
         notes, content
     )
 }
 
-/// Strip a `<working-notes>...</working-notes>` block (and trailing newlines) from content.
+/// Strip a `<notes>...</notes>` block (and trailing newlines) from content.
 /// Returns `None` if no block is found.
-fn strip_working_notes(content: &str) -> Option<String> {
-    let start = content.find("<working-notes>")?;
-    let end_tag = "</working-notes>";
+fn strip_notes(content: &str) -> Option<String> {
+    let start = content.find("<notes>")?;
+    let end_tag = "</notes>";
     let end = content.find(end_tag)? + end_tag.len();
     let after = content[end..].trim_start_matches('\n');
     let before = &content[..start];
@@ -917,12 +917,12 @@ fn strip_working_notes(content: &str) -> Option<String> {
     Some(if result.is_empty() { String::new() } else { result })
 }
 
-/// Extract the **last** `<working-notes>` block from LLM output.
+/// Extract the **last** `<notes>` block from LLM output.
 /// Returns `(cleaned_content, Option<notes_content>)`.
 /// The LLM may emit inline notes without calling the `notes` tool — this captures them.
-fn extract_llm_working_notes(content: &str) -> (String, Option<String>) {
-    let start_tag = "<working-notes>";
-    let end_tag = "</working-notes>";
+fn extract_llm_notes(content: &str) -> (String, Option<String>) {
+    let start_tag = "<notes>";
+    let end_tag = "</notes>";
     let start = match content.rfind(start_tag) {
         Some(s) => s,
         None => return (content.to_string(), None),
@@ -2825,11 +2825,11 @@ async fn run_tool_loop(
                 // Strip thinking tags and extract [REMEMBER:...] tags
                 let without_thinking = strip_thinking_tags(&think_result.response);
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-                let (after_remember, llm_notes) = extract_llm_working_notes(&after_remember);
+                let (after_remember, llm_notes) = extract_llm_notes(&after_remember);
 
                 // Full response for DB: preserve thinking tags, strip REMEMBER tags
                 let (db_content, _) = extract_remember_tags(&think_result.response);
-                let (db_content, _) = extract_llm_working_notes(&db_content);
+                let (db_content, _) = extract_llm_notes(&db_content);
 
                 // Save LLM-generated inline notes to DB (before prepend_notes reads them back)
                 if let Some(ref notes) = llm_notes {
@@ -4374,7 +4374,7 @@ async fn run_heartbeat(
     // 6. Process response: strip thinking tags, extract memories
     let without_thinking = strip_thinking_tags(&result.response);
     let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
-    let (cleaned_response, llm_notes) = extract_llm_working_notes(&cleaned_response);
+    let (cleaned_response, llm_notes) = extract_llm_notes(&cleaned_response);
     save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
     // Save LLM-generated inline notes to DB
@@ -4384,7 +4384,7 @@ async fn run_heartbeat(
 
     // Full response for DB: preserve thinking tags, strip REMEMBER tags
     let (db_content, _) = extract_remember_tags(&result.response);
-    let (db_content, _) = extract_llm_working_notes(&db_content);
+    let (db_content, _) = extract_llm_notes(&db_content);
     let db_content = prepend_notes(&db_content, &store, &conv_name, agent_name);
 
     // 7. Store response in <agent>-heartbeat conversation (preserve thinking in DB)
@@ -7202,78 +7202,78 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_strip_working_notes() {
+    fn test_strip_notes() {
         // Basic stripping
-        let content = "<working-notes>\nmy notes\n</working-notes>\n\nHello world";
-        let stripped = strip_working_notes(content).unwrap();
+        let content = "<notes>\nmy notes\n</notes>\n\nHello world";
+        let stripped = strip_notes(content).unwrap();
         assert_eq!(stripped, "Hello world");
 
         // No notes block → returns None
-        assert!(strip_working_notes("just plain text").is_none());
+        assert!(strip_notes("just plain text").is_none());
 
         // Notes only (no response after)
-        let content = "<working-notes>\nmy notes\n</working-notes>";
-        let stripped = strip_working_notes(content).unwrap();
+        let content = "<notes>\nmy notes\n</notes>";
+        let stripped = strip_notes(content).unwrap();
         assert_eq!(stripped, "");
 
         // Notes with thinking tags before
-        let content = "<think>reasoning</think>\n<working-notes>\nnotes\n</working-notes>\n\nresponse";
-        let stripped = strip_working_notes(content).unwrap();
+        let content = "<think>reasoning</think>\n<notes>\nnotes\n</notes>\n\nresponse";
+        let stripped = strip_notes(content).unwrap();
         assert_eq!(stripped, "<think>reasoning</think>\nresponse");
     }
 
     #[test]
-    fn test_extract_llm_working_notes() {
+    fn test_extract_llm_notes() {
         // Basic extraction
         let (cleaned, notes) =
-            extract_llm_working_notes("Hello\n<working-notes>\nmy plan\n</working-notes>\n\nworld");
+            extract_llm_notes("Hello\n<notes>\nmy plan\n</notes>\n\nworld");
         assert_eq!(cleaned, "Hello\nworld");
         assert_eq!(notes.unwrap(), "my plan");
 
         // No block → passthrough
-        let (cleaned, notes) = extract_llm_working_notes("just plain text");
+        let (cleaned, notes) = extract_llm_notes("just plain text");
         assert_eq!(cleaned, "just plain text");
         assert!(notes.is_none());
 
         // Empty block → stripped but no notes returned
         let (cleaned, notes) =
-            extract_llm_working_notes("before\n<working-notes>\n\n</working-notes>\nafter");
+            extract_llm_notes("before\n<notes>\n\n</notes>\nafter");
         assert_eq!(cleaned, "before\nafter");
         assert!(notes.is_none());
 
         // Content after block preserved
         let (cleaned, notes) =
-            extract_llm_working_notes("<working-notes>\ntodo list\n</working-notes>\nHere is my answer.");
+            extract_llm_notes("<notes>\ntodo list\n</notes>\nHere is my answer.");
         assert_eq!(cleaned, "Here is my answer.");
         assert_eq!(notes.unwrap(), "todo list");
 
         // Only notes, no surrounding content
         let (cleaned, notes) =
-            extract_llm_working_notes("<working-notes>\nsolitary\n</working-notes>");
+            extract_llm_notes("<notes>\nsolitary\n</notes>");
         assert_eq!(cleaned, "");
         assert_eq!(notes.unwrap(), "solitary");
     }
 
     #[test]
-    fn test_extract_llm_working_notes_with_thinking() {
-        // Thinking tags + working notes — both extracted correctly
-        let content = "<think>reasoning here</think>\nSome text\n<working-notes>\nmy notes\n</working-notes>\n\nfinal answer";
-        let (cleaned, notes) = extract_llm_working_notes(content);
+    fn test_extract_llm_notes_with_thinking() {
+        // Thinking tags + notes — both extracted correctly
+        let content = "<think>reasoning here</think>\nSome text\n<notes>\nmy notes\n</notes>\n\nfinal answer";
+        let (cleaned, notes) = extract_llm_notes(content);
         assert_eq!(cleaned, "<think>reasoning here</think>\nSome text\nfinal answer");
         assert_eq!(notes.unwrap(), "my notes");
     }
 
     #[test]
     fn test_prepend_then_extract_roundtrip() {
-        // prepend_notes produces a <working-notes> block at the start;
-        // extract_llm_working_notes should extract those notes and return the original content
+        // prepend_notes produces a <notes> block at the start;
+        // extract_llm_notes should extract those notes and return the original content
         let original = "Here is my response.";
         let notes_text = "step 1: check files\nstep 2: edit code";
         let prepended = format!(
-            "<working-notes>\n{}\n</working-notes>\n\n{}",
+            "<notes>\n{}\n</notes>\n\n{}",
             notes_text, original
         );
-        let (cleaned, extracted) = extract_llm_working_notes(&prepended);
+        let (cleaned, extracted) = extract_llm_notes(&prepended);
         assert_eq!(cleaned, original);
         assert_eq!(extracted.unwrap(), notes_text);
     }
@@ -7284,13 +7284,13 @@ api_key = "sk-test"
         let msgs = vec![
             make_conv_msg("user", "hi"),
             {
-                let mut m = make_conv_msg("arya", "<working-notes>\nold plan\n</working-notes>\n\nfirst response");
+                let mut m = make_conv_msg("arya", "<notes>\nold plan\n</notes>\n\nfirst response");
                 m.id = 2;
                 m
             },
             make_conv_msg("user", "next"),
             {
-                let mut m = make_conv_msg("arya", "<working-notes>\nnew plan\n</working-notes>\n\nsecond response");
+                let mut m = make_conv_msg("arya", "<notes>\nnew plan\n</notes>\n\nsecond response");
                 m.id = 4;
                 m
             },
@@ -7305,12 +7305,12 @@ api_key = "sk-test"
 
         // First assistant message should have notes stripped
         let first = asst_msgs[0].content.as_ref().unwrap();
-        assert!(!first.contains("<working-notes>"), "old notes should be stripped");
+        assert!(!first.contains("<notes>"), "old notes should be stripped");
         assert!(first.contains("first response"));
 
         // Last assistant message should keep notes
         let last = asst_msgs[1].content.as_ref().unwrap();
-        assert!(last.contains("<working-notes>"), "last notes should be kept");
+        assert!(last.contains("<notes>"), "last notes should be kept");
         assert!(last.contains("new plan"));
         assert!(last.contains("second response"));
     }
