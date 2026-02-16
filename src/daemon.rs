@@ -887,34 +887,6 @@ fn inject_recall_into_history(
 /// Inject a notes prompt when the agent has no notes yet.
 /// When notes exist, they are already embedded in stored assistant messages
 /// (via `prepend_notes()`) and stripped from all but the last by `format_conversation_history()`.
-fn inject_notes(
-    history: &mut Vec<ChatMessage>,
-    store: &ConversationStore,
-    conv_name: &str,
-    agent_name: &str,
-) {
-    match store.get_participant_notes(conv_name, agent_name) {
-        Ok(Some(notes)) if !notes.is_empty() => {
-            // Notes are already embedded in stored assistant messages — nothing to do
-        }
-        _ => {
-            // No notes yet — inject a prompt to encourage usage
-            history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(
-                    "<working-notes>\n\
-                     No notes yet. Use the `notes` tool to track your plan, progress, findings, \
-                     and what you've tried. Notes persist across turns and appear here automatically.\n\
-                     </working-notes>"
-                        .to_string(),
-                ),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-        }
-    }
-}
-
 /// Prepend `<working-notes>` block to an assistant response before storing in DB.
 /// Returns content unchanged if the agent has no notes.
 fn prepend_notes(
@@ -2999,7 +2971,7 @@ async fn run_tool_loop(
                     if current_message.is_empty() {
                         current_message = refreshed_final;
                     }
-                    inject_notes(&mut conversation_history, &store, conv_name, agent_name);
+
                 }
 
                 // Inject tool budget nudge
@@ -3126,12 +3098,7 @@ async fn process_message_work(
             (Vec::new(), content.to_string(), Vec::new(), None)
         };
 
-    // Inject working notes at end of history (before final user turn)
-    if let Some(cname) = conv_name {
-        if let Ok(store) = ConversationStore::init() {
-            inject_notes(&mut conversation_history, &store, cname, agent_name);
-        }
-    }
+
 
     // Build recall (tools + memories + conversation recall) based on user message
     let recall_result = build_recall_for_query(
@@ -3908,7 +3875,6 @@ async fn handle_notify(
         .map(|m| m.id);
     let (mut conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name);
-    inject_notes(&mut conversation_history, &store, conv_id, agent_name);
 
     // Build recall (tools + memories + conversation recall) based on current user message
     let recall_result = build_recall_for_query(
@@ -4337,8 +4303,7 @@ async fn run_heartbeat(
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
-    let (mut conversation_history, _) = format_conversation_history(&context_messages, agent_name);
-    inject_notes(&mut conversation_history, &store, &conv_name, agent_name);
+    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
 
     logger.log(&format!(
         "[heartbeat] Context: {} previous outputs",
@@ -7234,37 +7199,6 @@ api_key = "sk-test"
         assert!(matches!(result, Cow::Owned(_)));
         assert!(result.contains("[output truncated:"));
         assert!(result.ends_with(&"z".repeat(131_072)));
-    }
-
-    #[test]
-    fn test_inject_notes_into_history() {
-        use crate::conversation::ConversationStore;
-
-        let store = ConversationStore::init().unwrap();
-        let conv = format!("inject-notes-{}", std::process::id());
-        store.create_conversation(Some(&conv), &["dash"]).unwrap();
-
-        // No notes → nudge to start using notes (with XML tags)
-        let mut history = vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some("hello".to_string()),
-            tool_call_id: None,
-            tool_calls: None,
-        }];
-        inject_notes(&mut history, &store, &conv, "dash");
-        assert_eq!(history.len(), 2);
-        let empty_content = history[1].content.as_ref().unwrap();
-        assert!(empty_content.contains("<working-notes>"));
-        assert!(empty_content.contains("No notes yet"));
-        assert!(empty_content.contains("</working-notes>"));
-
-        // Set notes → inject_notes should NOT add a message (notes are embedded in stored messages)
-        history.clear();
-        store.set_participant_notes(&conv, "dash", "bug is in parser").unwrap();
-        inject_notes(&mut history, &store, &conv, "dash");
-        assert_eq!(history.len(), 0, "inject_notes should not add a message when notes exist");
-
-        store.delete_conversation(&conv).unwrap();
     }
 
     #[test]

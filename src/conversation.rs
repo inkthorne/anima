@@ -1485,6 +1485,12 @@ impl ConversationStore {
             params![conv_name],
         )?;
 
+        // Reset participant state (notes, cursor) since messages are gone
+        self.conn.execute(
+            "UPDATE participants SET notes = NULL, context_cursor = NULL WHERE conv_name = ?1",
+            params![conv_name],
+        )?;
+
         Ok(deleted)
     }
 
@@ -3259,6 +3265,30 @@ mod tests {
 
         store.clear_context_cursor(&conv, "arya").unwrap();
         assert!(store.get_context_cursor(&conv, "arya").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_clear_messages_resets_participant_state() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("clear-state"), &["dash"])
+            .unwrap();
+
+        // Set notes and cursor
+        store.set_participant_notes(&conv, "dash", "some working notes").unwrap();
+        store.set_context_cursor(&conv, "dash", 99).unwrap();
+        assert!(store.get_participant_notes(&conv, "dash").unwrap().is_some());
+        assert!(store.get_context_cursor(&conv, "dash").unwrap().is_some());
+
+        // Add a message so clear_messages has something to delete
+        store.add_message(&conv, "user", "hello", &[]).unwrap();
+
+        // Clear messages
+        store.clear_messages(&conv).unwrap();
+
+        // Notes and cursor should be reset
+        assert!(store.get_participant_notes(&conv, "dash").unwrap().is_none());
+        assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
     }
 
     #[test]
