@@ -68,6 +68,9 @@ pub struct LlmSection {
     /// API style: "chat" (default, /chat/completions) or "responses" (/responses)
     #[serde(default)]
     pub api_style: Option<String>,
+    /// Deduplication mode: "eager" (default, dedup every turn) or "lazy" (dedup only at fill threshold)
+    #[serde(default)]
+    pub deduplication: Option<String>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -90,6 +93,8 @@ pub struct ResolvedLlmConfig {
     pub max_tokens: Option<u32>,
     /// API style: "chat" (default) or "responses"
     pub api_style: Option<String>,
+    /// Whether dedup runs in lazy mode (only at context fill threshold)
+    pub dedup_lazy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -454,6 +459,10 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
             .or(base.allowed_tools.clone()),
         max_tokens: llm_section.max_tokens.or(base.max_tokens),
         api_style: llm_section.api_style.clone().or(base.api_style.clone()),
+        dedup_lazy: {
+            let val = llm_section.deduplication.clone().or(base.deduplication.clone());
+            val.as_deref() == Some("lazy")
+        },
     })
 }
 

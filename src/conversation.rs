@@ -285,6 +285,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "tool_call_id", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("messages", "cached_tokens", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "dedup_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
@@ -1135,6 +1136,50 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Get the dedup cursor for an agent in a conversation.
+    /// Messages with id <= cursor are eligible for dedup and notes stripping.
+    /// Returns None if no cursor is set (lazy mode: no dedup yet).
+    pub fn get_dedup_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<i64>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dedup_cursor FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let cursor: Option<Option<i64>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(cursor.flatten())
+    }
+
+    /// Set the dedup cursor for an agent in a conversation.
+    pub fn set_dedup_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        cursor_id: i64,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET dedup_cursor = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![cursor_id, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the dedup cursor for an agent (resets dedup state).
+    pub fn clear_dedup_cursor(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET dedup_cursor = NULL WHERE conv_name = ?1 AND agent = ?2",
+            params![conv_name, agent],
+        )?;
+        Ok(())
+    }
+
     /// Get the working notes for an agent in a conversation.
     pub fn get_participant_notes(
         &self,
@@ -1164,11 +1209,11 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Clear all context cursors for a given agent across all conversations.
+    /// Clear all context and dedup cursors for a given agent across all conversations.
     /// Used on daemon startup to prevent stale cursors from causing context overfill.
     pub fn clear_all_cursors_for_agent(&self, agent: &str) -> Result<(), ConversationError> {
         self.conn.execute(
-            "UPDATE participants SET context_cursor = NULL WHERE agent = ?1",
+            "UPDATE participants SET context_cursor = NULL, dedup_cursor = NULL WHERE agent = ?1",
             params![agent],
         )?;
         Ok(())
@@ -1538,7 +1583,7 @@ impl ConversationStore {
 
         // Reset participant state (notes, cursor) since messages are gone
         self.conn.execute(
-            "UPDATE participants SET notes = NULL, context_cursor = NULL WHERE conv_name = ?1",
+            "UPDATE participants SET notes = NULL, context_cursor = NULL, dedup_cursor = NULL WHERE conv_name = ?1",
             params![conv_name],
         )?;
 
@@ -3336,17 +3381,42 @@ mod tests {
     }
 
     #[test]
+    fn test_dedup_cursor_get_set_clear() {
+        let store = test_store();
+        let conv = store
+            .create_conversation(Some("dedup-cursor-test"), &["arya"])
+            .unwrap();
+
+        // Default is None
+        assert!(store.get_dedup_cursor(&conv, "arya").unwrap().is_none());
+
+        // Set and read back
+        store.set_dedup_cursor(&conv, "arya", 42).unwrap();
+        assert_eq!(store.get_dedup_cursor(&conv, "arya").unwrap(), Some(42));
+
+        // Update to a new value
+        store.set_dedup_cursor(&conv, "arya", 99).unwrap();
+        assert_eq!(store.get_dedup_cursor(&conv, "arya").unwrap(), Some(99));
+
+        // Clear
+        store.clear_dedup_cursor(&conv, "arya").unwrap();
+        assert!(store.get_dedup_cursor(&conv, "arya").unwrap().is_none());
+    }
+
+    #[test]
     fn test_clear_messages_resets_participant_state() {
         let store = test_store();
         let conv = store
             .create_conversation(Some("clear-state"), &["dash"])
             .unwrap();
 
-        // Set notes and cursor
+        // Set notes and cursors
         store.set_participant_notes(&conv, "dash", "some working notes").unwrap();
         store.set_context_cursor(&conv, "dash", 99).unwrap();
+        store.set_dedup_cursor(&conv, "dash", 50).unwrap();
         assert!(store.get_participant_notes(&conv, "dash").unwrap().is_some());
         assert!(store.get_context_cursor(&conv, "dash").unwrap().is_some());
+        assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_some());
 
         // Add a message so clear_messages has something to delete
         store.add_message(&conv, "user", "hello", &[]).unwrap();
@@ -3354,9 +3424,10 @@ mod tests {
         // Clear messages
         store.clear_messages(&conv).unwrap();
 
-        // Notes and cursor should be reset
+        // Notes and cursors should be reset
         assert!(store.get_participant_notes(&conv, "dash").unwrap().is_none());
         assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
+        assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
     }
 
     #[test]

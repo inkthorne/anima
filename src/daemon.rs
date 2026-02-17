@@ -300,6 +300,7 @@ fn build_recall_content(
 fn format_conversation_history(
     messages: &[ConversationMessage],
     current_agent: &str,
+    dedup_up_to: Option<i64>,
 ) -> (Vec<ChatMessage>, String) {
     if messages.is_empty() {
         return (Vec::new(), String::new());
@@ -445,6 +446,11 @@ fn format_conversation_history(
         let mut asst_dropped: HashMap<i64, usize> = HashMap::new();
 
         let mark_drop = |pair: &ToolPair, dropped: &mut HashSet<i64>, ad: &mut HashMap<i64, usize>| {
+            if let Some(cutoff) = dedup_up_to {
+                if pair.tool_result_msg_id > cutoff { return; }
+            } else {
+                return; // No pointer set → no dedup
+            }
             dropped.insert(pair.tool_result_msg_id);
             *ad.entry(pair.assistant_msg_id).or_insert(0) += 1;
         };
@@ -527,6 +533,10 @@ fn format_conversation_history(
         }
     };
 
+    // Track the last history index where the original message id <= dedup_up_to cutoff.
+    // Used to limit notes stripping to the frozen prefix region.
+    let mut dedup_boundary_idx: Option<usize> = None;
+
     // Process all messages
     for msg in messages {
         if drop_ids.contains(&msg.id) {
@@ -547,6 +557,9 @@ fn format_conversation_history(
                 tool_call_id: None,
                 tool_calls: None,
             });
+            if dedup_up_to.is_some_and(|cutoff| msg.id <= cutoff) {
+                dedup_boundary_idx = Some(history.len() - 1);
+            }
         } else if msg.from_agent == current_agent {
             // Agent's own response — flush pending user messages first
             flush_user_batch(&mut pending_user_batch, &mut history);
@@ -562,6 +575,9 @@ fn format_conversation_history(
                 tool_call_id: None,
                 tool_calls,
             });
+            if dedup_up_to.is_some_and(|cutoff| msg.id <= cutoff) {
+                dedup_boundary_idx = Some(history.len() - 1);
+            }
         } else if msg.from_agent == "tool" {
             // Skip tool results triggered by other agents — they're irrelevant noise.
             // Unattributed (triggered_by = None) are included for backward compatibility.
@@ -603,14 +619,22 @@ fn format_conversation_history(
         }
     }
 
-    // Strip <notes> from all but the last assistant message.
-    // Notes are embedded at storage time; only the most recent copy is useful context.
+    // Strip <notes> from assistant messages at or before the dedup boundary.
+    // Messages after the boundary are part of the frozen prefix — don't touch them.
+    // The last assistant message always keeps its notes (most recent copy is useful).
     let last_asst_idx = history.iter().rposition(|m| m.role == "assistant");
     for (i, msg) in history.iter_mut().enumerate() {
         if msg.role == "assistant" && Some(i) != last_asst_idx {
-            if let Some(ref content) = msg.content {
-                if let Some(stripped) = strip_notes(content) {
-                    msg.content = Some(stripped);
+            // Only strip if this message is within the dedup boundary
+            let within_boundary = match dedup_boundary_idx {
+                Some(boundary) => i <= boundary,
+                None => false, // No boundary → no stripping
+            };
+            if within_boundary {
+                if let Some(ref content) = msg.content {
+                    if let Some(stripped) = strip_notes(content) {
+                        msg.content = Some(stripped);
+                    }
                 }
             }
         }
@@ -1438,6 +1462,8 @@ pub struct DaemonConfig {
     pub max_iterations: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h")
     pub max_response_time: Option<String>,
+    /// Whether dedup runs in lazy mode (only at context fill threshold)
+    pub dedup_lazy: bool,
     /// Whether outbound @mention forwarding is enabled (default: true)
     pub mentions: bool,
 }
@@ -1539,6 +1565,7 @@ impl DaemonConfig {
             num_ctx: llm_config.num_ctx,
             max_iterations: agent_dir.config.think.max_iterations,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
+            dedup_lazy: llm_config.dedup_lazy,
             mentions: agent_dir.config.agent.mentions,
         })
     }
@@ -1906,6 +1933,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.mentions,
                             &shutdown,
                             config.semantic_memory.conversation_recall_limit,
+                            config.dedup_lazy,
                         )
                         .await;
 
@@ -1967,6 +1995,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
+        let worker_dedup_lazy = config.dedup_lazy;
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
@@ -1990,6 +2019,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_mentions,
                 worker_shutdown,
                 worker_conversation_recall_limit,
+                worker_dedup_lazy,
             )
             .await
         })
@@ -2449,6 +2479,7 @@ async fn agent_worker(
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
+    dedup_lazy: bool,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2503,6 +2534,7 @@ async fn agent_worker(
                     conversation_recall_limit,
                     max_iterations,
                     num_ctx,
+                    dedup_lazy,
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -2539,6 +2571,7 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
+                    dedup_lazy,
                 )
                 .await;
             }
@@ -2563,6 +2596,7 @@ async fn agent_worker(
                         &shutdown,
                         max_iterations,
                         num_ctx,
+                        dedup_lazy,
                     )
                     .await;
                 } else {
@@ -2672,6 +2706,7 @@ async fn run_tool_loop(
     shutdown: &Arc<tokio::sync::Notify>,
     logger: &Arc<AgentLogger>,
     log_tx: mpsc::Sender<String>,
+    dedup_lazy: bool,
 ) -> ToolLoopResult {
     // Open a store for DB operations (pause checks, message storage, context refresh).
     // Each tool batch opens its own store (via execute_native_tool_calls) for isolation.
@@ -2973,23 +3008,30 @@ async fn run_tool_loop(
                 }
 
                 // Refresh context from DB using cursor-based append system
-                check_fill_and_maybe_reset(
-                    &store,
-                    conv_name,
-                    agent_name,
-                    last_tokens_in.map(|t| t as i64),
-                    last_tokens_out.map(|t| t as i64),
-                    num_ctx.map(|n| n as i64),
-                    logger,
-                );
                 if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, logger, num_ctx) {
+                    let latest_msg_id = msgs.last().map(|m| m.id);
+                    check_fill_and_maybe_reset(
+                        &store,
+                        conv_name,
+                        agent_name,
+                        last_tokens_in.map(|t| t as i64),
+                        last_tokens_out.map(|t| t as i64),
+                        num_ctx.map(|n| n as i64),
+                        dedup_lazy,
+                        latest_msg_id,
+                        logger,
+                    );
+                    let dedup_up_to = if dedup_lazy {
+                        store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None)
+                    } else {
+                        latest_msg_id
+                    };
                     let (refreshed_history, refreshed_final) =
-                        format_conversation_history(&msgs, agent_name);
+                        format_conversation_history(&msgs, agent_name, dedup_up_to);
                     conversation_history = refreshed_history;
                     if current_message.is_empty() {
                         current_message = refreshed_final;
                     }
-
                 }
 
                 // Inject tool budget nudge
@@ -3065,6 +3107,7 @@ async fn process_message_work(
     conversation_recall_limit: usize,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
+    dedup_lazy: bool,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -3089,8 +3132,13 @@ async fn process_message_work(
                     Ok(msgs) if !msgs.is_empty() => {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
+                        let dedup_up_to = if dedup_lazy {
+                            store.get_dedup_cursor(cname, agent_name).unwrap_or(None)
+                        } else {
+                            msgs.last().map(|m| m.id)
+                        };
                         let (history, final_content) =
-                            format_conversation_history(&msgs, agent_name);
+                            format_conversation_history(&msgs, agent_name, dedup_up_to);
                         logger.log(&format!(
                             "[worker] Loaded {} history messages for conversation {}",
                             history.len(),
@@ -3190,6 +3238,7 @@ async fn process_message_work(
             shutdown,
             logger,
             log_tx.clone(),
+            dedup_lazy,
         ).await;
 
         drop(log_tx);
@@ -3794,6 +3843,13 @@ fn set_anchor_cursor(
 }
 
 /// Check context fill ratio and reset cursor if threshold exceeded.
+///
+/// In lazy dedup mode (`dedup_lazy = true`), uses a two-phase approach:
+/// 1. First time fill >= threshold: advance dedup_cursor to latest_msg_id
+///    (next turn will dedup + strip notes for messages up to that point)
+/// 2. If still over threshold after dedup: reset context_cursor + clear dedup_cursor
+///
+/// In eager mode (`dedup_lazy = false`): always reset context_cursor immediately.
 fn check_fill_and_maybe_reset(
     store: &ConversationStore,
     conv_name: &str,
@@ -3801,21 +3857,53 @@ fn check_fill_and_maybe_reset(
     tokens_in: Option<i64>,
     tokens_out: Option<i64>,
     num_ctx: Option<i64>,
+    dedup_lazy: bool,
+    latest_msg_id: Option<i64>,
     logger: &AgentLogger,
 ) {
     if let (Some(t_in), Some(t_out), Some(ctx)) = (tokens_in, tokens_out, num_ctx) {
         if ctx > 0 {
             let fill = (t_in + t_out) as f64 / ctx as f64;
             if fill >= CONTEXT_FILL_THRESHOLD {
-                logger.log(&format!(
-                    "[context] Fill {:.0}% >= threshold {:.0}% for {} in {}, resetting cursor",
-                    fill * 100.0,
-                    CONTEXT_FILL_THRESHOLD * 100.0,
-                    agent_name,
-                    conv_name
-                ));
-                if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
-                    logger.log(&format!("[context] Failed to clear cursor: {}", e));
+                if dedup_lazy {
+                    // Two-phase: try dedup first, then reset cursor if insufficient
+                    let current_dedup = store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None);
+                    let latest = latest_msg_id.unwrap_or(0);
+
+                    if current_dedup.is_none() || current_dedup.unwrap_or(0) < latest {
+                        // Phase 1: advance dedup cursor — next turn will dedup
+                        logger.log(&format!(
+                            "[context] Fill {:.0}% >= threshold, advancing dedup cursor to msg_id={} for {} in {}",
+                            fill * 100.0, latest, agent_name, conv_name
+                        ));
+                        if let Err(e) = store.set_dedup_cursor(conv_name, agent_name, latest) {
+                            logger.log(&format!("[context] Failed to set dedup cursor: {}", e));
+                        }
+                    } else {
+                        // Phase 2: dedup wasn't enough — reset context cursor
+                        logger.log(&format!(
+                            "[context] Fill {:.0}% still >= threshold after dedup, resetting cursor for {} in {}",
+                            fill * 100.0, agent_name, conv_name
+                        ));
+                        if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
+                            logger.log(&format!("[context] Failed to clear cursor: {}", e));
+                        }
+                        if let Err(e) = store.clear_dedup_cursor(conv_name, agent_name) {
+                            logger.log(&format!("[context] Failed to clear dedup cursor: {}", e));
+                        }
+                    }
+                } else {
+                    // Eager mode: reset cursor immediately
+                    logger.log(&format!(
+                        "[context] Fill {:.0}% >= threshold {:.0}% for {} in {}, resetting cursor",
+                        fill * 100.0,
+                        CONTEXT_FILL_THRESHOLD * 100.0,
+                        agent_name,
+                        conv_name
+                    ));
+                    if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
+                        logger.log(&format!("[context] Failed to clear cursor: {}", e));
+                    }
                 }
             }
         }
@@ -3848,6 +3936,7 @@ async fn handle_notify(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
+    dedup_lazy: bool,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -3901,8 +3990,13 @@ async fn handle_notify(
     let last_user_msg_id = context_messages.iter().rev()
         .find(|m| m.from_agent == "user")
         .map(|m| m.id);
+    let dedup_up_to = if dedup_lazy {
+        store.get_dedup_cursor(conv_id, agent_name).unwrap_or(None)
+    } else {
+        context_messages.last().map(|m| m.id)
+    };
     let (mut conversation_history, final_user_content) =
-        format_conversation_history(&context_messages, agent_name);
+        format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     // Build recall (tools + memories + conversation recall) based on current user message
     let recall_result = build_recall_for_query(
@@ -3998,6 +4092,7 @@ async fn handle_notify(
         shutdown,
         logger,
         log_tx.clone(),
+        dedup_lazy,
     ).await;
 
     // Clean up pause watcher
@@ -4065,6 +4160,8 @@ async fn handle_notify(
                 tokens_in,
                 tokens_out,
                 num_ctx_i64,
+                dedup_lazy,
+                Some(response_msg_id),
                 logger,
             );
 
@@ -4281,6 +4378,7 @@ async fn run_heartbeat(
     shutdown: &Arc<tokio::sync::Notify>,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
+    dedup_lazy: bool,
 ) {
     // Set current conversation for debug file naming
     {
@@ -4333,7 +4431,12 @@ async fn run_heartbeat(
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
-    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name);
+    let dedup_up_to = if dedup_lazy {
+        store.get_dedup_cursor(&conv_name, agent_name).unwrap_or(None)
+    } else {
+        context_messages.last().map(|m| m.id)
+    };
+    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     logger.log(&format!(
         "[heartbeat] Context: {} previous outputs",
@@ -5370,7 +5473,7 @@ api_key = "sk-test"
 
     #[test]
     fn test_format_conversation_history_empty() {
-        let (history, final_content) = format_conversation_history(&[], "arya");
+        let (history, final_content) = format_conversation_history(&[], "arya", Some(i64::MAX));
         assert!(history.is_empty());
         assert!(final_content.is_empty());
     }
@@ -5379,7 +5482,7 @@ api_key = "sk-test"
     fn test_format_conversation_history_single_user_message() {
         // Single message from user → should become final_content
         let msgs = vec![make_conv_msg("user", "hello")];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         assert!(history.is_empty());
         assert!(final_content.contains("\"from\": \"user\""));
@@ -5395,7 +5498,7 @@ api_key = "sk-test"
             make_conv_msg("arya", "hey there!"),
             make_conv_msg("user", "what's up?"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // History should have 2 messages: user JSON, assistant raw
         assert_eq!(history.len(), 2);
@@ -5425,7 +5528,7 @@ api_key = "sk-test"
             make_conv_msg("claude", "I can help"),
             make_conv_msg("user", "thanks"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // History: [user JSON], [assistant raw]
         // Final: [claude JSON + user JSON batched]
@@ -5448,7 +5551,7 @@ api_key = "sk-test"
             make_conv_msg("gendry", "need help"),
             make_conv_msg("arya", "what do you need?"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Both messages go into history since last message is from self
         // gendry → user JSON, arya → assistant raw
@@ -5474,7 +5577,7 @@ api_key = "sk-test"
     fn test_format_conversation_history_escapes_special_chars() {
         // Verify special characters are escaped in JSON wrapper
         let msgs = vec![make_conv_msg("user", "line1\nline2\"quote\\backslash")];
-        let (_, final_content) = format_conversation_history(&msgs, "arya");
+        let (_, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Newlines should be escaped as \n (literal)
         assert!(final_content.contains("\\n"));
@@ -5495,7 +5598,7 @@ api_key = "sk-test"
             make_conv_msg("arya", "resp2"),
             make_conv_msg("user", "msg3"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Should be: user, assistant, user, assistant (4 messages)
         // Final: user (msg3)
@@ -5521,7 +5624,7 @@ api_key = "sk-test"
             make_conv_msg("arya", "Hi! How can I help?"),
             make_conv_msg("user", "what's up?"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Should have 3 messages in history: assistant (recall), user, assistant (arya)
         assert_eq!(history.len(), 3);
@@ -5569,7 +5672,7 @@ api_key = "sk-test"
             make_conv_msg("arya", "Hi!"),
             make_conv_msg("user", "what's up?"),
         ];
-        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+        let (history, _final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Should have 4 messages: own recall, unattributed recall, user, assistant
         // (other_recall from gendry is filtered out)
@@ -5601,7 +5704,7 @@ api_key = "sk-test"
             make_tool_msg("[Tool Result for read_file]\nfile contents here", Some("arya")),
             make_conv_msg("user", "thanks"),
         ];
-        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+        let (history, _final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // History should include: user, assistant, tool result (3 messages)
         assert_eq!(history.len(), 3);
@@ -5620,7 +5723,7 @@ api_key = "sk-test"
             make_tool_msg("[Tool Result for shell]\nsome output", Some("gendry")),
             make_conv_msg("user", "what do you think @arya?"),
         ];
-        let (history, final_content) = format_conversation_history(&msgs, "arya");
+        let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Gendry's tool result should be filtered out.
         // History: user batch (user + gendry), no tool result
@@ -5643,7 +5746,7 @@ api_key = "sk-test"
             make_tool_msg("[Tool Result for read_file]\nold data", None), // unattributed
             make_conv_msg("user", "next"),
         ];
-        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+        let (history, _final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Unattributed tool result should be included
         assert_eq!(history.len(), 3);
@@ -5698,7 +5801,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _final_content) = format_conversation_history(&msgs, "arya");
+        let (history, _final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // First pair should be dropped entirely — only one read_file result in output
         let tool_results: Vec<&str> = history
@@ -5786,7 +5889,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Both should be present (different paths, no dedup)
         let tool_results: Vec<&str> = history
@@ -5852,7 +5955,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let tool_results: Vec<&str> = history
             .iter()
@@ -5923,7 +6026,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Both edit pairs dropped; read kept
         let edit_results: Vec<_> = history
@@ -5990,7 +6093,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let edit_results: Vec<_> = history
             .iter()
@@ -6045,7 +6148,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let shell_results: Vec<&str> = history
             .iter()
@@ -6099,7 +6202,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let shell_results: Vec<_> = history
             .iter()
@@ -6152,7 +6255,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let shell_results: Vec<_> = history
             .iter()
@@ -6208,7 +6311,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let shell_results: Vec<&str> = history
             .iter()
@@ -6282,7 +6385,7 @@ api_key = "sk-test"
             make_conv_msg("user", "use shell instead"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Only the last unknown-tool error pair should survive
         let error_results: Vec<&str> = history
@@ -6357,7 +6460,7 @@ api_key = "sk-test"
             msg_a1, msg_t1, msg_a2, msg_t2, msg_a3, msg_t3,
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Only the last notes result should survive
         let notes_results: Vec<_> = history
@@ -6419,7 +6522,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let read_results: Vec<&str> = history
             .iter()
@@ -6477,7 +6580,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         let read_results: Vec<_> = history
             .iter()
@@ -6543,7 +6646,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Unified fresh-view dedup: read and write both provide a full view of /a.rs.
         // The write is newer, so the earlier read is superseded and dropped.
@@ -6621,7 +6724,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Write is superseded by later read — both are fresh views, read is newer
         let write_results: Vec<_> = history
@@ -6711,7 +6814,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // The multi-tool assistant message (id=10) should be kept (not all tool_calls dropped)
         let assistant_msgs: Vec<&str> = history
@@ -7127,7 +7230,7 @@ api_key = "sk-test"
             },
         ];
 
-        let (history, _final_content) = format_conversation_history(&msgs, "dash");
+        let (history, _final_content) = format_conversation_history(&msgs, "dash", Some(i64::MAX));
 
         // Should have: assistant (with tool_calls), tool (role="tool" with tool_call_id)
         assert!(history.len() >= 2);
@@ -7157,7 +7260,7 @@ api_key = "sk-test"
             },
         ];
 
-        let (history, _final_content) = format_conversation_history(&msgs, "dash");
+        let (history, _final_content) = format_conversation_history(&msgs, "dash", Some(i64::MAX));
 
         // Legacy tool result should use role "user"
         assert!(history.len() >= 2);
@@ -7329,7 +7432,7 @@ api_key = "sk-test"
             make_conv_msg("user", "thanks"),
         ];
 
-        let (history, _) = format_conversation_history(&msgs, "arya");
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
         // Find assistant messages
         let asst_msgs: Vec<&ChatMessage> = history.iter().filter(|m| m.role == "assistant").collect();
@@ -7345,6 +7448,300 @@ api_key = "sk-test"
         assert!(last.contains("<notes>"), "last notes should be kept");
         assert!(last.contains("new plan"));
         assert!(last.contains("second response"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_lazy_dedup_skips_new_messages() {
+        // With cutoff before any tool results, no dedup should happen at all
+        let msgs = vec![
+            { let mut m = make_conv_msg("user", "read a.rs"); m.id = 1; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 2;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content of a.rs v1", Some("arya"));
+                m.id = 3;
+                m.tool_call_id = Some("tc1".into());
+                m
+            },
+            { let mut m = make_conv_msg("user", "read a.rs again"); m.id = 4; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 5;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content of a.rs v2", Some("arya"));
+                m.id = 6;
+                m.tool_call_id = Some("tc2".into());
+                m
+            },
+            { let mut m = make_conv_msg("user", "thanks"); m.id = 7; m },
+        ];
+
+        // Cutoff at id=1 (before any tool results) — nothing eligible for dedup
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(1));
+
+        let tool_results: Vec<&str> = history.iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+
+        // Both tool results survive — neither is within cutoff
+        assert_eq!(tool_results.len(), 2);
+        assert!(tool_results.iter().any(|c| c.contains("v1")));
+        assert!(tool_results.iter().any(|c| c.contains("v2")));
+    }
+
+    #[test]
+    fn test_format_conversation_history_lazy_dedup_drops_old_messages() {
+        // Messages at/before the dedup cutoff ARE deduped normally
+        let msgs = vec![
+            { let mut m = make_conv_msg("user", "read a.rs"); m.id = 1; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 2;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content of a.rs v1", Some("arya"));
+                m.id = 3;
+                m.tool_call_id = Some("tc1".into());
+                m
+            },
+            { let mut m = make_conv_msg("user", "read a.rs again"); m.id = 4; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 5;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content of a.rs v2", Some("arya"));
+                m.id = 6;
+                m.tool_call_id = Some("tc2".into());
+                m
+            },
+            // -- cutoff at id=7 covers all messages --
+            { let mut m = make_conv_msg("user", "thanks"); m.id = 7; m },
+        ];
+
+        // Cutoff at 7 — all messages eligible, behaves like eager mode
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(7));
+
+        let tool_results: Vec<&str> = history.iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+
+        // Only second (latest) read should survive — first is deduped
+        assert_eq!(tool_results.len(), 1);
+        assert!(tool_results[0].contains("v2"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_lazy_notes_stripping() {
+        // Notes should only be stripped from messages at/before the dedup boundary
+        let msgs = vec![
+            { let mut m = make_conv_msg("user", "hi"); m.id = 1; m },
+            {
+                let mut m = make_conv_msg("arya", "<notes>\nold plan\n</notes>\n\nfirst response");
+                m.id = 2;
+                m
+            },
+            // -- dedup cutoff at id=2 --
+            { let mut m = make_conv_msg("user", "next"); m.id = 3; m },
+            {
+                let mut m = make_conv_msg("arya", "<notes>\nmid plan\n</notes>\n\nsecond response");
+                m.id = 4;
+                m
+            },
+            { let mut m = make_conv_msg("user", "more"); m.id = 5; m },
+            {
+                let mut m = make_conv_msg("arya", "<notes>\nnew plan\n</notes>\n\nthird response");
+                m.id = 6;
+                m
+            },
+            { let mut m = make_conv_msg("user", "thanks"); m.id = 7; m },
+        ];
+
+        // Cutoff at id=2: only first assistant message is within boundary
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(2));
+
+        let asst_msgs: Vec<&ChatMessage> = history.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(asst_msgs.len(), 3);
+
+        // First assistant (id=2, within boundary) — notes stripped
+        let first = asst_msgs[0].content.as_ref().unwrap();
+        assert!(!first.contains("<notes>"), "notes within boundary should be stripped");
+        assert!(first.contains("first response"));
+
+        // Second assistant (id=4, after boundary) — notes kept (frozen prefix)
+        let second = asst_msgs[1].content.as_ref().unwrap();
+        assert!(second.contains("<notes>"), "notes after boundary should be kept");
+        assert!(second.contains("mid plan"));
+
+        // Third/last assistant (id=6) — notes always kept (last assistant)
+        let third = asst_msgs[2].content.as_ref().unwrap();
+        assert!(third.contains("<notes>"), "last assistant notes always kept");
+        assert!(third.contains("new plan"));
+    }
+
+    #[test]
+    fn test_format_conversation_history_eager_unchanged() {
+        // With dedup_up_to = latest msg id, behavior is identical to old "always dedup"
+        let msgs = vec![
+            { let mut m = make_conv_msg("user", "hi"); m.id = 1; m },
+            {
+                let mut m = make_conv_msg("arya", "<notes>\nold plan\n</notes>\n\nfirst response");
+                m.id = 2;
+                m
+            },
+            { let mut m = make_conv_msg("user", "next"); m.id = 3; m },
+            {
+                let mut m = make_conv_msg("arya", "<notes>\nnew plan\n</notes>\n\nsecond response");
+                m.id = 4;
+                m
+            },
+            { let mut m = make_conv_msg("user", "thanks"); m.id = 5; m },
+        ];
+
+        // Eager: pointer at latest message (5) — all messages eligible
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(5));
+
+        let asst_msgs: Vec<&ChatMessage> = history.iter().filter(|m| m.role == "assistant").collect();
+        assert_eq!(asst_msgs.len(), 2);
+
+        // First assistant — notes stripped (within boundary, not last)
+        let first = asst_msgs[0].content.as_ref().unwrap();
+        assert!(!first.contains("<notes>"), "old notes stripped in eager mode");
+        assert!(first.contains("first response"));
+
+        // Last assistant — notes kept
+        let last = asst_msgs[1].content.as_ref().unwrap();
+        assert!(last.contains("<notes>"), "last notes kept in eager mode");
+    }
+
+    #[test]
+    fn test_format_conversation_history_no_dedup_pointer() {
+        // With dedup_up_to = None, no dedup or notes stripping happens at all
+        let msgs = vec![
+            { let mut m = make_conv_msg("user", "read a.rs"); m.id = 1; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 2;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content v1", Some("arya"));
+                m.id = 3;
+                m.tool_call_id = Some("tc1".into());
+                m
+            },
+            { let mut m = make_conv_msg("user", "read again"); m.id = 4; m },
+            {
+                let mut m = make_conv_msg("arya", "");
+                m.id = 5;
+                m.tool_calls = Some(serde_json::to_string(&vec![
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                ]).unwrap());
+                m
+            },
+            {
+                let mut m = make_tool_msg("content v2", Some("arya"));
+                m.id = 6;
+                m.tool_call_id = Some("tc2".into());
+                m
+            },
+            { let mut m = make_conv_msg("user", "thanks"); m.id = 7; m },
+        ];
+
+        // No dedup pointer — nothing should be deduped
+        let (history, _) = format_conversation_history(&msgs, "arya", None);
+
+        let tool_results: Vec<&str> = history.iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+
+        // Both tool results survive — no dedup
+        assert_eq!(tool_results.len(), 2);
+        assert!(tool_results.iter().any(|c| c.contains("v1")));
+        assert!(tool_results.iter().any(|c| c.contains("v2")));
+    }
+
+    #[test]
+    fn test_check_fill_advances_dedup_cursor() {
+        use crate::conversation::ConversationStore;
+        let dir2 = tempdir().unwrap();
+        let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
+        let conv = store.create_conversation(Some("fill-test"), &["dash"]).unwrap();
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+
+        // No dedup cursor initially
+        assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
+
+        // Simulate fill >= 90% with lazy mode
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000), // 100% fill
+            true,       // dedup_lazy
+            Some(42),   // latest_msg_id
+            &logger,
+        );
+
+        // Dedup cursor should be set to latest_msg_id
+        assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
+        // Context cursor should NOT be cleared (still set to whatever it was)
+    }
+
+    #[test]
+    fn test_check_fill_resets_after_dedup_insufficient() {
+        use crate::conversation::ConversationStore;
+        let dir2 = tempdir().unwrap();
+        let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
+        let conv = store.create_conversation(Some("fill-test2"), &["dash"]).unwrap();
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+
+        // Set context cursor so we can verify it gets cleared
+        store.set_context_cursor(&conv, "dash", 10).unwrap();
+
+        // First call: advances dedup cursor
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000),
+            true, Some(42), &logger,
+        );
+        assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
+
+        // Second call: dedup cursor already at latest — triggers phase 2 (reset)
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000),
+            true, Some(42), &logger,
+        );
+
+        // Both cursors should be cleared
+        assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
+        assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
     }
 
 }
