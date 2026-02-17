@@ -946,6 +946,15 @@ impl OpenAIClient {
                                 }
                             }
                         }
+                        "response.function_call_arguments.done" => {
+                            if let Some(args) = parsed["arguments"].as_str() {
+                                if let Some(ref call_id) = current_fn_call_id {
+                                    if let Some(entry) = fn_call_builders.get_mut(call_id) {
+                                        entry.1 = args.to_string();
+                                    }
+                                }
+                            }
+                        }
                         "response.output_item.added" => {
                             if let Some(item) = parsed["item"].as_object() {
                                 if item.get("type").and_then(|v| v.as_str())
