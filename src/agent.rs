@@ -1285,16 +1285,16 @@ impl Agent {
         Some(context)
     }
 
-    /// Dump the raw LLM request payload to turns/{conv_name}.json in the agent directory.
-    /// This is called before each LLM request to provide the exact JSON for debugging/reproduction.
-    fn dump_context(
+    /// Dump the raw LLM request payload to turns/{conv_name}/req-{n}.json in the agent directory.
+    /// Returns the turn number so the caller can pass it to `dump_response`.
+    fn dump_request(
         &self,
         tools: &Option<Vec<ToolSpec>>,
         messages: &[ChatMessage],
-    ) {
+    ) -> Option<u64> {
         let agent_dir = match &self.agent_dir {
             Some(dir) => dir,
-            None => return, // No agent dir configured, skip dump
+            None => return None, // No agent dir configured, skip dump
         };
 
         // Determine conversation name for the file
@@ -1307,7 +1307,7 @@ impl Agent {
                 "[agent:{}] Failed to create turns directory: {}",
                 self.id, e
             );
-            return;
+            return None;
         }
 
         // Create .gitignore in turns/ to make it self-ignoring (debug files shouldn't be committed)
@@ -1316,21 +1316,19 @@ impl Agent {
             let _ = std::fs::write(&gitignore_path, "*\n!.gitignore\n");
         }
 
-        // Find next sequential number: scan for *.json, parse numeric stems, take max + 1
+        // Find next sequential number: scan for req-*.json, parse numeric part, take max + 1
         let next_n = std::fs::read_dir(&conv_dir)
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
-                e.path()
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .and_then(|s| s.parse::<u64>().ok())
+                let stem = e.path().file_stem()?.to_str()?.to_string();
+                stem.strip_prefix("req-")?.parse::<u64>().ok()
             })
             .max()
             .map_or(1, |m| m + 1);
 
-        let file_path = conv_dir.join(format!("{}.json", next_n));
+        let file_path = conv_dir.join(format!("req-{}.json", next_n));
 
         // Get model name from LLM if available
         let model = self
@@ -1408,7 +1406,43 @@ impl Agent {
 
         // Write to file (best-effort, don't fail the agent on IO errors)
         if let Err(e) = std::fs::write(&file_path, content) {
-            eprintln!("[agent:{}] Failed to write context dump: {}", self.id, e);
+            eprintln!("[agent:{}] Failed to write request dump: {}", self.id, e);
+            return None;
+        }
+
+        Some(next_n)
+    }
+
+    /// Dump the raw LLM response to turns/{conv_name}/resp-{n}.json.
+    fn dump_response(&self, turn_n: Option<u64>, response: &crate::llm::LLMResponse) {
+        let turn_n = match turn_n {
+            Some(n) => n,
+            None => return,
+        };
+        let agent_dir = match &self.agent_dir {
+            Some(dir) => dir,
+            None => return,
+        };
+        let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
+        let conv_dir = agent_dir.join("turns").join(conv_name);
+        let file_path = conv_dir.join(format!("resp-{}.json", turn_n));
+
+        let content =
+            serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string());
+        if let Err(e) = std::fs::write(&file_path, content) {
+            eprintln!("[agent:{}] Failed to write response dump: {}", self.id, e);
+        }
+
+        // Write raw HTTP response body for debugging parsing issues
+        if let Some(ref raw) = response.raw_body {
+            let raw_path = conv_dir.join(format!("raw-{}.json", turn_n));
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
+                let pretty =
+                    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| raw.clone());
+                let _ = std::fs::write(&raw_path, pretty);
+            } else {
+                let _ = std::fs::write(&raw_path, raw);
+            }
         }
     }
 
@@ -1483,12 +1517,13 @@ impl Agent {
                 }
             }
 
-            self.dump_context(&tools, &messages);
+            let turn_n = self.dump_request(&tools, &messages);
 
             let llm_start = Instant::now();
             let response = self
                 .call_llm(&llm, &messages, &tools, &options.retry_policy)
                 .await?;
+            self.dump_response(turn_n, &response);
 
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.emit(Event::LlmCall {
@@ -1698,12 +1733,13 @@ impl Agent {
         let messages =
             self.build_messages(&effective_system_prompt, &options.conversation_history, user_content);
 
-        self.dump_context(&tools, &messages);
+        let turn_n = self.dump_request(&tools, &messages);
 
         let llm_start = Instant::now();
         let response = self
             .call_llm(&llm, &messages, &tools, &options.retry_policy)
             .await?;
+        self.dump_response(turn_n, &response);
         let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
 
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
@@ -1761,12 +1797,13 @@ impl Agent {
         let messages =
             self.build_messages(&effective_system_prompt, &options.conversation_history, user_content);
 
-        self.dump_context(&tools, &messages);
+        let turn_n = self.dump_request(&tools, &messages);
 
         let llm_start = Instant::now();
         let response = self
             .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
             .await?;
+        self.dump_response(turn_n, &response);
         let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
 
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
@@ -1850,12 +1887,13 @@ impl Agent {
                 }
             }
 
-            self.dump_context(&tools, &messages);
+            let turn_n = self.dump_request(&tools, &messages);
 
             let llm_start = Instant::now();
             let response = self
                 .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
                 .await?;
+            self.dump_response(turn_n, &response);
 
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.emit(Event::LlmCall {

@@ -457,7 +457,7 @@ fn register_turns_hook() {
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
-            _ => {} // Created/ParticipantAdded — dirs created lazily by dump_context()
+            _ => {} // Created/ParticipantAdded — dirs created lazily by dump_request()
         }
     });
 }

@@ -268,6 +268,9 @@ pub struct LLMResponse {
     pub tool_calls: Vec<ToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageInfo>,
+    /// Raw HTTP response body for non-streaming calls (debugging parsing issues).
+    #[serde(skip)]
+    pub raw_body: Option<String>,
 }
 
 /// Token usage information from LLM API responses.
@@ -660,6 +663,7 @@ impl OpenAIClient {
             content: message["content"].as_str().map(|s| s.to_string()),
             tool_calls: parse_openai_tool_calls(&message["tool_calls"]),
             usage: parse_openai_usage(&parsed["usage"]),
+            raw_body: Some(response_text),
         })
     }
 
@@ -715,6 +719,7 @@ impl OpenAIClient {
             std::collections::HashMap::new();
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
+        let mut raw_lines: Vec<String> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -725,6 +730,10 @@ impl OpenAIClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
+
+                if !line.is_empty() {
+                    raw_lines.push(line.clone());
+                }
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
@@ -774,6 +783,7 @@ impl OpenAIClient {
             content: none_if_empty(full_content),
             tool_calls: finalize_tool_call_builders(tool_call_builders),
             usage,
+            raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
         })
     }
 }
@@ -834,6 +844,7 @@ impl OpenAIClient {
             content,
             tool_calls,
             usage: parse_responses_usage(&parsed["usage"]),
+            raw_body: Some(response_text),
         })
     }
 
@@ -893,6 +904,7 @@ impl OpenAIClient {
         let mut current_fn_call_id: Option<String> = None;
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
+        let mut raw_lines: Vec<String> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -903,6 +915,10 @@ impl OpenAIClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
+
+                if !line.is_empty() {
+                    raw_lines.push(line.clone());
+                }
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
@@ -984,6 +1000,7 @@ impl OpenAIClient {
             content: none_if_empty(full_content),
             tool_calls,
             usage,
+            raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
         })
     }
 }
@@ -1152,6 +1169,7 @@ impl LLM for AnthropicClient {
             content: none_if_empty(content_text),
             tool_calls,
             usage,
+            raw_body: Some(response_text),
         })
     }
 
@@ -1212,6 +1230,7 @@ impl LLM for AnthropicClient {
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut current_tool_use: Option<(String, String, String)> = None;
         let mut buffer = String::new();
+        let mut raw_lines: Vec<String> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -1222,6 +1241,10 @@ impl LLM for AnthropicClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
+
+                if !line.is_empty() {
+                    raw_lines.push(line.clone());
+                }
 
                 if line.is_empty() || line.starts_with(':') {
                     continue;
@@ -1298,6 +1321,7 @@ impl LLM for AnthropicClient {
             content: none_if_empty(full_content),
             tool_calls,
             usage: None,
+            raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
         })
     }
 }
@@ -1538,6 +1562,7 @@ impl LLM for OllamaClient {
             content,
             tool_calls,
             usage,
+            raw_body: Some(response_text),
         })
     }
 
@@ -1594,6 +1619,7 @@ impl LLM for OllamaClient {
             std::collections::HashMap::new();
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
+        let mut raw_lines: Vec<String> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result
@@ -1604,6 +1630,10 @@ impl LLM for OllamaClient {
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
                 buffer = buffer[line_end + 1..].to_string();
+
+                if !line.is_empty() {
+                    raw_lines.push(line.clone());
+                }
 
                 if line.is_empty() {
                     continue;
@@ -1655,6 +1685,7 @@ impl LLM for OllamaClient {
             content,
             tool_calls,
             usage,
+            raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
         })
     }
 }
@@ -1850,6 +1881,7 @@ impl LLM for ClaudeCodeClient {
             content,
             tool_calls: Vec::new(),
             usage,
+            raw_body: None,
         })
     }
 
@@ -1962,6 +1994,7 @@ impl LLM for ClaudeCodeClient {
             content: none_if_empty(full_content),
             tool_calls: Vec::new(),
             usage,
+            raw_body: None,
         })
     }
 }
