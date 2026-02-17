@@ -1412,7 +1412,7 @@ fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
 }
 
 /// Tools that bypass the allowlist and are always available to every agent.
-const ALWAYS_ALLOWED_TOOLS: &[&str] = &["notes"];
+const ALWAYS_ALLOWED_TOOLS: &[&str] = &[];
 
 /// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
 fn filter_by_allowlist<'a>(
@@ -3906,8 +3906,8 @@ fn check_fill_and_maybe_reset(
                     let current_dedup = store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None);
                     let latest = latest_msg_id.unwrap_or(0);
 
-                    if current_dedup.is_none() || current_dedup.unwrap_or(0) < latest {
-                        // Phase 1: advance dedup cursor — next turn will dedup
+                    if current_dedup.is_none() {
+                        // Phase 1: no dedup cursor yet — set it so next turn applies dedup
                         logger.log(&format!(
                             "[context] Fill {:.0}% >= threshold, advancing dedup cursor to msg_id={} for {} in {}",
                             fill * 100.0, latest, agent_name, conv_name
@@ -7782,6 +7782,41 @@ api_key = "sk-test"
         );
 
         // Both cursors should be cleared
+        assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
+        assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_check_fill_phase2_triggers_even_when_latest_advances() {
+        // Regression test: phase 2 must fire even when latest_msg_id grows between calls
+        // (new messages added between turns). Before fix, phase 1 always re-triggered
+        // because current_dedup < latest was always true.
+        use crate::conversation::ConversationStore;
+        let dir2 = tempdir().unwrap();
+        let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
+        let conv = store.create_conversation(Some("fill-phase2"), &["dash"]).unwrap();
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+
+        store.set_context_cursor(&conv, "dash", 5).unwrap();
+
+        // Phase 1: no dedup cursor → sets it to 42
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000),
+            true, Some(42), &logger,
+        );
+        assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
+        // Context cursor untouched
+        assert_eq!(store.get_context_cursor(&conv, "dash").unwrap(), Some(5));
+
+        // Phase 2: dedup cursor exists (42), latest advanced to 50 (new messages added).
+        // Still over threshold → should reset both cursors.
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000),
+            true, Some(50), &logger,
+        );
         assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
         assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
     }
