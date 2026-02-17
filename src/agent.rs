@@ -608,6 +608,10 @@ pub struct ThinkResult {
     pub duration_ms: Option<u64>,
     /// Number of prompt tokens served from cache (OpenAI Responses API, LMStudio).
     pub cached_tokens: Option<u32>,
+    /// Sequential turn number used for debug dump files (req-N.json, resp-N.json).
+    /// After the assistant message is stored to DB, the caller renames files from this
+    /// number to the DB message ID for easier cross-referencing.
+    pub dump_turn_n: Option<u64>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -1446,6 +1450,34 @@ impl Agent {
         }
     }
 
+    /// Rename debug turn dump files from sequential number to DB message ID.
+    /// Called after the assistant message is stored to the database, so the files
+    /// can be cross-referenced with `anima chat view` output.
+    pub fn rename_turn_files(&self, from_n: u64, to_id: i64) {
+        let agent_dir = match &self.agent_dir {
+            Some(dir) => dir,
+            None => return,
+        };
+        let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
+        let conv_dir = agent_dir.join("turns").join(conv_name);
+
+        for prefix in &["req", "resp", "raw"] {
+            let from_path = conv_dir.join(format!("{}-{}.json", prefix, from_n));
+            let to_path = conv_dir.join(format!("{}-{}.json", prefix, to_id));
+            if from_path.exists() {
+                if let Err(e) = std::fs::rename(&from_path, &to_path) {
+                    eprintln!(
+                        "[agent:{}] Failed to rename {} -> {}: {}",
+                        self.id,
+                        from_path.display(),
+                        to_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+    }
+
     pub async fn think_with_options(
         &mut self,
         task: &str,
@@ -1575,6 +1607,7 @@ impl Agent {
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
+                    dump_turn_n: None,
                 });
             }
 
@@ -1666,6 +1699,7 @@ impl Agent {
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
             cached_tokens: last_cached_tokens,
+            dump_turn_n: None,
         })
     }
 
@@ -1767,6 +1801,7 @@ impl Agent {
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
+            dump_turn_n: turn_n,
         })
     }
 
@@ -1831,6 +1866,7 @@ impl Agent {
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
+            dump_turn_n: turn_n,
         })
     }
 
@@ -1937,6 +1973,7 @@ impl Agent {
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
+                    dump_turn_n: None,
                 });
             }
 
@@ -2020,6 +2057,7 @@ impl Agent {
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
             cached_tokens: last_cached_tokens,
+            dump_turn_n: None,
         })
     }
 
