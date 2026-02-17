@@ -18,6 +18,88 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Find the best near-miss match for old_text in the file.
+/// Returns (start_line_index_0based, matched_count, total_old_lines) if above threshold.
+fn find_near_miss(file_lines: &[&str], old_lines: &[&str]) -> Option<(usize, usize, usize)> {
+    let n = old_lines.len();
+    if n == 0 || file_lines.is_empty() {
+        return None;
+    }
+    let mut best_matches = 0usize;
+    let mut best_pos = 0usize;
+    for start in 0..file_lines.len() {
+        let window_end = (start + n).min(file_lines.len());
+        let mut matches = 0usize;
+        for i in 0..(window_end - start) {
+            if file_lines[start + i].trim() == old_lines[i].trim() {
+                matches += 1;
+            }
+        }
+        if matches > best_matches {
+            best_matches = matches;
+            best_pos = start;
+        }
+    }
+    let threshold = ((n as f64 * 0.3).ceil() as usize).max(1);
+    if best_matches >= threshold {
+        Some((best_pos, best_matches, n))
+    } else {
+        None
+    }
+}
+
+fn format_near_miss(
+    file_lines: &[&str],
+    match_start: usize,
+    old_line_count: usize,
+    matched_count: usize,
+    context: usize,
+) -> String {
+    let match_end = (match_start + old_line_count).min(file_lines.len());
+    let display_start = match_start.saturating_sub(context);
+    let display_end = (match_end + context).min(file_lines.len());
+    let pct = (matched_count as f64 / old_line_count as f64 * 100.0) as usize;
+    let mut out = format!(
+        "Closest match ({}/{} lines, {}%) at lines {}-{}:\n\n",
+        matched_count,
+        old_line_count,
+        pct,
+        match_start + 1,
+        match_end,
+    );
+    for i in display_start..display_end {
+        let marker = if i >= match_start && i < match_end {
+            "|"
+        } else {
+            " "
+        };
+        out.push_str(&format!("{:>8} {} {}\n", i + 1, marker, file_lines[i]));
+    }
+    out
+}
+
+/// Format lines around a known match position with context.
+fn format_context_around(
+    file_lines: &[&str],
+    start_line: usize,
+    line_count: usize,
+    context: usize,
+) -> String {
+    let match_end = (start_line + line_count).min(file_lines.len());
+    let display_start = start_line.saturating_sub(context);
+    let display_end = (match_end + context).min(file_lines.len());
+    let mut out = format!("Text found at lines {}-{}:\n\n", start_line + 1, match_end);
+    for i in display_start..display_end {
+        let marker = if i >= start_line && i < match_end {
+            "|"
+        } else {
+            " "
+        };
+        out.push_str(&format!("{:>8} {} {}\n", i + 1, marker, file_lines[i]));
+    }
+    out
+}
+
 fn format_diff_summary(added: usize, removed: usize) -> String {
     let a = if added == 1 {
         "Added 1 line".to_string()
@@ -95,28 +177,53 @@ impl Tool for EditFileTool {
             .and_then(super::json_to_bool)
             .unwrap_or(false);
 
-        // Reject no-op edits
-        if old_text == new_text {
-            return Err(ToolError::InvalidInput(
-                "old_text and new_text are identical — no edit needed.".to_string(),
-            ));
-        }
-
         let path = expand_tilde(path_str);
 
         let content = tokio::fs::read_to_string(&path).await.map_err(|e| {
             ToolError::ExecutionFailed(format!("Failed to read file '{}': {}", path.display(), e))
         })?;
 
+        // Reject no-op edits — now after file read so we can show context
+        if old_text == new_text {
+            let file_lines: Vec<&str> = content.lines().collect();
+            let old_lines: Vec<&str> = old_text.lines().collect();
+            let message = if let Some(byte_pos) = content.find(old_text) {
+                let start_line = content[..byte_pos].matches('\n').count();
+                let ctx = format_context_around(&file_lines, start_line, old_lines.len(), 5);
+                format!(
+                    "No edit needed — old_text and new_text are identical. {}",
+                    ctx
+                )
+            } else {
+                "No edit needed — old_text and new_text are identical. Text not found in file — the edit may have been applied with different content. Use read_file to check.".to_string()
+            };
+            return Err(ToolError::InvalidInput(message));
+        }
+
         let match_count = content.matches(old_text).count();
 
         if match_count == 0 {
-            let total_lines = content.lines().count();
-            return Err(ToolError::ExecutionFailed(format!(
-                "old_text not found in '{}' ({} lines). Use read_file to check the file contents.",
-                path.display(),
-                total_lines,
-            )));
+            let file_lines: Vec<&str> = content.lines().collect();
+            let old_lines: Vec<&str> = old_text.lines().collect();
+            let total_lines = file_lines.len();
+            let message = if let Some((pos, matched, total)) =
+                find_near_miss(&file_lines, &old_lines)
+            {
+                let near = format_near_miss(&file_lines, pos, total, matched, 5);
+                format!(
+                    "old_text not found in '{}' ({} lines). {}",
+                    path.display(),
+                    total_lines,
+                    near
+                )
+            } else {
+                format!(
+                    "old_text not found in '{}' ({} lines). No similar region found. Use read_file to check the file contents.",
+                    path.display(),
+                    total_lines,
+                )
+            };
+            return Err(ToolError::ExecutionFailed(message));
         }
 
         if !replace_all && match_count > 1 {
@@ -311,7 +418,10 @@ mod tests {
         assert!(matches!(result, Err(ToolError::ExecutionFailed(ref msg)) if msg.contains("not found")));
         if let Err(ToolError::ExecutionFailed(msg)) = result {
             assert!(msg.contains("1 lines"), "Error should show line count");
-            assert!(!msg.contains("hello world"), "Error should not include file contents");
+            assert!(
+                msg.contains("No similar region found"),
+                "Should say no similar region for unrelated content"
+            );
         }
     }
 
@@ -464,8 +574,11 @@ mod tests {
 
         if let Err(ToolError::ExecutionFailed(msg)) = result {
             assert!(msg.contains("60 lines"), "Should show line count");
+            assert!(
+                msg.contains("No similar region found"),
+                "Should say no similar region for unrelated content"
+            );
             assert!(msg.contains("read_file"), "Should suggest read_file");
-            assert!(!msg.contains("line 1\n"), "Should not dump file contents");
         } else {
             panic!("Expected ExecutionFailed error");
         }
@@ -490,15 +603,158 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_edit_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "line1\nline2\nsame content\nline4\nline5\n").unwrap();
+
         let tool = EditFileTool;
         let result = tool
             .execute(json!({
-                "path": "/tmp/whatever.txt",
+                "path": path.to_str().unwrap(),
                 "old_text": "same content",
                 "new_text": "same content"
             }))
             .await;
 
         assert!(matches!(result, Err(ToolError::InvalidInput(ref msg)) if msg.contains("identical")));
+    }
+
+    #[tokio::test]
+    async fn test_noop_edit_shows_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(
+            &path,
+            "aaa\nbbb\nccc\ntarget line\neee\nfff\nggg\n",
+        )
+        .unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "target line",
+                "new_text": "target line"
+            }))
+            .await;
+
+        if let Err(ToolError::InvalidInput(msg)) = result {
+            assert!(msg.contains("identical"), "Should mention identical");
+            assert!(msg.contains("Text found at lines"), "Should show location, got: {}", msg);
+            assert!(msg.contains("target line"), "Should show the matched text, got: {}", msg);
+            assert!(msg.contains("bbb") || msg.contains("ccc"), "Should show context above, got: {}", msg);
+            assert!(msg.contains("eee") || msg.contains("fff"), "Should show context below, got: {}", msg);
+        } else {
+            panic!("Expected InvalidInput error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_noop_edit_text_not_in_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "completely different content\n").unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "not in file",
+                "new_text": "not in file"
+            }))
+            .await;
+
+        if let Err(ToolError::InvalidInput(msg)) = result {
+            assert!(msg.contains("identical"), "Should mention identical");
+            assert!(msg.contains("Text not found in file"), "Should say text not found, got: {}", msg);
+            assert!(msg.contains("read_file"), "Should suggest read_file, got: {}", msg);
+        } else {
+            panic!("Expected InvalidInput error");
+        }
+    }
+
+    #[test]
+    fn test_find_near_miss_one_line_changed() {
+        let file_lines = vec!["aaa", "bbb", "ccc", "ddd", "eee"];
+        // old_text has 1 line different (CHANGED instead of ccc)
+        let old_lines = vec!["aaa", "bbb", "CHANGED", "ddd", "eee"];
+        let result = find_near_miss(&file_lines, &old_lines);
+        assert!(result.is_some());
+        let (pos, matched, total) = result.unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(matched, 4);
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn test_find_near_miss_no_match() {
+        let file_lines = vec!["aaa", "bbb", "ccc"];
+        let old_lines = vec!["xxx", "yyy", "zzz"];
+        let result = find_near_miss(&file_lines, &old_lines);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_find_near_miss_whitespace_diff() {
+        let file_lines = vec!["  aaa", "    bbb", "  ccc"];
+        // Same content with different indentation
+        let old_lines = vec!["aaa", "  bbb", "    ccc"];
+        let result = find_near_miss(&file_lines, &old_lines);
+        assert!(result.is_some());
+        let (pos, matched, total) = result.unwrap();
+        assert_eq!(pos, 0);
+        assert_eq!(matched, 3, "Trimmed comparison should match all lines");
+        assert_eq!(total, 3);
+    }
+
+    #[tokio::test]
+    async fn test_near_miss_shown_in_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+
+        let tool = EditFileTool;
+        // old_text matches 4/5 lines — only line3 is different
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "line1\nline2\nCHANGED\nline4\nline5",
+                "new_text": "replacement"
+            }))
+            .await;
+
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(msg.contains("Closest match"), "Should show near-miss, got: {}", msg);
+            assert!(msg.contains("4/5 lines"), "Should show match count, got: {}", msg);
+        } else {
+            panic!("Expected ExecutionFailed error");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_near_miss_not_shown_when_no_match() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.txt");
+        std::fs::write(&path, "aaa\nbbb\nccc\n").unwrap();
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(json!({
+                "path": path.to_str().unwrap(),
+                "old_text": "xxx\nyyy\nzzz",
+                "new_text": "replacement"
+            }))
+            .await;
+
+        if let Err(ToolError::ExecutionFailed(msg)) = result {
+            assert!(
+                msg.contains("No similar region found"),
+                "Should say no similar region, got: {}",
+                msg
+            );
+            assert!(!msg.contains("Closest match"), "Should not show near-miss");
+        } else {
+            panic!("Expected ExecutionFailed error");
+        }
     }
 }
