@@ -8,7 +8,8 @@ use anima::tools::{AddTool, CopyLinesTool, EchoTool, EditFileTool, HttpTool, Lis
 use anima::{
     AnthropicClient, AutoMemoryConfig, ConversationStore, InMemoryStore, LLM, NotifyResult,
     OpenAIClient, ReflectionConfig, Runtime, SemanticMemoryStore, SqliteMemory, ThinkOptions,
-    expand_all_mention, format_age, notify_mentioned_agents_parallel, parse_mentions,
+    expand_all_mention, format_age, notify_mentioned_agents_parallel, on_conversation_event,
+    parse_mentions,
 };
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
@@ -313,6 +314,8 @@ enum ChatCommands {
 
 #[tokio::main]
 async fn main() {
+    register_turns_hook();
+
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Repl);
 
@@ -426,6 +429,37 @@ async fn main() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Conversation event hooks
+// ---------------------------------------------------------------------------
+
+/// Register turns-directory lifecycle hooks for conversation events.
+fn register_turns_hook() {
+    use anima::ConversationEvent;
+
+    on_conversation_event(|event| {
+        match event {
+            ConversationEvent::Cleared { conv_name, participants } => {
+                for agent in participants.iter().filter(|a| a.as_str() != "user") {
+                    let dir = agents_dir().join(agent).join("turns").join(conv_name);
+                    if dir.is_dir() {
+                        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+            ConversationEvent::Deleted { conv_name, participants } => {
+                for agent in participants.iter().filter(|a| a.as_str() != "user") {
+                    let dir = agents_dir().join(agent).join("turns").join(conv_name);
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
+            }
+            _ => {} // Created/ParticipantAdded — dirs created lazily by dump_context()
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -685,9 +719,20 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
             let used_str = format_tokens_short(total_tokens);
             let ctx_str = format_tokens_short(num_ctx);
 
+            let cache_str = if let Some(cached) = msg.cached_tokens {
+                if tokens_in > 0 {
+                    let cache_pct = (cached as f64 / tokens_in as f64 * 100.0) as u32;
+                    format!(" cache:{}%", cache_pct)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+
             format!(
-                " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%)\x1b[0m",
-                used_str, ctx_str, percentage
+                " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%){}\x1b[0m",
+                used_str, ctx_str, percentage, cache_str
             )
         }
         (Some(tokens_in), Some(tokens_out), _) => {
@@ -1099,6 +1144,7 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
                     pinned: false,
                     prompt_eval_ns: None,
                     tool_call_id: None,
+                    cached_tokens: None,
                 };
                 // Overwrite the prompt line with the formatted message
                 print!("\x1b[A\x1b[2K{}", format_message_display(&user_msg));

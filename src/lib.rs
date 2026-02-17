@@ -28,10 +28,11 @@ pub use agent::{
     ToolExecution,
 };
 pub use conversation::{
-    Conversation, ConversationError, ConversationMessage, ConversationStore, NotifyResult,
-    Participant, PendingNotification, expand_all_mention, generate_fun_name,
+    Conversation, ConversationError, ConversationEvent, ConversationMessage, ConversationStore,
+    NotifyResult, Participant, PendingNotification, expand_all_mention, generate_fun_name,
     notify_mentioned_agents, notify_mentioned_agents_fire_and_forget,
-    notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned, parse_mentions,
+    notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned,
+    on_conversation_event, parse_mentions,
 };
 pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
 pub use error::{AgentError, ErrorContext, ToolError};

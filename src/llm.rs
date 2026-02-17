@@ -278,6 +278,8 @@ pub struct UsageInfo {
     /// Prompt evaluation duration in nanoseconds (Ollama-specific).
     /// When KV caching is active, this drops significantly.
     pub prompt_eval_duration_ns: Option<u64>,
+    /// Number of prompt tokens served from cache (OpenAI Responses API, LMStudio).
+    pub cached_tokens: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -354,11 +356,20 @@ impl std::error::Error for LLMError {}
 // OpenAI client
 // ---------------------------------------------------------------------------
 
+/// Which OpenAI-compatible endpoint to use.
+#[derive(Debug, Clone, Default)]
+enum ApiStyle {
+    #[default]
+    Chat,      // /chat/completions
+    Responses, // /responses
+}
+
 pub struct OpenAIClient {
     client: Client,
     api_key: String,
     base_url: String,
     model: String,
+    api_style: ApiStyle,
 }
 
 impl OpenAIClient {
@@ -372,6 +383,7 @@ impl OpenAIClient {
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
+            api_style: ApiStyle::default(),
         }
     }
 
@@ -382,6 +394,14 @@ impl OpenAIClient {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    pub fn with_api_style(mut self, style: &str) -> Self {
+        self.api_style = match style {
+            "responses" => ApiStyle::Responses,
+            _ => ApiStyle::Chat,
+        };
         self
     }
 }
@@ -417,6 +437,139 @@ fn parse_openai_usage(value: &Value) -> Option<UsageInfo> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32,
         prompt_eval_duration_ns: None,
+        cached_tokens: u
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    })
+}
+
+/// Convert `Vec<ChatMessage>` to the Responses API `input` array format.
+/// Returns `(instructions, input_array)` — system messages become top-level `instructions`.
+fn format_messages_responses(messages: Vec<ChatMessage>) -> (Option<String>, Vec<Value>) {
+    let mut instructions: Option<String> = None;
+    let mut input = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                instructions = msg.content;
+            }
+            "user" | "assistant" => {
+                let mut item = serde_json::json!({
+                    "type": "message",
+                    "role": msg.role,
+                });
+                if let Some(content) = &msg.content {
+                    item["content"] = Value::String(content.clone());
+                }
+                input.push(item);
+
+                // Emit tool_calls as separate function_call items
+                if msg.role == "assistant" {
+                    if let Some(tcs) = &msg.tool_calls {
+                        for tc in tcs {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": tc.id,
+                                "name": tc.name,
+                                "arguments": tc.arguments.to_string()
+                            }));
+                        }
+                    }
+                }
+            }
+            "tool" => {
+                input.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                    "output": msg.content.as_deref().unwrap_or("")
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    (instructions, input)
+}
+
+/// Format `ToolSpec`s for the Responses API (flat, no nested `function` wrapper).
+fn format_tools_responses(tools: &[ToolSpec]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters
+            })
+        })
+        .collect()
+}
+
+/// Parse the Responses API `output` array into content + tool calls.
+fn parse_responses_output(output: &Value) -> (Option<String>, Vec<ToolCall>) {
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    if let Some(items) = output.as_array() {
+        for item in items {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if let Some(content_arr) = item["content"].as_array() {
+                        for block in content_arr {
+                            if let Some(text) = block["text"].as_str() {
+                                content_parts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item["call_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item["name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments: Value = item["arguments"]
+                        .as_str()
+                        .and_then(|s| serde_json::from_str(s).ok())
+                        .unwrap_or(serde_json::json!({}));
+                    tool_calls.push(ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let content = if content_parts.is_empty() {
+        None
+    } else {
+        Some(content_parts.join(""))
+    };
+    (content, tool_calls)
+}
+
+/// Parse usage from a Responses API response.
+fn parse_responses_usage(value: &Value) -> Option<UsageInfo> {
+    let u = value.as_object()?;
+    Some(UsageInfo {
+        prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        prompt_eval_duration_ns: None,
+        cached_tokens: u
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
     })
 }
 
@@ -427,6 +580,35 @@ impl LLM for OpenAIClient {
     }
 
     async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        match self.api_style {
+            ApiStyle::Responses => self.chat_complete_responses(messages, tools).await,
+            ApiStyle::Chat => self.chat_complete_chat(messages, tools).await,
+        }
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        match self.api_style {
+            ApiStyle::Responses => {
+                self.chat_complete_stream_responses(messages, tools, tx)
+                    .await
+            }
+            ApiStyle::Chat => self.chat_complete_stream_chat(messages, tools, tx).await,
+        }
+    }
+}
+
+// -- OpenAI Chat Completions (existing) --
+impl OpenAIClient {
+    async fn chat_complete_chat(
         &self,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolSpec>>,
@@ -481,7 +663,7 @@ impl LLM for OpenAIClient {
         })
     }
 
-    async fn chat_complete_stream(
+    async fn chat_complete_stream_chat(
         &self,
         messages: Vec<ChatMessage>,
         tools: Option<Vec<ToolSpec>>,
@@ -591,6 +773,216 @@ impl LLM for OpenAIClient {
         Ok(LLMResponse {
             content: none_if_empty(full_content),
             tool_calls: finalize_tool_call_builders(tool_call_builders),
+            usage,
+        })
+    }
+}
+
+// -- OpenAI Responses API --
+impl OpenAIClient {
+    async fn chat_complete_responses(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        let url = format!("{}/responses", self.base_url);
+        let (instructions, input) = format_messages_responses(messages);
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "input": input
+        });
+
+        if let Some(inst) = instructions {
+            request_body["instructions"] = Value::String(inst);
+        }
+
+        if let Some(tool_list) = tools {
+            request_body["tools"] =
+                serde_json::to_value(format_tools_responses(&tool_list)).unwrap();
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
+
+        let status = response.status().as_u16();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to read response: {}", e)))?;
+
+        if status >= 400 {
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", response_text),
+            ));
+        }
+
+        let parsed: Value = serde_json::from_str(&response_text)
+            .map_err(|e| LLMError::permanent(format!("Failed to parse response: {}", e)))?;
+
+        let (content, tool_calls) = parse_responses_output(&parsed["output"]);
+
+        Ok(LLMResponse {
+            content,
+            tool_calls,
+            usage: parse_responses_usage(&parsed["usage"]),
+        })
+    }
+
+    async fn chat_complete_stream_responses(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        use futures_util::StreamExt;
+
+        let url = format!("{}/responses", self.base_url);
+        let (instructions, input) = format_messages_responses(messages);
+
+        let mut request_body = serde_json::json!({
+            "model": self.model,
+            "input": input,
+            "stream": true
+        });
+
+        if let Some(inst) = instructions {
+            request_body["instructions"] = Value::String(inst);
+        }
+
+        if let Some(tool_list) = tools {
+            request_body["tools"] =
+                serde_json::to_value(format_tools_responses(&tool_list)).unwrap();
+        }
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| LLMError::retryable(format!("Failed to send request: {}", e)))?;
+
+        let status = response.status().as_u16();
+        if status >= 400 {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(LLMError::from_status(
+                status,
+                format!("API error: {}", error_text),
+            ));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut full_content = String::new();
+        // Map call_id → (name, arguments_string) for accumulating function calls
+        let mut fn_call_builders: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        let mut current_fn_call_id: Option<String> = None;
+        let mut buffer = String::new();
+        let mut usage: Option<UsageInfo> = None;
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result
+                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(line_end) = buffer.find('\n') {
+                let line = buffer[..line_end].trim().to_string();
+                buffer = buffer[line_end + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                // Extract event type and data from SSE
+                if let Some(data) = line.strip_prefix("data: ")
+                    && let Ok(parsed) = serde_json::from_str::<Value>(data)
+                {
+                    let event_type = parsed["type"].as_str().unwrap_or("");
+
+                    match event_type {
+                        "response.output_text.delta" => {
+                            if let Some(delta) = parsed["delta"].as_str() {
+                                full_content.push_str(delta);
+                                let _ = tx.send(delta.to_string()).await;
+                            }
+                        }
+                        "response.function_call_arguments.delta" => {
+                            if let Some(delta) = parsed["delta"].as_str() {
+                                if let Some(ref call_id) = current_fn_call_id {
+                                    if let Some(entry) = fn_call_builders.get_mut(call_id) {
+                                        entry.1.push_str(delta);
+                                    }
+                                }
+                            }
+                        }
+                        "response.output_item.added" => {
+                            if let Some(item) = parsed["item"].as_object() {
+                                if item.get("type").and_then(|v| v.as_str())
+                                    == Some("function_call")
+                                {
+                                    let call_id = item
+                                        .get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let name = item
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    fn_call_builders
+                                        .insert(call_id.clone(), (name, String::new()));
+                                    current_fn_call_id = Some(call_id);
+                                }
+                            }
+                        }
+                        "response.output_item.done" => {
+                            current_fn_call_id = None;
+                        }
+                        "response.completed" => {
+                            if let Some(resp) = parsed["response"].as_object() {
+                                if let Some(u) = resp.get("usage") {
+                                    usage = parse_responses_usage(u);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Build tool calls from accumulated function call builders
+        let tool_calls: Vec<ToolCall> = fn_call_builders
+            .into_iter()
+            .filter_map(|(call_id, (name, args_str))| {
+                let arguments: Value = serde_json::from_str(&args_str).ok()?;
+                Some(ToolCall {
+                    id: call_id,
+                    name,
+                    arguments,
+                })
+            })
+            .collect();
+
+        Ok(LLMResponse {
+            content: none_if_empty(full_content),
+            tool_calls,
             usage,
         })
     }
@@ -753,6 +1145,7 @@ impl LLM for AnthropicClient {
             prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             prompt_eval_duration_ns: None,
+            cached_tokens: None,
         });
 
         Ok(LLMResponse {
@@ -1064,12 +1457,14 @@ fn parse_ollama_usage(response: &Value) -> Option<UsageInfo> {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
             prompt_eval_duration_ns,
+            cached_tokens: None,
         })
     } else {
         Some(UsageInfo {
             prompt_tokens: response["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
             completion_tokens: response["eval_count"].as_u64().unwrap_or(0) as u32,
             prompt_eval_duration_ns,
+            cached_tokens: None,
         })
     }
 }
@@ -1441,6 +1836,7 @@ impl LLM for ClaudeCodeClient {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32,
             prompt_eval_duration_ns: None,
+            cached_tokens: None,
         });
 
         if parsed["is_error"].as_bool() == Some(true) {
@@ -1540,6 +1936,7 @@ impl LLM for ClaudeCodeClient {
                                 .unwrap_or(0)
                                 as u32,
                             prompt_eval_duration_ns: None,
+                            cached_tokens: None,
                         });
                     }
                     _ => {}

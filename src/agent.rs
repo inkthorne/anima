@@ -578,6 +578,8 @@ pub struct ToolExecution {
     pub iter_prompt_eval_ns: Option<u64>,
     /// Per-iteration LLM wall-clock duration in milliseconds.
     pub iter_duration_ms: Option<u64>,
+    /// Per-iteration cached tokens count.
+    pub iter_cached_tokens: Option<u32>,
 }
 
 /// Result from a think operation, including tool usage information.
@@ -604,6 +606,8 @@ pub struct ThinkResult {
     pub prompt_eval_duration_ns: Option<u64>,
     /// Wall-clock duration of the last LLM call in milliseconds.
     pub duration_ms: Option<u64>,
+    /// Number of prompt tokens served from cache (OpenAI Responses API, LMStudio).
+    pub cached_tokens: Option<u32>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -1184,6 +1188,7 @@ impl Agent {
                 iter_tokens_out: if i == 0 { iter_usage.map(|u| u.completion_tokens) } else { None },
                 iter_prompt_eval_ns: if i == 0 { iter_usage.and_then(|u| u.prompt_eval_duration_ns) } else { None },
                 iter_duration_ms: if i == 0 { iter_duration_ms } else { None },
+                iter_cached_tokens: if i == 0 { iter_usage.and_then(|u| u.cached_tokens) } else { None },
             };
             tool_trace.push(execution.clone());
 
@@ -1295,9 +1300,9 @@ impl Agent {
         // Determine conversation name for the file
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
 
-        // Create turns/ directory if it doesn't exist
-        let turns_dir = agent_dir.join("turns");
-        if let Err(e) = std::fs::create_dir_all(&turns_dir) {
+        // Create turns/{conv_name}/ directory if it doesn't exist
+        let conv_dir = agent_dir.join("turns").join(conv_name);
+        if let Err(e) = std::fs::create_dir_all(&conv_dir) {
             eprintln!(
                 "[agent:{}] Failed to create turns directory: {}",
                 self.id, e
@@ -1305,13 +1310,27 @@ impl Agent {
             return;
         }
 
-        // Create .gitignore to make turns/ self-ignoring (debug files shouldn't be committed)
-        let gitignore_path = turns_dir.join(".gitignore");
+        // Create .gitignore in turns/ to make it self-ignoring (debug files shouldn't be committed)
+        let gitignore_path = agent_dir.join("turns").join(".gitignore");
         if !gitignore_path.exists() {
             let _ = std::fs::write(&gitignore_path, "*\n!.gitignore\n");
         }
 
-        let file_path = turns_dir.join(format!("{}.json", conv_name));
+        // Find next sequential number: scan for *.json, parse numeric stems, take max + 1
+        let next_n = std::fs::read_dir(&conv_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .max()
+            .map_or(1, |m| m + 1);
+
+        let file_path = conv_dir.join(format!("{}.json", next_n));
 
         // Get model name from LLM if available
         let model = self
@@ -1453,6 +1472,7 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
+        let mut last_cached_tokens: Option<u32> = None;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1483,6 +1503,7 @@ impl Agent {
                 last_tokens_in = Some(usage.prompt_tokens);
                 last_tokens_out = Some(usage.completion_tokens);
                 last_prompt_eval_ns = usage.prompt_eval_duration_ns;
+                last_cached_tokens = usage.cached_tokens;
             }
 
             if response.tool_calls.is_empty() {
@@ -1518,6 +1539,7 @@ impl Agent {
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
+                    cached_tokens: last_cached_tokens,
                 });
             }
 
@@ -1608,6 +1630,7 @@ impl Agent {
             tokens_out: last_tokens_out,
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
+            cached_tokens: last_cached_tokens,
         })
     }
 
@@ -1686,6 +1709,7 @@ impl Agent {
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
         let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
         let prompt_eval_ns = response.usage.as_ref().and_then(|u| u.prompt_eval_duration_ns);
+        let cached_tokens = response.usage.as_ref().and_then(|u| u.cached_tokens);
 
         let last_tool_calls = if response.tool_calls.is_empty() {
             None
@@ -1706,6 +1730,7 @@ impl Agent {
             tokens_out,
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
+            cached_tokens,
         })
     }
 
@@ -1747,6 +1772,7 @@ impl Agent {
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
         let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
         let prompt_eval_ns = response.usage.as_ref().and_then(|u| u.prompt_eval_duration_ns);
+        let cached_tokens = response.usage.as_ref().and_then(|u| u.cached_tokens);
 
         let last_tool_calls = if response.tool_calls.is_empty() {
             None
@@ -1767,6 +1793,7 @@ impl Agent {
             tokens_out,
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
+            cached_tokens,
         })
     }
 
@@ -1812,6 +1839,7 @@ impl Agent {
         let mut last_tokens_in: Option<u32> = None;
         let mut last_tokens_out: Option<u32> = None;
         let mut last_prompt_eval_ns: Option<u64> = None;
+        let mut last_cached_tokens: Option<u32> = None;
 
         for _iteration in 0..options.max_iterations {
             // Check cancellation before each LLM call
@@ -1842,6 +1870,7 @@ impl Agent {
                 last_tokens_in = Some(usage.prompt_tokens);
                 last_tokens_out = Some(usage.completion_tokens);
                 last_prompt_eval_ns = usage.prompt_eval_duration_ns;
+                last_cached_tokens = usage.cached_tokens;
             }
 
             if response.tool_calls.is_empty() {
@@ -1869,6 +1898,7 @@ impl Agent {
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
+                    cached_tokens: last_cached_tokens,
                 });
             }
 
@@ -1951,6 +1981,7 @@ impl Agent {
             tokens_out: last_tokens_out,
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
+            cached_tokens: last_cached_tokens,
         })
     }
 

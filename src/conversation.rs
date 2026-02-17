@@ -5,7 +5,36 @@
 
 use rusqlite::{Connection, params};
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use thiserror::Error;
+
+// ── Conversation event hooks ────────────────────────────────────────
+
+/// Events fired by ConversationStore after successful DB operations.
+pub enum ConversationEvent<'a> {
+    Created { conv_name: &'a str, participants: &'a [&'a str] },
+    Deleted { conv_name: &'a str, participants: &'a [String] },
+    Cleared { conv_name: &'a str, participants: &'a [String] },
+    ParticipantAdded { conv_name: &'a str, agent: &'a str },
+}
+
+type ConversationHook = Box<dyn Fn(&ConversationEvent) + Send + Sync>;
+
+static CONVERSATION_HOOKS: LazyLock<Mutex<Vec<ConversationHook>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Register a hook that fires on conversation lifecycle events.
+pub fn on_conversation_event(hook: impl Fn(&ConversationEvent) + Send + Sync + 'static) {
+    CONVERSATION_HOOKS.lock().unwrap().push(Box::new(hook));
+}
+
+fn fire_conversation_event(event: &ConversationEvent) {
+    if let Ok(hooks) = CONVERSATION_HOOKS.lock() {
+        for hook in hooks.iter() {
+            hook(event);
+        }
+    }
+}
 
 /// Errors that can occur during conversation operations.
 #[derive(Debug, Error)]
@@ -72,6 +101,8 @@ pub struct ConversationMessage {
     pub prompt_eval_ns: Option<i64>,
     /// Native tool call ID for matching tool results to their tool_calls (OpenAI/Ollama protocol)
     pub tool_call_id: Option<String>,
+    /// Number of prompt tokens served from cache (OpenAI Responses API, LMStudio)
+    pub cached_tokens: Option<i64>,
 }
 
 /// A pending notification for an offline agent.
@@ -252,6 +283,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "prompt_tokens_est", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "prompt_eval_ns", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tool_call_id", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "cached_tokens", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
 
@@ -416,6 +448,11 @@ impl ConversationStore {
                 params![conv_name, agent, now],
             )?;
         }
+
+        fire_conversation_event(&ConversationEvent::Created {
+            conv_name: &conv_name,
+            participants,
+        });
 
         Ok(conv_name)
     }
@@ -628,6 +665,8 @@ impl ConversationStore {
             params![conv_name, agent, now],
         )?;
 
+        fire_conversation_event(&ConversationEvent::ParticipantAdded { conv_name, agent });
+
         Ok(())
     }
 
@@ -641,7 +680,7 @@ impl ConversationStore {
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
         self.add_message_with_tokens(
-            conv_name, from_agent, content, mentions, None, None, None, None, None, None,
+            conv_name, from_agent, content, mentions, None, None, None, None, None, None, None,
         )
     }
 
@@ -667,6 +706,7 @@ impl ConversationStore {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -685,10 +725,11 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
         prompt_eval_ns: Option<i64>,
+        cached_tokens: Option<i64>,
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, from_agent, content, mentions,
-            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None, prompt_eval_ns, None,
+            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None, prompt_eval_ns, None, cached_tokens,
         )
     }
 
@@ -702,7 +743,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "tool", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, None,
+            None, None, None, None, None, Some(triggered_by), None, None, None,
         )
     }
 
@@ -717,7 +758,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "tool", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, Some(tool_call_id),
+            None, None, None, None, None, Some(triggered_by), None, Some(tool_call_id), None,
         )
     }
 
@@ -731,7 +772,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "recall", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, None,
+            None, None, None, None, None, Some(triggered_by), None, None, None,
         )
     }
 
@@ -751,6 +792,7 @@ impl ConversationStore {
         triggered_by: Option<&str>,
         prompt_eval_ns: Option<i64>,
         tool_call_id: Option<&str>,
+        cached_tokens: Option<i64>,
     ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
@@ -762,8 +804,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -786,10 +828,11 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
         prompt_eval_ns: Option<i64>,
+        cached_tokens: Option<i64>,
     ) -> Result<(), ConversationError> {
         self.conn.execute(
-            "UPDATE messages SET duration_ms = ?1, tokens_in = ?2, tokens_out = ?3, num_ctx = ?4, prompt_eval_ns = ?5 WHERE id = ?6",
-            params![duration_ms, tokens_in, tokens_out, num_ctx, prompt_eval_ns, message_id],
+            "UPDATE messages SET duration_ms = ?1, tokens_in = ?2, tokens_out = ?3, num_ctx = ?4, prompt_eval_ns = ?5, cached_tokens = ?6 WHERE id = ?7",
+            params![duration_ms, tokens_in, tokens_out, num_ctx, prompt_eval_ns, cached_tokens, message_id],
         )?;
         Ok(())
     }
@@ -803,11 +846,12 @@ impl ConversationStore {
         tokens_out: Option<i64>,
         num_ctx: Option<i64>,
         prompt_eval_ns: Option<i64>,
+        cached_tokens: Option<i64>,
     ) -> Result<usize, ConversationError> {
         let count = self.conn.execute(
-            "UPDATE messages SET tokens_in = ?1, tokens_out = ?2, num_ctx = ?3, prompt_eval_ns = ?4
-             WHERE conv_name = ?5 AND from_agent = ?6 AND tokens_in IS NULL",
-            params![tokens_in, tokens_out, num_ctx, prompt_eval_ns, conv_name, from_agent],
+            "UPDATE messages SET tokens_in = ?1, tokens_out = ?2, num_ctx = ?3, prompt_eval_ns = ?4, cached_tokens = ?5
+             WHERE conv_name = ?6 AND from_agent = ?7 AND tokens_in IS NULL",
+            params![tokens_in, tokens_out, num_ctx, prompt_eval_ns, cached_tokens, conv_name, from_agent],
         )?;
         Ok(count)
     }
@@ -1467,6 +1511,13 @@ impl ConversationStore {
         self.find_by_name(conv_name)?
             .ok_or_else(|| ConversationError::NotFound(conv_name.to_string()))?;
 
+        // Fetch participants before clearing (needed for hook)
+        let participants: Vec<String> = self
+            .get_participants(conv_name)?
+            .into_iter()
+            .map(|p| p.agent)
+            .collect();
+
         // Delete pending notifications for this conversation
         self.conn.execute(
             "DELETE FROM pending_notifications WHERE conv_name = ?1",
@@ -1491,11 +1542,21 @@ impl ConversationStore {
             params![conv_name],
         )?;
 
+        fire_conversation_event(&ConversationEvent::Cleared { conv_name, participants: &participants });
+
         Ok(deleted)
     }
 
     /// Delete a conversation and all its related data.
     pub fn delete_conversation(&self, conv_name: &str) -> Result<(), ConversationError> {
+        // Fetch participants before deleting (needed for hook)
+        let participants: Vec<String> = self
+            .get_participants(conv_name)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.agent)
+            .collect();
+
         self.conn.execute(
             "DELETE FROM pending_notifications WHERE conv_name = ?1",
             params![conv_name],
@@ -1516,6 +1577,8 @@ impl ConversationStore {
             "DELETE FROM conversations WHERE name = ?1",
             params![conv_name],
         )?;
+
+        fire_conversation_event(&ConversationEvent::Deleted { conv_name, participants: &participants });
 
         Ok(())
     }
@@ -1635,11 +1698,12 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> 
         pinned: row.get::<_, i64>(13).unwrap_or(0) != 0,
         prompt_eval_ns: row.get(14)?,
         tool_call_id: row.get(15)?,
+        cached_tokens: row.get(16)?,
     })
 }
 
 /// SQL column list for message queries.
-const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned, prompt_eval_ns, tool_call_id";
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned, prompt_eval_ns, tool_call_id, cached_tokens";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
@@ -3031,6 +3095,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3049,6 +3114,7 @@ mod tests {
                 Some("arya"),
                 None,
                 Some("tc1"),
+                None,
             )
             .unwrap();
 
@@ -3087,6 +3153,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3105,6 +3172,7 @@ mod tests {
                 Some("arya"),
                 None,
                 Some("tc1"),
+                None,
             )
             .unwrap();
 

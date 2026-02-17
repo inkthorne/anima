@@ -65,6 +65,9 @@ pub struct LlmSection {
     /// Maximum tokens for Anthropic API responses
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// API style: "chat" (default, /chat/completions) or "responses" (/responses)
+    #[serde(default)]
+    pub api_style: Option<String>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -85,6 +88,8 @@ pub struct ResolvedLlmConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// Maximum tokens for Anthropic API responses
     pub max_tokens: Option<u32>,
+    /// API style: "chat" (default) or "responses"
+    pub api_style: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -448,6 +453,7 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
             .clone()
             .or(base.allowed_tools.clone()),
         max_tokens: llm_section.max_tokens.or(base.max_tokens),
+        api_style: llm_section.api_style.clone().or(base.api_style.clone()),
     })
 }
 

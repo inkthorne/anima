@@ -164,6 +164,7 @@ struct NativeToolModeResult {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     prompt_eval_duration_ns: Option<u64>,
+    cached_tokens: Option<u32>,
 }
 
 /// Expand injection directives in always.md content.
@@ -989,11 +990,12 @@ fn spawn_tool_trace_persister(
             let tokens_in = exec.iter_tokens_in.map(|t| t as i64);
             let tokens_out = exec.iter_tokens_out.map(|t| t as i64);
             let eval_ns = exec.iter_prompt_eval_ns.map(|t| t as i64);
+            let cached = exec.iter_cached_tokens.map(|t| t as i64);
             if let Err(e) = store.add_message_with_tokens(
                 &cname, &agent_name, content, &[],
                 exec.iter_duration_ms.map(|d| d as i64),
                 tool_calls_json.as_deref(),
-                tokens_in, tokens_out, num_ctx_i64, eval_ns,
+                tokens_in, tokens_out, num_ctx_i64, eval_ns, cached,
             ) {
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
@@ -2379,6 +2381,9 @@ async fn create_llm_from_config(
             if let Some(ref base_url) = config.base_url {
                 client = client.with_base_url(base_url);
             }
+            if let Some(ref style) = config.api_style {
+                client = client.with_api_style(style);
+            }
             Arc::new(client)
         }
         "anthropic" => {
@@ -2629,6 +2634,7 @@ struct ToolLoopResult {
     tokens_in: Option<u32>,
     tokens_out: Option<u32>,
     prompt_eval_duration_ns: Option<u64>,
+    cached_tokens: Option<u32>,
 }
 
 /// Unified tool loop for both native and JSON-block modes.
@@ -2681,6 +2687,7 @@ async fn run_tool_loop(
                 tokens_in: None,
                 tokens_out: None,
                 prompt_eval_duration_ns: None,
+                cached_tokens: None,
             };
         }
     };
@@ -2692,6 +2699,7 @@ async fn run_tool_loop(
     let mut last_tokens_in: Option<u32> = None;
     let mut last_tokens_out: Option<u32> = None;
     let mut last_prompt_eval_ns: Option<u64> = None;
+    let mut last_cached_tokens: Option<u32> = None;
 
     for _iteration in 0..max_iterations {
         // Check wall-clock time limit
@@ -2706,6 +2714,7 @@ async fn run_tool_loop(
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
+                    cached_tokens: last_cached_tokens,
                 };
             }
         }
@@ -2721,6 +2730,7 @@ async fn run_tool_loop(
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
+                    cached_tokens: last_cached_tokens,
                 };
             }
         }
@@ -2790,6 +2800,7 @@ async fn run_tool_loop(
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
                             prompt_eval_duration_ns: last_prompt_eval_ns,
+                            cached_tokens: last_cached_tokens,
                         };
                     }
                 }
@@ -2804,6 +2815,7 @@ async fn run_tool_loop(
                     tokens_in: None,
                     tokens_out: None,
                     prompt_eval_duration_ns: None,
+                    cached_tokens: None,
                 };
             }
         };
@@ -2816,10 +2828,12 @@ async fn run_tool_loop(
                 last_tokens_in = think_result.tokens_in;
                 last_tokens_out = think_result.tokens_out;
                 last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
+                last_cached_tokens = think_result.cached_tokens;
 
                 let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
                 let iter_tokens_out = think_result.tokens_out.map(|t| t as i64);
                 let iter_eval_ns = think_result.prompt_eval_duration_ns.map(|t| t as i64);
+                let iter_cached = think_result.cached_tokens.map(|t| t as i64);
                 let num_ctx_i64 = num_ctx.map(|n| n as i64);
 
                 // Strip thinking tags and extract [REMEMBER:...] tags
@@ -2854,6 +2868,7 @@ async fn run_tool_loop(
                                 tokens_in: last_tokens_in,
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
                             };
                         }
 
@@ -2865,7 +2880,7 @@ async fn run_tool_loop(
                             conv_name, agent_name, &db_content, &[],
                             think_result.duration_ms.map(|d| d as i64),
                             tool_calls_json.as_deref(),
-                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
+                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
                         ) {
                             logger.log(&format!("[loop] Failed to store assistant message: {}", e));
                         }
@@ -2887,6 +2902,7 @@ async fn run_tool_loop(
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
                             prompt_eval_duration_ns: last_prompt_eval_ns,
+                            cached_tokens: last_cached_tokens,
                         };
                     }
                 } else {
@@ -2904,6 +2920,7 @@ async fn run_tool_loop(
                                 tokens_in: last_tokens_in,
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
                             };
                         }
 
@@ -2914,7 +2931,7 @@ async fn run_tool_loop(
                             if let Err(e) = store.add_message_with_tokens(
                                 conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), None,
-                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns,
+                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
                             ) {
                                 logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
                             }
@@ -2950,6 +2967,7 @@ async fn run_tool_loop(
                             tokens_in: last_tokens_in,
                             tokens_out: last_tokens_out,
                             prompt_eval_duration_ns: last_prompt_eval_ns,
+                            cached_tokens: last_cached_tokens,
                         };
                     }
                 }
@@ -2989,6 +3007,7 @@ async fn run_tool_loop(
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
+                    cached_tokens: last_cached_tokens,
                 };
             }
             Err(e) => {
@@ -3002,6 +3021,7 @@ async fn run_tool_loop(
                     tokens_in: last_tokens_in,
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
+                    cached_tokens: last_cached_tokens,
                 };
             }
         }
@@ -3016,6 +3036,7 @@ async fn run_tool_loop(
         tokens_in: last_tokens_in,
         tokens_out: last_tokens_out,
         prompt_eval_duration_ns: last_prompt_eval_ns,
+        cached_tokens: last_cached_tokens,
     }
 }
 
@@ -3142,7 +3163,7 @@ async fn process_message_work(
 
     // With conversation: use unified tool loop (DB-backed context management)
     // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
-    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns) = if let Some(cname) = conv_name {
+    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens) = if let Some(cname) = conv_name {
         let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
         let start_time = std::time::Instant::now();
         let loop_budget = max_iterations.unwrap_or(25);
@@ -3174,7 +3195,7 @@ async fn process_message_work(
         drop(log_tx);
         let _ = log_fwd_handle.await;
 
-        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens)
     } else {
         // No conversation — use agent.rs tool loop directly (standalone mode)
         let (trace_tx, trace_rx) =
@@ -3203,9 +3224,9 @@ async fn process_message_work(
                     max_iterations,
                     num_ctx,
                 ).await;
-                (result.response.clone(), result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+                (result.response.clone(), result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens)
             } else {
-                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns) = process_json_block_mode(
+                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens) = process_json_block_mode(
                     &final_user_content,
                     &recall_result.relevant_tools,
                     token_tx,
@@ -3220,7 +3241,7 @@ async fn process_message_work(
                     max_iterations,
                     num_ctx,
                 ).await;
-                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns)
+                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens)
             }
         };
 
@@ -3248,6 +3269,7 @@ async fn process_message_work(
         let tokens_out = last_tokens_out.map(|t| t as i64);
         let num_ctx_i64 = num_ctx.map(|n| n as i64);
         let prompt_eval_ns = last_prompt_eval_ns.map(|t| t as i64);
+        let cached_tokens_i64 = last_cached_tokens.map(|t| t as i64);
         match ConversationStore::init() {
             Ok(store) => {
                 // Store recall AFTER response for persistence
@@ -3274,6 +3296,7 @@ async fn process_message_work(
                     tokens_out,
                     num_ctx_i64,
                     prompt_eval_ns,
+                    cached_tokens_i64,
                 ) {
                     Ok(response_msg_id) => {
                         // Embed agent response for future conversation recall
@@ -3377,7 +3400,7 @@ async fn process_native_tool_mode(
         ..Default::default()
     };
 
-    let (result, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns) = if let Some(tx) = token_tx {
+    let (result, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns, cached_tokens) = if let Some(tx) = token_tx {
         // Streaming mode - call directly (not spawned) so dropping the future cancels the LLM call
         let mut agent_guard = agent.lock().await;
         match agent_guard
@@ -3386,19 +3409,19 @@ async fn process_native_tool_mode(
         {
             Ok(result) => {
                 drop(agent_guard);
-                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns)
+                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens)
             }
             Err(e) => {
                 drop(agent_guard);
-                (format!("Error: {}", e), None, None, None, None)
+                (format!("Error: {}", e), None, None, None, None, None)
             }
         }
     } else {
         // Non-streaming mode
         let mut agent_guard = agent.lock().await;
         match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns),
-            Err(e) => (format!("Error: {}", e), None, None, None, None),
+            Ok(result) => (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens),
+            Err(e) => (format!("Error: {}", e), None, None, None, None, None),
         }
     };
 
@@ -3418,6 +3441,7 @@ async fn process_native_tool_mode(
         tokens_in,
         tokens_out,
         prompt_eval_duration_ns,
+        cached_tokens,
     }
 }
 
@@ -3456,7 +3480,7 @@ async fn process_json_block_mode(
     conversation_history: Vec<ChatMessage>,
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
-) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>) {
+) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>, Option<u32>) {
     let mut current_message = content.to_string();
     let max_tool_calls = max_iterations.unwrap_or(25);
     let mut tool_call_count = 0;
@@ -3468,6 +3492,8 @@ async fn process_json_block_mode(
     let mut last_tokens_out: Option<u32> = None;
     #[allow(unused_assignments)]
     let mut last_prompt_eval_ns: Option<u64> = None;
+    #[allow(unused_assignments)]
+    let mut last_cached_tokens: Option<u32> = None;
 
     loop {
         let options = ThinkOptions {
@@ -3543,10 +3569,11 @@ async fn process_json_block_mode(
                     last_tokens_in = result.tokens_in;
                     last_tokens_out = result.tokens_out;
                     last_prompt_eval_ns = result.prompt_eval_duration_ns;
+                    last_cached_tokens = result.cached_tokens;
                     result.response
                 }
-                Ok(Err(e)) => return (format!("Error: {}", e), None, None, None, None),
-                Err(e) => return (format!("Error: task panicked: {}", e), None, None, None, None),
+                Ok(Err(e)) => return (format!("Error: {}", e), None, None, None, None, None),
+                Err(e) => return (format!("Error: task panicked: {}", e), None, None, None, None, None),
             }
         } else {
             // Non-streaming mode
@@ -3560,9 +3587,10 @@ async fn process_json_block_mode(
                     last_tokens_in = result.tokens_in;
                     last_tokens_out = result.tokens_out;
                     last_prompt_eval_ns = result.prompt_eval_duration_ns;
+                    last_cached_tokens = result.cached_tokens;
                     result.response
                 }
-                Err(e) => return (format!("Error: {}", e), None, None, None, None),
+                Err(e) => return (format!("Error: {}", e), None, None, None, None, None),
             }
         };
 
@@ -3581,7 +3609,7 @@ async fn process_json_block_mode(
 
             if tool_call_count > max_tool_calls {
                 logger.tool("[worker] Max tool calls reached, stopping");
-                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
+                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
             }
 
             logger.tool(&format!(
@@ -3609,7 +3637,7 @@ async fn process_json_block_mode(
                 current_message.push_str(&format!("\n\n---\n{}", nudge));
             }
         } else {
-            return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns);
+            return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
         }
     }
 }
@@ -3986,11 +4014,12 @@ async fn handle_notify(
     let tokens_out = loop_result.tokens_out.map(|t| t as i64);
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
     let prompt_eval_ns_i64 = loop_result.prompt_eval_duration_ns.map(|t| t as i64);
+    let cached_tokens_i64 = loop_result.cached_tokens.map(|t| t as i64);
 
     // Stamp stats on intermediate messages
     if tokens_in.is_some() || tokens_out.is_some() {
         let _ = store.stamp_unstamped_messages(
-            conv_id, agent_name, tokens_in, tokens_out, num_ctx_i64, prompt_eval_ns_i64,
+            conv_id, agent_name, tokens_in, tokens_out, num_ctx_i64, prompt_eval_ns_i64, cached_tokens_i64,
         );
     }
 
@@ -4019,6 +4048,7 @@ async fn handle_notify(
         tokens_out,
         num_ctx_i64,
         prompt_eval_ns_i64,
+        cached_tokens_i64,
     ) {
         Ok(response_msg_id) => {
             logger.log(&format!(
@@ -5312,6 +5342,7 @@ api_key = "sk-test"
             pinned: false,
             prompt_eval_ns: None,
             tool_call_id: None,
+            cached_tokens: None,
         }
     }
 
@@ -5333,6 +5364,7 @@ api_key = "sk-test"
             pinned: false,
             prompt_eval_ns: None,
             tool_call_id: None,
+            cached_tokens: None,
         }
     }
 
