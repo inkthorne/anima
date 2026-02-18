@@ -3050,7 +3050,15 @@ async fn run_tool_loop(
                         logger,
                     );
                     let dedup_up_to = if dedup_lazy {
-                        store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None)
+                        match store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None) {
+                            Some(c) if c > 0 => {
+                                // Dedup pending → apply full dedup this one time, mark as applied
+                                let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
+                                latest_msg_id
+                            }
+                            Some(_) => latest_msg_id, // Negative: keep deduping (stable)
+                            None => None,             // No cursor: no dedup
+                        }
                     } else {
                         latest_msg_id
                     };
@@ -3164,7 +3172,14 @@ async fn process_message_work(
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
                         let dedup_up_to = if dedup_lazy {
-                            store.get_dedup_cursor(cname, agent_name).unwrap_or(None)
+                            match store.get_dedup_cursor(cname, agent_name).unwrap_or(None) {
+                                Some(c) if c > 0 => {
+                                    let _ = store.set_dedup_cursor(cname, agent_name, -c);
+                                    msgs.last().map(|m| m.id)
+                                }
+                                Some(_) => msgs.last().map(|m| m.id), // Negative: keep deduping
+                                None => None,
+                            }
                         } else {
                             msgs.last().map(|m| m.id)
                         };
@@ -3902,21 +3917,22 @@ fn check_fill_and_maybe_reset(
             let fill = (t_in + t_out) as f64 / ctx as f64;
             if fill >= CONTEXT_FILL_THRESHOLD {
                 if dedup_lazy {
-                    // Two-phase: try dedup first, then reset cursor if insufficient
+                    // Sign-encoded cursor: NULL=idle, positive=pending, negative=applied
                     let current_dedup = store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None);
-                    let latest = latest_msg_id.unwrap_or(0);
+                    let cursor_val = current_dedup.unwrap_or(0);
 
-                    if current_dedup.is_none() {
-                        // Phase 1: no dedup cursor yet — set it so next turn applies dedup
+                    if cursor_val == 0 {
+                        // Phase 1: no cursor yet — set positive cursor (dedup pending)
+                        let latest = latest_msg_id.unwrap_or(0);
                         logger.log(&format!(
-                            "[context] Fill {:.0}% >= threshold, advancing dedup cursor to msg_id={} for {} in {}",
+                            "[context] Fill {:.0}% >= threshold, setting dedup cursor to msg_id={} for {} in {}",
                             fill * 100.0, latest, agent_name, conv_name
                         ));
                         if let Err(e) = store.set_dedup_cursor(conv_name, agent_name, latest) {
                             logger.log(&format!("[context] Failed to set dedup cursor: {}", e));
                         }
-                    } else {
-                        // Phase 2: dedup wasn't enough — reset context cursor
+                    } else if cursor_val < 0 {
+                        // Phase 2: dedup was applied but fill still high — reset
                         logger.log(&format!(
                             "[context] Fill {:.0}% still >= threshold after dedup, resetting cursor for {} in {}",
                             fill * 100.0, agent_name, conv_name
@@ -3928,6 +3944,7 @@ fn check_fill_and_maybe_reset(
                             logger.log(&format!("[context] Failed to clear dedup cursor: {}", e));
                         }
                     }
+                    // cursor_val > 0: dedup pending but hasn't been applied yet — wait
                 } else {
                     // Eager mode: reset cursor immediately
                     logger.log(&format!(
@@ -4027,7 +4044,14 @@ async fn handle_notify(
         .find(|m| m.from_agent == "user")
         .map(|m| m.id);
     let dedup_up_to = if dedup_lazy {
-        store.get_dedup_cursor(conv_id, agent_name).unwrap_or(None)
+        match store.get_dedup_cursor(conv_id, agent_name).unwrap_or(None) {
+            Some(c) if c > 0 => {
+                let _ = store.set_dedup_cursor(conv_id, agent_name, -c);
+                context_messages.last().map(|m| m.id)
+            }
+            Some(_) => context_messages.last().map(|m| m.id), // Negative: keep deduping
+            None => None,
+        }
     } else {
         context_messages.last().map(|m| m.id)
     };
@@ -4474,7 +4498,14 @@ async fn run_heartbeat(
     let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
     let dedup_up_to = if dedup_lazy {
-        store.get_dedup_cursor(&conv_name, agent_name).unwrap_or(None)
+        match store.get_dedup_cursor(&conv_name, agent_name).unwrap_or(None) {
+            Some(c) if c > 0 => {
+                let _ = store.set_dedup_cursor(&conv_name, agent_name, -c);
+                context_messages.last().map(|m| m.id)
+            }
+            Some(_) => context_messages.last().map(|m| m.id), // Negative: keep deduping
+            None => None,
+        }
     } else {
         context_messages.last().map(|m| m.id)
     };
@@ -7766,7 +7797,7 @@ api_key = "sk-test"
         // Set context cursor so we can verify it gets cleared
         store.set_context_cursor(&conv, "dash", 10).unwrap();
 
-        // First call: advances dedup cursor
+        // Phase 1: advances dedup cursor (positive)
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
@@ -7774,7 +7805,10 @@ api_key = "sk-test"
         );
         assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
 
-        // Second call: dedup cursor already at latest — triggers phase 2 (reset)
+        // Simulate call-site negation (dedup was applied)
+        store.set_dedup_cursor(&conv, "dash", -42).unwrap();
+
+        // Phase 2: negative cursor + still over threshold → reset both cursors
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
@@ -7789,8 +7823,6 @@ api_key = "sk-test"
     #[test]
     fn test_check_fill_phase2_triggers_even_when_latest_advances() {
         // Regression test: phase 2 must fire even when latest_msg_id grows between calls
-        // (new messages added between turns). Before fix, phase 1 always re-triggered
-        // because current_dedup < latest was always true.
         use crate::conversation::ConversationStore;
         let dir2 = tempdir().unwrap();
         let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
@@ -7807,10 +7839,12 @@ api_key = "sk-test"
             true, Some(42), &logger,
         );
         assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
-        // Context cursor untouched
         assert_eq!(store.get_context_cursor(&conv, "dash").unwrap(), Some(5));
 
-        // Phase 2: dedup cursor exists (42), latest advanced to 50 (new messages added).
+        // Simulate call-site negation (dedup was applied)
+        store.set_dedup_cursor(&conv, "dash", -42).unwrap();
+
+        // Phase 2: negative cursor, latest advanced to 50 (new messages).
         // Still over threshold → should reset both cursors.
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
@@ -7819,6 +7853,132 @@ api_key = "sk-test"
         );
         assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
         assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_check_fill_positive_cursor_waits() {
+        // Positive cursor means dedup is pending — check_fill should NOT advance or reset
+        use crate::conversation::ConversationStore;
+        let dir2 = tempdir().unwrap();
+        let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
+        let conv = store.create_conversation(Some("fill-wait"), &["dash"]).unwrap();
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+
+        store.set_context_cursor(&conv, "dash", 5).unwrap();
+        store.set_dedup_cursor(&conv, "dash", 42).unwrap();
+
+        // Positive cursor + over threshold → should do nothing (wait for call-site to negate)
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(900), Some(100), Some(1000),
+            true, Some(50), &logger,
+        );
+
+        // Both cursors unchanged
+        assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
+        assert_eq!(store.get_context_cursor(&conv, "dash").unwrap(), Some(5));
+    }
+
+    #[test]
+    fn test_check_fill_below_threshold_preserves_negative_cursor() {
+        // When fill drops below threshold, negative cursor should be preserved
+        // (removing it would undo dedup and cause oscillation)
+        use crate::conversation::ConversationStore;
+        let dir2 = tempdir().unwrap();
+        let store = ConversationStore::open(&dir2.path().join("test.db")).unwrap();
+        let conv = store.create_conversation(Some("fill-preserve"), &["dash"]).unwrap();
+        let dir = tempdir().unwrap();
+        let logger = AgentLogger::new(dir.path(), "test-agent").unwrap();
+
+        // Set negative cursor (dedup was applied)
+        store.set_dedup_cursor(&conv, "dash", -42).unwrap();
+
+        // Fill below threshold (50%) with lazy mode
+        check_fill_and_maybe_reset(
+            &store, &conv, "dash",
+            Some(400), Some(100), Some(1000), // 50% fill
+            true, Some(50), &logger,
+        );
+
+        // Negative cursor should be preserved (not cleared)
+        let cursor = store.get_dedup_cursor(&conv, "dash").unwrap();
+        assert_eq!(cursor, Some(-42));
+    }
+
+    #[test]
+    fn test_dedup_none_vs_some_shows_oscillation_fix() {
+        // With dedup_up_to = None (old NULL/negative behavior), superseded reads come back.
+        // With dedup_up_to = Some(latest_msg_id), they are deduped (stable context).
+        let read_a_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+        let read_a_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+        }])
+        .unwrap();
+
+        let mut msg_agent1 = make_conv_msg("dash", "Reading file.");
+        msg_agent1.id = 10;
+        msg_agent1.tool_calls = Some(read_a_tc1);
+
+        let mut msg_tool1 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { old version }",
+            Some("dash"),
+        );
+        msg_tool1.id = 11;
+        msg_tool1.tool_call_id = Some("tc1".into());
+
+        let mut msg_agent2 = make_conv_msg("dash", "Re-reading file.");
+        msg_agent2.id = 20;
+        msg_agent2.tool_calls = Some(read_a_tc2);
+
+        let mut msg_tool2 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { new version }",
+            Some("dash"),
+        );
+        msg_tool2.id = 21;
+        msg_tool2.tool_call_id = Some("tc2".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "read /a.rs"),
+            msg_agent1,
+            msg_tool1,
+            make_conv_msg("user", "read it again"),
+            msg_agent2,
+            msg_tool2,
+        ];
+
+        // With None → no dedup (this was the bug: negative cursor mapped to None)
+        let (history_none, _) = format_conversation_history(&msgs, "dash", None);
+        let read_results_none: Vec<_> = history_none
+            .iter()
+            .filter(|m| {
+                m.role == "tool"
+                    && m.content
+                        .as_ref()
+                        .map_or(false, |c| c.contains("read_file"))
+            })
+            .collect();
+        assert_eq!(read_results_none.len(), 2, "None → no dedup, both reads kept");
+
+        // With Some(latest) → dedup applied (negative cursor now maps here)
+        let (history_some, _) = format_conversation_history(&msgs, "dash", Some(21));
+        let read_results_some: Vec<_> = history_some
+            .iter()
+            .filter(|m| {
+                m.role == "tool"
+                    && m.content
+                        .as_ref()
+                        .map_or(false, |c| c.contains("read_file"))
+            })
+            .collect();
+        assert_eq!(read_results_some.len(), 1, "Some → dedup applied, old read dropped");
     }
 
 }
