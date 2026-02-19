@@ -71,6 +71,15 @@ pub struct LlmSection {
     /// Deduplication mode: "eager" (default, dedup every turn) or "lazy" (dedup only at fill threshold)
     #[serde(default)]
     pub deduplication: Option<String>,
+    /// Sampling temperature (0.0 to 2.0)
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Top-p (nucleus) sampling (0.0 to 1.0)
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    /// Frequency penalty (-2.0 to 2.0)
+    #[serde(default)]
+    pub frequency_penalty: Option<f64>,
 }
 
 /// Resolved LLM configuration after loading model file and applying overrides.
@@ -95,6 +104,12 @@ pub struct ResolvedLlmConfig {
     pub api_style: Option<String>,
     /// Whether dedup runs in lazy mode (only at context fill threshold)
     pub dedup_lazy: bool,
+    /// Sampling temperature
+    pub temperature: Option<f64>,
+    /// Top-p (nucleus) sampling
+    pub top_p: Option<f64>,
+    /// Frequency penalty
+    pub frequency_penalty: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +478,9 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
             let val = llm_section.deduplication.clone().or(base.deduplication.clone());
             val.as_deref() == Some("lazy")
         },
+        temperature: llm_section.temperature.or(base.temperature),
+        top_p: llm_section.top_p.or(base.top_p),
+        frequency_penalty: llm_section.frequency_penalty.or(base.frequency_penalty),
     })
 }
 

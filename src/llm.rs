@@ -373,6 +373,9 @@ pub struct OpenAIClient {
     base_url: String,
     model: String,
     api_style: ApiStyle,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    frequency_penalty: Option<f64>,
 }
 
 impl OpenAIClient {
@@ -387,6 +390,9 @@ impl OpenAIClient {
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
             api_style: ApiStyle::default(),
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
         }
     }
 
@@ -406,6 +412,33 @@ impl OpenAIClient {
             _ => ApiStyle::Chat,
         };
         self
+    }
+
+    pub fn with_temperature(mut self, temperature: Option<f64>) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    pub fn with_top_p(mut self, top_p: Option<f64>) -> Self {
+        self.top_p = top_p;
+        self
+    }
+
+    pub fn with_frequency_penalty(mut self, frequency_penalty: Option<f64>) -> Self {
+        self.frequency_penalty = frequency_penalty;
+        self
+    }
+
+    fn inject_sampling_params(&self, request_body: &mut Value) {
+        if let Some(t) = self.temperature {
+            request_body["temperature"] = serde_json::json!(t);
+        }
+        if let Some(p) = self.top_p {
+            request_body["top_p"] = serde_json::json!(p);
+        }
+        if let Some(fp) = self.frequency_penalty {
+            request_body["frequency_penalty"] = serde_json::json!(fp);
+        }
     }
 }
 
@@ -630,6 +663,8 @@ impl OpenAIClient {
             request_body["tool_choice"] = serde_json::json!("auto");
         }
 
+        self.inject_sampling_params(&mut request_body);
+
         let response = self
             .client
             .post(&url)
@@ -690,6 +725,8 @@ impl OpenAIClient {
             request_body["tools"] = serde_json::to_value(format_tools_openai(&tool_list)).unwrap();
             request_body["tool_choice"] = serde_json::json!("auto");
         }
+
+        self.inject_sampling_params(&mut request_body);
 
         let response = self
             .client
@@ -812,6 +849,8 @@ impl OpenAIClient {
                 serde_json::to_value(format_tools_responses(&tool_list)).unwrap();
         }
 
+        self.inject_sampling_params(&mut request_body);
+
         let response = self
             .client
             .post(&url)
@@ -873,6 +912,8 @@ impl OpenAIClient {
             request_body["tools"] =
                 serde_json::to_value(format_tools_responses(&tool_list)).unwrap();
         }
+
+        self.inject_sampling_params(&mut request_body);
 
         let response = self
             .client

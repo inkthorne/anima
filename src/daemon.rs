@@ -2414,6 +2414,10 @@ async fn create_llm_from_config(
             if let Some(ref style) = config.api_style {
                 client = client.with_api_style(style);
             }
+            client = client
+                .with_temperature(config.temperature)
+                .with_top_p(config.top_p)
+                .with_frequency_penalty(config.frequency_penalty);
             Arc::new(client)
         }
         "anthropic" => {
