@@ -13,15 +13,15 @@ fn default_mem_entries() -> usize {
 }
 
 fn default_max_retries() -> usize {
-    3
+    5
 }
 
 fn default_initial_delay_ms() -> u64 {
-    100
+    2000
 }
 
 fn default_max_delay_ms() -> u64 {
-    5000
+    30000
 }
 
 fn default_exponential_base() -> f64 {
@@ -276,9 +276,9 @@ model = "gpt-4o"
         assert_eq!(config.memory.backend, "in_memory");
         assert_eq!(config.think.max_iterations, 25);
         // Retry defaults
-        assert_eq!(config.retry.max_retries, 3);
-        assert_eq!(config.retry.initial_delay_ms, 100);
-        assert_eq!(config.retry.max_delay_ms, 5000);
+        assert_eq!(config.retry.max_retries, 5);
+        assert_eq!(config.retry.initial_delay_ms, 2000);
+        assert_eq!(config.retry.max_delay_ms, 30000);
         // Observe defaults
         assert!(!config.observe.verbose);
         // LLM tools default to enabled
