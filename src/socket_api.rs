@@ -52,6 +52,15 @@ pub enum Request {
     Heartbeat,
 }
 
+/// Agent state as reported by the daemon.
+/// `Stopped` is determined externally (PID check) — the daemon only reports `Idle` or `Working`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    Idle,
+    Working,
+}
+
 /// Response types for the socket API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -59,7 +68,7 @@ pub enum Response {
     /// Response to a message request.
     Message { content: String },
     /// Response to a status request.
-    Status { running: bool, history_len: usize },
+    Status { state: AgentState, history_len: usize },
     /// Response to a list_agents request.
     Agents { agents: Vec<String> },
     /// Response to a system prompt request.
@@ -316,22 +325,40 @@ mod tests {
     #[test]
     fn test_response_status_serialization() {
         let response = Response::Status {
-            running: true,
+            state: AgentState::Idle,
             history_len: 5,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"type\":\"status\""));
-        assert!(json.contains("\"running\":true"));
+        assert!(json.contains("\"state\":\"idle\""));
         assert!(json.contains("\"history_len\":5"));
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         match parsed {
             Response::Status {
-                running,
+                state,
                 history_len,
             } => {
-                assert!(running);
+                assert_eq!(state, AgentState::Idle);
                 assert_eq!(history_len, 5);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_status_working_serialization() {
+        let response = Response::Status {
+            state: AgentState::Working,
+            history_len: 10,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"state\":\"working\""));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Status { state, .. } => {
+                assert_eq!(state, AgentState::Working);
             }
             _ => panic!("Wrong variant"),
         }

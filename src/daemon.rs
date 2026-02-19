@@ -1343,9 +1343,22 @@ async fn execute_tool_call(
             let tool = DaemonTaskTool::new(ctx.agent_name.clone(), ctx.conv_id.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
+                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
                     let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
-                    Ok(format!("Task dispatched to '{}' ({}). Result will be posted here when complete.", agent, task_conv))
+                    match status {
+                        "completed" => {
+                            let task_result = result.get("result").and_then(|s| s.as_str()).unwrap_or("");
+                            Ok(format!("Task completed by '{}' ({}).\n\n{}", agent, task_conv, task_result))
+                        }
+                        "timeout" => {
+                            let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("timed out");
+                            Ok(format!("Task timed out for '{}' ({}): {}", agent, task_conv, message))
+                        }
+                        _ => {
+                            Ok(format!("Task status '{}' for '{}' ({})", status, agent, task_conv))
+                        }
+                    }
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
@@ -1972,6 +1985,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create mpsc channel for serializing agent work
     // All Message, Notify, and Heartbeat work goes through this channel to prevent race conditions
     let (work_tx, work_rx) = mpsc::unbounded_channel::<AgentWork>();
+    let worker_busy = Arc::new(AtomicBool::new(false));
 
     // Spawn the worker task that owns the agent and processes work sequentially
     let worker_handle = {
@@ -1996,9 +2010,11 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
         let worker_dedup_lazy = config.dedup_lazy;
+        let worker_busy = worker_busy.clone();
         tokio::spawn(async move {
             agent_worker(
                 work_rx,
+                worker_busy,
                 worker_agent,
                 worker_name,
                 worker_system_prompt,
@@ -2152,6 +2168,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_heartbeat_config = heartbeat_config.clone();
                         let conn_task_store = task_store.clone();
                         let conn_work_tx = work_tx.clone();
+                        let conn_worker_busy = worker_busy.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
                         let conn_max_iterations = config.max_iterations;
@@ -2176,6 +2193,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 conn_task_store,
                                 conn_work_tx,
                                 conn_max_iterations,
+                                conn_worker_busy,
                             ).await {
                                 eprintln!("Connection error: {}", e);
                             }
@@ -2463,6 +2481,7 @@ async fn create_llm_from_config(
 #[allow(clippy::too_many_arguments)]
 async fn agent_worker(
     mut work_rx: mpsc::UnboundedReceiver<AgentWork>,
+    worker_busy: Arc<AtomicBool>,
     agent: Arc<Mutex<Agent>>,
     agent_name: String,
     system_prompt: Option<String>,
@@ -2507,6 +2526,8 @@ async fn agent_worker(
             let mut agent_guard = agent.lock().await;
             agent_guard.clear_history();
         }
+
+        worker_busy.store(true, Ordering::Relaxed);
 
         match work {
             AgentWork::Message {
@@ -2608,6 +2629,8 @@ async fn agent_worker(
                 }
             }
         }
+
+        worker_busy.store(false, Ordering::Relaxed);
     }
 
     logger.log("[worker] Agent worker stopped");
@@ -4865,6 +4888,7 @@ async fn handle_connection(
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
     max_iterations: Option<usize>,
+    worker_busy: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         // Read request with a timeout
@@ -5050,11 +5074,13 @@ async fn handle_connection(
             }
 
             Request::Status => {
-                let agent_guard = agent.lock().await;
-                Response::Status {
-                    running: true,
-                    history_len: agent_guard.history_len(),
-                }
+                let busy = worker_busy.load(Ordering::Relaxed);
+                let state = if busy { crate::socket_api::AgentState::Working } else { crate::socket_api::AgentState::Idle };
+                let history_len = match agent.try_lock() {
+                    Ok(guard) => guard.history_len(),
+                    Err(_) => 0,
+                };
+                Response::Status { state, history_len }
             }
 
             Request::Shutdown => {

@@ -48,7 +48,7 @@ impl Tool for DaemonTaskTool {
                 },
                 "task": {
                     "type": "string",
-                    "description": "The task for the agent to complete"
+                    "description": "Complete task instructions. The agent works in a fresh conversation with NO prior context — include everything needed: full file paths, project directory, data structures, edge cases, and success criteria."
                 }
             },
             "required": ["agent", "task"]
@@ -187,16 +187,6 @@ impl Tool for DaemonTaskTool {
                 }));
             }
 
-            // Inactivity timeout (120s since last new message)
-            if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
-                return Ok(serde_json::json!({
-                    "status": "timeout",
-                    "task_conv": conv_name,
-                    "agent": agent,
-                    "message": "No new messages for 120s"
-                }));
-            }
-
             // Open a fresh store each poll to see latest writes
             let poll_store = ConversationStore::init().map_err(|e| {
                 ToolError::ExecutionFailed(format!("Failed to open store for polling: {}", e))
@@ -207,10 +197,12 @@ impl Tool for DaemonTaskTool {
             })?;
 
             // Track activity: any new message resets the inactivity timer
+            let mut new_messages_this_tick = false;
             if let Some(max_id) = messages.iter().map(|m| m.id).max() {
                 if max_id > last_seen_id {
                     last_seen_id = max_id;
                     last_activity = now;
+                    new_messages_this_tick = true;
                 }
             }
 
@@ -228,7 +220,7 @@ impl Tool for DaemonTaskTool {
                     return Ok(serde_json::json!({
                         "status": "completed",
                         "task_conv": conv_name,
-                        "from_agent": msg.from_agent,
+                        "agent": msg.from_agent,
                         "result": msg.content,
                     }));
                 }
@@ -236,6 +228,36 @@ impl Tool for DaemonTaskTool {
                 if msg.duration_ms.is_some() && msg.tool_calls.is_some() {
                     break;
                 }
+            }
+
+            // If no new DB messages this tick, check if child agent is still working
+            // via socket status. If working, reset inactivity timer.
+            if !new_messages_this_tick {
+                if let Ok(stream) = UnixStream::connect(&socket_path).await {
+                    let mut status_api = SocketApi::new(stream);
+                    if status_api.write_request(&Request::Status).await.is_ok() {
+                        if let Ok(Some(resp)) = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            status_api.read_response(),
+                        ).await.unwrap_or(Ok(None)) {
+                            if let crate::socket_api::Response::Status { state, .. } = resp {
+                                if state == crate::socket_api::AgentState::Working {
+                                    last_activity = now;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Inactivity timeout (120s since last new message or working state)
+            if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
+                return Ok(serde_json::json!({
+                    "status": "timeout",
+                    "task_conv": conv_name,
+                    "agent": agent,
+                    "message": "No new messages for 120s"
+                }));
             }
         }
     }

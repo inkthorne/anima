@@ -365,7 +365,7 @@ async fn main() {
             }
         }
         Commands::Status => {
-            show_status();
+            show_status().await;
         }
         Commands::Ask { agent, message } => {
             if let Err(e) = ask_agent(&agent, &message).await {
@@ -1230,7 +1230,9 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
 // ---------------------------------------------------------------------------
 
 /// Show status of all agents (running/stopped).
-fn show_status() {
+async fn show_status() {
+    use anima::socket_api::AgentState;
+
     let Some(entries) = list_agent_dirs() else {
         return;
     };
@@ -1248,7 +1250,29 @@ fn show_status() {
 
         let (status, pid) = if PidFile::is_running(&pid_path) {
             let pid = PidFile::read(&pid_path).unwrap_or(0);
-            ("\x1b[32mrunning\x1b[0m", pid.to_string())
+            // Try to query the socket for idle/working state
+            let socket_path = agent_path.join("agent.sock");
+            let state_str = match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    let mut api = SocketApi::new(stream);
+                    if api.write_request(&Request::Status).await.is_ok() {
+                        match tokio::time::timeout(
+                            Duration::from_secs(2),
+                            api.read_response(),
+                        ).await {
+                            Ok(Ok(Some(Response::Status { state, .. }))) => match state {
+                                AgentState::Idle => "\x1b[32midle\x1b[0m",
+                                AgentState::Working => "\x1b[33mworking\x1b[0m",
+                            },
+                            _ => "\x1b[32mrunning\x1b[0m",
+                        }
+                    } else {
+                        "\x1b[32mrunning\x1b[0m"
+                    }
+                }
+                Err(_) => "\x1b[32mrunning\x1b[0m",
+            };
+            (state_str, pid.to_string())
         } else {
             ("\x1b[90mstopped\x1b[0m", "-".to_string())
         };
