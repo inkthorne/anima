@@ -1,9 +1,9 @@
+use super::shell::run_shell_with_kill;
 use crate::error::ToolError;
 use crate::tool::Tool;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::time::Duration;
-use tokio::process::Command;
 
 /// Default list of safe commands that can be executed.
 const DEFAULT_SAFE_COMMANDS: &[&str] = &[
@@ -149,25 +149,7 @@ impl Tool for SafeShellTool {
         self.validate_command(command)
             .map_err(ToolError::InvalidInput)?;
 
-        let output = tokio::time::timeout(
-            self.timeout,
-            Command::new("sh").arg("-c").arg(command).output(),
-        )
-        .await
-        .map_err(|_| {
-            ToolError::ExecutionFailed(format!("Command timed out after {:?}", self.timeout))
-        })?
-        .map_err(|e| ToolError::ExecutionFailed(format!("Failed to execute command: {}", e)))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        Ok(serde_json::json!({
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code
-        }))
+        run_shell_with_kill(command, self.timeout).await
     }
 }
 
