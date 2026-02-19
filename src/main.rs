@@ -722,7 +722,7 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
             let cache_str = if let Some(cached) = msg.cached_tokens {
                 if tokens_in > 0 {
                     let cache_pct = (cached as f64 / tokens_in as f64 * 100.0) as u32;
-                    format!(" cache:{}%", cache_pct)
+                    format!(" ({}% cached)", cache_pct)
                 } else {
                     String::new()
                 }
@@ -731,7 +731,7 @@ fn format_context_usage(msg: &anima::conversation::ConversationMessage) -> Strin
             };
 
             format!(
-                " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}%){}\x1b[0m",
+                " \x1b[90m•\x1b[0m \x1b[35m{}/{} ({}% full){}\x1b[0m",
                 used_str, ctx_str, percentage, cache_str
             )
         }
