@@ -3060,7 +3060,7 @@ async fn run_tool_loop(
                                 let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
                                 latest_msg_id
                             }
-                            Some(_) => latest_msg_id, // Negative: keep deduping (stable)
+                            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
                             None => None,             // No cursor: no dedup
                         }
                     } else {
@@ -3181,7 +3181,7 @@ async fn process_message_work(
                                     let _ = store.set_dedup_cursor(cname, agent_name, -c);
                                     msgs.last().map(|m| m.id)
                                 }
-                                Some(_) => msgs.last().map(|m| m.id), // Negative: keep deduping
+                                Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
                                 None => None,
                             }
                         } else {
@@ -4053,7 +4053,7 @@ async fn handle_notify(
                 let _ = store.set_dedup_cursor(conv_id, agent_name, -c);
                 context_messages.last().map(|m| m.id)
             }
-            Some(_) => context_messages.last().map(|m| m.id), // Negative: keep deduping
+            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
             None => None,
         }
     } else {
@@ -4507,7 +4507,7 @@ async fn run_heartbeat(
                 let _ = store.set_dedup_cursor(&conv_name, agent_name, -c);
                 context_messages.last().map(|m| m.id)
             }
-            Some(_) => context_messages.last().map(|m| m.id), // Negative: keep deduping
+            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
             None => None,
         }
     } else {
