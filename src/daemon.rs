@@ -1355,6 +1355,22 @@ async fn execute_tool_call(
                             let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("timed out");
                             Ok(format!("Task timed out for '{}' ({}): {}", agent, task_conv, message))
                         }
+                        "running" => {
+                            let elapsed = result.get("elapsed_minutes").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let msg_count = result.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let recent = result.get("recent_activity")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"))
+                                .unwrap_or_default();
+                            Ok(format!(
+                                "Task for '{}' still running after {}m ({} messages). Conv: {}\n\nRecent activity:\n{}\n\nTo continue waiting, call task with task_conv=\"{}\". To stop the agent, call task with task_conv=\"{}\" and abort=true.",
+                                agent, elapsed, msg_count, task_conv, recent, task_conv, task_conv
+                            ))
+                        }
+                        "cancelled" => {
+                            Ok(format!("Task cancelled for '{}' ({}). The agent will stop at the next iteration boundary.",
+                                agent, task_conv))
+                        }
                         _ => {
                             Ok(format!("Task status '{}' for '{}' ({})", status, agent, task_conv))
                         }
@@ -2287,8 +2303,13 @@ async fn create_agent_from_dir(
         agent.register_tool(Arc::new(ListFilesTool));
         agent.register_tool(Arc::new(CopyLinesTool));
         agent.register_tool(Arc::new(HttpTool::new()));
-        agent.register_tool(Arc::new(ShellTool::new()));
-        agent.register_tool(Arc::new(SafeShellTool::new()));
+        let shell_mem_limit = match agent_dir.config.shell.mem_limit_mb {
+            Some(0) => None,
+            Some(mb) => Some(mb * 1024 * 1024),
+            None => Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES),
+        };
+        agent.register_tool(Arc::new(ShellTool::new().with_mem_limit(shell_mem_limit)));
+        agent.register_tool(Arc::new(SafeShellTool::new().with_mem_limit(shell_mem_limit)));
         // Note: DaemonRememberTool is registered later after semantic memory is created
 
         // Register daemon-aware messaging tools
