@@ -35,6 +35,8 @@ pub struct EmbeddingClient {
     url: String,
     /// Model name for embeddings
     model: String,
+    /// HTTP client with timeouts
+    client: reqwest::Client,
 }
 
 impl EmbeddingClient {
@@ -47,6 +49,11 @@ impl EmbeddingClient {
         Self {
             url: url.unwrap_or("http://localhost:11434").to_string(),
             model: model.to_string(),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("Failed to build embedding HTTP client"),
         }
     }
 
@@ -57,7 +64,6 @@ impl EmbeddingClient {
 
     /// Generate an embedding for a single text.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
-        let client = reqwest::Client::new();
         let url = format!("{}/api/embeddings", self.url);
 
         let request_body = serde_json::json!({
@@ -66,7 +72,7 @@ impl EmbeddingClient {
             "keep_alive": "1h"
         });
 
-        let response = client
+        let response = self.client
             .post(&url)
             .json(&request_body)
             .send()
