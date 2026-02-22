@@ -35,7 +35,7 @@ impl Tool for DaemonStartTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Dispatch a task to an agent and wait for the result. The agent works in a separate conversation; this tool blocks until the agent finishes or goes idle (120s inactivity). At the 30-minute checkpoint, returns a progress report — use wait_task to continue waiting or stop_task to cancel."
+        "Dispatch a task to an agent and wait for the result. The agent works in a separate conversation; this tool blocks until the agent finishes or goes idle. Optional: inactivity_timeout_secs (default 120), soft_max_timeout_secs (default 1800). At the soft max checkpoint, returns a progress report — use wait_task to continue waiting or stop_task to cancel."
     }
 
     fn schema(&self) -> Value {
@@ -49,6 +49,14 @@ impl Tool for DaemonStartTaskTool {
                 "task": {
                     "type": "string",
                     "description": "Complete task instructions. The agent works in a fresh conversation with NO prior context — include everything needed: full file paths, project directory, data structures, edge cases, and success criteria."
+                },
+                "inactivity_timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds of inactivity before timing out (default: 120)"
+                },
+                "soft_max_timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds before returning a progress checkpoint (default: 1800)"
                 }
             },
             "required": ["agent", "task"]
@@ -71,6 +79,15 @@ impl Tool for DaemonStartTaskTool {
             .get("task")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidInput("task is required".to_string()))?;
+
+        let inactivity_timeout = input
+            .get("inactivity_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| std::time::Duration::from_secs(s));
+        let soft_max_timeout = input
+            .get("soft_max_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| std::time::Duration::from_secs(s));
 
         // Validate agent exists
         if !discovery::agent_exists(agent) {
@@ -162,7 +179,7 @@ impl Tool for DaemonStartTaskTool {
         // Read acknowledgement (dispatch confirmed)
         let _response = api.read_response().await.ok();
 
-        poll_task_conversation(&self.agent_name, &conv_name, agent).await
+        poll_task_conversation(&self.agent_name, &conv_name, agent, inactivity_timeout, soft_max_timeout).await
     }
 }
 
@@ -203,6 +220,14 @@ impl Tool for DaemonWaitTaskTool {
                 "task_conv": {
                     "type": "string",
                     "description": "The task conversation ID from a previous 'running' result"
+                },
+                "inactivity_timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds of inactivity before timing out (default: 120)"
+                },
+                "soft_max_timeout_secs": {
+                    "type": "integer",
+                    "description": "Seconds before returning a progress checkpoint (default: 1800)"
                 }
             },
             "required": ["task_conv"]
@@ -222,7 +247,16 @@ impl Tool for DaemonWaitTaskTool {
             ))
         })?;
 
-        poll_task_conversation(&self.agent_name, task_conv, &agent).await
+        let inactivity_timeout = input
+            .get("inactivity_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| std::time::Duration::from_secs(s));
+        let soft_max_timeout = input
+            .get("soft_max_timeout_secs")
+            .and_then(|v| v.as_u64())
+            .map(|s| std::time::Duration::from_secs(s));
+
+        poll_task_conversation(&self.agent_name, task_conv, &agent, inactivity_timeout, soft_max_timeout).await
     }
 }
 
@@ -325,6 +359,8 @@ async fn poll_task_conversation(
     parent_agent: &str,
     conv_name: &str,
     agent: &str,
+    inactivity_timeout_param: Option<std::time::Duration>,
+    soft_max_timeout_param: Option<std::time::Duration>,
 ) -> Result<Value, ToolError> {
     use crate::conversation::ConversationStore;
     use crate::discovery;
@@ -332,8 +368,8 @@ async fn poll_task_conversation(
     use tokio::net::UnixStream;
 
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-    const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-    const SOFT_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+    let inactivity_timeout = inactivity_timeout_param.unwrap_or(std::time::Duration::from_secs(120));
+    let soft_max = soft_max_timeout_param.unwrap_or(std::time::Duration::from_secs(1800));
 
     let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
     let start = tokio::time::Instant::now();
@@ -388,8 +424,8 @@ async fn poll_task_conversation(
             }
         }
 
-        // Soft max checkpoint (30 min) — return progress report instead of hard timeout
-        if now.duration_since(start) >= SOFT_MAX {
+        // Soft max checkpoint — return progress report instead of hard timeout
+        if now.duration_since(start) >= soft_max {
             let recent_activity: Vec<String> = messages
                 .iter()
                 .rev()
@@ -443,13 +479,13 @@ async fn poll_task_conversation(
             }
         }
 
-        // Inactivity timeout (120s since last new message or working state)
-        if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
+        // Inactivity timeout (since last new message or working state)
+        if now.duration_since(last_activity) >= inactivity_timeout {
             return Ok(serde_json::json!({
                 "status": "timeout",
                 "task_conv": conv_name,
                 "agent": agent,
-                "message": "No new messages for 120s"
+                "message": format!("No new messages for {}s", inactivity_timeout.as_secs())
             }));
         }
     }
