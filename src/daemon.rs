@@ -99,7 +99,7 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
 }
 
 use crate::agent::{Agent, ThinkOptions};
-use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection};
+use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection, resolve_embedding_config};
 use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
 use crate::conversation::ConversationError;
@@ -1840,20 +1840,37 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     // Create embedding client if configured
     let embedding_client: Option<Arc<EmbeddingClient>> =
-        if let Some(ref emb_config) = config.semantic_memory.embedding {
-            if emb_config.provider == "ollama" {
-                let client = EmbeddingClient::new(&emb_config.model, Some(&emb_config.url));
-                logger.log(&format!(
-                    "  Embedding client: {} via {} at {}",
-                    emb_config.model, emb_config.provider, emb_config.url
-                ));
-                Some(Arc::new(client))
-            } else {
-                logger.log(&format!(
-                    "  Embedding client: unsupported provider '{}'",
-                    emb_config.provider
-                ));
-                None
+        if let Some(ref emb_section) = config.semantic_memory.embedding {
+            match resolve_embedding_config(emb_section) {
+                Ok(emb) => {
+                    if emb.provider == "ollama" {
+                        let client = EmbeddingClient::new(&emb.model, Some(&emb.url));
+                        logger.log(&format!(
+                            "  Embedding client: {} via {} at {}",
+                            emb.model, emb.provider, emb.url
+                        ));
+                        Some(Arc::new(client))
+                    } else if emb.provider == "openai" {
+                        let api_key = emb.api_key.as_deref().unwrap_or("lemonade");
+                        let client =
+                            EmbeddingClient::new_openai(&emb.model, &emb.url, api_key);
+                        logger.log(&format!(
+                            "  Embedding client: {} via {} at {}",
+                            emb.model, emb.provider, emb.url
+                        ));
+                        Some(Arc::new(client))
+                    } else {
+                        logger.log(&format!(
+                            "  Embedding client: unsupported provider '{}'",
+                            emb.provider
+                        ));
+                        None
+                    }
+                }
+                Err(e) => {
+                    logger.log(&format!("  Embedding config error: {}", e));
+                    None
+                }
             }
         } else {
             None

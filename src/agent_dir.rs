@@ -148,16 +148,30 @@ fn default_embedding_url() -> String {
     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())
 }
 
-/// Configuration for embedding-based semantic search.
-#[derive(Debug, Clone, Deserialize)]
-pub struct EmbeddingConfig {
-    /// Embedding provider (currently only "ollama" is supported)
-    pub provider: String,
+/// Embedding configuration section in agent config.
+/// Can either reference a shared model file via `model_file`, or specify config directly.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EmbeddingSection {
+    /// Reference to a shared model file in ~/.anima/models/{name}.toml
+    pub model_file: Option<String>,
+    /// Embedding provider ("ollama" or "openai")
+    pub provider: Option<String>,
     /// Embedding model name (e.g., "nomic-embed-text")
+    pub model: Option<String>,
+    /// Base URL for the embedding API
+    pub url: Option<String>,
+    /// API key for OpenAI-compatible providers (optional)
+    pub api_key: Option<String>,
+}
+
+/// Resolved embedding configuration after loading model file and applying overrides.
+/// All required fields are guaranteed to be present.
+#[derive(Debug, Clone)]
+pub struct ResolvedEmbeddingConfig {
+    pub provider: String,
     pub model: String,
-    /// Base URL for the embedding API (optional, defaults to localhost)
-    #[serde(default = "default_embedding_url")]
     pub url: String,
+    pub api_key: Option<String>,
 }
 
 /// Configuration for the semantic memory system.
@@ -180,7 +194,7 @@ pub struct SemanticMemorySection {
     pub min_importance: f64,
     /// Embedding configuration for semantic search
     #[serde(default)]
-    pub embedding: Option<EmbeddingConfig>,
+    pub embedding: Option<EmbeddingSection>,
     /// Maximum number of recalled user messages from conversation history per turn
     #[serde(default = "default_conversation_recall_limit")]
     pub conversation_recall_limit: usize,
@@ -383,6 +397,15 @@ impl AgentDir {
         resolve_llm_config(&self.config.llm)
     }
 
+    /// Resolve the embedding configuration, loading model file if specified.
+    pub fn resolve_embedding_config(&self) -> Option<Result<ResolvedEmbeddingConfig, AgentDirError>> {
+        self.config
+            .semantic_memory
+            .embedding
+            .as_ref()
+            .map(resolve_embedding_config)
+    }
+
     /// Get the API key, expanding environment variables if needed.
     /// Falls back to provider-specific env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY).
     pub fn api_key(&self) -> Result<Option<String>, AgentDirError> {
@@ -490,6 +513,63 @@ pub fn resolve_llm_config(llm_section: &LlmSection) -> Result<ResolvedLlmConfig,
         temperature: llm_section.temperature.or(base.temperature),
         top_p: llm_section.top_p.or(base.top_p),
         frequency_penalty: llm_section.frequency_penalty.or(base.frequency_penalty),
+    })
+}
+
+/// Load a shared embedding model definition file from ~/.anima/models/{name}.toml
+fn load_embedding_file(name: &str) -> Result<EmbeddingSection, AgentDirError> {
+    let model_path = models_dir().join(format!("{}.toml", name));
+
+    if !model_path.exists() {
+        return Err(AgentDirError::ModelFileNotFound(model_path));
+    }
+
+    let content = std::fs::read_to_string(&model_path)?;
+    let config: EmbeddingSection = toml::from_str(&content)?;
+    Ok(config)
+}
+
+/// Resolve embedding configuration by loading model file (if specified) and applying overrides.
+/// Returns a ResolvedEmbeddingConfig with all required fields guaranteed.
+pub fn resolve_embedding_config(
+    section: &EmbeddingSection,
+) -> Result<ResolvedEmbeddingConfig, AgentDirError> {
+    let base = match &section.model_file {
+        Some(model_file) => load_embedding_file(model_file)?,
+        None => section.clone(),
+    };
+
+    let missing_field = |field: &str| AgentDirError::ModelFileMissingField {
+        field: field.to_string(),
+        path: section
+            .model_file
+            .as_ref()
+            .map(|n| models_dir().join(format!("{}.toml", n)))
+            .unwrap_or_default(),
+    };
+
+    // Agent config overrides model file for all fields
+    let provider = section
+        .provider
+        .clone()
+        .or(base.provider.clone())
+        .ok_or_else(|| missing_field("provider"))?;
+    let model = section
+        .model
+        .clone()
+        .or(base.model.clone())
+        .ok_or_else(|| missing_field("model"))?;
+    let url = section
+        .url
+        .clone()
+        .or(base.url.clone())
+        .unwrap_or_else(default_embedding_url);
+
+    Ok(ResolvedEmbeddingConfig {
+        provider,
+        model,
+        url,
+        api_key: section.api_key.clone().or(base.api_key.clone()),
     })
 }
 
@@ -1350,6 +1430,157 @@ tools = true
             assert_eq!(resolved.model, "claude-sonnet-4-20250514");
             assert_eq!(resolved.api_key, Some("sk-test".to_string()));
             assert_eq!(resolved.tools, true);
+        });
+    }
+
+    // =========================================================================
+    // Shared embedding model definitions tests
+    // =========================================================================
+
+    #[test]
+    #[serial]
+    fn test_embedding_model_file_loading() {
+        let fake_home = tempdir().unwrap();
+        write_model_file(
+            fake_home.path(),
+            "embed-test",
+            "provider = \"openai\"\nmodel = \"Qwen3-Embedding-0.6B-GGUF\"\nurl = \"http://localhost:8080/v1\"\n",
+        );
+
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+
+[semantic_memory]
+enabled = true
+
+[semantic_memory.embedding]
+model_file = "embed-test"
+"#;
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
+
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_embedding_config().unwrap().unwrap();
+
+            assert_eq!(resolved.provider, "openai");
+            assert_eq!(resolved.model, "Qwen3-Embedding-0.6B-GGUF");
+            assert_eq!(resolved.url, "http://localhost:8080/v1");
+            assert_eq!(resolved.api_key, None);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn test_embedding_model_file_with_overrides() {
+        let fake_home = tempdir().unwrap();
+        write_model_file(
+            fake_home.path(),
+            "embed-base",
+            "provider = \"openai\"\nmodel = \"Qwen3-Embedding-0.6B-GGUF\"\nurl = \"http://localhost:8080/v1\"\n",
+        );
+
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+
+[semantic_memory]
+enabled = true
+
+[semantic_memory.embedding]
+model_file = "embed-base"
+url = "http://other-host:8080/v1"
+"#;
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
+
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let resolved = agent_dir.resolve_embedding_config().unwrap().unwrap();
+
+            assert_eq!(resolved.provider, "openai");
+            assert_eq!(resolved.model, "Qwen3-Embedding-0.6B-GGUF");
+            assert_eq!(resolved.url, "http://other-host:8080/v1");
+        });
+    }
+
+    #[test]
+    fn test_embedding_inline_config() {
+        let dir = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+
+[semantic_memory]
+enabled = true
+
+[semantic_memory.embedding]
+provider = "ollama"
+model = "nomic-embed-text"
+url = "http://localhost:11434"
+"#;
+        fs::write(dir.path().join("config.toml"), config_content).unwrap();
+
+        let agent_dir = AgentDir::load(dir.path()).unwrap();
+        let resolved = agent_dir.resolve_embedding_config().unwrap().unwrap();
+
+        assert_eq!(resolved.provider, "ollama");
+        assert_eq!(resolved.model, "nomic-embed-text");
+        assert_eq!(resolved.url, "http://localhost:11434");
+    }
+
+    #[test]
+    #[serial]
+    fn test_embedding_model_file_not_found() {
+        let fake_home = tempdir().unwrap();
+        fs::create_dir_all(fake_home.path().join(".anima").join("models")).unwrap();
+
+        let agent_dir_path = tempdir().unwrap();
+        let config_content = r#"
+[agent]
+name = "test"
+
+[llm]
+provider = "openai"
+model = "gpt-4"
+
+[semantic_memory]
+enabled = true
+
+[semantic_memory.embedding]
+model_file = "nonexistent-embed"
+"#;
+        fs::write(
+            agent_dir_path.path().join("config.toml"),
+            config_content,
+        )
+        .unwrap();
+
+        with_fake_home(fake_home.path(), || {
+            let agent_dir = AgentDir::load(agent_dir_path.path()).unwrap();
+            let result = agent_dir.resolve_embedding_config().unwrap();
+            assert!(matches!(result, Err(AgentDirError::ModelFileNotFound(_))));
         });
     }
 
