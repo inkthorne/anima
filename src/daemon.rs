@@ -1070,6 +1070,19 @@ async fn execute_tool_call(
     tool_def: Option<&ToolDefinition>,
     context: Option<&ToolExecutionContext>,
 ) -> Result<String, String> {
+    // Enforce allowed_tools at execution time (defense-in-depth)
+    if let Some(ctx) = context {
+        if let Some(ref allowed) = ctx.allowed_tools {
+            let name = tool_call.tool.as_str();
+            if name != "list_tools" && !allowed.iter().any(|a| a == name) {
+                return Err(format!(
+                    "Tool '{}' is not in this agent's allowed_tools list",
+                    name
+                ));
+            }
+        }
+    }
+
     match tool_call.tool.as_str() {
         "read_file" => {
             let tool = ReadFileTool;
@@ -8072,6 +8085,87 @@ api_key = "sk-test"
             })
             .collect();
         assert_eq!(read_results_some.len(), 1, "Some → dedup applied, old read dropped");
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_blocked_by_allowlist() {
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: None,
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: Some(vec!["read_file".to_string()]),
+        };
+        let call = ToolCall {
+            tool: "shell".to_string(),
+            params: serde_json::json!({"command": "echo hi"}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not in this agent's allowed_tools"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_allowed_by_allowlist() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: None,
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: Some(vec!["read_file".to_string()]),
+        };
+        let call = ToolCall {
+            tool: "read_file".to_string(),
+            params: serde_json::json!({"path": file_path.to_str().unwrap()}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_ok(), "read_file should be allowed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_list_tools_always_allowed() {
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: None,
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: Some(vec!["read_file".to_string()]),
+        };
+        let call = ToolCall {
+            tool: "list_tools".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_ok(), "list_tools should always be allowed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn test_execute_tool_call_no_allowlist_allows_all() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, "hello").unwrap();
+
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: None,
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: None,
+        };
+        let call = ToolCall {
+            tool: "read_file".to_string(),
+            params: serde_json::json!({"path": file_path.to_str().unwrap()}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_ok(), "No allowlist should allow all tools: {:?}", result);
     }
 
 }
