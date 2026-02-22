@@ -46,5 +46,5 @@ pub use safe_shell::SafeShellTool;
 pub use search_conversation::DaemonSearchConversationTool;
 pub use send_message::{DaemonSendMessageTool, ListAgentsTool, SendMessageTool};
 pub use shell::ShellTool;
-pub use task::{DaemonTaskTool, parse_task_origin};
+pub use task::{DaemonStartTaskTool, DaemonStopTaskTool, DaemonWaitTaskTool, parse_task_origin};
 pub use write_file::WriteFileTool;

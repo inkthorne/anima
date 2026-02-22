@@ -6,36 +6,36 @@ use serde_json::Value;
 /// Daemon-aware tool that dispatches a task to an agent and waits for the result.
 /// Creates a task conversation, posts the task with origin metadata, notifies the child agent,
 /// then polls until the child produces a final response (or timeout).
-pub struct DaemonTaskTool {
+pub struct DaemonStartTaskTool {
     agent_name: String,
     conv_id: Option<String>,
 }
 
-impl DaemonTaskTool {
+impl DaemonStartTaskTool {
     pub fn new(agent_name: String, conv_id: Option<String>) -> Self {
-        DaemonTaskTool {
+        DaemonStartTaskTool {
             agent_name,
             conv_id,
         }
     }
 }
 
-impl std::fmt::Debug for DaemonTaskTool {
+impl std::fmt::Debug for DaemonStartTaskTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DaemonTaskTool")
+        f.debug_struct("DaemonStartTaskTool")
             .field("agent_name", &self.agent_name)
             .finish()
     }
 }
 
 #[async_trait]
-impl Tool for DaemonTaskTool {
+impl Tool for DaemonStartTaskTool {
     fn name(&self) -> &str {
-        "task"
+        "start_task"
     }
 
     fn description(&self) -> &str {
-        "Dispatch a task to an agent and wait for the result. The agent works in a separate conversation; this tool blocks until the agent finishes or goes idle (120s inactivity). At 30m, returns a progress report with recent activity — call again with task_conv to resume waiting, or with abort=true to cancel."
+        "Dispatch a task to an agent and wait for the result. The agent works in a separate conversation; this tool blocks until the agent finishes or goes idle (120s inactivity). At the 30-minute checkpoint, returns a progress report — use wait_task to continue waiting or stop_task to cancel."
     }
 
     fn schema(&self) -> Value {
@@ -49,16 +49,9 @@ impl Tool for DaemonTaskTool {
                 "task": {
                     "type": "string",
                     "description": "Complete task instructions. The agent works in a fresh conversation with NO prior context — include everything needed: full file paths, project directory, data structures, edge cases, and success criteria."
-                },
-                "task_conv": {
-                    "type": "string",
-                    "description": "Resume polling or abort an existing task conversation (from a previous 'running' result)"
-                },
-                "abort": {
-                    "type": "boolean",
-                    "description": "If true with task_conv, cancel the task and signal the agent to stop"
                 }
-            }
+            },
+            "required": ["agent", "task"]
         })
     }
 
@@ -69,61 +62,10 @@ impl Tool for DaemonTaskTool {
         use rand::RngExt;
         use tokio::net::UnixStream;
 
-        let task_conv = input.get("task_conv").and_then(|v| v.as_str());
-        let abort = input.get("abort").and_then(|v| v.as_bool()).unwrap_or(false);
-
-        // Mode 3: abort — post cancel message + pause conversation
-        if let Some(task_conv) = task_conv {
-            let agent = extract_child_agent(task_conv).ok_or_else(|| {
-                ToolError::InvalidInput(format!(
-                    "Cannot extract agent name from task_conv '{}' (expected task:parent:child:id)",
-                    task_conv
-                ))
-            })?;
-
-            if abort {
-                let store = ConversationStore::init().map_err(|e| {
-                    ToolError::ExecutionFailed(format!("Failed to open store: {}", e))
-                })?;
-                // Post cancel message so the agent knows why it was stopped
-                store
-                    .add_message(
-                        task_conv,
-                        &self.agent_name,
-                        &format!("[task cancelled by {}]", self.agent_name),
-                        &[&agent],
-                    )
-                    .map_err(|e| {
-                        ToolError::ExecutionFailed(format!(
-                            "Failed to post cancel message: {}",
-                            e
-                        ))
-                    })?;
-                // Pause conversation — triggers the existing cancel flag in handle_notify
-                store.set_paused(task_conv, true).map_err(|e| {
-                    ToolError::ExecutionFailed(format!(
-                        "Failed to pause task conversation: {}",
-                        e
-                    ))
-                })?;
-                return Ok(serde_json::json!({
-                    "status": "cancelled",
-                    "task_conv": task_conv,
-                    "agent": agent,
-                }));
-            }
-
-            // Mode 2: resume — poll existing conversation
-            return self
-                .poll_task_conversation(task_conv, &agent)
-                .await;
-        }
-
-        // Mode 1: new task — requires agent + task
         let agent = input
             .get("agent")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ToolError::InvalidInput("agent is required (or provide task_conv to resume/abort)".to_string()))?;
+            .ok_or_else(|| ToolError::InvalidInput("agent is required".to_string()))?;
 
         let task = input
             .get("task")
@@ -220,145 +162,295 @@ impl Tool for DaemonTaskTool {
         // Read acknowledgement (dispatch confirmed)
         let _response = api.read_response().await.ok();
 
-        self.poll_task_conversation(&conv_name, agent).await
+        poll_task_conversation(&self.agent_name, &conv_name, agent).await
     }
 }
 
-impl DaemonTaskTool {
-    /// Poll a task conversation until the child produces a final response, goes idle, or hits
-    /// the soft max (30m). On soft max, returns a "running" status with recent activity instead
-    /// of a hard timeout.
-    async fn poll_task_conversation(
-        &self,
-        conv_name: &str,
-        agent: &str,
-    ) -> Result<Value, ToolError> {
+/// Daemon-aware tool that continues waiting for a running task's result.
+/// Use after a start_task returns 'running' status at the 30-minute checkpoint.
+pub struct DaemonWaitTaskTool {
+    agent_name: String,
+}
+
+impl DaemonWaitTaskTool {
+    pub fn new(agent_name: String) -> Self {
+        DaemonWaitTaskTool { agent_name }
+    }
+}
+
+impl std::fmt::Debug for DaemonWaitTaskTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonWaitTaskTool")
+            .field("agent_name", &self.agent_name)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonWaitTaskTool {
+    fn name(&self) -> &str {
+        "wait_task"
+    }
+
+    fn description(&self) -> &str {
+        "Continue waiting for a running task's result. Use after a task returns 'running' status at the 30-minute checkpoint."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_conv": {
+                    "type": "string",
+                    "description": "The task conversation ID from a previous 'running' result"
+                }
+            },
+            "required": ["task_conv"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, ToolError> {
+        let task_conv = input
+            .get("task_conv")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("task_conv is required".to_string()))?;
+
+        let agent = extract_child_agent(task_conv).ok_or_else(|| {
+            ToolError::InvalidInput(format!(
+                "Cannot extract agent name from task_conv '{}' (expected task:parent:child:id)",
+                task_conv
+            ))
+        })?;
+
+        poll_task_conversation(&self.agent_name, task_conv, &agent).await
+    }
+}
+
+/// Daemon-aware tool that stops a running task and signals the agent to stop working.
+pub struct DaemonStopTaskTool {
+    agent_name: String,
+}
+
+impl DaemonStopTaskTool {
+    pub fn new(agent_name: String) -> Self {
+        DaemonStopTaskTool { agent_name }
+    }
+}
+
+impl std::fmt::Debug for DaemonStopTaskTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonStopTaskTool")
+            .field("agent_name", &self.agent_name)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl Tool for DaemonStopTaskTool {
+    fn name(&self) -> &str {
+        "stop_task"
+    }
+
+    fn description(&self) -> &str {
+        "Stop a running task and signal the agent to stop working. Use when you no longer need the result of a delegated task."
+    }
+
+    fn schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_conv": {
+                    "type": "string",
+                    "description": "The task conversation ID to cancel"
+                }
+            },
+            "required": ["task_conv"]
+        })
+    }
+
+    async fn execute(&self, input: Value) -> Result<Value, ToolError> {
         use crate::conversation::ConversationStore;
-        use crate::discovery;
-        use crate::socket_api::{Request, SocketApi};
-        use tokio::net::UnixStream;
 
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-        const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
-        const SOFT_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+        let task_conv = input
+            .get("task_conv")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ToolError::InvalidInput("task_conv is required".to_string()))?;
 
-        let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
-        let start = tokio::time::Instant::now();
-        let mut last_activity = start;
-        let mut last_seen_id: i64 = 0;
+        let agent = extract_child_agent(task_conv).ok_or_else(|| {
+            ToolError::InvalidInput(format!(
+                "Cannot extract agent name from task_conv '{}' (expected task:parent:child:id)",
+                task_conv
+            ))
+        })?;
 
-        loop {
-            tokio::time::sleep(POLL_INTERVAL).await;
+        let store = ConversationStore::init().map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to open store: {}", e))
+        })?;
 
-            let now = tokio::time::Instant::now();
-
-            // Open a fresh store each poll to see latest writes
-            let poll_store = ConversationStore::init().map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to open store for polling: {}", e))
+        // Post cancel message so the agent knows why it was stopped
+        store
+            .add_message(
+                task_conv,
+                &self.agent_name,
+                &format!("[task cancelled by {}]", self.agent_name),
+                &[&agent],
+            )
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!(
+                    "Failed to post cancel message: {}",
+                    e
+                ))
             })?;
 
-            let messages = poll_store.get_messages(conv_name, None).map_err(|e| {
-                ToolError::ExecutionFailed(format!("Failed to poll task conversation: {}", e))
-            })?;
+        // Pause conversation — triggers the existing cancel flag in handle_notify
+        store.set_paused(task_conv, true).map_err(|e| {
+            ToolError::ExecutionFailed(format!(
+                "Failed to pause task conversation: {}",
+                e
+            ))
+        })?;
 
-            // Track activity: any new message resets the inactivity timer
-            let mut new_messages_this_tick = false;
-            if let Some(max_id) = messages.iter().map(|m| m.id).max() {
-                if max_id > last_seen_id {
-                    last_seen_id = max_id;
-                    last_activity = now;
-                    new_messages_this_tick = true;
-                }
+        Ok(serde_json::json!({
+            "status": "cancelled",
+            "task_conv": task_conv,
+            "agent": agent,
+        }))
+    }
+}
+
+/// Poll a task conversation until the child produces a final response, goes idle, or hits
+/// the soft max (30m). On soft max, returns a "running" status with recent activity instead
+/// of a hard timeout.
+async fn poll_task_conversation(
+    parent_agent: &str,
+    conv_name: &str,
+    agent: &str,
+) -> Result<Value, ToolError> {
+    use crate::conversation::ConversationStore;
+    use crate::discovery;
+    use crate::socket_api::{Request, SocketApi};
+    use tokio::net::UnixStream;
+
+    const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+    const INACTIVITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+    const SOFT_MAX: std::time::Duration = std::time::Duration::from_secs(1800);
+
+    let socket_path = discovery::agents_dir().join(agent).join("agent.sock");
+    let start = tokio::time::Instant::now();
+    let mut last_activity = start;
+    let mut last_seen_id: i64 = 0;
+
+    loop {
+        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let now = tokio::time::Instant::now();
+
+        // Open a fresh store each poll to see latest writes
+        let poll_store = ConversationStore::init().map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to open store for polling: {}", e))
+        })?;
+
+        let messages = poll_store.get_messages(conv_name, None).map_err(|e| {
+            ToolError::ExecutionFailed(format!("Failed to poll task conversation: {}", e))
+        })?;
+
+        // Track activity: any new message resets the inactivity timer
+        let mut new_messages_this_tick = false;
+        if let Some(max_id) = messages.iter().map(|m| m.id).max() {
+            if max_id > last_seen_id {
+                last_seen_id = max_id;
+                last_activity = now;
+                new_messages_this_tick = true;
             }
+        }
 
-            // Iterate in reverse — look for the latest final response
-            for msg in messages.iter().rev() {
-                // Skip tool results, recall, and our own messages
-                if msg.from_agent == "tool"
-                    || msg.from_agent == "recall"
-                    || msg.from_agent == self.agent_name
-                {
-                    continue;
-                }
-                // Must be an LLM response (has duration) with no pending tool calls
-                if msg.duration_ms.is_some() && msg.tool_calls.is_none() {
-                    return Ok(serde_json::json!({
-                        "status": "completed",
-                        "task_conv": conv_name,
-                        "agent": msg.from_agent,
-                        "result": msg.content,
-                    }));
-                }
-                // If we hit a message with tool_calls, the agent is still working — stop scanning
-                if msg.duration_ms.is_some() && msg.tool_calls.is_some() {
-                    break;
-                }
+        // Iterate in reverse — look for the latest final response
+        for msg in messages.iter().rev() {
+            // Skip tool results, recall, and our own messages
+            if msg.from_agent == "tool"
+                || msg.from_agent == "recall"
+                || msg.from_agent == parent_agent
+            {
+                continue;
             }
-
-            // Soft max checkpoint (30 min) — return progress report instead of hard timeout
-            if now.duration_since(start) >= SOFT_MAX {
-                let recent_activity: Vec<String> = messages
-                    .iter()
-                    .rev()
-                    .filter(|m| {
-                        m.from_agent != "tool"
-                            && m.from_agent != "recall"
-                            && m.from_agent != self.agent_name
-                    })
-                    .take(3)
-                    .map(|m| {
-                        let content = if m.content.len() > 200 {
-                            format!("{}...", &m.content[..200])
-                        } else {
-                            m.content.clone()
-                        };
-                        format!("[{}] {}", m.from_agent, content)
-                    })
-                    .collect();
-
-                let elapsed_minutes = now.duration_since(start).as_secs() / 60;
+            // Must be an LLM response (has duration) with no pending tool calls
+            if msg.duration_ms.is_some() && msg.tool_calls.is_none() {
                 return Ok(serde_json::json!({
-                    "status": "running",
+                    "status": "completed",
                     "task_conv": conv_name,
-                    "agent": agent,
-                    "elapsed_minutes": elapsed_minutes,
-                    "message_count": messages.len(),
-                    "recent_activity": recent_activity,
+                    "agent": msg.from_agent,
+                    "result": msg.content,
                 }));
             }
+            // If we hit a message with tool_calls, the agent is still working — stop scanning
+            if msg.duration_ms.is_some() && msg.tool_calls.is_some() {
+                break;
+            }
+        }
 
-            // If no new DB messages this tick, check if child agent is still working
-            // via socket status. If working, reset inactivity timer.
-            if !new_messages_this_tick {
-                if let Ok(stream) = UnixStream::connect(&socket_path).await {
-                    let mut status_api = SocketApi::new(stream);
-                    if status_api.write_request(&Request::Status).await.is_ok() {
-                        if let Ok(Some(resp)) = tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            status_api.read_response(),
-                        )
-                        .await
-                        .unwrap_or(Ok(None))
-                        {
-                            if let crate::socket_api::Response::Status { state, .. } = resp {
-                                if state == crate::socket_api::AgentState::Working {
-                                    last_activity = now;
-                                }
+        // Soft max checkpoint (30 min) — return progress report instead of hard timeout
+        if now.duration_since(start) >= SOFT_MAX {
+            let recent_activity: Vec<String> = messages
+                .iter()
+                .rev()
+                .filter(|m| {
+                    m.from_agent != "tool"
+                        && m.from_agent != "recall"
+                        && m.from_agent != parent_agent
+                })
+                .take(3)
+                .map(|m| {
+                    let content = if m.content.len() > 200 {
+                        format!("{}...", &m.content[..200])
+                    } else {
+                        m.content.clone()
+                    };
+                    format!("[{}] {}", m.from_agent, content)
+                })
+                .collect();
+
+            let elapsed_minutes = now.duration_since(start).as_secs() / 60;
+            return Ok(serde_json::json!({
+                "status": "running",
+                "task_conv": conv_name,
+                "agent": agent,
+                "elapsed_minutes": elapsed_minutes,
+                "message_count": messages.len(),
+                "recent_activity": recent_activity,
+            }));
+        }
+
+        // If no new DB messages this tick, check if child agent is still working
+        // via socket status. If working, reset inactivity timer.
+        if !new_messages_this_tick {
+            if let Ok(stream) = UnixStream::connect(&socket_path).await {
+                let mut status_api = SocketApi::new(stream);
+                if status_api.write_request(&Request::Status).await.is_ok() {
+                    if let Ok(Some(resp)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        status_api.read_response(),
+                    )
+                    .await
+                    .unwrap_or(Ok(None))
+                    {
+                        if let crate::socket_api::Response::Status { state, .. } = resp {
+                            if state == crate::socket_api::AgentState::Working {
+                                last_activity = now;
                             }
                         }
                     }
                 }
             }
+        }
 
-            // Inactivity timeout (120s since last new message or working state)
-            if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
-                return Ok(serde_json::json!({
-                    "status": "timeout",
-                    "task_conv": conv_name,
-                    "agent": agent,
-                    "message": "No new messages for 120s"
-                }));
-            }
+        // Inactivity timeout (120s since last new message or working state)
+        if now.duration_since(last_activity) >= INACTIVITY_TIMEOUT {
+            return Ok(serde_json::json!({
+                "status": "timeout",
+                "task_conv": conv_name,
+                "agent": agent,
+                "message": "No new messages for 120s"
+            }));
         }
     }
 }
@@ -434,45 +526,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_daemon_task_tool_name() {
-        let tool = DaemonTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
-        assert_eq!(tool.name(), "task");
+    async fn test_start_task_tool_name() {
+        let tool = DaemonStartTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
+        assert_eq!(tool.name(), "start_task");
     }
 
     #[tokio::test]
-    async fn test_daemon_task_schema() {
-        let tool = DaemonTaskTool::new("parent".to_string(), None);
+    async fn test_start_task_schema() {
+        let tool = DaemonStartTaskTool::new("parent".to_string(), None);
         let schema = tool.schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["agent"].is_object());
         assert!(schema["properties"]["task"].is_object());
-        assert!(schema["properties"]["task_conv"].is_object());
-        assert!(schema["properties"]["abort"].is_object());
-        // No required array — validation happens in execute()
-        assert!(schema.get("required").is_none());
+        // task_conv and abort should not be present
+        assert!(schema["properties"].get("task_conv").is_none());
+        assert!(schema["properties"].get("abort").is_none());
+        // required should be ["agent", "task"]
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("agent")));
+        assert!(required.contains(&json!("task")));
     }
 
     #[tokio::test]
-    async fn test_daemon_task_missing_agent_and_task_conv() {
-        let tool = DaemonTaskTool::new("parent".to_string(), None);
+    async fn test_start_task_missing_agent() {
+        let tool = DaemonStartTaskTool::new("parent".to_string(), None);
         let result = tool.execute(json!({"task": "do something"})).await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
 
     #[tokio::test]
-    async fn test_daemon_task_missing_task() {
-        let tool = DaemonTaskTool::new("parent".to_string(), None);
+    async fn test_start_task_missing_task() {
+        let tool = DaemonStartTaskTool::new("parent".to_string(), None);
         let result = tool.execute(json!({"agent": "test-agent"})).await;
         assert!(matches!(result, Err(ToolError::InvalidInput(_))));
     }
 
     #[tokio::test]
-    async fn test_daemon_task_nonexistent_agent() {
-        let tool = DaemonTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
+    async fn test_start_task_nonexistent_agent() {
+        let tool = DaemonStartTaskTool::new("parent".to_string(), Some("conv-1".to_string()));
         let result = tool
             .execute(json!({"agent": "nonexistent-xyz-999", "task": "hello"}))
             .await;
         assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+    }
+
+    #[tokio::test]
+    async fn test_wait_task_schema() {
+        let tool = DaemonWaitTaskTool::new("parent".to_string());
+        let schema = tool.schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["task_conv"].is_object());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task_conv")));
+    }
+
+    #[tokio::test]
+    async fn test_wait_task_bad_task_conv() {
+        let tool = DaemonWaitTaskTool::new("parent".to_string());
+        let result = tool.execute(json!({"task_conv": "bad-format"})).await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_stop_task_schema() {
+        let tool = DaemonStopTaskTool::new("parent".to_string());
+        let schema = tool.schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["task_conv"].is_object());
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&json!("task_conv")));
+    }
+
+    #[tokio::test]
+    async fn test_stop_task_bad_task_conv() {
+        let tool = DaemonStopTaskTool::new("parent".to_string());
+        let result = tool
+            .execute(json!({"task_conv": "bad-format"}))
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
+    }
+
+    #[tokio::test]
+    async fn test_stop_task_returns_cancelled() {
+        use crate::conversation::ConversationStore;
+
+        let store = ConversationStore::init().unwrap();
+        let conv = format!("task:parent:child:{}", std::process::id());
+        store
+            .create_conversation(Some(&conv), &["parent", "child"])
+            .unwrap();
+
+        let tool = DaemonStopTaskTool::new("parent".to_string());
+        let result = tool
+            .execute(json!({"task_conv": conv}))
+            .await
+            .unwrap();
+
+        assert_eq!(result["status"], "cancelled");
+        assert_eq!(result["task_conv"], conv);
+        assert_eq!(result["agent"], "child");
+
+        // Verify cancel message was posted
+        let messages = store.get_messages(&conv, None).unwrap();
+        assert!(messages
+            .iter()
+            .any(|m| m.content.contains("[task cancelled by parent]")));
+
+        // Verify conversation is paused
+        assert!(store.is_paused(&conv).unwrap());
+
+        store.delete_conversation(&conv).unwrap();
     }
 
     #[test]
@@ -564,47 +727,6 @@ mod tests {
         assert_eq!(extract_child_agent("task:parent:child"), None);
         assert_eq!(extract_child_agent("task:parent"), None);
         assert_eq!(extract_child_agent("task"), None);
-    }
-
-    #[tokio::test]
-    async fn test_abort_bad_task_conv() {
-        let tool = DaemonTaskTool::new("parent".to_string(), None);
-        let result = tool
-            .execute(json!({"task_conv": "bad-format", "abort": true}))
-            .await;
-        assert!(matches!(result, Err(ToolError::InvalidInput(_))));
-    }
-
-    #[tokio::test]
-    async fn test_abort_returns_cancelled() {
-        use crate::conversation::ConversationStore;
-
-        let store = ConversationStore::init().unwrap();
-        let conv = format!("task:parent:child:{}", std::process::id());
-        store
-            .create_conversation(Some(&conv), &["parent", "child"])
-            .unwrap();
-
-        let tool = DaemonTaskTool::new("parent".to_string(), None);
-        let result = tool
-            .execute(json!({"task_conv": conv, "abort": true}))
-            .await
-            .unwrap();
-
-        assert_eq!(result["status"], "cancelled");
-        assert_eq!(result["task_conv"], conv);
-        assert_eq!(result["agent"], "child");
-
-        // Verify cancel message was posted
-        let messages = store.get_messages(&conv, None).unwrap();
-        assert!(messages
-            .iter()
-            .any(|m| m.content.contains("[task cancelled by parent]")));
-
-        // Verify conversation is paused
-        assert!(store.is_paused(&conv).unwrap());
-
-        store.delete_conversation(&conv).unwrap();
     }
 
     #[test]

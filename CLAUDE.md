@@ -4,8 +4,8 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v3.11.13
-**Tests:** 740 passing
+**Version:** v3.11.14
+**Tests:** 746 passing
 **Repo:** github.com/inkthorne/anima
 
 ## Quick Context
@@ -38,6 +38,7 @@ src/
 ├── observe.rs          # Observer trait, ConsoleObserver, MetricsCollector
 ├── retry.rs            # RetryPolicy, exponential backoff
 ├── supervision.rs      # ChildHandle, ChildConfig, ChildStatus
+├── auth.rs             # OAuth/token authentication (login, logout, whoami)
 ├── debug.rs            # Debug logging utilities
 └── tools/
     ├── mod.rs
@@ -53,8 +54,10 @@ src/
     ├── remember.rs     # RememberTool, DaemonRememberTool
     ├── search_conversation.rs # DaemonSearchConversationTool
     ├── claude_code.rs  # ClaudeCodeTool (delegate tasks to Claude Code)
-    ├── spawn_child.rs  # SpawnChildTool
-    ├── wait_for_child.rs # WaitForChildTool, WaitForChildrenTool
+    ├── task.rs         # DaemonStartTaskTool, DaemonStopTaskTool, DaemonWaitTaskTool
+    ├── notes.rs        # DaemonNotesTool (agent scratchpad)
+    ├── copy_lines.rs   # CopyLinesTool (copy lines between files)
+    ├── peek_file.rs    # PeekFileTool (preview file contents)
     ├── add.rs          # AddTool (demo)
     └── echo.rs         # EchoTool (demo)
 ```
@@ -90,7 +93,7 @@ src/
 - `tools = true` in model config: Native tool calling — LLM gets ToolSpecs
 - `tools = false`: JSON-block — Model outputs `{"tool": "x", "params": {...}}`, daemon parses and executes
 
-**Available Tools:** `read_file`, `edit_file`, `write_file`, `list_files`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `search_conversation`, `claude_code`, `spawn_child`, `wait_for_children`
+**Available Tools:** `read_file`, `edit_file`, `write_file`, `list_files`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `search_conversation`, `claude_code`, `start_task`, `wait_task`, `stop_task`, `notes`, `copy_lines`, `peek_file`
 
 **Safe Shell:** `SafeShellTool` has a command allowlist — only approved commands can be executed, including in pipelines.
 
@@ -127,6 +130,11 @@ anima stop <name>       # Stop running daemon (supports glob patterns)
 anima restart <name>    # Stop then start (supports glob patterns)
 anima heartbeat <name>  # Trigger heartbeat for running daemon
 
+# Authentication
+anima login             # Log in with Anthropic subscription (OAuth)
+anima logout            # Log out (remove stored tokens)
+anima whoami            # Show current auth status
+
 # Interaction
 anima                   # REPL mode (connects to daemons)
 anima ask <name> "msg"  # One-shot query (no daemon required)
@@ -141,6 +149,8 @@ anima chat view <conv>  # View messages (--limit, --since, --json)
 anima chat pause <conv> # Pause conversation (queues notifications)
 anima chat stop <conv>  # Stop paused conversation (drops queued notifications)
 anima chat resume <conv># Resume paused conversation
+anima chat pin <conv> <id>   # Pin a message in context
+anima chat unpin <conv> <id> # Unpin a message
 anima chat delete <name># Delete conversation
 anima chat clear <conv> # Clear messages (keeps conversation)
 anima chat cleanup      # Delete expired messages and empty conversations
@@ -174,7 +184,7 @@ anima task <config> "task" [--stream] [-v] # One-shot with config file
 cargo check           # Type check
 cargo build --release # Build
 cargo install --path . # Install to PATH
-cargo test            # Run tests (660 tests)
+cargo test            # Run tests (746 tests)
 ```
 
 ## Key Design Decisions

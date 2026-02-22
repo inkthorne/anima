@@ -19,6 +19,7 @@ const DEFAULT_SAFE_COMMANDS: &[&str] = &[
 pub struct SafeShellTool {
     timeout: Duration,
     allowed_commands: Vec<String>,
+    mem_limit_bytes: Option<u64>,
 }
 
 impl SafeShellTool {
@@ -29,6 +30,7 @@ impl SafeShellTool {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            mem_limit_bytes: Some(super::shell::DEFAULT_MEM_LIMIT_BYTES),
         }
     }
 
@@ -39,6 +41,7 @@ impl SafeShellTool {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            mem_limit_bytes: Some(super::shell::DEFAULT_MEM_LIMIT_BYTES),
         }
     }
 
@@ -46,7 +49,13 @@ impl SafeShellTool {
         Self {
             timeout: Duration::from_secs(30),
             allowed_commands: allowed,
+            mem_limit_bytes: Some(super::shell::DEFAULT_MEM_LIMIT_BYTES),
         }
+    }
+
+    pub fn with_mem_limit(mut self, limit: Option<u64>) -> Self {
+        self.mem_limit_bytes = limit;
+        self
     }
 
     /// Extract all base commands from a shell command string.
@@ -149,7 +158,7 @@ impl Tool for SafeShellTool {
         self.validate_command(command)
             .map_err(ToolError::InvalidInput)?;
 
-        run_shell_with_kill(command, self.timeout).await
+        run_shell_with_kill(command, self.timeout, self.mem_limit_bytes).await
     }
 }
 

@@ -633,8 +633,11 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "send_message" => {
             args.get("to").and_then(|v| v.as_str()).map(|to| format!("@{}", to))
         }
-        "task" => {
+        "start_task" => {
             args.get("agent").and_then(|v| v.as_str()).map(String::from)
+        }
+        "wait_task" | "stop_task" => {
+            args.get("task_conv").and_then(|v| v.as_str()).map(|s| truncate(s, 40))
         }
         "claude_code" => {
             args.get("task").and_then(|v| v.as_str()).map(|s| truncate(s, 60))

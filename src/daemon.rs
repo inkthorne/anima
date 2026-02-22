@@ -123,7 +123,7 @@ use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_proces
 use crate::tools::list_agents::DaemonListAgentsTool;
 use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::notes::DaemonNotesTool;
-use crate::tools::task::DaemonTaskTool;
+use crate::tools::task::{DaemonStartTaskTool, DaemonStopTaskTool, DaemonWaitTaskTool};
 use crate::tools::{
     AddTool, CopyLinesTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool,
     EditFileTool, HttpTool, ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool,
@@ -1033,6 +1033,38 @@ fn spawn_tool_trace_persister(
 
 /// Execute a tool call and return the result as a string.
 /// If a tool_def is provided, command validation is performed for shell tools.
+/// Format the result of a start_task or wait_task call into a human-readable string.
+fn format_task_result(result: &serde_json::Value) -> Result<String, String> {
+    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
+    let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
+    let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
+    match status {
+        "completed" => {
+            let task_result = result.get("result").and_then(|s| s.as_str()).unwrap_or("");
+            Ok(format!("Task completed by '{}' ({}).\n\n{}", agent, task_conv, task_result))
+        }
+        "timeout" => {
+            let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("timed out");
+            Ok(format!("Task timed out for '{}' ({}): {}", agent, task_conv, message))
+        }
+        "running" => {
+            let elapsed = result.get("elapsed_minutes").and_then(|v| v.as_u64()).unwrap_or(0);
+            let msg_count = result.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+            let recent = result.get("recent_activity")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"))
+                .unwrap_or_default();
+            Ok(format!(
+                "Task for '{}' still running after {}m ({} messages). Conv: {}\n\nRecent activity:\n{}\n\nTo continue waiting, call wait_task with task_conv=\"{}\". To stop the agent, call stop_task with task_conv=\"{}\".",
+                agent, elapsed, msg_count, task_conv, recent, task_conv, task_conv
+            ))
+        }
+        _ => {
+            Ok(format!("Task status '{}' for '{}' ({})", status, agent, task_conv))
+        }
+    }
+}
+
 async fn execute_tool_call(
     tool_call: &ToolCall,
     tool_def: Option<&ToolDefinition>,
@@ -1313,7 +1345,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "task", "search_conversation", "notes"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "start_task", "wait_task", "stop_task", "search_conversation", "notes"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -1332,49 +1364,36 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, task, search_conversation, notes\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, start_task, wait_task, stop_task, search_conversation, notes\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
             }
         }
-        "task" => {
-            let ctx = context.ok_or("task tool requires execution context")?;
-            let tool = DaemonTaskTool::new(ctx.agent_name.clone(), ctx.conv_id.clone());
+        "start_task" => {
+            let ctx = context.ok_or("start_task requires execution context")?;
+            let tool = DaemonStartTaskTool::new(ctx.agent_name.clone(), ctx.conv_id.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => format_task_result(&result),
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "wait_task" => {
+            let ctx = context.ok_or("wait_task requires execution context")?;
+            let tool = DaemonWaitTaskTool::new(ctx.agent_name.clone());
+            match tool.execute(tool_call.params.clone()).await {
+                Ok(result) => format_task_result(&result),
+                Err(e) => Err(format!("Tool error: {}", e)),
+            }
+        }
+        "stop_task" => {
+            let ctx = context.ok_or("stop_task requires execution context")?;
+            let tool = DaemonStopTaskTool::new(ctx.agent_name.clone());
             match tool.execute(tool_call.params.clone()).await {
                 Ok(result) => {
-                    let status = result.get("status").and_then(|s| s.as_str()).unwrap_or("unknown");
-                    let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
-                    match status {
-                        "completed" => {
-                            let task_result = result.get("result").and_then(|s| s.as_str()).unwrap_or("");
-                            Ok(format!("Task completed by '{}' ({}).\n\n{}", agent, task_conv, task_result))
-                        }
-                        "timeout" => {
-                            let message = result.get("message").and_then(|s| s.as_str()).unwrap_or("timed out");
-                            Ok(format!("Task timed out for '{}' ({}): {}", agent, task_conv, message))
-                        }
-                        "running" => {
-                            let elapsed = result.get("elapsed_minutes").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let msg_count = result.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
-                            let recent = result.get("recent_activity")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"))
-                                .unwrap_or_default();
-                            Ok(format!(
-                                "Task for '{}' still running after {}m ({} messages). Conv: {}\n\nRecent activity:\n{}\n\nTo continue waiting, call task with task_conv=\"{}\". To stop the agent, call task with task_conv=\"{}\" and abort=true.",
-                                agent, elapsed, msg_count, task_conv, recent, task_conv, task_conv
-                            ))
-                        }
-                        "cancelled" => {
-                            Ok(format!("Task cancelled for '{}' ({}). The agent will stop at the next iteration boundary.",
-                                agent, task_conv))
-                        }
-                        _ => {
-                            Ok(format!("Task status '{}' for '{}' ({})", status, agent, task_conv))
-                        }
-                    }
+                    let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
+                    Ok(format!("Task cancelled for '{}' ({}). The agent will stop at the next iteration boundary.", agent, task_conv))
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
@@ -1513,6 +1532,8 @@ pub struct HeartbeatDaemonConfig {
     pub interval: Duration,
     /// Path to the heartbeat.md file
     pub heartbeat_path: PathBuf,
+    /// Path to the goals.md file
+    pub goals_path: PathBuf,
 }
 
 impl DaemonConfig {
@@ -1542,6 +1563,7 @@ impl DaemonConfig {
 
         // Parse heartbeat config if enabled and interval set
         let heartbeat_path = dir_path.join("heartbeat.md");
+        let goals_path = dir_path.join("goals.md");
         let heartbeat = if agent_dir.config.heartbeat.enabled {
             agent_dir
                 .config
@@ -1552,6 +1574,7 @@ impl DaemonConfig {
                     parse_duration(interval_str).map(|interval| HeartbeatDaemonConfig {
                         interval,
                         heartbeat_path: heartbeat_path.clone(),
+                        goals_path: goals_path.clone(),
                     })
                 })
         } else {
@@ -1762,9 +1785,10 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(ref hb) = config.heartbeat {
         logger.log(&format!(
-            "  Heartbeat: every {:?}, file: {}",
+            "  Heartbeat: every {:?}, file: {}, goals: {}",
             hb.interval,
-            hb.heartbeat_path.display()
+            hb.heartbeat_path.display(),
+            hb.goals_path.display()
         ));
     }
 
@@ -2315,7 +2339,9 @@ async fn create_agent_from_dir(
         // Register daemon-aware messaging tools
         agent.register_tool(Arc::new(DaemonSendMessageTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonListAgentsTool::new(agent_name.clone())));
-        agent.register_tool(Arc::new(DaemonTaskTool::new(agent_name.clone(), None)));
+        agent.register_tool(Arc::new(DaemonStartTaskTool::new(agent_name.clone(), None)));
+        agent.register_tool(Arc::new(DaemonWaitTaskTool::new(agent_name.clone())));
+        agent.register_tool(Arc::new(DaemonStopTaskTool::new(agent_name.clone())));
         agent.register_tool(Arc::new(DaemonNotesTool::new(agent_name.clone(), None)));
         agent.register_tool(Arc::new(DaemonSearchConversationTool));
     }
@@ -4511,6 +4537,22 @@ async fn run_heartbeat(
             logger.log(&format!("[heartbeat] Failed to read heartbeat.md: {}", e));
             return;
         }
+    };
+
+    // Load goals.md (optional — agent may not have goals yet)
+    let goals_content = std::fs::read_to_string(&config.goals_path)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+
+    logger.log(&format!(
+        "[heartbeat] Goals: {} chars",
+        goals_content.as_ref().map_or(0, |g| g.len())
+    ));
+
+    let heartbeat_prompt = if let Some(goals) = goals_content {
+        format!("{}\n\n## Current Goals\n\n{}", heartbeat_prompt, goals)
+    } else {
+        format!("{}\n\n## Current Goals\n\nNo goals set. Use write_file to create goals.md in your agent directory when you have work to track.", heartbeat_prompt)
     };
 
     logger.log(&format!(

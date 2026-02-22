@@ -201,6 +201,13 @@ impl Default for SemanticMemorySection {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct ShellSection {
+    /// Memory limit in MB for shell-spawned processes.
+    /// Default: 8192 (8 GB). Set to 0 to disable.
+    pub mem_limit_mb: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct ThinkSection {
     /// Maximum iterations for tool call loops (default: 10)
     pub max_iterations: Option<usize>,
@@ -234,6 +241,8 @@ pub struct AgentDirConfig {
     pub heartbeat: crate::config::HeartbeatConfig,
     #[serde(default)]
     pub think: ThinkSection,
+    #[serde(default)]
+    pub shell: ShellSection,
 }
 
 #[derive(Debug)]
@@ -518,7 +527,12 @@ path = "memory.db"
 # [timer]
 # enabled = true
 # interval = "5m"
-# message = "Heartbeat — check for anything interesting"
+# message = "Timer trigger"
+
+# Optional heartbeat configuration
+# [heartbeat]
+# enabled = true
+# interval = "30m"
 "#
     );
     std::fs::write(agent_path.join("config.toml"), config_content)?;

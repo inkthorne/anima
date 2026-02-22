@@ -5,14 +5,22 @@ use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
 
+/// Default memory limit for shell-spawned processes: 8 GB.
+pub(crate) const DEFAULT_MEM_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Spawn a shell command in its own process group and kill the entire group on timeout.
 ///
 /// Uses `setpgid(0, 0)` so the child (and any grandchildren) form an isolated process group.
 /// On timeout, `kill(-pgid, SIGKILL)` reaps the whole tree, then `wait()` cleans up the zombie.
 /// `kill_on_drop(true)` acts as a safety net if the `Child` handle is dropped unexpectedly.
+///
+/// If `mem_limit_bytes` is `Some(n)`, sets `RLIMIT_AS` to cap virtual address space.
+/// This prevents runaway child processes from consuming all system RAM.
+/// `None` disables the limit.
 pub(crate) async fn run_shell_with_kill(
     command: &str,
     timeout: Duration,
+    mem_limit_bytes: Option<u64>,
 ) -> Result<Value, ToolError> {
     use std::os::unix::process::CommandExt as _;
 
@@ -21,10 +29,19 @@ pub(crate) async fn run_shell_with_kill(
         cmd.arg("-c").arg(command);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
-        // SAFETY: setpgid is async-signal-safe and called before exec.
+        // SAFETY: setpgid and setrlimit are async-signal-safe and called before exec.
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 libc::setpgid(0, 0);
+                if let Some(limit) = mem_limit_bytes {
+                    let rlim = libc::rlimit {
+                        rlim_cur: limit as libc::rlim_t,
+                        rlim_max: limit as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_AS, &rlim) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
@@ -101,17 +118,27 @@ pub(crate) async fn run_shell_with_kill(
 #[derive(Debug)]
 pub struct ShellTool {
     timeout: Duration,
+    mem_limit_bytes: Option<u64>,
 }
 
 impl ShellTool {
     pub fn new() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            mem_limit_bytes: Some(DEFAULT_MEM_LIMIT_BYTES),
         }
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            mem_limit_bytes: Some(DEFAULT_MEM_LIMIT_BYTES),
+        }
+    }
+
+    pub fn with_mem_limit(mut self, limit: Option<u64>) -> Self {
+        self.mem_limit_bytes = limit;
+        self
     }
 }
 
@@ -152,7 +179,7 @@ impl Tool for ShellTool {
                 ToolError::InvalidInput("Missing or invalid 'command' field".to_string())
             })?;
 
-        run_shell_with_kill(command, self.timeout).await
+        run_shell_with_kill(command, self.timeout, self.mem_limit_bytes).await
     }
 }
 
@@ -191,6 +218,7 @@ mod tests {
     fn test_shell_tool_default() {
         let tool = ShellTool::default();
         assert_eq!(tool.timeout, Duration::from_secs(30));
+        assert_eq!(tool.mem_limit_bytes, Some(DEFAULT_MEM_LIMIT_BYTES));
     }
 
     #[test]
