@@ -271,6 +271,9 @@ pub struct LLMResponse {
     /// Raw HTTP response body for non-streaming calls (debugging parsing issues).
     #[serde(skip)]
     pub raw_body: Option<String>,
+    /// Raw SSE byte stream for streaming calls (debugging streaming issues).
+    #[serde(skip)]
+    pub raw_stream: Option<String>,
 }
 
 /// Token usage information from LLM API responses.
@@ -297,6 +300,9 @@ pub struct LLMError {
     pub status_code: Option<u16>,
     #[serde(default)]
     pub is_retryable: bool,
+    /// Raw SSE byte stream captured before the error occurred.
+    #[serde(skip)]
+    pub raw_stream: Option<String>,
 }
 
 impl LLMError {
@@ -305,6 +311,7 @@ impl LLMError {
             message: message.into(),
             status_code: None,
             is_retryable: true,
+            raw_stream: None,
         }
     }
 
@@ -313,6 +320,7 @@ impl LLMError {
             message: message.into(),
             status_code: Some(status),
             is_retryable: true,
+            raw_stream: None,
         }
     }
 
@@ -321,6 +329,7 @@ impl LLMError {
             message: message.into(),
             status_code: None,
             is_retryable: false,
+            raw_stream: None,
         }
     }
 
@@ -329,6 +338,7 @@ impl LLMError {
             message: message.into(),
             status_code: Some(status),
             is_retryable: false,
+            raw_stream: None,
         }
     }
 
@@ -339,7 +349,14 @@ impl LLMError {
             message: message.into(),
             status_code: Some(status),
             is_retryable,
+            raw_stream: None,
         }
+    }
+
+    /// Attach raw stream capture data to this error.
+    pub fn with_stream(mut self, stream: String) -> Self {
+        self.raw_stream = Some(stream);
+        self
     }
 }
 
@@ -709,6 +726,7 @@ impl OpenAIClient {
             tool_calls: parse_openai_tool_calls(&message["tool_calls"]),
             usage: parse_openai_usage(&parsed["usage"]),
             raw_body: Some(response_text),
+            raw_stream: None,
         })
     }
 
@@ -767,12 +785,20 @@ impl OpenAIClient {
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
         let mut raw_lines: Vec<String> = Vec::new();
+        let mut stream_capture = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(LLMError::retryable(format!("Failed to read stream chunk: {}", e))
+                        .with_stream(stream_capture));
+                }
+            };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            stream_capture.push_str(&chunk_str);
+            buffer.push_str(&chunk_str);
 
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
@@ -831,6 +857,7 @@ impl OpenAIClient {
             tool_calls: finalize_tool_call_builders(tool_call_builders),
             usage,
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
+            raw_stream: Some(stream_capture),
         })
     }
 }
@@ -894,6 +921,7 @@ impl OpenAIClient {
             tool_calls,
             usage: parse_responses_usage(&parsed["usage"]),
             raw_body: Some(response_text),
+            raw_stream: None,
         })
     }
 
@@ -958,6 +986,7 @@ impl OpenAIClient {
         let mut usage: Option<UsageInfo> = None;
         let mut raw_lines: Vec<String> = Vec::new();
         let mut stream_completed = false;
+        let mut stream_capture = String::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -970,11 +999,14 @@ impl OpenAIClient {
                     return Err(LLMError::retryable(format!(
                         "Failed to read stream chunk: {}",
                         e
-                    )));
+                    ))
+                    .with_stream(stream_capture));
                 }
             };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            stream_capture.push_str(&chunk_str);
+            buffer.push_str(&chunk_str);
 
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
@@ -1089,6 +1121,7 @@ impl OpenAIClient {
             tool_calls,
             usage,
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
+            raw_stream: Some(stream_capture),
         })
     }
 }
@@ -1260,6 +1293,7 @@ impl LLM for AnthropicClient {
             tool_calls,
             usage,
             raw_body: Some(response_text),
+            raw_stream: None,
         })
     }
 
@@ -1321,12 +1355,20 @@ impl LLM for AnthropicClient {
         let mut current_tool_use: Option<(String, String, String)> = None;
         let mut buffer = String::new();
         let mut raw_lines: Vec<String> = Vec::new();
+        let mut stream_capture = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(LLMError::retryable(format!("Failed to read stream chunk: {}", e))
+                        .with_stream(stream_capture));
+                }
+            };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            stream_capture.push_str(&chunk_str);
+            buffer.push_str(&chunk_str);
 
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
@@ -1412,6 +1454,7 @@ impl LLM for AnthropicClient {
             tool_calls,
             usage: None,
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
+            raw_stream: Some(stream_capture),
         })
     }
 }
@@ -1655,6 +1698,7 @@ impl LLM for OllamaClient {
             tool_calls,
             usage,
             raw_body: Some(response_text),
+            raw_stream: None,
         })
     }
 
@@ -1712,12 +1756,20 @@ impl LLM for OllamaClient {
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
         let mut raw_lines: Vec<String> = Vec::new();
+        let mut stream_capture = String::new();
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    return Err(LLMError::retryable(format!("Failed to read stream chunk: {}", e))
+                        .with_stream(stream_capture));
+                }
+            };
 
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            let chunk_str = String::from_utf8_lossy(&chunk);
+            stream_capture.push_str(&chunk_str);
+            buffer.push_str(&chunk_str);
 
             while let Some(line_end) = buffer.find('\n') {
                 let line = buffer[..line_end].trim().to_string();
@@ -1778,6 +1830,7 @@ impl LLM for OllamaClient {
             tool_calls,
             usage,
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
+            raw_stream: Some(stream_capture),
         })
     }
 }
@@ -1974,6 +2027,7 @@ impl LLM for ClaudeCodeClient {
             tool_calls: Vec::new(),
             usage,
             raw_body: None,
+            raw_stream: None,
         })
     }
 
@@ -2087,6 +2141,7 @@ impl LLM for ClaudeCodeClient {
             tool_calls: Vec::new(),
             usage,
             raw_body: None,
+            raw_stream: None,
         })
     }
 }

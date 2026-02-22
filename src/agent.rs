@@ -1102,6 +1102,7 @@ impl Agent {
         tools: &Option<Vec<ToolSpec>>,
         retry_policy: &Option<RetryPolicy>,
         token_tx: &mpsc::Sender<String>,
+        turn_n: Option<u64>,
     ) -> Result<crate::llm::LLMResponse, crate::error::AgentError> {
         if let Some(policy) = retry_policy {
             let llm_ref = llm.clone();
@@ -1125,11 +1126,21 @@ impl Agent {
                 .await;
             result
                 .result
-                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+                .map_err(|e| {
+                    if let Some(ref stream) = e.raw_stream {
+                        self.dump_stream(turn_n, stream);
+                    }
+                    crate::error::AgentError::LlmError(e.message)
+                })
         } else {
             llm.chat_complete_stream(messages.to_vec(), tools.clone(), token_tx.clone())
                 .await
-                .map_err(|e| crate::error::AgentError::LlmError(e.message))
+                .map_err(|e| {
+                    if let Some(ref stream) = e.raw_stream {
+                        self.dump_stream(turn_n, stream);
+                    }
+                    crate::error::AgentError::LlmError(e.message)
+                })
         }
     }
 
@@ -1448,6 +1459,28 @@ impl Agent {
                 let _ = std::fs::write(&raw_path, raw);
             }
         }
+
+        // Write raw SSE stream capture for debugging streaming issues
+        if let Some(ref stream) = response.raw_stream {
+            let stream_path = conv_dir.join(format!("stream-{}.json", turn_n));
+            let _ = std::fs::write(&stream_path, stream);
+        }
+    }
+
+    /// Dump raw stream capture to turns/{conv_name}/stream-{n}.json on error.
+    fn dump_stream(&self, turn_n: Option<u64>, raw_stream: &str) {
+        let turn_n = match turn_n {
+            Some(n) => n,
+            None => return,
+        };
+        let agent_dir = match &self.agent_dir {
+            Some(dir) => dir,
+            None => return,
+        };
+        let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
+        let conv_dir = agent_dir.join("turns").join(conv_name);
+        let stream_path = conv_dir.join(format!("stream-{}.json", turn_n));
+        let _ = std::fs::write(&stream_path, raw_stream);
     }
 
     /// Rename debug turn dump files from sequential number to DB message ID.
@@ -1461,7 +1494,7 @@ impl Agent {
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
         let conv_dir = agent_dir.join("turns").join(conv_name);
 
-        for prefix in &["req", "resp", "raw"] {
+        for prefix in &["req", "resp", "raw", "stream"] {
             let from_path = conv_dir.join(format!("{}-{}.json", prefix, from_n));
             let to_path = conv_dir.join(format!("{}-{}.json", prefix, to_id));
             if from_path.exists() {
@@ -1836,7 +1869,7 @@ impl Agent {
 
         let llm_start = Instant::now();
         let response = self
-            .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
+            .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx, turn_n)
             .await?;
         self.dump_response(turn_n, &response);
         let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
@@ -1927,7 +1960,7 @@ impl Agent {
 
             let llm_start = Instant::now();
             let response = self
-                .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx)
+                .call_llm_stream(&llm, &messages, &tools, &options.retry_policy, &token_tx, turn_n)
                 .await?;
             self.dump_response(turn_n, &response);
 
