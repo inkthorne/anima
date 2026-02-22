@@ -663,6 +663,7 @@ pub struct ToolExecutionContext {
     pub semantic_memory_store: Option<Arc<Mutex<SemanticMemoryStore>>>,
     pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub allowed_tools: Option<Vec<String>>,
+    pub logger: Option<Arc<AgentLogger>>,
 }
 
 /// Result of building recall content (tools + memories).
@@ -874,7 +875,13 @@ async fn save_memories(
     let store = mem_store.lock().await;
     for memory in memories_to_save {
         let embedding = if let Some(emb_client) = embedding_client {
-            emb_client.embed(memory).await.ok()
+            match emb_client.embed(memory).await {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    logger.log(&format!("Failed to generate embedding for memory: {}", e));
+                    None
+                }
+            }
         } else {
             None
         };
@@ -1256,7 +1263,15 @@ async fn execute_tool_call(
 
             // Generate embedding if client is available
             let embedding = if let Some(emb_client) = &ctx.embedding_client {
-                emb_client.embed(content).await.ok()
+                match emb_client.embed(content).await {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        if let Some(logger) = &ctx.logger {
+                            logger.log(&format!("Failed to generate embedding for remember tool: {}", e));
+                        }
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -3340,6 +3355,7 @@ async fn process_message_work(
         semantic_memory_store: semantic_memory.clone(),
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
+        logger: Some(logger.clone()),
     };
 
     // With conversation: use unified tool loop (DB-backed context management)
@@ -4189,6 +4205,7 @@ async fn handle_notify(
         semantic_memory_store: semantic_memory.clone(),
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
+        logger: Some(logger.clone()),
     };
 
     // Channel for forwarding log messages to the daemon logger
@@ -8096,6 +8113,7 @@ api_key = "sk-test"
             semantic_memory_store: None,
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
+            logger: None,
         };
         let call = ToolCall {
             tool: "shell".to_string(),
@@ -8119,6 +8137,7 @@ api_key = "sk-test"
             semantic_memory_store: None,
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
+            logger: None,
         };
         let call = ToolCall {
             tool: "read_file".to_string(),
@@ -8137,6 +8156,7 @@ api_key = "sk-test"
             semantic_memory_store: None,
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
+            logger: None,
         };
         let call = ToolCall {
             tool: "list_tools".to_string(),
@@ -8159,6 +8179,7 @@ api_key = "sk-test"
             semantic_memory_store: None,
             embedding_client: None,
             allowed_tools: None,
+            logger: None,
         };
         let call = ToolCall {
             tool: "read_file".to_string(),
