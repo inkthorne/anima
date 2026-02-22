@@ -1454,7 +1454,16 @@ fn convert_params_to_json_schema(params: &serde_json::Value) -> serde_json::Valu
                 let is_optional = type_str.to_lowercase().contains("optional");
                 let base_type = type_str.split_whitespace().next().unwrap_or("string");
 
-                properties.insert(name.clone(), serde_json::json!({"type": base_type}));
+                // Normalize to JSON Schema types
+                let json_type = match base_type {
+                    "bool" => "boolean",
+                    "int" => "integer",
+                    "float" | "double" => "number",
+                    "str" => "string",
+                    other => other,
+                };
+
+                properties.insert(name.clone(), serde_json::json!({"type": json_type}));
 
                 if !is_optional {
                     required.push(serde_json::Value::String(name.clone()));
