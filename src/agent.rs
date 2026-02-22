@@ -3403,6 +3403,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs"}),
+                    parse_error: None,
                 }]),
             },
             // First result
@@ -3421,6 +3422,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs"}),
+                    parse_error: None,
                 }]),
             },
             // Second result
@@ -3457,6 +3459,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3473,6 +3476,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/b.rs"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3503,6 +3507,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "ls"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3534,6 +3539,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "write_file".into(),
                     arguments: json!({"path": "/a.rs", "content": "old"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3551,6 +3557,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "write_file".into(),
                     arguments: json!({"path": "/a.rs", "content": "new"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3582,6 +3589,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "edit_file".into(),
                     arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3599,6 +3607,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3630,6 +3639,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "edit_file".into(),
                     arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3663,6 +3673,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1 | tail -5"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3680,6 +3691,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3711,6 +3723,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "git status"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3728,6 +3741,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "git diff"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3760,6 +3774,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs", "start_line": 1, "end_line": 10}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3777,6 +3792,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "read_file".into(),
                     arguments: json!({"path": "/a.rs"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3808,6 +3824,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "edit_file".into(),
                     arguments: json!({"path": "/a.rs", "old_string": "x", "new_string": "y"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3825,6 +3842,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "write_file".into(),
                     arguments: json!({"path": "/a.rs", "content": "new content"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3856,6 +3874,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3873,6 +3892,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cd ~/dev/minilang && cargo test 2>&1"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3905,6 +3925,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cargo check"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3922,6 +3943,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cargo check"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3952,6 +3974,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "notes".into(),
                     arguments: json!({"content": "first notes"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3968,6 +3991,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "notes".into(),
                     arguments: json!({"content": "second notes"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -3984,6 +4008,7 @@ mod tests {
                     id: "tc3".into(),
                     name: "notes".into(),
                     arguments: json!({"content": "third notes"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -4018,6 +4043,7 @@ mod tests {
                     id: "tc1".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cargo check 2>&1 | tail -5"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {
@@ -4035,6 +4061,7 @@ mod tests {
                     id: "tc2".into(),
                     name: "shell".into(),
                     arguments: json!({"command": "cargo check 2>&1 | tail -20"}),
+                    parse_error: None,
                 }]),
             },
             ChatMessage {

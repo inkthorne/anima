@@ -2758,6 +2758,28 @@ async fn execute_native_tool_calls(
     };
     let mut results = Vec::new();
     for tc in tool_calls {
+        // Report parse errors back to the LLM with correct tool usage
+        if let Some(ref error) = tc.parse_error {
+            let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.name));
+            let usage_hint = tool_def
+                .map(|td| {
+                    format!(
+                        "\n\nExpected parameters:\n{}",
+                        serde_json::to_string_pretty(&td.params).unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            let error_msg = format!("[Tool Error for {}]\n{}{}", tc.name, error, usage_hint);
+            logger.tool(&format!("[loop] {} → parse error: {}", tc.name, error));
+            if let Err(e) =
+                store.add_native_tool_result(conv_name, &tc.id, &error_msg, agent_name)
+            {
+                logger.log(&format!("[loop] Failed to store tool error: {}", e));
+            }
+            results.push(tc.name.clone());
+            continue;
+        }
+
         let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.name));
         // Convert llm::ToolCall to daemon::ToolCall for execute_tool_call
         let daemon_tc = ToolCall {
@@ -5982,12 +6004,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
         let read_a_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6071,12 +6095,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
         let read_b_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/b.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6137,12 +6163,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "content": "v1"}),
+            parse_error: None,
         }])
         .unwrap();
         let write_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "content": "v2"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6201,18 +6229,21 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "edit_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "old_str": "a", "new_str": "b"}),
+            parse_error: None,
         }])
         .unwrap();
         let edit_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "edit_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "old_str": "b", "new_str": "c"}),
+            parse_error: None,
         }])
         .unwrap();
         let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc3".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6284,12 +6315,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "edit_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "old_str": "a", "new_str": "b"}),
+            parse_error: None,
         }])
         .unwrap();
         let edit_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "edit_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "old_str": "b", "new_str": "c"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6335,12 +6368,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1 | tail -5"}),
+            parse_error: None,
         }])
         .unwrap();
         let cargo_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "cd ~/dev/minilang && cargo check 2>&1"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6393,12 +6428,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
+            parse_error: None,
         }])
         .unwrap();
         let ls_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6446,12 +6483,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "ls"}),
+            parse_error: None,
         }])
         .unwrap();
         let git_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "git status"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6498,12 +6537,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "./target/release/minilang examples/demo.mini | head -20"}),
+            parse_error: None,
         }])
         .unwrap();
         let tc2_json = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "shell".into(),
             arguments: serde_json::json!({"command": "./target/release/minilang examples/demo.mini | head -50"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6556,18 +6597,21 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "run".into(),
             arguments: serde_json::json!({"command": "cargo test"}),
+            parse_error: None,
         }])
         .unwrap();
         let run_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "run".into(),
             arguments: serde_json::json!({"command": "cargo build"}),
+            parse_error: None,
         }])
         .unwrap();
         let run_tc3 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc3".into(),
             name: "run".into(),
             arguments: serde_json::json!({"command": "cargo check"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6641,18 +6685,21 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "notes".into(),
             arguments: serde_json::json!({"content": "first notes"}),
+            parse_error: None,
         }])
         .unwrap();
         let notes_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "notes".into(),
             arguments: serde_json::json!({"content": "second notes"}),
+            parse_error: None,
         }])
         .unwrap();
         let notes_tc3 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc3".into(),
             name: "notes".into(),
             arguments: serde_json::json!({"content": "third notes"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6709,12 +6756,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "start_line": 1, "end_line": 10}),
+            parse_error: None,
         }])
         .unwrap();
         let full_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6767,12 +6816,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "start_line": 5}),
+            parse_error: None,
         }])
         .unwrap();
         let write_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6833,12 +6884,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
         let write_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6911,12 +6964,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "write_file".into(),
             arguments: serde_json::json!({"path": "/a.rs", "content": "new"}),
+            parse_error: None,
         }])
         .unwrap();
         let read_tc = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -6988,11 +7043,13 @@ api_key = "sk-test"
                 id: "tc1".into(),
                 name: "read_file".into(),
                 arguments: serde_json::json!({"path": "/a.rs"}),
+                parse_error: None,
             },
             crate::llm::ToolCall {
                 id: "tc2".into(),
                 name: "shell".into(),
                 arguments: serde_json::json!({"command": "ls"}),
+                parse_error: None,
             },
         ])
         .unwrap();
@@ -7000,6 +7057,7 @@ api_key = "sk-test"
             id: "tc3".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -7435,6 +7493,7 @@ api_key = "sk-test"
                         id: "call_xyz".to_string(),
                         name: "read_file".to_string(),
                         arguments: serde_json::json!({"path": "test.rs"}),
+                        parse_error: None,
                     }])
                     .unwrap(),
                 );
@@ -7681,7 +7740,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 2;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -7696,7 +7755,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 5;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -7732,7 +7791,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 2;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -7747,7 +7806,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 5;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -7866,7 +7925,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 2;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc1".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -7881,7 +7940,7 @@ api_key = "sk-test"
                 let mut m = make_conv_msg("arya", "");
                 m.id = 5;
                 m.tool_calls = Some(serde_json::to_string(&vec![
-                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}) },
+                    crate::llm::ToolCall { id: "tc2".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/a.rs"}), parse_error: None },
                 ]).unwrap());
                 m
             },
@@ -8063,12 +8122,14 @@ api_key = "sk-test"
             id: "tc1".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
         let read_a_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
             id: "tc2".into(),
             name: "read_file".into(),
             arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
         }])
         .unwrap();
 
@@ -8213,6 +8274,72 @@ api_key = "sk-test"
         };
         let result = execute_tool_call(&call, None, Some(&ctx)).await;
         assert!(result.is_ok(), "No allowlist should allow all tools: {:?}", result);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_execute_native_tool_calls_parse_error() {
+        // Use the real store (execute_native_tool_calls calls ConversationStore::init() internally)
+        let store = ConversationStore::init().unwrap();
+        let conv = store
+            .create_conversation(Some("test-parse-error"), &["test-agent"])
+            .unwrap();
+
+        let tool_calls = vec![crate::llm::ToolCall {
+            id: "tc_bad".into(),
+            name: "read_file".into(),
+            arguments: serde_json::Value::Null,
+            parse_error: Some(
+                "Invalid JSON in arguments: expected value at line 1 column 1. Raw: {bad".into(),
+            ),
+        }];
+
+        let logger = Arc::new(test_logger());
+        let tool_context = ToolExecutionContext {
+            agent_name: "test-agent".to_string(),
+            task_store: None,
+            conv_id: None,
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: None,
+            logger: None,
+        };
+
+        let results = execute_native_tool_calls(
+            &tool_calls,
+            &None,
+            &tool_context,
+            &conv,
+            "test-agent",
+            &logger,
+            None,
+        )
+        .await;
+
+        // Should return the tool name (meaning it was "handled")
+        assert_eq!(results, vec!["read_file"]);
+
+        // Verify the stored tool result contains the error
+        let messages = store.get_messages(&conv, None).unwrap();
+        let tool_msg = messages
+            .iter()
+            .find(|m| m.from_agent == "tool")
+            .expect("should have a tool result message");
+        assert!(
+            tool_msg.content.contains("[Tool Error for read_file]"),
+            "expected [Tool Error] prefix, got: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.contains("Invalid JSON"),
+            "expected parse error text, got: {}",
+            tool_msg.content
+        );
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("tc_bad"));
+        assert_eq!(tool_msg.triggered_by.as_deref(), Some("test-agent"));
+
+        // Cleanup
+        store.delete_conversation(&conv).unwrap();
     }
 
 }

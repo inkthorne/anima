@@ -163,14 +163,23 @@ fn finalize_tool_call_builders(
 
     let mut out = Vec::with_capacity(indices.len());
     for index in indices {
-        if let Some((id, name, arguments_str)) = builders.remove(&index)
-            && let Ok(arguments) = serde_json::from_str(&arguments_str)
-        {
-            out.push(ToolCall {
-                id,
-                name,
-                arguments,
-            });
+        if let Some((id, name, arguments_str)) = builders.remove(&index) {
+            match serde_json::from_str(&arguments_str) {
+                Ok(arguments) => {
+                    out.push(ToolCall { id, name, arguments, parse_error: None });
+                }
+                Err(e) => {
+                    out.push(ToolCall {
+                        id,
+                        name,
+                        arguments: Value::Null,
+                        parse_error: Some(format!(
+                            "Invalid JSON in arguments: {}. Raw: {}",
+                            e, arguments_str
+                        )),
+                    });
+                }
+            }
         }
     }
     out
@@ -260,6 +269,10 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// Set when the model's tool call arguments failed to parse as JSON.
+    /// Contains the parse error message; `arguments` will be `Value::Null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parse_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +489,7 @@ fn parse_openai_tool_calls(value: &Value) -> Vec<ToolCall> {
                         id,
                         name,
                         arguments,
+                        parse_error: None,
                     })
                 })
                 .collect()
@@ -606,6 +620,7 @@ fn parse_responses_output(output: &Value) -> (Option<String>, Vec<ToolCall>) {
                         id,
                         name,
                         arguments,
+                        parse_error: None,
                     });
                 }
                 _ => {}
@@ -1160,13 +1175,19 @@ impl OpenAIClient {
         // Build tool calls from accumulated function call builders
         let tool_calls: Vec<ToolCall> = fn_call_builders
             .into_iter()
-            .filter_map(|(call_id, (name, args_str))| {
-                let arguments: Value = serde_json::from_str(&args_str).ok()?;
-                Some(ToolCall {
-                    id: call_id,
-                    name,
-                    arguments,
-                })
+            .map(|(call_id, (name, args_str))| {
+                match serde_json::from_str(&args_str) {
+                    Ok(arguments) => ToolCall { id: call_id, name, arguments, parse_error: None },
+                    Err(e) => ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: Value::Null,
+                        parse_error: Some(format!(
+                            "Invalid JSON in arguments: {}. Raw: {}",
+                            e, args_str
+                        )),
+                    },
+                }
             })
             .collect();
 
@@ -1328,6 +1349,7 @@ impl LLM for AnthropicClient {
                             id: block["id"].as_str().unwrap_or_default().to_string(),
                             name: block["name"].as_str().unwrap_or_default().to_string(),
                             arguments: block["input"].clone(),
+                            parse_error: None,
                         });
                     }
                     _ => {}
@@ -1483,18 +1505,36 @@ impl LLM for AnthropicClient {
                                 && !id.is_empty()
                                 && !name.is_empty()
                             {
-                                let arguments = if input_str.is_empty() {
-                                    serde_json::json!({})
-                                } else if let Ok(parsed) = serde_json::from_str(&input_str) {
-                                    parsed
+                                if input_str.is_empty() {
+                                    tool_calls.push(ToolCall {
+                                        id,
+                                        name,
+                                        arguments: serde_json::json!({}),
+                                        parse_error: None,
+                                    });
                                 } else {
-                                    continue;
-                                };
-                                tool_calls.push(ToolCall {
-                                    id,
-                                    name,
-                                    arguments,
-                                });
+                                    match serde_json::from_str(&input_str) {
+                                        Ok(parsed) => {
+                                            tool_calls.push(ToolCall {
+                                                id,
+                                                name,
+                                                arguments: parsed,
+                                                parse_error: None,
+                                            });
+                                        }
+                                        Err(e) => {
+                                            tool_calls.push(ToolCall {
+                                                id,
+                                                name,
+                                                arguments: Value::Null,
+                                                parse_error: Some(format!(
+                                                    "Invalid JSON in arguments: {}. Raw: {}",
+                                                    e, input_str
+                                                )),
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                         _ => {}
@@ -1647,6 +1687,7 @@ fn parse_ollama_tool_calls(value: &Value) -> Vec<ToolCall> {
                         id,
                         name,
                         arguments,
+                        parse_error: None,
                     })
                 })
                 .collect()
@@ -1919,6 +1960,7 @@ fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
             id: format!("xmlcall_{}", i),
             name,
             arguments: Value::Object(params),
+            parse_error: None,
         });
     }
 
@@ -2541,5 +2583,85 @@ mod tests {
     fn test_parse_stream_error_none_for_empty_object() {
         let parsed: Value = serde_json::from_str(r#"{}"#).unwrap();
         assert!(parse_stream_error(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_finalize_tool_call_builders_invalid_json() {
+        let mut builders = std::collections::HashMap::new();
+        builders.insert(0, (
+            "call_1".to_string(),
+            "read_file".to_string(),
+            "{bad json".to_string(),
+        ));
+
+        let result = finalize_tool_call_builders(builders);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].id, "call_1");
+        assert_eq!(result[0].name, "read_file");
+        assert_eq!(result[0].arguments, Value::Null);
+        assert!(result[0].parse_error.is_some());
+        let err = result[0].parse_error.as_ref().unwrap();
+        assert!(err.contains("Invalid JSON"), "error should mention invalid JSON: {}", err);
+        assert!(err.contains("{bad json"), "error should include raw input: {}", err);
+    }
+
+    #[test]
+    fn test_finalize_tool_call_builders_mixed_valid_and_invalid() {
+        let mut builders = std::collections::HashMap::new();
+        builders.insert(0, (
+            "call_ok".to_string(),
+            "read_file".to_string(),
+            r#"{"path": "/a.rs"}"#.to_string(),
+        ));
+        builders.insert(1, (
+            "call_bad".to_string(),
+            "write_file".to_string(),
+            "not json at all".to_string(),
+        ));
+
+        let result = finalize_tool_call_builders(builders);
+        assert_eq!(result.len(), 2, "both valid and invalid should be included");
+
+        // Index 0 — valid
+        assert_eq!(result[0].id, "call_ok");
+        assert!(result[0].parse_error.is_none());
+        assert_eq!(result[0].arguments["path"], "/a.rs");
+
+        // Index 1 — invalid
+        assert_eq!(result[1].id, "call_bad");
+        assert!(result[1].parse_error.is_some());
+        assert_eq!(result[1].arguments, Value::Null);
+    }
+
+    #[test]
+    fn test_tool_call_parse_error_serde_roundtrip() {
+        // With parse_error set
+        let tc_with_error = ToolCall {
+            id: "tc1".into(),
+            name: "shell".into(),
+            arguments: Value::Null,
+            parse_error: Some("Invalid JSON in arguments: ...".into()),
+        };
+        let json = serde_json::to_string(&tc_with_error).unwrap();
+        assert!(json.contains("parse_error"));
+        let deserialized: ToolCall = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.parse_error, tc_with_error.parse_error);
+
+        // Without parse_error (None) — field should be absent from JSON
+        let tc_no_error = ToolCall {
+            id: "tc2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/a.rs"}),
+            parse_error: None,
+        };
+        let json = serde_json::to_string(&tc_no_error).unwrap();
+        assert!(!json.contains("parse_error"), "None parse_error should be omitted from JSON");
+        let deserialized: ToolCall = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.parse_error.is_none());
+
+        // Deserializing old JSON without parse_error field
+        let old_json = r#"{"id":"tc3","name":"echo","arguments":{}}"#;
+        let deserialized: ToolCall = serde_json::from_str(old_json).unwrap();
+        assert!(deserialized.parse_error.is_none(), "missing field should default to None");
     }
 }
