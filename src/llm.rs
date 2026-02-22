@@ -636,6 +636,21 @@ fn parse_responses_usage(value: &Value) -> Option<UsageInfo> {
     })
 }
 
+/// Detect server error events in an SSE data payload.
+/// Returns an `LLMError` if the payload contains an `"error"` object.
+fn parse_stream_error(parsed: &Value) -> Option<LLMError> {
+    let err_obj = parsed.get("error").and_then(|v| v.as_object())?;
+    let code = err_obj
+        .get("code")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(500) as u16;
+    let msg = err_obj
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown stream error");
+    Some(LLMError::from_status(code, msg))
+}
+
 #[async_trait]
 impl LLM for OpenAIClient {
     fn model_name(&self) -> &str {
@@ -987,6 +1002,7 @@ impl OpenAIClient {
         let mut raw_lines: Vec<String> = Vec::new();
         let mut stream_completed = false;
         let mut stream_capture = String::new();
+        let mut stream_error: Option<LLMError> = None;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -1024,6 +1040,12 @@ impl OpenAIClient {
                 if let Some(data) = line.strip_prefix("data: ")
                     && let Ok(parsed) = serde_json::from_str::<Value>(data)
                 {
+                    // Check for server error events (no "type" field, have "error" object)
+                    if let Some(err) = parse_stream_error(&parsed) {
+                        stream_error = Some(err);
+                        break;
+                    }
+
                     let event_type = parsed["type"].as_str().unwrap_or("");
 
                     match event_type {
@@ -1078,6 +1100,33 @@ impl OpenAIClient {
                             }
                         }
                         "response.output_item.done" => {
+                            // Extract authoritative arguments from completed function_call items.
+                            // This overwrites delta-accumulated args, which can be malformed
+                            // when the model server produces inconsistent delta chunks.
+                            if let Some(item) = parsed["item"].as_object() {
+                                if item.get("type").and_then(|v| v.as_str())
+                                    == Some("function_call")
+                                {
+                                    let call_id = item
+                                        .get("call_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let name = item
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let args = item
+                                        .get("arguments")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("{}");
+                                    fn_call_builders
+                                        .entry(call_id.to_string())
+                                        .and_modify(|e| e.1 = args.to_string())
+                                        .or_insert_with(|| {
+                                            (name.to_string(), args.to_string())
+                                        });
+                                }
+                            }
                             current_fn_call_id = None;
                         }
                         "response.completed" => {
@@ -1092,6 +1141,11 @@ impl OpenAIClient {
                     }
                 }
             }
+        }
+
+        // If the server sent an error mid-stream, return it so retry logic kicks in
+        if let Some(err) = stream_error {
+            return Err(err.with_stream(stream_capture));
         }
 
         // Prepend reasoning as <think> tags (feeds into strip_thinking() in agent.rs)
@@ -2417,5 +2471,75 @@ mod tests {
 
         let usage = parse_openai_usage(&chunk["usage"]);
         assert!(usage.is_none());
+    }
+
+    // ---- parse_stream_error tests ----
+
+    #[test]
+    fn test_parse_stream_error_server_500() {
+        let parsed: Value = serde_json::from_str(r#"{
+            "error": {
+                "code": 500,
+                "message": "Invalid diff: new_string not found in file",
+                "type": "server_error"
+            }
+        }"#).unwrap();
+
+        let err = parse_stream_error(&parsed).expect("should return LLMError");
+        assert_eq!(err.status_code, Some(500));
+        assert!(err.message.contains("Invalid diff"));
+        assert!(err.is_retryable);
+    }
+
+    #[test]
+    fn test_parse_stream_error_missing_code() {
+        let parsed: Value = serde_json::from_str(r#"{
+            "error": {"message": "oops"}
+        }"#).unwrap();
+
+        let err = parse_stream_error(&parsed).expect("should return LLMError");
+        assert_eq!(err.status_code, Some(500));
+        assert!(err.message.contains("oops"));
+        assert!(err.is_retryable);
+    }
+
+    #[test]
+    fn test_parse_stream_error_missing_message() {
+        let parsed: Value = serde_json::from_str(r#"{
+            "error": {"code": 502}
+        }"#).unwrap();
+
+        let err = parse_stream_error(&parsed).expect("should return LLMError");
+        assert_eq!(err.status_code, Some(502));
+        assert!(err.message.contains("Unknown stream error"));
+        assert!(err.is_retryable);
+    }
+
+    #[test]
+    fn test_parse_stream_error_client_error() {
+        let parsed: Value = serde_json::from_str(r#"{
+            "error": {"code": 400, "message": "bad request"}
+        }"#).unwrap();
+
+        let err = parse_stream_error(&parsed).expect("should return LLMError");
+        assert_eq!(err.status_code, Some(400));
+        assert!(err.message.contains("bad request"));
+        assert!(!err.is_retryable);
+    }
+
+    #[test]
+    fn test_parse_stream_error_none_for_normal_event() {
+        let parsed: Value = serde_json::from_str(r#"{
+            "type": "response.output_text.delta",
+            "delta": "hi"
+        }"#).unwrap();
+
+        assert!(parse_stream_error(&parsed).is_none());
+    }
+
+    #[test]
+    fn test_parse_stream_error_none_for_empty_object() {
+        let parsed: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(parse_stream_error(&parsed).is_none());
     }
 }
