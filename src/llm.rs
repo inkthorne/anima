@@ -500,7 +500,15 @@ fn format_messages_responses(messages: Vec<ChatMessage>) -> (Option<String>, Vec
                     "role": msg.role,
                 });
                 if let Some(content) = &msg.content {
-                    item["content"] = Value::String(content.clone());
+                    let content_type = if msg.role == "assistant" {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    item["content"] = serde_json::json!([{
+                        "type": content_type,
+                        "text": content
+                    }]);
                 }
                 input.push(item);
 
@@ -941,6 +949,7 @@ impl OpenAIClient {
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
+        let mut reasoning_content = String::new();
         // Map call_id → (name, arguments_string) for accumulating function calls
         let mut fn_call_builders: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
@@ -948,10 +957,22 @@ impl OpenAIClient {
         let mut buffer = String::new();
         let mut usage: Option<UsageInfo> = None;
         let mut raw_lines: Vec<String> = Vec::new();
+        let mut stream_completed = false;
 
         while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result
-                .map_err(|e| LLMError::retryable(format!("Failed to read stream chunk: {}", e)))?;
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    if stream_completed || !full_content.is_empty() || !reasoning_content.is_empty()
+                    {
+                        break;
+                    }
+                    return Err(LLMError::retryable(format!(
+                        "Failed to read stream chunk: {}",
+                        e
+                    )));
+                }
+            };
 
             buffer.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -974,6 +995,11 @@ impl OpenAIClient {
                     let event_type = parsed["type"].as_str().unwrap_or("");
 
                     match event_type {
+                        "response.reasoning_text.delta" => {
+                            if let Some(delta) = parsed["delta"].as_str() {
+                                reasoning_content.push_str(delta);
+                            }
+                        }
                         "response.output_text.delta" => {
                             if let Some(delta) = parsed["delta"].as_str() {
                                 full_content.push_str(delta);
@@ -1023,6 +1049,7 @@ impl OpenAIClient {
                             current_fn_call_id = None;
                         }
                         "response.completed" => {
+                            stream_completed = true;
                             if let Some(resp) = parsed["response"].as_object() {
                                 if let Some(u) = resp.get("usage") {
                                     usage = parse_responses_usage(u);
@@ -1034,6 +1061,15 @@ impl OpenAIClient {
                 }
             }
         }
+
+        // Prepend reasoning as <think> tags (feeds into strip_thinking() in agent.rs)
+        let final_content = if reasoning_content.is_empty() {
+            full_content
+        } else if full_content.is_empty() {
+            format!("<think>{}</think>", reasoning_content)
+        } else {
+            format!("<think>{}</think>\n\n{}", reasoning_content, full_content)
+        };
 
         // Build tool calls from accumulated function call builders
         let tool_calls: Vec<ToolCall> = fn_call_builders
@@ -1049,7 +1085,7 @@ impl OpenAIClient {
             .collect();
 
         Ok(LLMResponse {
-            content: none_if_empty(full_content),
+            content: none_if_empty(final_content),
             tool_calls,
             usage,
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
