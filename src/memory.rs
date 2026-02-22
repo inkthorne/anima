@@ -141,7 +141,7 @@ impl SqliteMemory {
     }
 
     fn init_schema(&self) -> Result<(), MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +170,7 @@ impl SqliteMemory {
         let agent_id = self.agent_id.clone();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
             // Use i64 for SQLite compatibility (i64::MAX is ~292 billion years from epoch, plenty)
             let since_i64 = since as i64;
             let until_i64 = until.map(|u| u as i64).unwrap_or(i64::MAX);
@@ -223,7 +223,7 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().ok()?;
             let result: Result<(String, i64, i64), _> = conn.query_row(
                 "SELECT value, created_at, updated_at FROM memories WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id, key],
@@ -250,7 +250,7 @@ impl Memory for SqliteMemory {
         let timestamp = now();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
             // Check if exists to preserve created_at
             let existing: Option<i64> = conn
@@ -282,7 +282,7 @@ impl Memory for SqliteMemory {
         let key = key.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let Ok(conn) = conn.lock() else { return false; };
             let rows = conn
                 .execute(
                     "DELETE FROM memories WHERE agent_id = ?1 AND key = ?2",
@@ -301,7 +301,7 @@ impl Memory for SqliteMemory {
         let prefix = prefix.map(|s| s.to_string());
 
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
+            let conn = conn.lock().ok()?;
             // Use LIKE with a wildcard pattern: "prefix%" for filtered, "%" for all keys
             let pattern = match &prefix {
                 Some(p) => format!("{}%", p),
@@ -457,7 +457,7 @@ impl SemanticMemoryStore {
     }
 
     fn init_schema(&self) -> Result<(), MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS semantic_memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -519,7 +519,7 @@ impl SemanticMemoryStore {
         let timestamp = now();
         let embedding_blob = embedding.map(embedding_to_blob);
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         // Check for existing exact match
         let existing: Option<(i64, f64)> = conn
@@ -611,7 +611,7 @@ impl SemanticMemoryStore {
             }
         };
 
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
 
         // Load all memories for this agent with their embeddings
         let query = format!(
@@ -698,7 +698,7 @@ impl SemanticMemoryStore {
 
     /// Get the count of memories for this agent.
     pub fn count(&self) -> Result<i64, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1",
@@ -798,7 +798,7 @@ impl SemanticMemoryStore {
 
     /// Get the currently configured embedding model from metadata.
     pub fn get_embedding_model(&self) -> Result<Option<String>, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let result: Result<String, _> = conn.query_row(
             "SELECT value FROM memory_meta WHERE key = 'embedding_model'",
             [],
@@ -813,7 +813,7 @@ impl SemanticMemoryStore {
 
     /// Set the embedding model in metadata.
     pub fn set_embedding_model(&self, model: &str) -> Result<(), MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         conn.execute(
             "INSERT OR REPLACE INTO memory_meta (key, value) VALUES ('embedding_model', ?1)",
             params![model],
@@ -824,7 +824,7 @@ impl SemanticMemoryStore {
 
     /// Check if any memories are missing embeddings.
     pub fn has_null_embeddings(&self) -> Result<bool, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NULL",
@@ -837,7 +837,7 @@ impl SemanticMemoryStore {
 
     /// Get all memories that need embeddings (have NULL embedding).
     pub fn get_memories_needing_embeddings(&self) -> Result<Vec<(i64, String)>, MemoryError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         let mut stmt = conn.prepare(
             "SELECT id, content FROM semantic_memories WHERE agent_id = ?1 AND embedding IS NULL"
         ).map_err(|e| MemoryError::StorageError(e.to_string()))?;
@@ -855,7 +855,7 @@ impl SemanticMemoryStore {
     /// Update the embedding for a specific memory.
     pub fn update_embedding(&self, id: i64, embedding: &[f32]) -> Result<(), MemoryError> {
         let blob = embedding_to_blob(embedding);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn.lock().map_err(|e| MemoryError::StorageError(e.to_string()))?;
         conn.execute(
             "UPDATE semantic_memories SET embedding = ?1 WHERE id = ?2",
             params![blob, id],
