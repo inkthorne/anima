@@ -34,7 +34,7 @@ pub use conversation::{
     notify_mentioned_agents_parallel, notify_mentioned_agents_parallel_owned,
     on_conversation_event, parse_mentions,
 };
-pub use embedding::{EmbeddingClient, EmbeddingError, cosine_similarity};
+pub use embedding::{EmbeddingClient, EmbeddingError, EmbeddingProvider, cosine_similarity};
 pub use error::{AgentError, ErrorContext, ToolError};
 pub use llm::{
     AnthropicAuth, AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, LLMError, LLMResponse,
