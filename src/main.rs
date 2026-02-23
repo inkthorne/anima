@@ -561,7 +561,7 @@ fn format_message_header(msg: &anima::conversation::ConversationMessage) -> Stri
 /// Format a conversation message header and content for pretty display.
 fn format_message_display(msg: &anima::conversation::ConversationMessage) -> String {
     let header = format_message_header(msg);
-    let content = anima::strip_thinking_tags(&msg.content);
+    let content = msg.content.clone();
 
     let display_content = if content.is_empty() {
         if let Some(names) = extract_tool_names(msg) {

@@ -1063,7 +1063,8 @@ impl OpenAIClient {
                     let event_type = parsed["type"].as_str().unwrap_or("");
 
                     match event_type {
-                        "response.reasoning_text.delta" => {
+                        "response.reasoning_text.delta"
+                        | "response.reasoning_summary_text.delta" => {
                             if let Some(delta) = parsed["delta"].as_str() {
                                 reasoning_content.push_str(delta);
                             }
