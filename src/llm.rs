@@ -1023,8 +1023,7 @@ impl OpenAIClient {
             let chunk = match chunk_result {
                 Ok(c) => c,
                 Err(e) => {
-                    if stream_completed || !full_content.is_empty() || !reasoning_content.is_empty()
-                    {
+                    if stream_completed {
                         break;
                     }
                     return Err(LLMError::retryable(format!(
@@ -1161,6 +1160,15 @@ impl OpenAIClient {
         // If the server sent an error mid-stream, return it so retry logic kicks in
         if let Some(err) = stream_error {
             return Err(err.with_stream(stream_capture));
+        }
+
+        // If the stream ended without response.completed, it was interrupted
+        if !stream_completed && stream_error.is_none() {
+            return Err(LLMError::retryable(
+                "Stream ended without response.completed event (interrupted or timeout)"
+                    .to_string(),
+            )
+            .with_stream(stream_capture));
         }
 
         // Prepend reasoning as <think> tags (feeds into strip_thinking() in agent.rs)
