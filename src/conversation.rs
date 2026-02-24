@@ -983,6 +983,42 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Bulk-copy all messages from one conversation to another.
+    ///
+    /// Preserves `from_agent`, `content`, `tool_calls`, `tool_call_id`, `triggered_by`,
+    /// `duration_ms`, token stats. Copies pinned status via `pin_message()` after insertion.
+    /// Returns the number of messages copied.
+    pub fn copy_messages(&self, from_conv: &str, to_conv: &str) -> Result<usize, ConversationError> {
+        let messages = self.get_messages(from_conv, None)?;
+        let mut count = 0;
+
+        for msg in &messages {
+            let msg_id = self.add_message_full(
+                to_conv,
+                &msg.from_agent,
+                &msg.content,
+                &[],  // mentions not needed in subtask copy
+                msg.duration_ms,
+                msg.tool_calls.as_deref(),
+                msg.tokens_in,
+                msg.tokens_out,
+                msg.num_ctx,
+                msg.triggered_by.as_deref(),
+                msg.prompt_eval_ns,
+                msg.tool_call_id.as_deref(),
+                msg.cached_tokens,
+            )?;
+
+            if msg.pinned {
+                self.pin_message(to_conv, msg_id, true)?;
+            }
+
+            count += 1;
+        }
+
+        Ok(count)
+    }
+
     /// Get messages with pinned messages always included, regardless of the limit window.
     ///
     /// When `limit` is Some(n): fetches pinned messages + last N messages, merging them

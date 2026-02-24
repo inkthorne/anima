@@ -673,6 +673,16 @@ pub struct ToolExecutionContext {
     pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub allowed_tools: Option<Vec<String>>,
     pub logger: Option<Arc<AgentLogger>>,
+
+    // Fields for nested tool loop (subtask)
+    pub agent: Option<Arc<Mutex<Agent>>>,
+    pub system_prompt: Option<String>,
+    pub tool_registry: Option<Arc<ToolRegistry>>,
+    pub use_native_tools: bool,
+    pub num_ctx: Option<u32>,
+    pub shutdown: Option<Arc<tokio::sync::Notify>>,
+    pub dedup_lazy: bool,
+    pub subtask_depth: u32,
 }
 
 /// Result of building recall content (tools + memories).
@@ -1080,11 +1090,12 @@ fn format_task_result(result: &serde_json::Value) -> Result<String, String> {
     }
 }
 
-async fn execute_tool_call(
-    tool_call: &ToolCall,
-    tool_def: Option<&ToolDefinition>,
-    context: Option<&ToolExecutionContext>,
-) -> Result<String, String> {
+fn execute_tool_call<'a>(
+    tool_call: &'a ToolCall,
+    tool_def: Option<&'a ToolDefinition>,
+    context: Option<&'a ToolExecutionContext>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>> {
+    Box::pin(async move {
     // Enforce allowed_tools at execution time (defense-in-depth)
     if let Some(ctx) = context {
         if let Some(ref allowed) = ctx.allowed_tools {
@@ -1381,7 +1392,7 @@ async fn execute_tool_call(
 
                     // Always include built-in tools that are typically allowed
                     let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "start_task", "wait_task", "stop_task", "search_conversation", "notes"] {
+                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "start_task", "wait_task", "stop_task", "search_conversation", "notes", "subtask"] {
                         if !result.contains(builtin)
                             && allowed
                                 .map(|a| a.iter().any(|x| x == *builtin))
@@ -1400,7 +1411,7 @@ async fn execute_tool_call(
                 Err(e) => {
                     // Fallback: return built-in tools if registry fails to load
                     Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, start_task, wait_task, stop_task, search_conversation, notes\n(Note: tools.toml failed to load: {})",
+                        "Built-in tools: list_tools, list_agents, remember, send_message, start_task, wait_task, stop_task, search_conversation, notes, subtask\n(Note: tools.toml failed to load: {})",
                         e
                     ))
                 }
@@ -1442,8 +1453,142 @@ async fn execute_tool_call(
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
         }
+        "subtask" => {
+            let ctx = context.ok_or("subtask requires execution context")?;
+
+            // Depth limit
+            const MAX_SUBTASK_DEPTH: u32 = 3;
+            if ctx.subtask_depth >= MAX_SUBTASK_DEPTH {
+                return Err(format!(
+                    "Subtask depth limit reached (max {}). Complete this work inline.",
+                    MAX_SUBTASK_DEPTH
+                ));
+            }
+
+            // Extract parameters
+            let task = tool_call.params.get("task")
+                .and_then(|v| v.as_str())
+                .ok_or("subtask requires a 'task' parameter (string)")?;
+            let max_iterations = tool_call.params.get("max_iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(25) as usize;
+
+            let parent_conv = ctx.conv_id.as_deref()
+                .ok_or("subtask requires an active conversation")?;
+            let agent = ctx.agent.as_ref()
+                .ok_or("subtask requires agent context")?;
+            let shutdown = ctx.shutdown.as_ref()
+                .ok_or("subtask requires shutdown signal")?;
+            let logger = ctx.logger.as_ref()
+                .ok_or("subtask requires logger")?;
+
+            // Generate subtask conversation name
+            let hex_id = format!("{:08x}", rand::random::<u32>());
+            let subtask_conv = format!("subtask:{}:{}:{}", ctx.agent_name, parent_conv, hex_id);
+
+            logger.log(&format!(
+                "[subtask] Forking '{}' from '{}' (depth {})",
+                subtask_conv, parent_conv, ctx.subtask_depth + 1
+            ));
+
+            // Create subtask conversation and copy parent messages
+            let store = ConversationStore::init()
+                .map_err(|e| format!("Failed to init store: {}", e))?;
+            store.create_conversation(Some(&subtask_conv), &[&ctx.agent_name])
+                .map_err(|e| format!("Failed to create subtask conversation: {}", e))?;
+            let copied = store.copy_messages(parent_conv, &subtask_conv)
+                .map_err(|e| format!("Failed to copy messages: {}", e))?;
+            logger.log(&format!("[subtask] Copied {} messages to '{}'", copied, subtask_conv));
+
+            // Post subtask instruction as user message
+            store.add_message(&subtask_conv, "user", task, &[])
+                .map_err(|e| format!("Failed to post subtask instruction: {}", e))?;
+
+            // Load context and format conversation history
+            let context_messages = load_agent_context(&store, &subtask_conv, &ctx.agent_name, logger, ctx.num_ctx)
+                .map_err(|e| format!("Failed to load subtask context: {}", e))?;
+            let dedup_up_to = context_messages.last().map(|m| m.id);
+            let (conversation_history, final_user_content) =
+                format_conversation_history(&context_messages, &ctx.agent_name, dedup_up_to);
+
+            // Wrap final user content in <conversation> tags (no recall — full parent context already present)
+            let wrapped_content = format!("<conversation>\n{}\n</conversation>", final_user_content);
+
+            // Build nested tool context with incremented depth
+            let nested_ctx = ToolExecutionContext {
+                agent_name: ctx.agent_name.clone(),
+                task_store: ctx.task_store.clone(),
+                conv_id: Some(subtask_conv.clone()),
+                semantic_memory_store: ctx.semantic_memory_store.clone(),
+                embedding_client: ctx.embedding_client.clone(),
+                allowed_tools: ctx.allowed_tools.clone(),
+                logger: Some(Arc::clone(logger)),
+                agent: Some(Arc::clone(agent)),
+                system_prompt: ctx.system_prompt.clone(),
+                tool_registry: ctx.tool_registry.clone(),
+                use_native_tools: ctx.use_native_tools,
+                num_ctx: ctx.num_ctx,
+                shutdown: Some(Arc::clone(shutdown)),
+                dedup_lazy: ctx.dedup_lazy,
+                subtask_depth: ctx.subtask_depth + 1,
+            };
+
+            // Build external tools for native mode (recall from registry)
+            let external_tools = if ctx.use_native_tools {
+                ctx.tool_registry.as_ref().map(|registry| {
+                    let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
+                    let filtered = filter_by_allowlist(all, &ctx.allowed_tools);
+                    tool_definitions_to_specs(&filtered)
+                })
+            } else {
+                None
+            };
+
+            // Spawn log forwarder and run nested tool loop
+            let (log_tx, log_fwd_handle) = spawn_log_forwarder(Arc::clone(logger));
+            let start_time = std::time::Instant::now();
+
+            let loop_result = run_tool_loop(
+                &wrapped_content,
+                conversation_history,
+                agent,
+                &ctx.agent_name,
+                &ctx.system_prompt,
+                external_tools,
+                ctx.use_native_tools,
+                max_iterations,
+                ctx.num_ctx,
+                &ctx.tool_registry,
+                &nested_ctx,
+                &ctx.semantic_memory_store,
+                &ctx.embedding_client,
+                &subtask_conv,
+                None, // no streaming
+                None, // no cancel
+                None, // no response deadline
+                start_time,
+                shutdown,
+                logger,
+                log_tx.clone(),
+                ctx.dedup_lazy,
+            ).await;
+
+            drop(log_tx);
+            let _ = log_fwd_handle.await;
+
+            // Store final response in subtask conversation for debugging visibility
+            let _ = store.add_message(&subtask_conv, &ctx.agent_name, &loop_result.response, &[]);
+
+            logger.log(&format!(
+                "[subtask] Completed '{}' → {} bytes",
+                subtask_conv, loop_result.response.len()
+            ));
+
+            Ok(loop_result.response)
+        }
         _ => Err(format!("Unknown tool: {}", tool_call.tool)),
     }
+    }) // Box::pin
 }
 
 /// Convert ToolDefinition params to JSON Schema format for native tool calling.
@@ -3415,6 +3560,14 @@ async fn process_message_work(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
         logger: Some(logger.clone()),
+        agent: Some(Arc::clone(agent)),
+        system_prompt: system_prompt.clone(),
+        tool_registry: tool_registry.as_ref().map(Arc::clone),
+        use_native_tools,
+        num_ctx,
+        shutdown: Some(Arc::clone(shutdown)),
+        dedup_lazy,
+        subtask_depth: 0,
     };
 
     // With conversation: use unified tool loop (DB-backed context management)
@@ -4268,6 +4421,14 @@ async fn handle_notify(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
         logger: Some(logger.clone()),
+        agent: Some(Arc::clone(agent)),
+        system_prompt: system_prompt.clone(),
+        tool_registry: tool_registry.as_ref().map(Arc::clone),
+        use_native_tools,
+        num_ctx,
+        shutdown: Some(Arc::clone(shutdown)),
+        dedup_lazy,
+        subtask_depth: 0,
     };
 
     // Channel for forwarding log messages to the daemon logger
@@ -8238,6 +8399,14 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
         };
         let call = ToolCall {
             tool: "shell".to_string(),
@@ -8262,6 +8431,14 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
         };
         let call = ToolCall {
             tool: "read_file".to_string(),
@@ -8281,6 +8458,14 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
         };
         let call = ToolCall {
             tool: "list_tools".to_string(),
@@ -8304,6 +8489,14 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
         };
         let call = ToolCall {
             tool: "read_file".to_string(),
@@ -8340,6 +8533,14 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
         };
 
         let results = execute_native_tool_calls(
@@ -8379,4 +8580,104 @@ api_key = "sk-test"
         store.delete_conversation(&conv).unwrap();
     }
 
+    #[tokio::test]
+    async fn test_subtask_depth_limit() {
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: Some("test-conv".to_string()),
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: None,
+            logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 3, // At max depth
+        };
+        let call = ToolCall {
+            tool: "subtask".to_string(),
+            params: serde_json::json!({"task": "do something"}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("depth limit reached"));
+    }
+
+    #[tokio::test]
+    async fn test_subtask_requires_context() {
+        let call = ToolCall {
+            tool: "subtask".to_string(),
+            params: serde_json::json!({"task": "do something"}),
+        };
+        let result = execute_tool_call(&call, None, None).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("requires execution context"));
+    }
+
+    #[tokio::test]
+    async fn test_subtask_requires_task_param() {
+        let ctx = ToolExecutionContext {
+            agent_name: "test".to_string(),
+            task_store: None,
+            conv_id: Some("test-conv".to_string()),
+            semantic_memory_store: None,
+            embedding_client: None,
+            allowed_tools: None,
+            logger: None,
+            agent: None,
+            system_prompt: None,
+            tool_registry: None,
+            use_native_tools: false,
+            num_ctx: None,
+            shutdown: None,
+            dedup_lazy: false,
+            subtask_depth: 0,
+        };
+        let call = ToolCall {
+            tool: "subtask".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = execute_tool_call(&call, None, Some(&ctx)).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("'task' parameter"));
+    }
+
+    #[test]
+    fn test_subtask_conversation_naming() {
+        let agent = "dash";
+        let parent = "my-chat";
+        let hex = format!("{:08x}", 0xdeadbeef_u32);
+        let name = format!("subtask:{}:{}:{}", agent, parent, hex);
+        assert!(name.starts_with("subtask:"));
+        assert_eq!(name, "subtask:dash:my-chat:deadbeef");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_copy_messages() {
+        let store = ConversationStore::init().unwrap();
+        let src = store.create_conversation(Some("test-copy-src"), &["agent-a"]).unwrap();
+        store.add_message(&src, "user", "hello", &[]).unwrap();
+        store.add_message(&src, "agent-a", "world", &[]).unwrap();
+
+        let dst = store.create_conversation(Some("test-copy-dst"), &["agent-a"]).unwrap();
+        let count = store.copy_messages(&src, &dst).unwrap();
+        assert_eq!(count, 2);
+
+        let messages = store.get_messages(&dst, None).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].from_agent, "user");
+        assert_eq!(messages[0].content, "hello");
+        assert_eq!(messages[1].from_agent, "agent-a");
+        assert_eq!(messages[1].content, "world");
+
+        // Cleanup
+        store.delete_conversation(&src).unwrap();
+        store.delete_conversation(&dst).unwrap();
+    }
 }
