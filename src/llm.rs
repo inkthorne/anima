@@ -1163,13 +1163,19 @@ impl OpenAIClient {
             return Err(err.with_stream(stream_capture));
         }
 
-        // If the stream ended without response.completed, it was interrupted
+        // If the stream ended without response.completed, check if we got useful content.
+        // Ollama sometimes skips the completion event for text-only responses.
         if !stream_completed && stream_error.is_none() {
-            return Err(LLMError::retryable(
-                "Stream ended without response.completed event (interrupted or timeout)"
-                    .to_string(),
-            )
-            .with_stream(stream_capture));
+            let has_content = !full_content.is_empty()
+                || !reasoning_content.is_empty()
+                || !fn_call_builders.is_empty();
+            if !has_content {
+                return Err(LLMError::retryable(
+                    "Stream ended without response.completed event (interrupted or timeout)"
+                        .to_string(),
+                )
+                .with_stream(stream_capture));
+            }
         }
 
         // Prepend reasoning as <think> tags (feeds into strip_thinking() in agent.rs)

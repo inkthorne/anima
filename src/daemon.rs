@@ -73,6 +73,18 @@ pub struct ToolCall {
     pub params: serde_json::Value,
 }
 
+/// Extract `<python>...</python>` blocks from agent output.
+/// Returns (cleaned_output, Vec<code_strings>).
+fn extract_python_blocks(output: &str) -> (String, Vec<String>) {
+    let re = regex::Regex::new(r"(?s)<python>\s*\n?(.*?)\n?\s*</python>").unwrap();
+    let mut blocks = Vec::new();
+    for cap in re.captures_iter(output) {
+        blocks.push(cap[1].to_string());
+    }
+    let cleaned = re.replace_all(output, "").trim().to_string();
+    (cleaned, blocks)
+}
+
 /// Extract a JSON tool block from agent output.
 /// Returns (cleaned_output, Option<ToolCall>)
 pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
@@ -121,8 +133,9 @@ use crate::tool::Tool;
 use crate::tool_registry::{ToolDefinition, ToolRegistry};
 use crate::tools::claude_code::{ClaudeCodeTool, TaskStatus, TaskStore, is_process_running};
 use crate::tools::list_agents::DaemonListAgentsTool;
-use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::notes::DaemonNotesTool;
+use crate::tools::python::run_python;
+use crate::tools::send_message::DaemonSendMessageTool;
 use crate::tools::task::{DaemonStartTaskTool, DaemonStopTaskTool, DaemonWaitTaskTool};
 use crate::tools::{
     AddTool, CopyLinesTool, DaemonRememberTool, DaemonSearchConversationTool, EchoTool,
@@ -3250,17 +3263,92 @@ async fn run_tool_loop(
                         current_message = String::new();
                         let _ = results; // consumed
                     } else {
-                        // No tool calls — final response
-                        return ToolLoopResult {
-                            response: after_remember,
-                            db_response: db_content,
-                            duration_ms: last_duration_ms,
-                            tokens_in: last_tokens_in,
-                            tokens_out: last_tokens_out,
-                            prompt_eval_duration_ns: last_prompt_eval_ns,
-                            cached_tokens: last_cached_tokens,
-                            dump_turn_n: last_dump_turn_n,
-                        };
+                        // No native tool calls — check for <python> auto-execute blocks
+                        let (_, python_blocks) = extract_python_blocks(&after_remember);
+                        if !python_blocks.is_empty() {
+                            if store.is_paused(conv_name).unwrap_or(false) {
+                                logger.log("[loop] Conversation paused, skipping python execution");
+                                return ToolLoopResult {
+                                    response: after_remember,
+                                    db_response: db_content,
+                                    duration_ms: last_duration_ms,
+                                    tokens_in: last_tokens_in,
+                                    tokens_out: last_tokens_out,
+                                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                                    cached_tokens: last_cached_tokens,
+                                    dump_turn_n: last_dump_turn_n,
+                                };
+                            }
+
+                            tool_call_count += python_blocks.len();
+
+                            // Store assistant message (with <python> blocks)
+                            match store.add_message_with_tokens(
+                                conv_name, agent_name, &db_content, &[],
+                                think_result.duration_ms.map(|d| d as i64), None,
+                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                            ) {
+                                Ok(msg_id) => {
+                                    if let Some(turn_n) = think_result.dump_turn_n {
+                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    logger.log(&format!("[loop] Failed to store assistant message: {}", e));
+                                }
+                            }
+
+                            // Execute each python block
+                            let timeout = std::time::Duration::from_secs(30);
+                            let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
+                            let mut result_parts = Vec::new();
+                            for (i, code) in python_blocks.iter().enumerate() {
+                                logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
+                                match run_python(code, timeout, mem_limit).await {
+                                    Ok(val) => {
+                                        let stdout = val["stdout"].as_str().unwrap_or("");
+                                        let stderr = val["stderr"].as_str().unwrap_or("");
+                                        let exit_code = val["exit_code"].as_i64().unwrap_or(0);
+                                        let mut part = format!("<python-output>\n{}", stdout);
+                                        if !stderr.is_empty() {
+                                            part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
+                                        }
+                                        if exit_code != 0 {
+                                            part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
+                                        }
+                                        part.push_str("</python-output>");
+                                        result_parts.push(part);
+                                    }
+                                    Err(e) => {
+                                        result_parts.push(format!("<python-output>\n<error>{}</error>\n</python-output>", e));
+                                    }
+                                }
+                            }
+
+                            let tool_message = truncate_tool_result(
+                                &result_parts.join("\n---\n"),
+                                num_ctx,
+                            ).into_owned();
+                            logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
+
+                            if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
+                                logger.log(&format!("[loop] Failed to store python result: {}", e));
+                            }
+
+                            current_message = String::new();
+                        } else {
+                            // No tool calls — final response
+                            return ToolLoopResult {
+                                response: after_remember,
+                                db_response: db_content,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
+                                dump_turn_n: last_dump_turn_n,
+                            };
+                        }
                     }
                 } else {
                     // === JSON-block mode ===
@@ -3324,17 +3412,94 @@ async fn run_tool_loop(
 
                         current_message = tool_message;
                     } else {
-                        // No tool call — final response
-                        return ToolLoopResult {
-                            response: cleaned_response,
-                            db_response: db_content,
-                            duration_ms: last_duration_ms,
-                            tokens_in: last_tokens_in,
-                            tokens_out: last_tokens_out,
-                            prompt_eval_duration_ns: last_prompt_eval_ns,
-                            cached_tokens: last_cached_tokens,
-                            dump_turn_n: last_dump_turn_n,
-                        };
+                        // No JSON tool call — check for <python> auto-execute blocks
+                        let (_, python_blocks) = extract_python_blocks(&cleaned_response);
+                        if !python_blocks.is_empty() {
+                            if store.is_paused(conv_name).unwrap_or(false) {
+                                logger.log("[loop] Conversation paused, skipping python execution");
+                                return ToolLoopResult {
+                                    response: cleaned_response,
+                                    db_response: db_content,
+                                    duration_ms: last_duration_ms,
+                                    tokens_in: last_tokens_in,
+                                    tokens_out: last_tokens_out,
+                                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                                    cached_tokens: last_cached_tokens,
+                                    dump_turn_n: last_dump_turn_n,
+                                };
+                            }
+
+                            tool_call_count += python_blocks.len();
+
+                            // Store assistant message (with <python> blocks)
+                            if !db_content.trim().is_empty() {
+                                match store.add_message_with_tokens(
+                                    conv_name, agent_name, &db_content, &[],
+                                    think_result.duration_ms.map(|d| d as i64), None,
+                                    iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                ) {
+                                    Ok(msg_id) => {
+                                        if let Some(turn_n) = think_result.dump_turn_n {
+                                            agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        logger.log(&format!("[loop] Failed to store assistant message: {}", e));
+                                    }
+                                }
+                            }
+
+                            // Execute each python block
+                            let timeout = std::time::Duration::from_secs(30);
+                            let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
+                            let mut result_parts = Vec::new();
+                            for (i, code) in python_blocks.iter().enumerate() {
+                                logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
+                                match run_python(code, timeout, mem_limit).await {
+                                    Ok(val) => {
+                                        let stdout = val["stdout"].as_str().unwrap_or("");
+                                        let stderr = val["stderr"].as_str().unwrap_or("");
+                                        let exit_code = val["exit_code"].as_i64().unwrap_or(0);
+                                        let mut part = format!("<python-output>\n{}", stdout);
+                                        if !stderr.is_empty() {
+                                            part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
+                                        }
+                                        if exit_code != 0 {
+                                            part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
+                                        }
+                                        part.push_str("</python-output>");
+                                        result_parts.push(part);
+                                    }
+                                    Err(e) => {
+                                        result_parts.push(format!("<python-output>\n<error>{}</error>\n</python-output>", e));
+                                    }
+                                }
+                            }
+
+                            let tool_message = truncate_tool_result(
+                                &result_parts.join("\n---\n"),
+                                num_ctx,
+                            ).into_owned();
+                            logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
+
+                            if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
+                                logger.log(&format!("[loop] Failed to store python result: {}", e));
+                            }
+
+                            current_message = String::new();
+                        } else {
+                            // No tool call — final response
+                            return ToolLoopResult {
+                                response: cleaned_response,
+                                db_response: db_content,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
+                                dump_turn_n: last_dump_turn_n,
+                            };
+                        }
                     }
                 }
 
@@ -8679,5 +8844,34 @@ api_key = "sk-test"
         // Cleanup
         store.delete_conversation(&src).unwrap();
         store.delete_conversation(&dst).unwrap();
+    }
+
+    #[test]
+    fn test_extract_python_blocks_single() {
+        let input = "Here is the result:\n<python>\nprint('hello')\n</python>\nDone.";
+        let (cleaned, blocks) = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], "print('hello')");
+        assert!(cleaned.contains("Here is the result:"));
+        assert!(cleaned.contains("Done."));
+        assert!(!cleaned.contains("<python>"));
+    }
+
+    #[test]
+    fn test_extract_python_blocks_multiple() {
+        let input = "<python>\nx = 1\n</python>\ntext\n<python>\ny = 2\n</python>";
+        let (cleaned, blocks) = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], "x = 1");
+        assert_eq!(blocks[1], "y = 2");
+        assert_eq!(cleaned, "text");
+    }
+
+    #[test]
+    fn test_extract_python_blocks_none() {
+        let input = "Just plain text, no python blocks here.";
+        let (cleaned, blocks) = extract_python_blocks(input);
+        assert!(blocks.is_empty());
+        assert_eq!(cleaned, input);
     }
 }

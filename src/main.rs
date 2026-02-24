@@ -672,6 +672,15 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
         "notes" => {
             args.get("content").and_then(|v| v.as_str()).map(|s| truncate(s, 60))
         }
+        "subtask" => {
+            args.get("task").and_then(|v| v.as_str()).map(|s| truncate(s, 80))
+        }
+        "python" => {
+            args.get("code")
+                .and_then(|v| v.as_str())
+                .map(|s| s.lines().next().unwrap_or(s))
+                .map(|s| truncate(s, 60))
+        }
         _ => None,
     };
 
