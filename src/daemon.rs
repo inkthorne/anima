@@ -745,11 +745,7 @@ async fn build_recall_for_query(
         if !all_tools.is_empty() {
             logger.tool(&format!("Native tools: {} allowed", all_tools.len()));
         }
-        let specs = if !all_tools.is_empty() {
-            Some(tool_definitions_to_specs(&all_tools))
-        } else {
-            None
-        };
+        let specs = Some(tool_definitions_to_specs(&all_tools));
         (String::new(), specs, Vec::new())
     } else {
         // JSON-block mode: keyword-match relevant tools
