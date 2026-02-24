@@ -520,18 +520,35 @@ fn format_conversation_history(
         drop_ids = ids;
     }
 
-    // Helper to flush pending user messages into a single ChatMessage
-    let flush_user_batch = |batch: &mut Vec<String>, hist: &mut Vec<ChatMessage>| {
-        if !batch.is_empty() {
-            hist.push(ChatMessage {
-                role: "user".to_string(),
-                content: Some(batch.join("\n")),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-            batch.clear();
-        }
-    };
+    // Helper to flush pending user messages into a single ChatMessage.
+    // When recall is present, merges it using the same <recall>+<conversation> XML format
+    // that wrap_user_content_with_recall() produces, keeping the token sequence stable
+    // across turns for KV cache stability.
+    let flush_user_batch =
+        |batch: &mut Vec<String>, recall: &mut Option<String>, hist: &mut Vec<ChatMessage>| {
+            if !batch.is_empty() {
+                let joined = batch.join("\n");
+                let content = match recall.take() {
+                    Some(recall_text) if !recall_text.is_empty() => {
+                        format!(
+                            "<recall>\n{}\n</recall>\n\n<conversation>\n{}\n</conversation>",
+                            recall_text, joined
+                        )
+                    }
+                    _ => format!("<conversation>\n{}\n</conversation>", joined),
+                };
+                hist.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: Some(content),
+                    tool_call_id: None,
+                    tool_calls: None,
+                });
+                batch.clear();
+            }
+        };
+
+    // Recall content to merge into the next user batch (for KV cache stability).
+    let mut pending_recall: Option<String> = None;
 
     // Track the last history index where the original message id <= dedup_up_to cutoff.
     // Used to limit notes stripping to the frozen prefix region.
@@ -543,26 +560,18 @@ fn format_conversation_history(
             continue;
         }
         if msg.from_agent == "recall" {
-            // Skip recall injected by other agents — they're irrelevant noise.
-            // Unattributed (triggered_by = None) are included for backward compatibility.
+            // Only keep recall triggered by current agent (or unattributed for legacy).
+            // Other agents' recall is irrelevant noise.
             match &msg.triggered_by {
                 Some(owner) if owner != current_agent => continue,
-                _ => {}
+                _ => {
+                    pending_recall = Some(msg.content.clone());
+                }
             }
-            // Recall goes BEFORE pending user messages to maintain:
-            // [recall] [user] ordering (recall precedes the query it supports)
-            history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(msg.content.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
-            if dedup_up_to.is_some_and(|cutoff| msg.id <= cutoff) {
-                dedup_boundary_idx = Some(history.len() - 1);
-            }
+            continue;
         } else if msg.from_agent == current_agent {
             // Agent's own response — flush pending user messages first
-            flush_user_batch(&mut pending_user_batch, &mut history);
+            flush_user_batch(&mut pending_user_batch, &mut pending_recall, &mut history);
 
             let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg
                 .tool_calls
@@ -587,7 +596,7 @@ fn format_conversation_history(
             }
             // Tool results/errors should NOT be batched with user messages.
             // Flush any pending user messages first, then add tool result.
-            flush_user_batch(&mut pending_user_batch, &mut history);
+            flush_user_batch(&mut pending_user_batch, &mut pending_recall, &mut history);
             if msg.tool_call_id.is_some() {
                 // Native tool result — emit with role "tool" and tool_call_id for API compatibility
                 history.push(ChatMessage {
@@ -898,21 +907,20 @@ async fn save_memories(
     }
 }
 
-/// Prepend recall content as an assistant message to conversation history.
-/// Pattern: [history...] [assistant: recall] [user: task]
-fn inject_recall_into_history(
+/// Combine recall context with the user message using XML structure.
+/// If recall is empty/None, returns user_content unchanged.
+fn wrap_user_content_with_recall(
     recall_content: &Option<String>,
-    conversation_history: &mut Vec<ChatMessage>,
-) {
-    if let Some(recall_text) = recall_content {
-        if !recall_text.is_empty() {
-            conversation_history.push(ChatMessage {
-                role: "assistant".to_string(),
-                content: Some(recall_text.clone()),
-                tool_call_id: None,
-                tool_calls: None,
-            });
+    user_content: &str,
+) -> String {
+    match recall_content {
+        Some(recall_text) if !recall_text.is_empty() => {
+            format!(
+                "<recall>\n{}\n</recall>\n\n<conversation>\n{}\n</conversation>",
+                recall_text, user_content
+            )
         }
+        _ => format!("<conversation>\n{}\n</conversation>", user_content),
     }
 }
 
@@ -3314,7 +3322,7 @@ async fn process_message_work(
 
     // Load conversation history first (using append-only context cursors)
     // Also capture window message IDs for conversation recall exclusion
-    let (mut conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
+    let (conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
                 Ok(store) => match load_agent_context(&store, cname, agent_name, &logger, num_ctx) {
@@ -3393,7 +3401,10 @@ async fn process_message_work(
     }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
-    inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
+    let final_user_content = wrap_user_content_with_recall(
+        &recall_result.recall_content,
+        &final_user_content,
+    );
 
     // Create tool execution context
     let tool_context = ToolExecutionContext {
@@ -4206,7 +4217,7 @@ async fn handle_notify(
     } else {
         context_messages.last().map(|m| m.id)
     };
-    let (mut conversation_history, final_user_content) =
+    let (conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     // Build recall (tools + memories + conversation recall) based on current user message
@@ -4235,7 +4246,10 @@ async fn handle_notify(
     }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
-    inject_recall_into_history(&recall_result.recall_content, &mut conversation_history);
+    let final_user_content = wrap_user_content_with_recall(
+        &recall_result.recall_content,
+        &final_user_content,
+    );
 
     logger.log(&format!(
         "[notify] Context: {} messages → {} history + final user turn",
@@ -5856,12 +5870,10 @@ api_key = "sk-test"
     }
 
     #[test]
-    fn test_format_conversation_history_recall_becomes_assistant() {
-        // Recall messages should become standalone assistant messages, NOT JSON-wrapped user content.
-        // DB order after a completed turn: user₁, recall, assistant₁, user₂
-        // Correct history: [recall], [user₁-JSON], [assistant₁], final = [user₂-JSON]
-        // Recall is placed BEFORE the user message it was associated with, matching
-        // the in-memory ordering during the original turn.
+    fn test_format_conversation_history_recall_merged_into_user() {
+        // Recall messages should be merged into the user message using the same
+        // <recall>+<conversation> XML format that wrap_user_content_with_recall() produces,
+        // keeping the token sequence stable across turns for KV cache stability.
         let msgs = vec![
             make_conv_msg("user", "hello"),
             make_conv_msg("recall", "[recalled memories]\n- Memory 1\n- Memory 2"),
@@ -5870,36 +5882,27 @@ api_key = "sk-test"
         ];
         let (history, final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
-        // Should have 3 messages in history: assistant (recall), user, assistant (arya)
-        assert_eq!(history.len(), 3);
-        // Recall should be first — assistant role with raw content (not JSON-wrapped)
-        assert_eq!(history[0].role, "assistant");
-        assert!(history[0].content.as_ref().unwrap().contains("[recalled memories]"));
-        assert!(!history[0].content.as_ref().unwrap().contains("\"from\": \"recall\""));
-        // User message comes after recall
-        assert_eq!(history[1].role, "user");
-        assert!(
-            history[1]
-                .content
-                .as_ref()
-                .unwrap()
-                .contains("\"from\": \"user\"")
-        );
-        // Arya's response should also be assistant role
-        assert_eq!(history[2].role, "assistant");
-        assert_eq!(history[2].content.as_ref().unwrap(), "Hi! How can I help?");
+        // Should have 2 messages in history: user (with recall merged), assistant
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
+        let user_content = history[0].content.as_ref().unwrap();
+        assert!(user_content.contains("<recall>"));
+        assert!(user_content.contains("- Memory 1"));
+        assert!(user_content.contains("- Memory 2"));
+        assert!(user_content.contains("</recall>"));
+        assert!(user_content.contains("<conversation>"));
+        assert!(user_content.contains("hello"));
+        assert_eq!(history[1].role, "assistant");
+        assert_eq!(history[1].content.as_ref().unwrap(), "Hi! How can I help?");
 
         // Final content should be the last user message
-        assert!(final_content.contains("\"from\": \"user\""));
         assert!(final_content.contains("what's up?"));
-        // Final content should NOT contain recall (would indicate double injection bug)
-        assert!(!final_content.contains("Relevant memories"));
     }
 
     #[test]
-    fn test_format_conversation_history_other_agent_recall_filtered() {
-        // Recall messages triggered by another agent should be excluded.
-        // Unattributed recall (triggered_by = None) should still be included for backward compat.
+    fn test_format_conversation_history_own_recall_merged_other_filtered() {
+        // Own recall (triggered_by = current agent) and unattributed recall should be
+        // merged into user messages. Other agents' recall should be filtered out.
         let mut own_recall = make_conv_msg("recall", "[recalled memories]\n- My memory");
         own_recall.triggered_by = Some("arya".to_string());
 
@@ -5918,21 +5921,55 @@ api_key = "sk-test"
         ];
         let (history, _final_content) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
 
-        // Should have 4 messages: own recall, unattributed recall, user, assistant
-        // (other_recall from gendry is filtered out)
-        assert_eq!(history.len(), 4);
-        // First two are recall (assistant role)
-        assert_eq!(history[0].role, "assistant");
-        assert!(history[0].content.as_ref().unwrap().contains("My memory"));
+        // Should have 2 messages: user (with merged recall), assistant
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, "user");
         assert_eq!(history[1].role, "assistant");
-        assert!(history[1].content.as_ref().unwrap().contains("Old memory"));
-        // Gendry's recall should NOT appear anywhere
-        let all_content: String = history
-            .iter()
-            .filter_map(|m| m.content.as_ref())
-            .cloned()
-            .collect();
-        assert!(!all_content.contains("Gendry's memory"));
+
+        let user_content = history[0].content.as_ref().unwrap();
+        // Own recall was overwritten by unattributed recall (last one wins),
+        // so the merged content should contain the unattributed recall
+        assert!(user_content.contains("<recall>"));
+        assert!(user_content.contains("Old memory"));
+        assert!(user_content.contains("<conversation>"));
+        assert!(user_content.contains("hello"));
+
+        // Other agent's recall should NOT appear
+        assert!(!user_content.contains("Gendry's memory"));
+    }
+
+    #[test]
+    fn test_wrap_user_content_with_recall_some() {
+        let recall = Some("- Memory 1\n- Tool: read_file".to_string());
+        let user = r#"{"from": "user", "text": "fix the bug"}"#;
+        let result = wrap_user_content_with_recall(&recall, user);
+        assert!(result.starts_with("<recall>"));
+        assert!(result.contains("- Memory 1"));
+        assert!(result.contains("- Tool: read_file"));
+        assert!(result.contains("<conversation>"));
+        assert!(result.contains("fix the bug"));
+        assert!(result.ends_with("</conversation>"));
+    }
+
+    #[test]
+    fn test_wrap_user_content_with_recall_none() {
+        let user = r#"{"from": "user", "text": "hello"}"#;
+        let result = wrap_user_content_with_recall(&None, user);
+        assert_eq!(
+            result,
+            "<conversation>\n{\"from\": \"user\", \"text\": \"hello\"}\n</conversation>"
+        );
+    }
+
+    #[test]
+    fn test_wrap_user_content_with_recall_empty() {
+        let recall = Some(String::new());
+        let user = r#"{"from": "user", "text": "hello"}"#;
+        let result = wrap_user_content_with_recall(&recall, user);
+        assert_eq!(
+            result,
+            "<conversation>\n{\"from\": \"user\", \"text\": \"hello\"}\n</conversation>"
+        );
     }
 
     // =========================================================================
