@@ -6,11 +6,11 @@ use regex::Regex;
 use crate::daemon::AgentLogger;
 use crate::llm::{ChatMessage, LLM, LLMError};
 
-/// A model-driven pipeline that uses `<read>` tags to load files on demand.
+/// A model-driven pipeline that uses `<stage>` tags to load files on demand.
 ///
 /// The model receives `instructions.md` (with `{{input}}` replaced) and can
-/// emit `<read>filename</read>` tags to load files from the pipeline directory.
-/// The loop continues until a response contains no `<read>` tags.
+/// emit `<stage>filename</stage>` tags to load files from the pipeline directory.
+/// The loop continues until a response contains no `<stage>` tags.
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     /// Content of `instructions.md` (with `{{input}}` placeholder)
@@ -33,7 +33,7 @@ impl Pipeline {
     }
 
     /// Execute the pipeline by sending instructions to the LLM and looping
-    /// on `<read>` tags until the model produces a final response.
+    /// on `<stage>` tags until the model produces a final response.
     pub async fn execute(
         &self,
         input: &str,
@@ -79,15 +79,15 @@ impl Pipeline {
 
             let content = response.content.unwrap_or_default();
 
-            let (cleaned, reads) = extract_read_tags(&content);
+            let (cleaned, stages) = extract_stage_tags(&content);
 
-            if reads.is_empty() {
+            if stages.is_empty() {
                 // If the LLM failed to categorize on the first iteration,
                 // fall back to default.md so it still gets proper instructions.
                 if iteration == 0 {
                     let default_path = self.pipeline_dir.join("default.md");
                     if let Ok(default_content) = std::fs::read_to_string(&default_path) {
-                        logger.log("[pipeline] No <read> tags on iteration 0, falling back to default.md");
+                        logger.log("[pipeline] No <stage> tags on iteration 0, falling back to default.md");
                         messages.push(ChatMessage {
                             role: "assistant".to_string(),
                             content: Some(content),
@@ -115,7 +115,7 @@ impl Pipeline {
 
             logger.log(&format!(
                 "[pipeline] Iteration {}: reading {:?}",
-                iteration, reads
+                iteration, stages
             ));
 
             // Push the assistant's response (with tags) into history
@@ -127,7 +127,7 @@ impl Pipeline {
             });
 
             // Load requested files and send back as user message
-            let file_contents: Vec<String> = reads
+            let file_contents: Vec<String> = stages
                 .iter()
                 .map(|filename| {
                     let path = self.pipeline_dir.join(filename.trim());
@@ -152,10 +152,10 @@ impl Pipeline {
     }
 }
 
-/// Extract `<read>filename</read>` tags from content.
+/// Extract `<stage>filename</stage>` tags from content.
 /// Returns the cleaned content (tags stripped) and the list of filenames.
-pub fn extract_read_tags(content: &str) -> (String, Vec<String>) {
-    let re = Regex::new(r"<read>(.*?)</read>").unwrap();
+pub fn extract_stage_tags(content: &str) -> (String, Vec<String>) {
+    let re = Regex::new(r"<stage>(.*?)</stage>").unwrap();
     let filenames: Vec<String> = re
         .captures_iter(content)
         .map(|cap| cap[1].to_string())
@@ -211,30 +211,30 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_read_tags_none() {
-        let (cleaned, reads) = extract_read_tags("Hello world, no tags here.");
+    fn test_extract_stage_tags_none() {
+        let (cleaned, stages) = extract_stage_tags("Hello world, no tags here.");
         assert_eq!(cleaned, "Hello world, no tags here.");
-        assert!(reads.is_empty());
+        assert!(stages.is_empty());
     }
 
     #[test]
-    fn test_extract_read_tags_single() {
-        let (_, reads) = extract_read_tags("Let me check <read>questions.md</read> for guidance.");
-        assert_eq!(reads, vec!["questions.md"]);
+    fn test_extract_stage_tags_single() {
+        let (_, stages) = extract_stage_tags("Let me check <stage>questions.md</stage> for guidance.");
+        assert_eq!(stages, vec!["questions.md"]);
     }
 
     #[test]
-    fn test_extract_read_tags_multiple() {
-        let (_, reads) = extract_read_tags(
-            "Reading <read>a.md</read> and <read>b.md</read> now.",
+    fn test_extract_stage_tags_multiple() {
+        let (_, stages) = extract_stage_tags(
+            "Reading <stage>a.md</stage> and <stage>b.md</stage> now.",
         );
-        assert_eq!(reads, vec!["a.md", "b.md"]);
+        assert_eq!(stages, vec!["a.md", "b.md"]);
     }
 
     #[test]
-    fn test_extract_read_tags_strips_from_content() {
+    fn test_extract_stage_tags_strips_from_content() {
         let (cleaned, _) =
-            extract_read_tags("Before <read>file.md</read> after");
+            extract_stage_tags("Before <stage>file.md</stage> after");
         assert_eq!(cleaned, "Before  after");
     }
 
