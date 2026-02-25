@@ -1798,6 +1798,14 @@ impl LLM for OllamaClient {
         let content = parsed["message"]["content"]
             .as_str()
             .map(|s| s.to_string());
+        let reasoning = parsed["message"]["thinking"]
+            .as_str()
+            .unwrap_or("");
+        let content = match (reasoning.is_empty(), content) {
+            (true, c) => c,
+            (false, None) => Some(format!("<think>{}</think>", reasoning)),
+            (false, Some(c)) => Some(format!("<think>{}</think>\n\n{}", reasoning, c)),
+        };
         let tool_calls = parse_ollama_tool_calls(&parsed["message"]["tool_calls"]);
         let usage = parse_ollama_usage(&parsed);
 
@@ -1861,6 +1869,7 @@ impl LLM for OllamaClient {
 
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_call_builders: std::collections::HashMap<usize, (String, String, String)> =
             std::collections::HashMap::new();
         let mut buffer = String::new();
@@ -1906,6 +1915,12 @@ impl LLM for OllamaClient {
                         let _ = tx.send(content.to_string()).await;
                     }
 
+                    if let Some(thinking) = parsed["message"]["thinking"].as_str()
+                        && !thinking.is_empty()
+                    {
+                        reasoning_content.push_str(thinking);
+                    }
+
                     if let Some(tc_array) = parsed["message"]["tool_calls"].as_array() {
                         for tc in tc_array {
                             let index = tc["index"].as_u64().unwrap_or(0) as usize;
@@ -1931,6 +1946,14 @@ impl LLM for OllamaClient {
         }
 
         let tool_calls = finalize_tool_call_builders(tool_call_builders);
+
+        let full_content = if reasoning_content.is_empty() {
+            full_content
+        } else if full_content.is_empty() {
+            format!("<think>{}</think>", reasoning_content)
+        } else {
+            format!("<think>{}</think>\n\n{}", reasoning_content, full_content)
+        };
 
         let (content, tool_calls) =
             apply_xml_tool_fallback(none_if_empty(full_content), tool_calls);
