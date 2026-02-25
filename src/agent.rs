@@ -1312,208 +1312,43 @@ impl Agent {
         tools: &Option<Vec<ToolSpec>>,
         messages: &[ChatMessage],
     ) -> Option<u64> {
-        let agent_dir = match &self.agent_dir {
-            Some(dir) => dir,
-            None => return None, // No agent dir configured, skip dump
-        };
-
-        // Determine conversation name for the file
+        let agent_dir = self.agent_dir.as_ref()?;
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
-
-        // Create turns/{conv_name}/ directory if it doesn't exist
-        let conv_dir = agent_dir.join("turns").join(conv_name);
-        if let Err(e) = std::fs::create_dir_all(&conv_dir) {
-            eprintln!(
-                "[agent:{}] Failed to create turns directory: {}",
-                self.id, e
-            );
-            return None;
-        }
-
-        // Create .gitignore in turns/ to make it self-ignoring (debug files shouldn't be committed)
-        let gitignore_path = agent_dir.join("turns").join(".gitignore");
-        if !gitignore_path.exists() {
-            let _ = std::fs::write(&gitignore_path, "*\n!.gitignore\n");
-        }
-
-        // Find next sequential number: scan for req-*.json, parse numeric part, take max + 1
-        let next_n = std::fs::read_dir(&conv_dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|e| {
-                let stem = e.path().file_stem()?.to_str()?.to_string();
-                stem.strip_prefix("req-")?.parse::<u64>().ok()
-            })
-            .max()
-            .map_or(1, |m| m + 1);
-
-        let file_path = conv_dir.join(format!("req-{}.json", next_n));
-
-        // Get model name from LLM if available
         let model = self
             .llm
             .as_ref()
             .map(|l| l.model_name().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-
-        // Format messages for Ollama API (tool_calls arguments as objects, not strings)
-        let formatted_messages: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|msg| {
-                let mut formatted = serde_json::json!({
-                    "role": msg.role,
-                });
-                if let Some(ref content) = msg.content {
-                    formatted["content"] = serde_json::Value::String(content.clone());
-                }
-                if let Some(ref tool_call_id) = msg.tool_call_id {
-                    formatted["tool_call_id"] = serde_json::Value::String(tool_call_id.clone());
-                }
-                if let Some(ref tool_calls) = msg.tool_calls
-                    && !tool_calls.is_empty()
-                {
-                    let formatted_tool_calls: Vec<serde_json::Value> = tool_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.arguments  // Object, not string (Ollama native format)
-                                }
-                            })
-                        })
-                        .collect();
-                    formatted["tool_calls"] = serde_json::Value::Array(formatted_tool_calls);
-                }
-                formatted
-            })
-            .collect();
-
-        // Build request body matching Ollama /api/chat format
-        let mut request_body = serde_json::json!({
-            "model": model,
-            "messages": formatted_messages,
-            "stream": false
-        });
-
-        // Add tools if present (Ollama format)
-        if let Some(tool_list) = tools
-            && !tool_list.is_empty()
-        {
-            let formatted_tools: Vec<serde_json::Value> = tool_list
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "type": "function",
-                        "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters
-                        }
-                    })
-                })
-                .collect();
-            request_body["tools"] = serde_json::Value::Array(formatted_tools);
-            request_body["tool_choice"] = serde_json::json!("auto");
-        }
-
-        // Write pretty-printed JSON for readability while maintaining valid JSON
-        let content =
-            serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "{}".to_string());
-
-        // Write to file (best-effort, don't fail the agent on IO errors)
-        if let Err(e) = std::fs::write(&file_path, content) {
-            eprintln!("[agent:{}] Failed to write request dump: {}", self.id, e);
-            return None;
-        }
-
-        Some(next_n)
+        crate::debug::dump_request(agent_dir, conv_name, &model, tools, messages)
     }
 
     /// Dump the raw LLM response to turns/{conv_name}/resp-{n}.json.
     fn dump_response(&self, turn_n: Option<u64>, response: &crate::llm::LLMResponse) {
-        let turn_n = match turn_n {
-            Some(n) => n,
-            None => return,
-        };
-        let agent_dir = match &self.agent_dir {
-            Some(dir) => dir,
-            None => return,
+        let Some(agent_dir) = &self.agent_dir else {
+            return;
         };
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
-        let conv_dir = agent_dir.join("turns").join(conv_name);
-        let file_path = conv_dir.join(format!("resp-{}.json", turn_n));
-
-        let content =
-            serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string());
-        if let Err(e) = std::fs::write(&file_path, content) {
-            eprintln!("[agent:{}] Failed to write response dump: {}", self.id, e);
-        }
-
-        // Write raw HTTP response body for debugging parsing issues
-        if let Some(ref raw) = response.raw_body {
-            let raw_path = conv_dir.join(format!("raw-{}.json", turn_n));
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
-                let pretty =
-                    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| raw.clone());
-                let _ = std::fs::write(&raw_path, pretty);
-            } else {
-                let _ = std::fs::write(&raw_path, raw);
-            }
-        }
-
-        // Write raw SSE stream capture for debugging streaming issues
-        if let Some(ref stream) = response.raw_stream {
-            let stream_path = conv_dir.join(format!("stream-{}.json", turn_n));
-            let _ = std::fs::write(&stream_path, stream);
-        }
+        crate::debug::dump_response(agent_dir, conv_name, turn_n, response);
     }
 
     /// Dump raw stream capture to turns/{conv_name}/stream-{n}.json on error.
     fn dump_stream(&self, turn_n: Option<u64>, raw_stream: &str) {
-        let turn_n = match turn_n {
-            Some(n) => n,
-            None => return,
-        };
-        let agent_dir = match &self.agent_dir {
-            Some(dir) => dir,
-            None => return,
+        let Some(agent_dir) = &self.agent_dir else {
+            return;
         };
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
-        let conv_dir = agent_dir.join("turns").join(conv_name);
-        let stream_path = conv_dir.join(format!("stream-{}.json", turn_n));
-        let _ = std::fs::write(&stream_path, raw_stream);
+        crate::debug::dump_stream(agent_dir, conv_name, turn_n, raw_stream);
     }
 
     /// Rename debug turn dump files from sequential number to DB message ID.
     /// Called after the assistant message is stored to the database, so the files
     /// can be cross-referenced with `anima chat view` output.
     pub fn rename_turn_files(&self, from_n: u64, to_id: i64) {
-        let agent_dir = match &self.agent_dir {
-            Some(dir) => dir,
-            None => return,
+        let Some(agent_dir) = &self.agent_dir else {
+            return;
         };
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
-        let conv_dir = agent_dir.join("turns").join(conv_name);
-
-        for prefix in &["req", "resp", "raw", "stream"] {
-            let from_path = conv_dir.join(format!("{}-{}.json", prefix, from_n));
-            let to_path = conv_dir.join(format!("{}-{}.json", prefix, to_id));
-            if from_path.exists() {
-                if let Err(e) = std::fs::rename(&from_path, &to_path) {
-                    eprintln!(
-                        "[agent:{}] Failed to rename {} -> {}: {}",
-                        self.id,
-                        from_path.display(),
-                        to_path.display(),
-                        e
-                    );
-                }
-            }
-        }
+        crate::debug::rename_turn_files(agent_dir, conv_name, from_n, to_id);
     }
 
     pub async fn think_with_options(

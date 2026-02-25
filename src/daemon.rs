@@ -2213,6 +2213,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.semantic_memory.conversation_recall_limit,
                             config.dedup_lazy,
                             &config.pipeline,
+                            Some(&config.agent_dir),
                         )
                         .await;
 
@@ -2277,6 +2278,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
         let worker_dedup_lazy = config.dedup_lazy;
         let worker_pipeline = config.pipeline;
+        let worker_agent_dir = config.agent_dir;
         let worker_busy = worker_busy.clone();
         tokio::spawn(async move {
             agent_worker(
@@ -2304,6 +2306,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_conversation_recall_limit,
                 worker_dedup_lazy,
                 worker_pipeline,
+                worker_agent_dir,
             )
             .await
         })
@@ -2779,6 +2782,7 @@ async fn agent_worker(
     conversation_recall_limit: usize,
     dedup_lazy: bool,
     pipeline: Option<crate::pipeline::Pipeline>,
+    agent_dir: PathBuf,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2874,6 +2878,7 @@ async fn agent_worker(
                     conversation_recall_limit,
                     dedup_lazy,
                     &pipeline,
+                    Some(&agent_dir),
                 )
                 .await;
             }
@@ -4481,6 +4486,7 @@ async fn handle_notify(
     conversation_recall_limit: usize,
     dedup_lazy: bool,
     pipeline: &Option<crate::pipeline::Pipeline>,
+    agent_dir: Option<&Path>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -4560,7 +4566,7 @@ async fn handle_notify(
             }
         };
 
-        match pipeline.execute(&final_user_content, &llm, logger).await {
+        match pipeline.execute(&final_user_content, &llm, logger, agent_dir, Some(conv_id)).await {
             Ok(response_text) => {
                 let elapsed = start_time.elapsed().as_millis() as i64;
                 match store.add_message_with_tokens(

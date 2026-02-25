@@ -39,6 +39,8 @@ impl Pipeline {
         input: &str,
         llm: &Arc<dyn LLM>,
         logger: &AgentLogger,
+        agent_dir: Option<&Path>,
+        conv_name: Option<&str>,
     ) -> Result<String, LLMError> {
         let prompt = self.instructions.replace("{{input}}", input);
 
@@ -51,8 +53,30 @@ impl Pipeline {
 
         let mut iteration = 0;
 
+        let model = llm.model_name().to_string();
+
         loop {
+            let turn_n = agent_dir.and_then(|dir| {
+                crate::debug::dump_request(
+                    dir,
+                    conv_name.unwrap_or("pipeline"),
+                    &model,
+                    &None,
+                    &messages,
+                )
+            });
+
             let response = llm.chat_complete(messages.clone(), None).await?;
+
+            if let Some(dir) = agent_dir {
+                crate::debug::dump_response(
+                    dir,
+                    conv_name.unwrap_or("pipeline"),
+                    turn_n,
+                    &response,
+                );
+            }
+
             let content = response.content.unwrap_or_default();
 
             let (cleaned, reads) = extract_read_tags(&content);
