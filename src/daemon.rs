@@ -1713,6 +1713,8 @@ pub struct DaemonConfig {
     pub dedup_lazy: bool,
     /// Whether outbound @mention forwarding is enabled (default: true)
     pub mentions: bool,
+    /// Thought pipeline (if pipeline/ directory exists with .md stage files)
+    pub pipeline: Option<crate::pipeline::Pipeline>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1801,6 +1803,9 @@ impl DaemonConfig {
             None => Some(runtime_context),
         };
 
+        // Load thought pipeline
+        let pipeline = crate::pipeline::Pipeline::load(&dir_path);
+
         Ok(Self {
             name,
             agent_dir: dir_path,
@@ -1818,6 +1823,7 @@ impl DaemonConfig {
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             dedup_lazy: llm_config.dedup_lazy,
             mentions: agent_dir.config.agent.mentions,
+            pipeline,
         })
     }
 }
@@ -1989,6 +1995,9 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             hb.heartbeat_path.display(),
             hb.goals_path.display()
         ));
+    }
+    if config.pipeline.is_some() {
+        logger.log("  Pipeline: loaded");
     }
 
     // Auto-detect num_ctx from OpenAI-compatible /v1/models endpoint
@@ -2203,6 +2212,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &shutdown,
                             config.semantic_memory.conversation_recall_limit,
                             config.dedup_lazy,
+                            &config.pipeline,
                         )
                         .await;
 
@@ -2266,6 +2276,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
         let worker_dedup_lazy = config.dedup_lazy;
+        let worker_pipeline = config.pipeline;
         let worker_busy = worker_busy.clone();
         tokio::spawn(async move {
             agent_worker(
@@ -2292,6 +2303,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_shutdown,
                 worker_conversation_recall_limit,
                 worker_dedup_lazy,
+                worker_pipeline,
             )
             .await
         })
@@ -2766,6 +2778,7 @@ async fn agent_worker(
     shutdown: Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
     dedup_lazy: bool,
+    pipeline: Option<crate::pipeline::Pipeline>,
 ) {
     logger.log("[worker] Agent worker started");
 
@@ -2860,6 +2873,7 @@ async fn agent_worker(
                     &shutdown,
                     conversation_recall_limit,
                     dedup_lazy,
+                    &pipeline,
                 )
                 .await;
             }
@@ -4466,6 +4480,7 @@ async fn handle_notify(
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
     dedup_lazy: bool,
+    pipeline: &Option<crate::pipeline::Pipeline>,
 ) -> Response {
     // Track start time for response duration
     let start_time = std::time::Instant::now();
@@ -4533,6 +4548,95 @@ async fn handle_notify(
     };
     let (conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name, dedup_up_to);
+
+    // Pipeline path: if pipeline exists, skip recall/tool loop and run pipeline instead
+    if let Some(pipeline) = pipeline {
+        let llm = match agent.lock().await.llm_client() {
+            Some(llm) => llm,
+            None => {
+                return Response::Error {
+                    message: "Pipeline: no LLM configured".to_string(),
+                };
+            }
+        };
+
+        match pipeline.execute(&final_user_content, &llm, logger).await {
+            Ok(response_text) => {
+                let elapsed = start_time.elapsed().as_millis() as i64;
+                match store.add_message_with_tokens(
+                    conv_id,
+                    agent_name,
+                    &response_text,
+                    &[],
+                    Some(elapsed),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ) {
+                    Ok(msg_id) => {
+                        logger.log(&format!(
+                            "[pipeline] Stored response as msg_id={} ({}ms)",
+                            msg_id, elapsed
+                        ));
+
+                        // Parse @mentions and forward (same as normal path)
+                        let should_forward = mentions_enabled
+                            && depth < MAX_MENTION_DEPTH
+                            && !store.is_paused(conv_id).unwrap_or(false);
+
+                        if should_forward {
+                            let mentions =
+                                crate::conversation::parse_mentions(&response_text);
+                            let valid_mentions: Vec<String> = mentions
+                                .into_iter()
+                                .filter(|m| m != agent_name && m != "user" && m != "all")
+                                .filter(|m| discovery::agent_exists(m))
+                                .collect();
+
+                            if !valid_mentions.is_empty() {
+                                logger.log(&format!(
+                                    "[pipeline] Forwarding to {} agents at depth {}: {:?}",
+                                    valid_mentions.len(),
+                                    depth + 1,
+                                    valid_mentions
+                                ));
+                                for mention in &valid_mentions {
+                                    let _ = store.add_participant(conv_id, mention);
+                                }
+                                for mention in valid_mentions {
+                                    forward_notify_to_agent(
+                                        &mention,
+                                        conv_id,
+                                        msg_id,
+                                        depth + 1,
+                                        logger,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+
+                        return Response::Notified {
+                            response_message_id: msg_id,
+                        };
+                    }
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("Pipeline: failed to store response: {}", e),
+                        };
+                    }
+                }
+            }
+            Err(e) => {
+                return Response::Error {
+                    message: format!("Pipeline error: {}", e),
+                };
+            }
+        }
+    }
 
     // Build recall (tools + memories + conversation recall) based on current user message
     let recall_result = build_recall_for_query(

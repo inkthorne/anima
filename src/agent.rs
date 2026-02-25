@@ -701,6 +701,11 @@ impl Agent {
         self.current_conversation = name;
     }
 
+    /// Get a reference to the LLM client, if configured.
+    pub fn llm_client(&self) -> Option<Arc<dyn LLM>> {
+        self.llm.clone()
+    }
+
     /// Attach an observer for monitoring agent activity.
     pub fn with_observer(mut self, observer: Arc<dyn Observer>) -> Self {
         self.observer = Some(observer);

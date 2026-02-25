@@ -13,6 +13,7 @@ pub mod memory;
 pub mod message;
 pub mod messaging;
 pub mod observe;
+pub mod pipeline;
 pub mod repl;
 pub mod retry;
 pub mod runtime;
