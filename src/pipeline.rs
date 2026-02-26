@@ -164,10 +164,10 @@ impl Pipeline {
 /// Extract `<stage>filename</stage>` tags from content.
 /// Returns the cleaned content (tags stripped) and the list of filenames.
 pub fn extract_stage_tags(content: &str) -> (String, Vec<String>) {
-    let re = Regex::new(r"<stage>(.*?)</stage>").unwrap();
+    let re = Regex::new(r"(?s)<stage>(.*?)</stage>").unwrap();
     let filenames: Vec<String> = re
         .captures_iter(content)
-        .map(|cap| cap[1].to_string())
+        .map(|cap| cap[1].trim().to_string())
         .collect();
     let cleaned = re.replace_all(content, "").to_string();
     (cleaned, filenames)
@@ -187,7 +187,7 @@ fn extract_xml_vars(content: &str) -> HashMap<String, String> {
         let open_end = cap.get(0).unwrap().end();
         if let Some(close_pos) = content[open_end..].find(&close_tag) {
             let value = &content[open_end..open_end + close_pos];
-            vars.insert(tag.to_string(), value.to_string());
+            vars.insert(tag.to_string(), value.trim().to_string());
         }
     }
     vars
@@ -308,6 +308,18 @@ mod tests {
     fn test_extract_xml_vars_none() {
         let vars = extract_xml_vars("No XML tags here at all.");
         assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_extract_stage_tags_multiline() {
+        let (_, stages) = extract_stage_tags("<stage>\nfile.md\n</stage>");
+        assert_eq!(stages, vec!["file.md"]);
+    }
+
+    #[test]
+    fn test_extract_xml_vars_multiline() {
+        let vars = extract_xml_vars("<message>\nhello\n</message>");
+        assert_eq!(vars.get("message").unwrap(), "hello");
     }
 
     #[test]
