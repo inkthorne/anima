@@ -3314,10 +3314,9 @@ async fn run_tool_loop(
                     logger.log("[state] Handoff: clearing state");
                 }
 
-                // Full response for DB: preserve thinking tags, strip REMEMBER/next-state/handoff/xml-var tags
+                // Full response for DB: preserve thinking and next-state tags, strip REMEMBER/handoff/xml-var tags
                 let (db_content, _) = extract_remember_tags(&think_result.response);
                 let (db_content, _) = extract_llm_notes(&db_content);
-                let (db_content, _) = crate::pipeline::extract_state_tags(&db_content);
                 let (db_content, _) = crate::pipeline::extract_handoff_tag(&db_content);
                 let (db_content, _) = crate::pipeline::extract_and_strip_xml_vars(&db_content);
 
