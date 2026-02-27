@@ -198,13 +198,13 @@ pub fn extract_handoff_tag(content: &str) -> (String, bool) {
 }
 
 /// Extract all `<tagname>content</tagname>` pairs from assistant output,
-/// excluding `<next-state>` tags (which are handled separately).
+/// excluding `<next-state>` and `<python>` tags (which are handled separately).
 pub fn extract_xml_vars(content: &str) -> HashMap<String, String> {
     let open_re = Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_]*)>").unwrap();
     let mut vars = HashMap::new();
     for cap in open_re.captures_iter(content) {
         let tag = &cap[1];
-        if tag == "next-state" {
+        if tag == "next-state" || tag == "python" {
             continue;
         }
         let close_tag = format!("</{}>", tag);
@@ -339,6 +339,13 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_xml_vars_excludes_python() {
+        let vars = extract_xml_vars("<python>print('hello')</python><message>done</message>");
+        assert!(!vars.contains_key("python"));
+        assert_eq!(vars.get("message").unwrap(), "done");
+    }
+
+    #[test]
     fn test_extract_xml_vars_multiple() {
         let vars = extract_xml_vars("<intent>greet</intent> some text <tone>friendly</tone>");
         assert_eq!(vars.len(), 2);
@@ -438,5 +445,18 @@ mod tests {
         assert!(!vars.contains_key("next-state"));
         assert_eq!(vars.get("messages").unwrap(), "hi");
         assert_eq!(cleaned, "<next-state>foo.md</next-state>");
+    }
+
+    #[test]
+    fn test_extract_and_strip_xml_vars_preserves_python() {
+        // python tags are excluded by extract_xml_vars, so they should remain in cleaned content
+        let (cleaned, vars) = extract_and_strip_xml_vars(
+            "Here's the code:\n\n<python>\nprint('hello')\n</python>\n\n<tone>helpful</tone>",
+        );
+        assert!(!vars.contains_key("python"));
+        assert_eq!(vars.get("tone").unwrap(), "helpful");
+        assert!(cleaned.contains("<python>"));
+        assert!(cleaned.contains("print('hello')"));
+        assert!(cleaned.contains("</python>"));
     }
 }
