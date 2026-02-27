@@ -1719,7 +1719,7 @@ pub struct DaemonConfig {
     pub mentions: bool,
     /// Initial state file for the state system (e.g. "instructions.md")
     pub initial_state: Option<String>,
-    /// Path to the pipeline/ directory containing state template files
+    /// Path to the states/ directory containing state template files
     pub state_dir: Option<PathBuf>,
 }
 
@@ -1811,9 +1811,9 @@ impl DaemonConfig {
 
         // Load state system config
         let initial_state = agent_dir.config.agent.state.clone();
-        let pipeline_dir = dir_path.join("pipeline");
-        let state_dir = if pipeline_dir.is_dir() {
-            Some(pipeline_dir)
+        let states_dir = dir_path.join("states");
+        let state_dir = if states_dir.is_dir() {
+            Some(states_dir)
         } else {
             None
         };

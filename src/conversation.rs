@@ -1246,7 +1246,7 @@ impl ConversationStore {
         Ok(())
     }
 
-    /// Get the current state (pipeline stage file) for an agent in a conversation.
+    /// Get the current state file for an agent in a conversation.
     pub fn get_participant_state(
         &self,
         conv_name: &str,
@@ -1261,7 +1261,7 @@ impl ConversationStore {
         Ok(state.flatten())
     }
 
-    /// Set the current state (pipeline stage file) for an agent in a conversation.
+    /// Set the current state file for an agent in a conversation.
     pub fn set_participant_state(
         &self,
         conv_name: &str,
