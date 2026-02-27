@@ -287,6 +287,7 @@ impl ConversationStore {
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "dedup_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "state", "TEXT DEFAULT NULL")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
         self.conn.execute_batch(
@@ -1245,6 +1246,35 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Get the current state (pipeline stage file) for an agent in a conversation.
+    pub fn get_participant_state(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let state: Option<Option<String>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(state.flatten())
+    }
+
+    /// Set the current state (pipeline stage file) for an agent in a conversation.
+    pub fn set_participant_state(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        state: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET state = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![state, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
     /// Clear all context and dedup cursors for a given agent across all conversations.
     /// Used on daemon startup to prevent stale cursors from causing context overfill.
     pub fn clear_all_cursors_for_agent(&self, agent: &str) -> Result<(), ConversationError> {
@@ -1617,9 +1647,9 @@ impl ConversationStore {
             params![conv_name],
         )?;
 
-        // Reset participant state (notes, cursor) since messages are gone
+        // Reset participant state (notes, cursor, state) since messages are gone
         self.conn.execute(
-            "UPDATE participants SET notes = NULL, context_cursor = NULL, dedup_cursor = NULL WHERE conv_name = ?1",
+            "UPDATE participants SET notes = NULL, context_cursor = NULL, dedup_cursor = NULL, state = NULL WHERE conv_name = ?1",
             params![conv_name],
         )?;
 

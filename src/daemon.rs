@@ -1582,6 +1582,8 @@ fn execute_tool_call<'a>(
                 logger,
                 log_tx.clone(),
                 ctx.dedup_lazy,
+                None, // no state for subtasks
+                None,
             ).await;
 
             drop(log_tx);
@@ -1715,8 +1717,10 @@ pub struct DaemonConfig {
     pub dedup_lazy: bool,
     /// Whether outbound @mention forwarding is enabled (default: true)
     pub mentions: bool,
-    /// Thought pipeline (if pipeline/ directory exists with .md stage files)
-    pub pipeline: Option<crate::pipeline::Pipeline>,
+    /// Initial state file for the state system (e.g. "instructions.md")
+    pub initial_state: Option<String>,
+    /// Path to the pipeline/ directory containing state template files
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Timer configuration for periodic triggers.
@@ -1805,8 +1809,14 @@ impl DaemonConfig {
             None => Some(runtime_context),
         };
 
-        // Load thought pipeline
-        let pipeline = crate::pipeline::Pipeline::load(&dir_path);
+        // Load state system config
+        let initial_state = agent_dir.config.agent.state.clone();
+        let pipeline_dir = dir_path.join("pipeline");
+        let state_dir = if pipeline_dir.is_dir() {
+            Some(pipeline_dir)
+        } else {
+            None
+        };
 
         Ok(Self {
             name,
@@ -1825,7 +1835,8 @@ impl DaemonConfig {
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             dedup_lazy: llm_config.dedup_lazy,
             mentions: agent_dir.config.agent.mentions,
-            pipeline,
+            initial_state,
+            state_dir,
         })
     }
 }
@@ -1998,8 +2009,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
             hb.goals_path.display()
         ));
     }
-    if config.pipeline.is_some() {
-        logger.log("  Pipeline: loaded");
+    if let Some(ref state) = config.initial_state {
+        logger.log(&format!("  State: initial={}", state));
     }
 
     // Auto-detect num_ctx from OpenAI-compatible /v1/models endpoint
@@ -2214,7 +2225,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             &shutdown,
                             config.semantic_memory.conversation_recall_limit,
                             config.dedup_lazy,
-                            &config.pipeline,
+                            config.initial_state.as_deref(),
+                            config.state_dir.as_deref(),
                             Some(&config.agent_dir),
                         )
                         .await;
@@ -2279,7 +2291,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_shutdown = shutdown.clone();
         let worker_conversation_recall_limit = config.semantic_memory.conversation_recall_limit;
         let worker_dedup_lazy = config.dedup_lazy;
-        let worker_pipeline = config.pipeline;
+        let worker_initial_state = config.initial_state;
+        let worker_state_dir = config.state_dir;
         let worker_agent_dir = config.agent_dir;
         let worker_busy = worker_busy.clone();
         tokio::spawn(async move {
@@ -2307,7 +2320,8 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_shutdown,
                 worker_conversation_recall_limit,
                 worker_dedup_lazy,
-                worker_pipeline,
+                worker_initial_state,
+                worker_state_dir,
                 worker_agent_dir,
             )
             .await
@@ -2783,7 +2797,8 @@ async fn agent_worker(
     shutdown: Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
     dedup_lazy: bool,
-    pipeline: Option<crate::pipeline::Pipeline>,
+    initial_state: Option<String>,
+    state_dir: Option<PathBuf>,
     agent_dir: PathBuf,
 ) {
     logger.log("[worker] Agent worker started");
@@ -2880,7 +2895,8 @@ async fn agent_worker(
                     &shutdown,
                     conversation_recall_limit,
                     dedup_lazy,
-                    &pipeline,
+                    initial_state.as_deref(),
+                    state_dir.as_deref(),
                     Some(&agent_dir),
                 )
                 .await;
@@ -3044,6 +3060,9 @@ async fn run_tool_loop(
     logger: &Arc<AgentLogger>,
     log_tx: mpsc::Sender<String>,
     dedup_lazy: bool,
+    // State system
+    state_dir: Option<&Path>,
+    initial_state: Option<&str>,
 ) -> ToolLoopResult {
     // Open a store for DB operations (pause checks, message storage, context refresh).
     // Each tool batch opens its own store (via execute_native_tool_calls) for isolation.
@@ -3068,6 +3087,8 @@ async fn run_tool_loop(
     let mut conversation_history = conversation_history;
     let mut current_message = initial_message.to_string();
     let mut tool_call_count = 0usize;
+    let mut state_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    state_vars.insert("input".to_string(), initial_message.to_string());
     let mut last_duration_ms: Option<u64> = None;
     let mut last_tokens_in: Option<u32> = None;
     let mut last_tokens_out: Option<u32> = None;
@@ -3114,6 +3135,38 @@ async fn run_tool_loop(
         // Clear agent's internal history to avoid duplication with DB-backed history
         agent.lock().await.clear_history();
 
+        // Capture state before LLM call for self-loop detection
+        let state_before = if state_dir.is_some() {
+            store.get_participant_state(conv_name, agent_name)
+                .unwrap_or(None)
+                .or_else(|| initial_state.map(|s| s.to_string()))
+        } else {
+            None
+        };
+
+        // Apply state template wrapping if a state is active
+        let llm_message = if let Some(dir) = state_dir {
+            if let Some(ref state_file) = state_before {
+                let template_path = dir.join(state_file.trim());
+                match std::fs::read_to_string(&template_path) {
+                    Ok(template) => {
+                        state_vars.insert("input".to_string(), current_message.clone());
+                        let wrapped = crate::pipeline::expand_vars(&template, &state_vars);
+                        logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
+                        wrapped
+                    }
+                    Err(_) => {
+                        logger.log(&format!("[state] Template not found: {}", state_file.trim()));
+                        current_message.clone()
+                    }
+                }
+            } else {
+                current_message.clone()
+            }
+        } else {
+            current_message.clone()
+        };
+
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
             conversation_history: if conversation_history.is_empty() {
@@ -3145,7 +3198,7 @@ async fn run_tool_loop(
                 let mut agent_guard = agent.lock().await;
                 match tokio::time::timeout(
                     remaining,
-                    agent_guard.think_single_turn_streaming(&current_message, options, iter_token_tx),
+                    agent_guard.think_single_turn_streaming(&llm_message, options, iter_token_tx),
                 ).await {
                     Ok(r) => { drop(agent_guard); Ok(r) }
                     Err(_elapsed) => {
@@ -3156,7 +3209,7 @@ async fn run_tool_loop(
             } else {
                 let mut agent_guard = agent.lock().await;
                 let r = agent_guard
-                    .think_single_turn_streaming(&current_message, options, iter_token_tx)
+                    .think_single_turn_streaming(&llm_message, options, iter_token_tx)
                     .await;
                 drop(agent_guard);
                 Ok(r)
@@ -3220,9 +3273,53 @@ async fn run_tool_loop(
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
                 let (after_remember, llm_notes) = extract_llm_notes(&after_remember);
 
-                // Full response for DB: preserve thinking tags, strip REMEMBER tags
+                // Extract <state> and <handoff/> tags
+                let (after_remember, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
+                let (after_remember, handoff) = crate::pipeline::extract_handoff_tag(&after_remember);
+
+                // Process state transitions
+                if !state_tags.is_empty() {
+                    let new_state = state_tags.last().unwrap();
+                    let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
+                    logger.log(&format!("[state] Transition → {}", new_state));
+
+                    // Extract XML vars from LLM output for next state template
+                    let new_vars = crate::pipeline::extract_xml_vars(&think_result.response);
+                    state_vars.extend(new_vars);
+
+                    // Strip XML var tags from content to check if there's real content left
+                    let (content_without_vars, _) = crate::pipeline::extract_and_strip_xml_vars(&after_remember);
+
+                    if content_without_vars.trim().is_empty() {
+                        if state_before.as_deref() == Some(new_state.as_str()) {
+                            // Self-loop with no content → no response needed
+                            logger.log("[state] Self-loop with no content, skipping response");
+                            return ToolLoopResult {
+                                response: String::new(),
+                                db_response: String::new(),
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
+                                dump_turn_n: last_dump_turn_n,
+                            };
+                        }
+                        // Different state with no content → re-run with new state template
+                        logger.log(&format!("[state] Re-running with new state: {}", new_state));
+                        continue;
+                    }
+                } else if handoff {
+                    let _ = store.set_participant_state(conv_name, agent_name, None);
+                    logger.log("[state] Handoff: clearing state");
+                }
+
+                // Full response for DB: preserve thinking tags, strip REMEMBER/state/handoff/xml-var tags
                 let (db_content, _) = extract_remember_tags(&think_result.response);
                 let (db_content, _) = extract_llm_notes(&db_content);
+                let (db_content, _) = crate::pipeline::extract_state_tags(&db_content);
+                let (db_content, _) = crate::pipeline::extract_handoff_tag(&db_content);
+                let (db_content, _) = crate::pipeline::extract_and_strip_xml_vars(&db_content);
 
                 // Save LLM-generated inline notes to DB (before prepend_notes reads them back)
                 if let Some(ref notes) = llm_notes {
@@ -3785,6 +3882,8 @@ async fn process_message_work(
             logger,
             log_tx.clone(),
             dedup_lazy,
+            None, // no state for REPL messages
+            None,
         ).await;
 
         drop(log_tx);
@@ -4490,7 +4589,8 @@ async fn handle_notify(
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
     dedup_lazy: bool,
-    pipeline: &Option<crate::pipeline::Pipeline>,
+    initial_state: Option<&str>,
+    state_dir: Option<&Path>,
     agent_dir: Option<&Path>,
 ) -> Response {
     // Track start time for response duration
@@ -4557,104 +4657,14 @@ async fn handle_notify(
     } else {
         context_messages.last().map(|m| m.id)
     };
-    let (conversation_history, mut final_user_content) =
+    let (conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
-    // Pipeline path: if pipeline exists, skip recall/tool loop and run pipeline instead
-    if let Some(pipeline) = pipeline {
-        let llm = match agent.lock().await.llm_client() {
-            Some(llm) => llm,
-            None => {
-                return Response::Error {
-                    message: "Pipeline: no LLM configured".to_string(),
-                };
-            }
-        };
-
-        match pipeline.execute(&final_user_content, &llm, logger, agent_dir, Some(conv_id)).await {
-            Ok(result) => {
-                if result.handoff {
-                    // Handoff: replace final_user_content with pipeline output
-                    // and fall through to the tool loop below
-                    logger.log("[pipeline] Handoff: entering tool loop with pipeline output");
-                    final_user_content = result.response;
-                } else {
-                    // No handoff: store response and return (original behavior)
-                    let response_text = result.response;
-                    let elapsed = start_time.elapsed().as_millis() as i64;
-                    match store.add_message_with_tokens(
-                        conv_id,
-                        agent_name,
-                        &response_text,
-                        &[],
-                        Some(elapsed),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                    ) {
-                        Ok(msg_id) => {
-                            logger.log(&format!(
-                                "[pipeline] Stored response as msg_id={} ({}ms)",
-                                msg_id, elapsed
-                            ));
-
-                            // Parse @mentions and forward (same as normal path)
-                            let should_forward = mentions_enabled
-                                && depth < MAX_MENTION_DEPTH
-                                && !store.is_paused(conv_id).unwrap_or(false);
-
-                            if should_forward {
-                                let mentions =
-                                    crate::conversation::parse_mentions(&response_text);
-                                let valid_mentions: Vec<String> = mentions
-                                    .into_iter()
-                                    .filter(|m| m != agent_name && m != "user" && m != "all")
-                                    .filter(|m| discovery::agent_exists(m))
-                                    .collect();
-
-                                if !valid_mentions.is_empty() {
-                                    logger.log(&format!(
-                                        "[pipeline] Forwarding to {} agents at depth {}: {:?}",
-                                        valid_mentions.len(),
-                                        depth + 1,
-                                        valid_mentions
-                                    ));
-                                    for mention in &valid_mentions {
-                                        let _ = store.add_participant(conv_id, mention);
-                                    }
-                                    for mention in valid_mentions {
-                                        forward_notify_to_agent(
-                                            &mention,
-                                            conv_id,
-                                            msg_id,
-                                            depth + 1,
-                                            logger,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-
-                            return Response::Notified {
-                                response_message_id: msg_id,
-                            };
-                        }
-                        Err(e) => {
-                            return Response::Error {
-                                message: format!("Pipeline: failed to store response: {}", e),
-                            };
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                return Response::Error {
-                    message: format!("Pipeline error: {}", e),
-                };
-            }
+    // Set initial state for this conversation if configured and not yet set
+    if let Some(init_state) = initial_state {
+        if store.get_participant_state(conv_id, agent_name).unwrap_or(None).is_none() {
+            let _ = store.set_participant_state(conv_id, agent_name, Some(init_state));
+            logger.log(&format!("[state] Set initial state: {}", init_state));
         }
     }
 
@@ -4766,6 +4776,8 @@ async fn handle_notify(
         logger,
         log_tx.clone(),
         dedup_lazy,
+        state_dir,
+        initial_state,
     ).await;
 
     // Clean up pause watcher
@@ -4806,6 +4818,10 @@ async fn handle_notify(
     }
 
     // Notes already prepended by run_tool_loop — no second prepend_notes here
+    if db_cleaned_response.trim().is_empty() {
+        logger.log("[notify] Empty response, skipping message storage");
+        return Response::Notified { response_message_id: 0 };
+    }
     match store.add_message_with_tokens(
         conv_id,
         agent_name,
