@@ -7,6 +7,16 @@ use regex::Regex;
 use crate::daemon::AgentLogger;
 use crate::llm::{ChatMessage, LLM, LLMError};
 
+/// Result of a pipeline execution.
+#[derive(Debug, Clone)]
+pub struct PipelineResult {
+    /// The final response text (with tags stripped).
+    pub response: String,
+    /// Whether the pipeline emitted a `<handoff/>` tag, indicating the daemon
+    /// should enter the tool loop with `response` as context.
+    pub handoff: bool,
+}
+
 /// A model-driven pipeline that uses `<stage>` tags to load files on demand.
 ///
 /// The model receives `instructions.md` (with `{{input}}` replaced) and can
@@ -42,7 +52,7 @@ impl Pipeline {
         logger: &AgentLogger,
         agent_dir: Option<&Path>,
         conv_name: Option<&str>,
-    ) -> Result<String, LLMError> {
+    ) -> Result<PipelineResult, LLMError> {
         let mut vars: HashMap<String, String> = HashMap::new();
         vars.insert("input".to_string(), input.to_string());
 
@@ -114,12 +124,17 @@ impl Pipeline {
                     }
                 }
 
+                let (cleaned, handoff) = extract_handoff_tag(&cleaned);
                 logger.log(&format!(
-                    "[pipeline] Final output after {} iterations: {}",
+                    "[pipeline] Final output after {} iterations (handoff={}): {}",
                     iteration,
+                    handoff,
                     truncate(&cleaned, 200)
                 ));
-                return Ok(cleaned);
+                return Ok(PipelineResult {
+                    response: cleaned,
+                    handoff,
+                });
             }
 
             logger.log(&format!(
@@ -171,6 +186,15 @@ pub fn extract_stage_tags(content: &str) -> (String, Vec<String>) {
         .collect();
     let cleaned = re.replace_all(content, "").to_string();
     (cleaned, filenames)
+}
+
+/// Detect and strip `<handoff/>` (or `<handoff>`) tag from content.
+/// Returns the cleaned content and whether a handoff tag was found.
+pub fn extract_handoff_tag(content: &str) -> (String, bool) {
+    let re = Regex::new(r"(?s)<handoff\s*/?>").unwrap();
+    let has_handoff = re.is_match(content);
+    let cleaned = re.replace_all(content, "").trim().to_string();
+    (cleaned, has_handoff)
 }
 
 /// Extract all `<tagname>content</tagname>` pairs from assistant output,
@@ -320,6 +344,33 @@ mod tests {
     fn test_extract_xml_vars_multiline() {
         let vars = extract_xml_vars("<message>\nhello\n</message>");
         assert_eq!(vars.get("message").unwrap(), "hello");
+    }
+
+    #[test]
+    fn test_extract_handoff_self_closing() {
+        let (cleaned, handoff) = extract_handoff_tag("Do this plan.\n\n<handoff/>");
+        assert!(handoff);
+        assert_eq!(cleaned, "Do this plan.");
+    }
+
+    #[test]
+    fn test_extract_handoff_open_tag() {
+        let (cleaned, handoff) = extract_handoff_tag("Execute now <handoff>");
+        assert!(handoff);
+        assert_eq!(cleaned, "Execute now");
+    }
+
+    #[test]
+    fn test_extract_handoff_with_space() {
+        let (_, handoff) = extract_handoff_tag("Plan ready <handoff />");
+        assert!(handoff);
+    }
+
+    #[test]
+    fn test_extract_handoff_none() {
+        let (cleaned, handoff) = extract_handoff_tag("Just a normal response.");
+        assert!(!handoff);
+        assert_eq!(cleaned, "Just a normal response.");
     }
 
     #[test]

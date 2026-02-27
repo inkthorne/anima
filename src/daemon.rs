@@ -4552,7 +4552,7 @@ async fn handle_notify(
     } else {
         context_messages.last().map(|m| m.id)
     };
-    let (conversation_history, final_user_content) =
+    let (conversation_history, mut final_user_content) =
         format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     // Pipeline path: if pipeline exists, skip recall/tool loop and run pipeline instead
@@ -4567,72 +4567,81 @@ async fn handle_notify(
         };
 
         match pipeline.execute(&final_user_content, &llm, logger, agent_dir, Some(conv_id)).await {
-            Ok(response_text) => {
-                let elapsed = start_time.elapsed().as_millis() as i64;
-                match store.add_message_with_tokens(
-                    conv_id,
-                    agent_name,
-                    &response_text,
-                    &[],
-                    Some(elapsed),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ) {
-                    Ok(msg_id) => {
-                        logger.log(&format!(
-                            "[pipeline] Stored response as msg_id={} ({}ms)",
-                            msg_id, elapsed
-                        ));
+            Ok(result) => {
+                if result.handoff {
+                    // Handoff: replace final_user_content with pipeline output
+                    // and fall through to the tool loop below
+                    logger.log("[pipeline] Handoff: entering tool loop with pipeline output");
+                    final_user_content = result.response;
+                } else {
+                    // No handoff: store response and return (original behavior)
+                    let response_text = result.response;
+                    let elapsed = start_time.elapsed().as_millis() as i64;
+                    match store.add_message_with_tokens(
+                        conv_id,
+                        agent_name,
+                        &response_text,
+                        &[],
+                        Some(elapsed),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    ) {
+                        Ok(msg_id) => {
+                            logger.log(&format!(
+                                "[pipeline] Stored response as msg_id={} ({}ms)",
+                                msg_id, elapsed
+                            ));
 
-                        // Parse @mentions and forward (same as normal path)
-                        let should_forward = mentions_enabled
-                            && depth < MAX_MENTION_DEPTH
-                            && !store.is_paused(conv_id).unwrap_or(false);
+                            // Parse @mentions and forward (same as normal path)
+                            let should_forward = mentions_enabled
+                                && depth < MAX_MENTION_DEPTH
+                                && !store.is_paused(conv_id).unwrap_or(false);
 
-                        if should_forward {
-                            let mentions =
-                                crate::conversation::parse_mentions(&response_text);
-                            let valid_mentions: Vec<String> = mentions
-                                .into_iter()
-                                .filter(|m| m != agent_name && m != "user" && m != "all")
-                                .filter(|m| discovery::agent_exists(m))
-                                .collect();
+                            if should_forward {
+                                let mentions =
+                                    crate::conversation::parse_mentions(&response_text);
+                                let valid_mentions: Vec<String> = mentions
+                                    .into_iter()
+                                    .filter(|m| m != agent_name && m != "user" && m != "all")
+                                    .filter(|m| discovery::agent_exists(m))
+                                    .collect();
 
-                            if !valid_mentions.is_empty() {
-                                logger.log(&format!(
-                                    "[pipeline] Forwarding to {} agents at depth {}: {:?}",
-                                    valid_mentions.len(),
-                                    depth + 1,
-                                    valid_mentions
-                                ));
-                                for mention in &valid_mentions {
-                                    let _ = store.add_participant(conv_id, mention);
-                                }
-                                for mention in valid_mentions {
-                                    forward_notify_to_agent(
-                                        &mention,
-                                        conv_id,
-                                        msg_id,
+                                if !valid_mentions.is_empty() {
+                                    logger.log(&format!(
+                                        "[pipeline] Forwarding to {} agents at depth {}: {:?}",
+                                        valid_mentions.len(),
                                         depth + 1,
-                                        logger,
-                                    )
-                                    .await;
+                                        valid_mentions
+                                    ));
+                                    for mention in &valid_mentions {
+                                        let _ = store.add_participant(conv_id, mention);
+                                    }
+                                    for mention in valid_mentions {
+                                        forward_notify_to_agent(
+                                            &mention,
+                                            conv_id,
+                                            msg_id,
+                                            depth + 1,
+                                            logger,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
-                        }
 
-                        return Response::Notified {
-                            response_message_id: msg_id,
-                        };
-                    }
-                    Err(e) => {
-                        return Response::Error {
-                            message: format!("Pipeline: failed to store response: {}", e),
-                        };
+                            return Response::Notified {
+                                response_message_id: msg_id,
+                            };
+                        }
+                        Err(e) => {
+                            return Response::Error {
+                                message: format!("Pipeline: failed to store response: {}", e),
+                            };
+                        }
                     }
                 }
             }
