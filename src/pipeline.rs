@@ -17,11 +17,11 @@ pub struct PipelineResult {
     pub handoff: bool,
 }
 
-/// A model-driven pipeline that uses `<state>` tags to load files on demand.
+/// A model-driven pipeline that uses `<next-state>` tags to load files on demand.
 ///
 /// The model receives `instructions.md` (with `{{input}}` replaced) and can
-/// emit `<state>filename</state>` tags to load files from the pipeline directory.
-/// The loop continues until a response contains no `<state>` tags.
+/// emit `<next-state>filename</next-state>` tags to load files from the pipeline directory.
+/// The loop continues until a response contains no `<next-state>` tags.
 #[derive(Debug, Clone)]
 pub struct Pipeline {
     /// Content of `instructions.md` (with `{{input}}` placeholder)
@@ -106,7 +106,7 @@ impl Pipeline {
                     let default_path = self.pipeline_dir.join("default.md");
                     if let Ok(default_content) = std::fs::read_to_string(&default_path) {
                         let expanded = expand_vars(&default_content, &vars);
-                        logger.log("[pipeline] No <state> tags on iteration 0, falling back to default.md");
+                        logger.log("[pipeline] No <next-state> tags on iteration 0, falling back to default.md");
                         messages.push(ChatMessage {
                             role: "assistant".to_string(),
                             content: Some(content),
@@ -176,10 +176,10 @@ impl Pipeline {
     }
 }
 
-/// Extract `<state>filename</state>` tags from content.
+/// Extract `<next-state>filename</next-state>` tags from content.
 /// Returns the cleaned content (tags stripped) and the list of filenames.
 pub fn extract_state_tags(content: &str) -> (String, Vec<String>) {
-    let re = Regex::new(r"(?s)<state>(.*?)</state>").unwrap();
+    let re = Regex::new(r"(?s)<next-state>(.*?)</next-state>").unwrap();
     let filenames: Vec<String> = re
         .captures_iter(content)
         .map(|cap| cap[1].trim().to_string())
@@ -198,13 +198,13 @@ pub fn extract_handoff_tag(content: &str) -> (String, bool) {
 }
 
 /// Extract all `<tagname>content</tagname>` pairs from assistant output,
-/// excluding `<state>` tags (which are handled separately).
+/// excluding `<next-state>` tags (which are handled separately).
 pub fn extract_xml_vars(content: &str) -> HashMap<String, String> {
     let open_re = Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_]*)>").unwrap();
     let mut vars = HashMap::new();
     for cap in open_re.captures_iter(content) {
         let tag = &cap[1];
-        if tag == "state" {
+        if tag == "next-state" {
             continue;
         }
         let close_tag = format!("</{}>", tag);
@@ -300,14 +300,14 @@ mod tests {
 
     #[test]
     fn test_extract_state_tags_single() {
-        let (_, stages) = extract_state_tags("Let me check <state>questions.md</state> for guidance.");
+        let (_, stages) = extract_state_tags("Let me check <next-state>questions.md</next-state> for guidance.");
         assert_eq!(stages, vec!["questions.md"]);
     }
 
     #[test]
     fn test_extract_state_tags_multiple() {
         let (_, stages) = extract_state_tags(
-            "Reading <state>a.md</state> and <state>b.md</state> now.",
+            "Reading <next-state>a.md</next-state> and <next-state>b.md</next-state> now.",
         );
         assert_eq!(stages, vec!["a.md", "b.md"]);
     }
@@ -315,7 +315,7 @@ mod tests {
     #[test]
     fn test_extract_state_tags_strips_from_content() {
         let (cleaned, _) =
-            extract_state_tags("Before <state>file.md</state> after");
+            extract_state_tags("Before <next-state>file.md</next-state> after");
         assert_eq!(cleaned, "Before  after");
     }
 
@@ -332,9 +332,9 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_xml_vars_excludes_state() {
-        let vars = extract_xml_vars("<state>foo</state><message>bar</message>");
-        assert!(!vars.contains_key("state"));
+    fn test_extract_xml_vars_excludes_next_state() {
+        let vars = extract_xml_vars("<next-state>foo</next-state><message>bar</message>");
+        assert!(!vars.contains_key("next-state"));
         assert_eq!(vars.get("message").unwrap(), "bar");
     }
 
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn test_extract_state_tags_multiline() {
-        let (_, stages) = extract_state_tags("<state>\nfile.md\n</state>");
+        let (_, stages) = extract_state_tags("<next-state>\nfile.md\n</next-state>");
         assert_eq!(stages, vec!["file.md"]);
     }
 
@@ -432,11 +432,11 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_and_strip_xml_vars_preserves_state() {
-        // state tags are excluded by extract_xml_vars, so they should remain
-        let (cleaned, vars) = extract_and_strip_xml_vars("<state>foo.md</state><messages>hi</messages>");
-        assert!(!vars.contains_key("state"));
+    fn test_extract_and_strip_xml_vars_preserves_next_state() {
+        // next-state tags are excluded by extract_xml_vars, so they should remain
+        let (cleaned, vars) = extract_and_strip_xml_vars("<next-state>foo.md</next-state><messages>hi</messages>");
+        assert!(!vars.contains_key("next-state"));
         assert_eq!(vars.get("messages").unwrap(), "hi");
-        assert_eq!(cleaned, "<state>foo.md</state>");
+        assert_eq!(cleaned, "<next-state>foo.md</next-state>");
     }
 }
