@@ -66,15 +66,19 @@ impl Tool for PythonTool {
                 ToolError::InvalidInput("Missing or invalid 'code' field".to_string())
             })?;
 
-        run_python(code, self.timeout, self.mem_limit_bytes).await
+        run_python(code, self.timeout, self.mem_limit_bytes, None).await
     }
 }
 
 /// Spawn `python3 -` with code on stdin, using process group isolation and timeout.
+///
+/// If `agent_dir` is provided and contains a `python/` subdirectory, it is added
+/// to the child process's `PYTHONPATH` so the agent can `import` modules from there.
 pub async fn run_python(
     code: &str,
     timeout: Duration,
     mem_limit_bytes: Option<u64>,
+    agent_dir: Option<&std::path::Path>,
 ) -> Result<Value, ToolError> {
     use std::os::unix::process::CommandExt as _;
 
@@ -84,6 +88,14 @@ pub async fn run_python(
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
+
+        // Auto-inject PYTHONPATH if agent has a python/ directory
+        if let Some(dir) = agent_dir {
+            let python_dir = dir.join("python");
+            if python_dir.is_dir() {
+                cmd.env("PYTHONPATH", &python_dir);
+            }
+        }
         // SAFETY: setpgid and setrlimit are async-signal-safe and called before exec.
         unsafe {
             cmd.pre_exec(move || {

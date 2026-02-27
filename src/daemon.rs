@@ -686,6 +686,7 @@ pub struct ToolExecutionContext {
     pub embedding_client: Option<Arc<EmbeddingClient>>,
     pub allowed_tools: Option<Vec<String>>,
     pub logger: Option<Arc<AgentLogger>>,
+    pub agent_dir: Option<PathBuf>,
 
     // Fields for nested tool loop (subtask)
     pub agent: Option<Arc<Mutex<Agent>>>,
@@ -1532,6 +1533,7 @@ fn execute_tool_call<'a>(
                 embedding_client: ctx.embedding_client.clone(),
                 allowed_tools: ctx.allowed_tools.clone(),
                 logger: Some(Arc::clone(logger)),
+                agent_dir: ctx.agent_dir.clone(),
                 agent: Some(Arc::clone(agent)),
                 system_prompt: ctx.system_prompt.clone(),
                 tool_registry: ctx.tool_registry.clone(),
@@ -2840,6 +2842,7 @@ async fn agent_worker(
                     max_iterations,
                     num_ctx,
                     dedup_lazy,
+                    Some(&agent_dir),
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -3319,7 +3322,7 @@ async fn run_tool_loop(
                             let mut result_parts = Vec::new();
                             for (i, code) in python_blocks.iter().enumerate() {
                                 logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
-                                match run_python(code, timeout, mem_limit).await {
+                                match run_python(code, timeout, mem_limit, tool_context.agent_dir.as_deref()).await {
                                     Ok(val) => {
                                         let stdout = val["stdout"].as_str().unwrap_or("");
                                         let stderr = val["stderr"].as_str().unwrap_or("");
@@ -3470,7 +3473,7 @@ async fn run_tool_loop(
                             let mut result_parts = Vec::new();
                             for (i, code) in python_blocks.iter().enumerate() {
                                 logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
-                                match run_python(code, timeout, mem_limit).await {
+                                match run_python(code, timeout, mem_limit, tool_context.agent_dir.as_deref()).await {
                                     Ok(val) => {
                                         let stdout = val["stdout"].as_str().unwrap_or("");
                                         let stderr = val["stderr"].as_str().unwrap_or("");
@@ -3630,6 +3633,7 @@ async fn process_message_work(
     max_iterations: Option<usize>,
     num_ctx: Option<u32>,
     dedup_lazy: bool,
+    agent_dir: Option<&Path>,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -3740,6 +3744,7 @@ async fn process_message_work(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
         logger: Some(logger.clone()),
+        agent_dir: agent_dir.map(|p| p.to_path_buf()),
         agent: Some(Arc::clone(agent)),
         system_prompt: system_prompt.clone(),
         tool_registry: tool_registry.as_ref().map(Arc::clone),
@@ -4701,6 +4706,7 @@ async fn handle_notify(
         embedding_client: embedding_client.clone(),
         allowed_tools: allowed_tools.clone(),
         logger: Some(logger.clone()),
+        agent_dir: agent_dir.map(|p| p.to_path_buf()),
         agent: Some(Arc::clone(agent)),
         system_prompt: system_prompt.clone(),
         tool_registry: tool_registry.as_ref().map(Arc::clone),
@@ -8679,6 +8685,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8711,6 +8718,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8738,6 +8746,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: Some(vec!["read_file".to_string()]),
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8769,6 +8778,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8813,6 +8823,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8870,6 +8881,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
@@ -8909,6 +8921,7 @@ api_key = "sk-test"
             embedding_client: None,
             allowed_tools: None,
             logger: None,
+            agent_dir: None,
             agent: None,
             system_prompt: None,
             tool_registry: None,
