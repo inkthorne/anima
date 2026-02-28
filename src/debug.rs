@@ -218,7 +218,7 @@ pub fn dump_request(
     let mut request_body = serde_json::json!({
         "model": model,
         "messages": formatted_messages,
-        "stream": false
+        "stream": true
     });
 
     // Add tools if present (Ollama format)
