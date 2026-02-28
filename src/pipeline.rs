@@ -217,6 +217,36 @@ pub fn extract_xml_vars(content: &str) -> HashMap<String, String> {
     vars
 }
 
+/// Extract variables from a `<set-vars>...</set-vars>` wrapper tag.
+/// Only parses child elements within the wrapper. Returns empty map if no wrapper found.
+pub fn extract_set_vars(content: &str) -> HashMap<String, String> {
+    let re = Regex::new(r"(?s)<set-vars>(.*?)</set-vars>").unwrap();
+    let mut vars = HashMap::new();
+    if let Some(cap) = re.captures(content) {
+        let inner = &cap[1];
+        // Use the same approach as extract_xml_vars: find opening tags, then their closing tags
+        let open_re = Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_]*)>").unwrap();
+        for child_cap in open_re.captures_iter(inner) {
+            let tag = &child_cap[1];
+            let close_tag = format!("</{}>", tag);
+            let open_end = child_cap.get(0).unwrap().end();
+            if let Some(close_pos) = inner[open_end..].find(&close_tag) {
+                let value = &inner[open_end..open_end + close_pos];
+                vars.insert(tag.to_string(), value.trim().to_string());
+            }
+        }
+    }
+    vars
+}
+
+/// Extract variables from `<set-vars>` wrapper AND strip the wrapper from content.
+pub fn extract_and_strip_set_vars(content: &str) -> (String, HashMap<String, String>) {
+    let vars = extract_set_vars(content);
+    let re = Regex::new(r"(?s)\s*<set-vars>.*?</set-vars>").unwrap();
+    let cleaned = re.replace_all(content, "").trim().to_string();
+    (cleaned, vars)
+}
+
 /// Extract XML vars from content AND return cleaned content with var tags stripped.
 /// Like `extract_xml_vars` but also removes the matched tags from the content.
 pub fn extract_and_strip_xml_vars(content: &str) -> (String, HashMap<String, String>) {
@@ -233,6 +263,43 @@ pub fn extract_and_strip_xml_vars(content: &str) -> (String, HashMap<String, Str
         }
     }
     (cleaned.trim().to_string(), vars)
+}
+
+/// Parsed YAML frontmatter from a state file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StateFrontmatter {
+    /// Whether this state waits for user input before executing.
+    pub wait: bool,
+}
+
+/// Parse YAML frontmatter from a state file.
+/// Returns the frontmatter properties and the body content (without frontmatter).
+/// Frontmatter is delimited by `---` fences at the start of the file.
+pub fn parse_state_frontmatter(content: &str) -> (StateFrontmatter, &str) {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return (StateFrontmatter::default(), content);
+    }
+    // Find closing --- (must be on its own line after the opening ---)
+    let after_open = &trimmed[3..];
+    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
+    if let Some(end_pos) = after_open.find("\n---") {
+        let frontmatter_str = &after_open[..end_pos];
+        let body_start = end_pos + 4; // skip "\n---"
+        let body = after_open[body_start..].strip_prefix('\n').unwrap_or(&after_open[body_start..]);
+
+        let mut fm = StateFrontmatter::default();
+        for line in frontmatter_str.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("wait:") {
+                fm.wait = val.trim() == "true";
+            }
+        }
+
+        (fm, body)
+    } else {
+        (StateFrontmatter::default(), content)
+    }
 }
 
 /// Replace `{{varname}}` placeholders in text using the provided variable map.
@@ -458,5 +525,117 @@ mod tests {
         assert!(cleaned.contains("<python>"));
         assert!(cleaned.contains("print('hello')"));
         assert!(cleaned.contains("</python>"));
+    }
+
+    // --- Frontmatter parsing tests ---
+
+    #[test]
+    fn test_parse_frontmatter_none() {
+        let (fm, body) = parse_state_frontmatter("Just a normal template.");
+        assert!(!fm.wait);
+        assert_eq!(body, "Just a normal template.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_wait_true() {
+        let content = "---\nwait: true\n---\nPrompt text here.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(fm.wait);
+        assert_eq!(body, "Prompt text here.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_wait_false() {
+        let content = "---\nwait: false\n---\nAuto-execute prompt.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(!fm.wait);
+        assert_eq!(body, "Auto-execute prompt.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_no_wait_key() {
+        let content = "---\nother: value\n---\nPrompt.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(!fm.wait); // defaults to false
+        assert_eq!(body, "Prompt.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_unclosed() {
+        let content = "---\nwait: true\nNo closing fence.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(!fm.wait); // no valid frontmatter
+        assert_eq!(body, content);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_multiline_body() {
+        let content = "---\nwait: true\n---\nLine 1\nLine 2\nLine 3";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(fm.wait);
+        assert_eq!(body, "Line 1\nLine 2\nLine 3");
+    }
+
+    // --- <set-vars> extraction tests ---
+
+    #[test]
+    fn test_extract_set_vars_basic() {
+        let vars = extract_set_vars("<set-vars>\n  <color>yellow</color>\n  <size>large</size>\n</set-vars>");
+        assert_eq!(vars.len(), 2);
+        assert_eq!(vars.get("color").unwrap(), "yellow");
+        assert_eq!(vars.get("size").unwrap(), "large");
+    }
+
+    #[test]
+    fn test_extract_set_vars_none() {
+        let vars = extract_set_vars("No set-vars here.");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_extract_set_vars_ignores_bare_xml() {
+        // Bare XML tags outside <set-vars> should NOT be captured
+        let vars = extract_set_vars("<message>hello</message>");
+        assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_extract_set_vars_with_surrounding_text() {
+        let content = "Some response text.\n\n<set-vars>\n  <topic>rust</topic>\n</set-vars>\n<next-state>final</next-state>";
+        let vars = extract_set_vars(content);
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars.get("topic").unwrap(), "rust");
+    }
+
+    #[test]
+    fn test_extract_and_strip_set_vars_basic() {
+        let (cleaned, vars) = extract_and_strip_set_vars(
+            "Response text.\n\n<set-vars>\n  <color>blue</color>\n</set-vars>"
+        );
+        assert_eq!(vars.get("color").unwrap(), "blue");
+        assert_eq!(cleaned, "Response text.");
+    }
+
+    #[test]
+    fn test_extract_and_strip_set_vars_preserves_other_tags() {
+        let (cleaned, vars) = extract_and_strip_set_vars(
+            "Text <message>hi</message>\n<set-vars>\n  <x>1</x>\n</set-vars>"
+        );
+        assert_eq!(vars.get("x").unwrap(), "1");
+        assert!(cleaned.contains("<message>hi</message>"));
+    }
+
+    #[test]
+    fn test_extract_and_strip_set_vars_none() {
+        let (cleaned, vars) = extract_and_strip_set_vars("plain text");
+        assert!(vars.is_empty());
+        assert_eq!(cleaned, "plain text");
+    }
+
+    #[test]
+    fn test_extract_set_vars_multiline_value() {
+        let content = "<set-vars>\n  <code>fn main() {\n    println!(\"hello\");\n}</code>\n</set-vars>";
+        let vars = extract_set_vars(content);
+        assert_eq!(vars.get("code").unwrap(), "fn main() {\n    println!(\"hello\");\n}");
     }
 }

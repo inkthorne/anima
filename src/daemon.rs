@@ -3088,7 +3088,7 @@ async fn run_tool_loop(
     let mut current_message = initial_message.to_string();
     let mut tool_call_count = 0usize;
     let mut state_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    state_vars.insert("input".to_string(), initial_message.to_string());
+    state_vars.insert("user".to_string(), initial_message.to_string());
     let mut last_duration_ms: Option<u64> = None;
     let mut last_tokens_in: Option<u32> = None;
     let mut last_tokens_out: Option<u32> = None;
@@ -3150,8 +3150,9 @@ async fn run_tool_loop(
                 let template_path = dir.join(state_file.trim());
                 match std::fs::read_to_string(&template_path) {
                     Ok(template) => {
-                        state_vars.insert("input".to_string(), current_message.clone());
-                        let wrapped = crate::pipeline::expand_vars(&template, &state_vars);
+                        // Parse and strip YAML frontmatter (Gap 1)
+                        let (_, body) = crate::pipeline::parse_state_frontmatter(&template);
+                        let wrapped = crate::pipeline::expand_vars(body, &state_vars);
                         logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
                         wrapped
                     }
@@ -3273,52 +3274,11 @@ async fn run_tool_loop(
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
                 let (after_remember, llm_notes) = extract_llm_notes(&after_remember);
 
-                // Extract <next-state> and <handoff/> tags
-                let (after_remember, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
-                let (after_remember, handoff) = crate::pipeline::extract_handoff_tag(&after_remember);
-
-                // Process state transitions
-                if !state_tags.is_empty() {
-                    let new_state = state_tags.last().unwrap();
-                    let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
-                    logger.log(&format!("[state] Transition → {}", new_state));
-
-                    // Extract XML vars from LLM output for next state template
-                    let new_vars = crate::pipeline::extract_xml_vars(&think_result.response);
-                    state_vars.extend(new_vars);
-
-                    // Strip XML var tags from content to check if there's real content left
-                    let (content_without_vars, _) = crate::pipeline::extract_and_strip_xml_vars(&after_remember);
-
-                    if content_without_vars.trim().is_empty() {
-                        if state_before.as_deref() == Some(new_state.as_str()) {
-                            // Self-loop with no content → no response needed
-                            logger.log("[state] Self-loop with no content, skipping response");
-                            return ToolLoopResult {
-                                response: String::new(),
-                                db_response: String::new(),
-                                duration_ms: last_duration_ms,
-                                tokens_in: last_tokens_in,
-                                tokens_out: last_tokens_out,
-                                prompt_eval_duration_ns: last_prompt_eval_ns,
-                                cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
-                            };
-                        }
-                        // Different state with no content → re-run with new state template
-                        logger.log(&format!("[state] Re-running with new state: {}", new_state));
-                        continue;
-                    }
-                } else if handoff {
-                    let _ = store.set_participant_state(conv_name, agent_name, None);
-                    logger.log("[state] Handoff: clearing state");
-                }
-
-                // Full response for DB: preserve thinking and next-state tags, strip REMEMBER/handoff/xml-var tags
+                // Full response for DB: preserve thinking and next-state tags, strip REMEMBER/handoff/set-vars
                 let (db_content, _) = extract_remember_tags(&think_result.response);
                 let (db_content, _) = extract_llm_notes(&db_content);
                 let (db_content, _) = crate::pipeline::extract_handoff_tag(&db_content);
-                let (db_content, _) = crate::pipeline::extract_and_strip_xml_vars(&db_content);
+                let (db_content, _) = crate::pipeline::extract_and_strip_set_vars(&db_content);
 
                 // Save LLM-generated inline notes to DB (before prepend_notes reads them back)
                 if let Some(ref notes) = llm_notes {
@@ -3330,6 +3290,12 @@ async fn run_tool_loop(
                 // Save memories
                 save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
+                // === Tool call handling ===
+                // Tool calls take priority — state processing only happens on the
+                // final non-tool-calling response (Gap 7).
+                let mut tool_executed = false;
+                let final_response_text;
+
                 if use_native_tools {
                     // === Native tool mode ===
                     if let Some(ref tool_calls) = think_result.last_tool_calls {
@@ -3337,7 +3303,7 @@ async fn run_tool_loop(
                         if store.is_paused(conv_name).unwrap_or(false) {
                             logger.log("[loop] Conversation paused, skipping tool execution");
                             return ToolLoopResult {
-                                response: after_remember,
+                                response: after_remember.clone(),
                                 db_response: db_content,
                                 duration_ms: last_duration_ms,
                                 tokens_in: last_tokens_in,
@@ -3376,6 +3342,8 @@ async fn run_tool_loop(
 
                         current_message = String::new();
                         let _ = results; // consumed
+                        tool_executed = true;
+                        final_response_text = String::new(); // unused when tool_executed
                     } else {
                         // No native tool calls — check for <python> auto-execute blocks
                         let (_, python_blocks) = extract_python_blocks(&after_remember);
@@ -3383,7 +3351,7 @@ async fn run_tool_loop(
                             if store.is_paused(conv_name).unwrap_or(false) {
                                 logger.log("[loop] Conversation paused, skipping python execution");
                                 return ToolLoopResult {
-                                    response: after_remember,
+                                    response: after_remember.clone(),
                                     db_response: db_content,
                                     duration_ms: last_duration_ms,
                                     tokens_in: last_tokens_in,
@@ -3450,18 +3418,11 @@ async fn run_tool_loop(
                             }
 
                             current_message = String::new();
+                            tool_executed = true;
+                            final_response_text = String::new(); // unused when tool_executed
                         } else {
-                            // No tool calls — final response
-                            return ToolLoopResult {
-                                response: after_remember,
-                                db_response: db_content,
-                                duration_ms: last_duration_ms,
-                                tokens_in: last_tokens_in,
-                                tokens_out: last_tokens_out,
-                                prompt_eval_duration_ns: last_prompt_eval_ns,
-                                cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
-                            };
+                            // No tool calls in native mode
+                            final_response_text = after_remember;
                         }
                     }
                 } else {
@@ -3473,7 +3434,7 @@ async fn run_tool_loop(
                         if store.is_paused(conv_name).unwrap_or(false) {
                             logger.log("[loop] Conversation paused, skipping tool execution");
                             return ToolLoopResult {
-                                response: after_remember,
+                                response: cleaned_response,
                                 db_response: db_content,
                                 duration_ms: last_duration_ms,
                                 tokens_in: last_tokens_in,
@@ -3525,6 +3486,8 @@ async fn run_tool_loop(
                         }
 
                         current_message = tool_message;
+                        tool_executed = true;
+                        final_response_text = String::new(); // unused when tool_executed
                     } else {
                         // No JSON tool call — check for <python> auto-execute blocks
                         let (_, python_blocks) = extract_python_blocks(&cleaned_response);
@@ -3601,10 +3564,172 @@ async fn run_tool_loop(
                             }
 
                             current_message = String::new();
+                            tool_executed = true;
+                            final_response_text = String::new(); // unused when tool_executed
                         } else {
-                            // No tool call — final response
+                            // No tool calls in JSON-block mode
+                            final_response_text = cleaned_response;
+                        }
+                    }
+                }
+
+                // === No tool calls — process state transitions (Gaps 1-7) ===
+                if !tool_executed {
+                    if let Some(dir) = state_dir {
+                        if state_before.is_some() {
+                            // Extract state tags and set-vars from final response
+                            let (stripped, state_tags) = crate::pipeline::extract_state_tags(&final_response_text);
+                            let (stripped, handoff) = crate::pipeline::extract_handoff_tag(&stripped);
+                            let (stripped, set_vars) = crate::pipeline::extract_and_strip_set_vars(&stripped);
+
+                            if !state_tags.is_empty() {
+                                let new_state = state_tags.last().unwrap();
+
+                                // Gap 6: Validate state file exists
+                                let new_template_path = dir.join(new_state.trim());
+                                if !new_template_path.exists() {
+                                    logger.log(&format!("[state] Invalid state: {}", new_state));
+                                    // Store response in DB before error feedback
+                                    if !db_content.trim().is_empty() {
+                                        match store.add_message_with_tokens(
+                                            conv_name, agent_name, &db_content, &[],
+                                            think_result.duration_ms.map(|d| d as i64), None,
+                                            iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                        ) {
+                                            Ok(msg_id) => {
+                                                if let Some(turn_n) = think_result.dump_turn_n {
+                                                    agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                }
+                                            }
+                                            Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
+                                        }
+                                    }
+                                    let available = list_state_files(dir);
+                                    current_message = format!(
+                                        "[State error: '{}' does not exist. Available states: {}. Choose a valid state with <next-state>name</next-state>.]",
+                                        new_state, available
+                                    );
+                                    // Store error as tool result so LLM sees it
+                                    if let Err(e) = store.add_tool_result(conv_name, &current_message, agent_name) {
+                                        logger.log(&format!("[loop] Failed to store state error: {}", e));
+                                    }
+                                    // Fall through to context refresh, will continue loop
+                                } else {
+                                    let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
+                                    logger.log(&format!("[state] Transition → {}", new_state));
+
+                                    // Gap 5: Variable scoping — fresh vars with builtins + set-vars
+                                    let user_preserved = state_vars.get("user").cloned().unwrap_or_default();
+                                    state_vars = set_vars;
+                                    state_vars.insert("user".to_string(), user_preserved);
+                                    // Gap 3: Set {{assistant}} to final response text
+                                    state_vars.insert("assistant".to_string(), stripped.clone());
+
+                                    // Self-loop with no content → skip response
+                                    if stripped.trim().is_empty() {
+                                        if state_before.as_deref() == Some(new_state.as_str()) {
+                                            logger.log("[state] Self-loop with no content, skipping response");
+                                            return ToolLoopResult {
+                                                response: String::new(),
+                                                db_response: String::new(),
+                                                duration_ms: last_duration_ms,
+                                                tokens_in: last_tokens_in,
+                                                tokens_out: last_tokens_out,
+                                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                                cached_tokens: last_cached_tokens,
+                                                dump_turn_n: last_dump_turn_n,
+                                            };
+                                        }
+                                        // Different state with no content → auto-execute
+                                        logger.log(&format!("[state] Re-running with new state: {}", new_state));
+                                        current_message = String::new();
+                                        // Fall through to context refresh, will continue loop
+                                    } else {
+                                        // Gap 1: Check if new state is wait or non-wait
+                                        let new_template = std::fs::read_to_string(&new_template_path).unwrap_or_default();
+                                        let (fm, _) = crate::pipeline::parse_state_frontmatter(&new_template);
+
+                                        if fm.wait {
+                                            // Wait state — end chain, return response
+                                            logger.log(&format!("[state] Entering wait state: {}", new_state));
+                                            return ToolLoopResult {
+                                                response: stripped,
+                                                db_response: db_content,
+                                                duration_ms: last_duration_ms,
+                                                tokens_in: last_tokens_in,
+                                                tokens_out: last_tokens_out,
+                                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                                cached_tokens: last_cached_tokens,
+                                                dump_turn_n: last_dump_turn_n,
+                                            };
+                                        } else {
+                                            // Non-wait state — store response in DB, auto-execute
+                                            logger.log(&format!("[state] Auto-executing non-wait state: {}", new_state));
+                                            if !db_content.trim().is_empty() {
+                                                match store.add_message_with_tokens(
+                                                    conv_name, agent_name, &db_content, &[],
+                                                    think_result.duration_ms.map(|d| d as i64), None,
+                                                    iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                                ) {
+                                                    Ok(msg_id) => {
+                                                        if let Some(turn_n) = think_result.dump_turn_n {
+                                                            agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                        }
+                                                    }
+                                                    Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
+                                                }
+                                            }
+                                            current_message = String::new();
+                                            // Fall through to context refresh, will continue loop
+                                        }
+                                    }
+                                }
+                            } else if handoff {
+                                let _ = store.set_participant_state(conv_name, agent_name, None);
+                                logger.log("[state] Handoff: clearing state");
+                                return ToolLoopResult {
+                                    response: stripped,
+                                    db_response: db_content,
+                                    duration_ms: last_duration_ms,
+                                    tokens_in: last_tokens_in,
+                                    tokens_out: last_tokens_out,
+                                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                                    cached_tokens: last_cached_tokens,
+                                    dump_turn_n: last_dump_turn_n,
+                                };
+                            } else {
+                                // Gap 6: Missing <next-state> — error feedback to LLM
+                                logger.log("[state] Missing <next-state> tag, notifying LLM");
+                                // Store response in DB before error feedback
+                                if !db_content.trim().is_empty() {
+                                    match store.add_message_with_tokens(
+                                        conv_name, agent_name, &db_content, &[],
+                                        think_result.duration_ms.map(|d| d as i64), None,
+                                        iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                    ) {
+                                        Ok(msg_id) => {
+                                            if let Some(turn_n) = think_result.dump_turn_n {
+                                                agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                            }
+                                        }
+                                        Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
+                                    }
+                                }
+                                let available = list_state_files(dir);
+                                current_message = format!(
+                                    "[State error: You must emit a <next-state>state_name</next-state> tag. Available states: {}.]",
+                                    available
+                                );
+                                // Store error as tool result so LLM sees it
+                                if let Err(e) = store.add_tool_result(conv_name, &current_message, agent_name) {
+                                    logger.log(&format!("[loop] Failed to store state error: {}", e));
+                                }
+                                // Fall through to context refresh, will continue loop
+                            }
+                        } else {
+                            // No state active — return final response
                             return ToolLoopResult {
-                                response: cleaned_response,
+                                response: final_response_text,
                                 db_response: db_content,
                                 duration_ms: last_duration_ms,
                                 tokens_in: last_tokens_in,
@@ -3614,6 +3739,18 @@ async fn run_tool_loop(
                                 dump_turn_n: last_dump_turn_n,
                             };
                         }
+                    } else {
+                        // No state dir — return final response
+                        return ToolLoopResult {
+                            response: final_response_text,
+                            db_response: db_content,
+                            duration_ms: last_duration_ms,
+                            tokens_in: last_tokens_in,
+                            tokens_out: last_tokens_out,
+                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                            cached_tokens: last_cached_tokens,
+                            dump_turn_n: last_dump_turn_n,
+                        };
                     }
                 }
 
@@ -4353,6 +4490,21 @@ const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
 /// Truncate a tool result string if it exceeds the budget.
 /// Budget = 10% of num_ctx × 4 chars/token, or DEFAULT_MAX_TOOL_RESULT_BYTES as fallback.
 /// Keeps the **tail** (where errors and results live) and prepends a truncation notice.
+/// List available state files in a directory (for error messages).
+fn list_state_files(dir: &Path) -> String {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names.join(", ")
+        })
+        .unwrap_or_default()
+}
+
 fn truncate_tool_result(result: &str, num_ctx: Option<u32>) -> Cow<'_, str> {
     let max_bytes = num_ctx
         .map(|n| (n as usize / 10) * 4)
