@@ -241,7 +241,7 @@ pub struct AgentSection {
     pub recall_file: Option<PathBuf>,
     #[serde(default = "default_mentions_enabled")]
     pub mentions: bool,
-    /// Initial state file (e.g. "initial.md") in the states/ directory.
+    /// Initial state name (e.g. "initial") in the states/ directory.
     /// When set, the agent starts each conversation with this state.
     #[serde(default)]
     pub state: Option<String>,

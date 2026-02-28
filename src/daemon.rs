@@ -3147,7 +3147,7 @@ async fn run_tool_loop(
         // Apply state template wrapping if a state is active
         let llm_message = if let Some(dir) = state_dir {
             if let Some(ref state_file) = state_before {
-                let template_path = dir.join(state_file.trim());
+                let template_path = dir.join(format!("{}.md", state_file.trim()));
                 match std::fs::read_to_string(&template_path) {
                     Ok(template) => {
                         // Parse and strip YAML frontmatter (Gap 1)
@@ -3586,7 +3586,7 @@ async fn run_tool_loop(
                                 let new_state = state_tags.last().unwrap();
 
                                 // Gap 6: Validate state file exists
-                                let new_template_path = dir.join(new_state.trim());
+                                let new_template_path = dir.join(format!("{}.md", new_state.trim()));
                                 if !new_template_path.exists() {
                                     logger.log(&format!("[state] Invalid state: {}", new_state));
                                     // Store response in DB before error feedback
