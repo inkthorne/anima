@@ -279,6 +279,11 @@ pub fn extract_and_strip_xml_vars(content: &str) -> (String, HashMap<String, Str
 pub struct StateFrontmatter {
     /// Whether this state waits for user input before executing.
     pub wait: bool,
+    /// Whether tools are enabled for this state.
+    /// `None` = not specified (all tools, backward compatible).
+    /// `Some(false)` = no tools sent to LLM.
+    /// `Some(true)` = tools enabled (same as default).
+    pub tools: Option<bool>,
 }
 
 /// Parse YAML frontmatter from a state file.
@@ -302,6 +307,9 @@ pub fn parse_state_frontmatter(content: &str) -> (StateFrontmatter, &str) {
             let line = line.trim();
             if let Some(val) = line.strip_prefix("wait:") {
                 fm.wait = val.trim() == "true";
+            }
+            if let Some(val) = line.strip_prefix("tools:") {
+                fm.tools = Some(val.trim() == "true");
             }
         }
 
@@ -679,5 +687,41 @@ mod tests {
         let (final_cleaned, vars) = extract_and_strip_set_vars(&cleaned);
         assert_eq!(vars.get("x").unwrap(), "1");
         assert_eq!(final_cleaned, "Response.");
+    }
+
+    // --- tools frontmatter tests ---
+
+    #[test]
+    fn test_parse_frontmatter_tools_false() {
+        let content = "---\ntools: false\n---\nRoute the request.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.tools, Some(false));
+        assert_eq!(body, "Route the request.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_tools_true() {
+        let content = "---\ntools: true\n---\nDo work.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.tools, Some(true));
+        assert_eq!(body, "Do work.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_wait_and_tools() {
+        let content = "---\nwait: true\ntools: false\n---\nWait without tools.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(fm.wait);
+        assert_eq!(fm.tools, Some(false));
+        assert_eq!(body, "Wait without tools.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_tools_not_specified() {
+        let content = "---\nwait: true\n---\nJust wait.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(fm.wait);
+        assert_eq!(fm.tools, None);
+        assert_eq!(body, "Just wait.");
     }
 }
