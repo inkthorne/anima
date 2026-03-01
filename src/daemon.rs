@@ -3145,6 +3145,7 @@ async fn run_tool_loop(
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_cached_tokens: Option<u32> = None;
     let mut last_dump_turn_n: Option<u64> = None;
+    let mut prev_iter_had_tools = false;
 
     for _iteration in 0..max_iterations {
         // Check wall-clock time limit
@@ -3197,18 +3198,26 @@ async fn run_tool_loop(
         // Apply state template wrapping if a state is active
         let llm_message = if let Some(dir) = state_dir {
             if let Some(ref state_file) = state_before {
-                let template_path = dir.join(format!("{}.md", state_file.trim()));
-                match std::fs::read_to_string(&template_path) {
-                    Ok(template) => {
-                        // Parse and strip YAML frontmatter (Gap 1)
-                        let (_, body) = crate::pipeline::parse_state_frontmatter(&template);
-                        let wrapped = crate::pipeline::expand_vars(body, &state_vars);
-                        logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
-                        wrapped
-                    }
-                    Err(_) => {
-                        logger.log(&format!("[state] Template not found: {}", state_file.trim()));
-                        current_message.clone()
+                if prev_iter_had_tools {
+                    // Continuing tool chain — don't re-inject template instructions.
+                    // The template is already in conversation history from the first iteration;
+                    // the LLM just needs to continue from tool results.
+                    logger.log(&format!("[state] Tool chain continuation, skipping template re-wrap for: {}", state_file.trim()));
+                    current_message.clone()
+                } else {
+                    let template_path = dir.join(format!("{}.md", state_file.trim()));
+                    match std::fs::read_to_string(&template_path) {
+                        Ok(template) => {
+                            // Parse and strip YAML frontmatter (Gap 1)
+                            let (_, body) = crate::pipeline::parse_state_frontmatter(&template);
+                            let wrapped = crate::pipeline::expand_vars(body, &state_vars);
+                            logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
+                            wrapped
+                        }
+                        Err(_) => {
+                            logger.log(&format!("[state] Template not found: {}", state_file.trim()));
+                            current_message.clone()
+                        }
                     }
                 }
             } else {
@@ -3879,6 +3888,8 @@ async fn run_tool_loop(
                         };
                     }
                 }
+
+                prev_iter_had_tools = tool_executed;
 
                 // Refresh context from DB using cursor-based append system
                 if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, logger, num_ctx) {
