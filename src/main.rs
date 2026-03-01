@@ -1372,6 +1372,27 @@ fn format_verbose_output(kind: &str, data: &serde_json::Value) {
                 name, status, duration_ms, preview_str
             );
         }
+        "user_prompt" => {
+            let content = data["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                eprintln!("\x1b[32m--- user prompt ---\x1b[0m");
+                eprintln!("\x1b[32m{}\x1b[0m", content);
+                eprintln!("\x1b[32m--- end prompt ---\x1b[0m");
+            }
+        }
+        "state_frontmatter" => {
+            let state = data["state"].as_str().unwrap_or("?");
+            let wait = data["wait"].as_bool().unwrap_or(false);
+            let tools = &data["tools"];
+            let tools_str = match tools {
+                serde_json::Value::Bool(b) => format!("{}", b),
+                _ => "default".to_string(),
+            };
+            eprintln!(
+                "\x1b[31m[frontmatter] state={} wait={} tools={}\x1b[0m",
+                state, wait, tools_str
+            );
+        }
         "memory" => {
             let content = data["content"].as_str().unwrap_or("");
             if !content.is_empty() {
@@ -1413,6 +1434,9 @@ async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::e
             .map_err(|e| format!("Failed to read response: {}", e))?
         {
             Some(Response::Chunk { text }) => {
+                if !had_chunks {
+                    print!("\x1b[33m");
+                }
                 had_chunks = true;
                 print!("{}", text);
                 io::stdout().flush()?;
@@ -1433,6 +1457,9 @@ async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::e
                 format_verbose_output(&kind, &data);
             }
             Some(Response::Done) => {
+                if had_chunks {
+                    print!("\x1b[0m");
+                }
                 println!();
                 break;
             }
@@ -1594,7 +1621,7 @@ async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
 
     if !discovery::is_agent_running(&agent_name) {
         return Err(format!(
-            "Agent '{}' is not running. Use `anima start {} <message>` first.",
+            "Agent '{}' is not running. Use `anima agent debug {} \"<message>\"` first.",
             agent_name, agent
         ).into());
     }

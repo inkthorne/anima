@@ -3225,6 +3225,20 @@ async fn run_tool_loop(
                     let fm = std::fs::read_to_string(&template_path)
                         .ok()
                         .map(|t| crate::pipeline::parse_state_frontmatter(&t).0);
+                    if let Some(ref vtx) = verbose_tx {
+                        if let Some(ref fm_val) = fm {
+                            if fm_val.wait || fm_val.tools.is_some() {
+                                let _ = vtx.send(Response::Verbose {
+                                    kind: "state_frontmatter".to_string(),
+                                    data: serde_json::json!({
+                                        "state": state_file.trim(),
+                                        "wait": fm_val.wait,
+                                        "tools": fm_val.tools,
+                                    }),
+                                }).await;
+                            }
+                        }
+                    }
                     (reminder, fm)
                 } else {
                     let template_path = dir.join(format!("{}.md", state_file.trim()));
@@ -3234,6 +3248,18 @@ async fn run_tool_loop(
                             let (fm, body) = crate::pipeline::parse_state_frontmatter(&template);
                             let wrapped = crate::pipeline::expand_vars(body, &state_vars);
                             logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
+                            if let Some(ref vtx) = verbose_tx {
+                                if fm.wait || fm.tools.is_some() {
+                                    let _ = vtx.send(Response::Verbose {
+                                        kind: "state_frontmatter".to_string(),
+                                        data: serde_json::json!({
+                                            "state": state_file.trim(),
+                                            "wait": fm.wait,
+                                            "tools": fm.tools,
+                                        }),
+                                    }).await;
+                                }
+                            }
                             (wrapped, Some(fm))
                         }
                         Err(_) => {
@@ -3257,6 +3283,14 @@ async fn run_tool_loop(
             }
             _ => external_tools.clone(),
         };
+
+        // Emit verbose: user_prompt (the full state-wrapped, recall-injected message)
+        if let Some(ref vtx) = verbose_tx {
+            let _ = vtx.send(Response::Verbose {
+                kind: "user_prompt".to_string(),
+                data: serde_json::json!({ "content": llm_message }),
+            }).await;
+        }
 
         let options = ThinkOptions {
             system_prompt: system_prompt.clone(),
