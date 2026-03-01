@@ -3381,6 +3381,8 @@ async fn run_tool_loop(
                 // Tool calls take priority — state processing only happens on the
                 // final non-tool-calling response (Gap 7).
                 let mut tool_executed = false;
+                let mut pending_state: Option<String> = None;
+                let mut pending_state_source = String::new();
                 let final_response_text;
 
                 if use_native_tools {
@@ -3432,6 +3434,16 @@ async fn run_tool_loop(
                         let _ = results; // consumed
                         tool_executed = true;
                         final_response_text = String::new(); // unused when tool_executed
+
+                        // Check if LLM emitted a state transition alongside tool calls
+                        if state_dir.is_some() {
+                            let (_, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
+                            if !state_tags.is_empty() {
+                                pending_state = Some(state_tags.last().unwrap().clone());
+                                pending_state_source = after_remember.clone();
+                                logger.log(&format!("[state] Detected <next-state> alongside tools: {}", pending_state.as_ref().unwrap()));
+                            }
+                        }
                     } else {
                         // No native tool calls — check for <python> auto-execute blocks
                         let (_, python_blocks) = extract_python_blocks(&after_remember);
@@ -3508,6 +3520,16 @@ async fn run_tool_loop(
                             current_message = String::new();
                             tool_executed = true;
                             final_response_text = String::new(); // unused when tool_executed
+
+                            // Check if LLM emitted a state transition alongside python execution
+                            if state_dir.is_some() {
+                                let (_, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
+                                if !state_tags.is_empty() {
+                                    pending_state = Some(state_tags.last().unwrap().clone());
+                                    pending_state_source = after_remember.clone();
+                                    logger.log(&format!("[state] Detected <next-state> alongside python: {}", pending_state.as_ref().unwrap()));
+                                }
+                            }
                         } else {
                             // No tool calls in native mode
                             final_response_text = after_remember;
@@ -3615,6 +3637,16 @@ async fn run_tool_loop(
                         current_message = tool_message;
                         tool_executed = true;
                         final_response_text = String::new(); // unused when tool_executed
+
+                        // Check if LLM emitted a state transition alongside tool call
+                        if state_dir.is_some() {
+                            let (_, state_tags) = crate::pipeline::extract_state_tags(&cleaned_response);
+                            if !state_tags.is_empty() {
+                                pending_state = Some(state_tags.last().unwrap().clone());
+                                pending_state_source = cleaned_response.clone();
+                                logger.log(&format!("[state] Detected <next-state> alongside tools: {}", pending_state.as_ref().unwrap()));
+                            }
+                        }
                     } else {
                         // No JSON tool call — check for <python> auto-execute blocks
                         let (_, python_blocks) = extract_python_blocks(&cleaned_response);
@@ -3693,6 +3725,16 @@ async fn run_tool_loop(
                             current_message = String::new();
                             tool_executed = true;
                             final_response_text = String::new(); // unused when tool_executed
+
+                            // Check if LLM emitted a state transition alongside python execution
+                            if state_dir.is_some() {
+                                let (_, state_tags) = crate::pipeline::extract_state_tags(&cleaned_response);
+                                if !state_tags.is_empty() {
+                                    pending_state = Some(state_tags.last().unwrap().clone());
+                                    pending_state_source = cleaned_response.clone();
+                                    logger.log(&format!("[state] Detected <next-state> alongside python: {}", pending_state.as_ref().unwrap()));
+                                }
+                            }
                         } else {
                             // No tool calls in JSON-block mode
                             final_response_text = cleaned_response;
@@ -3889,7 +3931,38 @@ async fn run_tool_loop(
                     }
                 }
 
-                prev_iter_had_tools = tool_executed;
+                // Process state transition that was detected alongside tool calls
+                if tool_executed {
+                    if let Some(ref new_state) = pending_state {
+                        if let Some(dir) = state_dir {
+                            let new_template_path = dir.join(format!("{}.md", new_state.trim()));
+                            if new_template_path.exists() {
+                                let (stripped, _) = crate::pipeline::extract_state_tags(&pending_state_source);
+                                let (stripped, _) = crate::pipeline::extract_handoff_tag(&stripped);
+                                let (stripped, clear_vars) = crate::pipeline::extract_clear_vars_tag(&stripped);
+                                let (stripped, set_vars) = crate::pipeline::extract_and_strip_set_vars(&stripped);
+
+                                if clear_vars {
+                                    let user_preserved = state_vars.get("user").cloned().unwrap_or_default();
+                                    state_vars.clear();
+                                    state_vars.insert("user".to_string(), user_preserved);
+                                    logger.log("[state] Variables cleared");
+                                }
+                                for (k, v) in set_vars {
+                                    state_vars.insert(k, v);
+                                }
+                                state_vars.insert("assistant".to_string(), stripped);
+
+                                let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
+                                logger.log(&format!("[state] Transition → {} (after tools)", new_state));
+                            } else {
+                                logger.log(&format!("[state] Invalid pending state: {}", new_state));
+                            }
+                        }
+                    }
+                }
+
+                prev_iter_had_tools = if pending_state.is_some() { false } else { tool_executed };
 
                 // Refresh context from DB using cursor-based append system
                 if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, logger, num_ctx) {
