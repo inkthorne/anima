@@ -256,6 +256,12 @@ pub fn extract_and_strip_set_vars(content: &str) -> (String, HashMap<String, Str
     (cleaned, vars)
 }
 
+/// Peek at the `state` key inside a `<set-vars>` block without stripping.
+pub fn peek_state_from_set_vars(content: &str) -> Option<String> {
+    let vars = extract_set_vars(content);
+    vars.get("state").cloned()
+}
+
 /// Extract XML vars from content AND return cleaned content with var tags stripped.
 /// Like `extract_xml_vars` but also removes the matched tags from the content.
 pub fn extract_and_strip_xml_vars(content: &str) -> (String, HashMap<String, String>) {
@@ -654,6 +660,39 @@ mod tests {
         let content = "<set-vars>\n  <code>fn main() {\n    println!(\"hello\");\n}</code>\n</set-vars>";
         let vars = extract_set_vars(content);
         assert_eq!(vars.get("code").unwrap(), "fn main() {\n    println!(\"hello\");\n}");
+    }
+
+    // --- peek_state_from_set_vars tests ---
+
+    #[test]
+    fn test_peek_state_from_set_vars_found() {
+        let content = "Some text\n<set-vars>\n  <state>plan</state>\n  <task>do stuff</task>\n</set-vars>";
+        assert_eq!(peek_state_from_set_vars(content), Some("plan".to_string()));
+    }
+
+    #[test]
+    fn test_peek_state_from_set_vars_none() {
+        let content = "No set-vars here.";
+        assert_eq!(peek_state_from_set_vars(content), None);
+    }
+
+    #[test]
+    fn test_peek_state_from_set_vars_no_state_key() {
+        let content = "<set-vars>\n  <task>do stuff</task>\n</set-vars>";
+        assert_eq!(peek_state_from_set_vars(content), None);
+    }
+
+    #[test]
+    fn test_peek_state_from_set_vars_round_trip() {
+        // Ensure state is preserved when extract_and_strip_set_vars processes the same content
+        let content = "Response text.\n\n<set-vars>\n  <state>review</state>\n  <topic>rust</topic>\n</set-vars>";
+        let peeked = peek_state_from_set_vars(content);
+        assert_eq!(peeked, Some("review".to_string()));
+
+        let (stripped, vars) = extract_and_strip_set_vars(content);
+        assert_eq!(vars.get("state").cloned(), Some("review".to_string()));
+        assert_eq!(vars.get("topic").cloned(), Some("rust".to_string()));
+        assert_eq!(stripped, "Response text.");
     }
 
     #[test]

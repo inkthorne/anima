@@ -3220,7 +3220,7 @@ async fn run_tool_loop(
                     let available = list_state_files(dir);
                     let reminder = format!(
                         "[You are in the '{}' state. Continue using tools if needed. \
-                         When finished, emit <next-state>STATE_NAME</next-state> to proceed. \
+                         When finished, emit <set-vars><state>STATE_NAME</state></set-vars> to proceed. \
                          Available states: {}.]",
                         state_file.trim(),
                         available,
@@ -3445,7 +3445,7 @@ async fn run_tool_loop(
                 let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
                 let (after_remember, llm_notes) = extract_llm_notes(&after_remember);
 
-                // Full response for DB: preserve thinking and next-state tags, strip REMEMBER/handoff/set-vars
+                // Full response for DB: preserve thinking tags, strip REMEMBER/handoff/set-vars
                 let (db_content, _) = extract_remember_tags(&think_result.response);
                 let (db_content, _) = extract_llm_notes(&db_content);
                 let (db_content, _) = crate::pipeline::extract_handoff_tag(&db_content);
@@ -3522,11 +3522,10 @@ async fn run_tool_loop(
 
                         // Check if LLM emitted a state transition alongside tool calls
                         if state_dir.is_some() {
-                            let (_, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
-                            if !state_tags.is_empty() {
-                                pending_state = Some(state_tags.last().unwrap().clone());
+                            if let Some(st) = crate::pipeline::peek_state_from_set_vars(&after_remember) {
+                                pending_state = Some(st.clone());
                                 pending_state_source = after_remember.clone();
-                                logger.log(&format!("[state] Detected <next-state> alongside tools: {}", pending_state.as_ref().unwrap()));
+                                logger.log(&format!("[state] Detected <state> in <set-vars> alongside tools: {}", st));
                             }
                         }
                     } else {
@@ -3608,11 +3607,10 @@ async fn run_tool_loop(
 
                             // Check if LLM emitted a state transition alongside python execution
                             if state_dir.is_some() {
-                                let (_, state_tags) = crate::pipeline::extract_state_tags(&after_remember);
-                                if !state_tags.is_empty() {
-                                    pending_state = Some(state_tags.last().unwrap().clone());
+                                if let Some(st) = crate::pipeline::peek_state_from_set_vars(&after_remember) {
+                                    pending_state = Some(st.clone());
                                     pending_state_source = after_remember.clone();
-                                    logger.log(&format!("[state] Detected <next-state> alongside python: {}", pending_state.as_ref().unwrap()));
+                                    logger.log(&format!("[state] Detected <state> in <set-vars> alongside python: {}", st));
                                 }
                             }
                         } else {
@@ -3725,11 +3723,10 @@ async fn run_tool_loop(
 
                         // Check if LLM emitted a state transition alongside tool call
                         if state_dir.is_some() {
-                            let (_, state_tags) = crate::pipeline::extract_state_tags(&cleaned_response);
-                            if !state_tags.is_empty() {
-                                pending_state = Some(state_tags.last().unwrap().clone());
+                            if let Some(st) = crate::pipeline::peek_state_from_set_vars(&cleaned_response) {
+                                pending_state = Some(st.clone());
                                 pending_state_source = cleaned_response.clone();
-                                logger.log(&format!("[state] Detected <next-state> alongside tools: {}", pending_state.as_ref().unwrap()));
+                                logger.log(&format!("[state] Detected <state> in <set-vars> alongside tools: {}", st));
                             }
                         }
                     } else {
@@ -3813,11 +3810,10 @@ async fn run_tool_loop(
 
                             // Check if LLM emitted a state transition alongside python execution
                             if state_dir.is_some() {
-                                let (_, state_tags) = crate::pipeline::extract_state_tags(&cleaned_response);
-                                if !state_tags.is_empty() {
-                                    pending_state = Some(state_tags.last().unwrap().clone());
+                                if let Some(st) = crate::pipeline::peek_state_from_set_vars(&cleaned_response) {
+                                    pending_state = Some(st.clone());
                                     pending_state_source = cleaned_response.clone();
-                                    logger.log(&format!("[state] Detected <next-state> alongside python: {}", pending_state.as_ref().unwrap()));
+                                    logger.log(&format!("[state] Detected <state> in <set-vars> alongside python: {}", st));
                                 }
                             }
                         } else {
@@ -3831,14 +3827,13 @@ async fn run_tool_loop(
                 if !tool_executed {
                     if let Some(dir) = state_dir {
                         if state_before.is_some() {
-                            // Extract state tags, clear-vars, and set-vars from final response
-                            let (stripped, state_tags) = crate::pipeline::extract_state_tags(&final_response_text);
-                            let (stripped, handoff) = crate::pipeline::extract_handoff_tag(&stripped);
+                            // Extract state (from set-vars), clear-vars, and set-vars from final response
+                            let (stripped, handoff) = crate::pipeline::extract_handoff_tag(&final_response_text);
                             let (stripped, clear_vars) = crate::pipeline::extract_clear_vars_tag(&stripped);
                             let (stripped, set_vars) = crate::pipeline::extract_and_strip_set_vars(&stripped);
+                            let new_state_opt = set_vars.get("state").cloned();
 
-                            if !state_tags.is_empty() {
-                                let new_state = state_tags.last().unwrap();
+                            if let Some(ref new_state) = new_state_opt {
 
                                 // Gap 6: Validate state file exists
                                 let new_template_path = dir.join(format!("{}.md", new_state.trim()));
@@ -3861,7 +3856,7 @@ async fn run_tool_loop(
                                     }
                                     let available = list_state_files(dir);
                                     current_message = format!(
-                                        "[State error: '{}' does not exist. Available states: {}. Choose a valid state with <next-state>name</next-state>.]",
+                                        "[State error: '{}' does not exist. Available states: {}. Choose a valid state with <state>name</state> inside <set-vars>.]",
                                         new_state, available
                                     );
                                     // Store error as tool result so LLM sees it
@@ -3965,8 +3960,8 @@ async fn run_tool_loop(
                                     dump_turn_n: last_dump_turn_n,
                                 };
                             } else {
-                                // Gap 6: Missing <next-state> — error feedback to LLM
-                                logger.log("[state] Missing <next-state> tag, notifying LLM");
+                                // Gap 6: Missing <state> in <set-vars> — error feedback to LLM
+                                logger.log("[state] Missing <state> in <set-vars>, notifying LLM");
                                 // Store response in DB before error feedback
                                 if !db_content.trim().is_empty() {
                                     match store.add_message_with_tokens(
@@ -3984,7 +3979,7 @@ async fn run_tool_loop(
                                 }
                                 let available = list_state_files(dir);
                                 current_message = format!(
-                                    "[State error: You must emit a <next-state>state_name</next-state> tag. Available states: {}.]",
+                                    "[State error: You must include <state>state_name</state> inside your <set-vars> block. Available states: {}.]",
                                     available
                                 );
                                 // Store error as tool result so LLM sees it
@@ -4027,8 +4022,7 @@ async fn run_tool_loop(
                         if let Some(dir) = state_dir {
                             let new_template_path = dir.join(format!("{}.md", new_state.trim()));
                             if new_template_path.exists() {
-                                let (stripped, _) = crate::pipeline::extract_state_tags(&pending_state_source);
-                                let (stripped, _) = crate::pipeline::extract_handoff_tag(&stripped);
+                                let (stripped, _) = crate::pipeline::extract_handoff_tag(&pending_state_source);
                                 let (stripped, clear_vars) = crate::pipeline::extract_clear_vars_tag(&stripped);
                                 let (stripped, set_vars) = crate::pipeline::extract_and_strip_set_vars(&stripped);
 
