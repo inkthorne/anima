@@ -3279,7 +3279,7 @@ async fn run_tool_loop(
         let effective_tools = match state_fm.as_ref().and_then(|fm| fm.tools) {
             Some(false) => {
                 logger.log("[state] Tools disabled for this state (tools: false)");
-                None
+                Some(vec![])
             }
             _ => external_tools.clone(),
         };
