@@ -99,8 +99,16 @@ enum Commands {
         verbose: bool,
     },
     /// Start an agent daemon in the background. Supports glob patterns (*, ?).
+    /// With a message: step-debug mode (restart, fresh conversation, one iteration).
     Start {
         /// Agent name or glob pattern (from ~/.anima/agents/)
+        agent: String,
+        /// Optional message for step-debug mode
+        message: Vec<String>,
+    },
+    /// Step-debug: process one more iteration of the tool loop
+    Step {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
     },
     /// Stop a running agent daemon. Supports glob patterns (*, ?).
@@ -355,8 +363,21 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Start { agent } => {
-            if let Err(e) = start_agent(&agent) {
+        Commands::Start { agent, message } => {
+            if message.is_empty() {
+                if let Err(e) = start_agent(&agent) {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            } else {
+                if let Err(e) = start_agent_debug(&agent, &message.join(" ")).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Step { agent } => {
+            if let Err(e) = step_agent(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -1367,6 +1388,58 @@ fn format_verbose_output(kind: &str, data: &serde_json::Value) {
     }
 }
 
+/// Stream agent response from a SocketApi connection.
+/// Prints chunks to stdout, verbose/tool events to stderr.
+async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::error::Error>> {
+    let mut had_chunks = false;
+    loop {
+        match api
+            .read_response()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?
+        {
+            Some(Response::Chunk { text }) => {
+                had_chunks = true;
+                print!("{}", text);
+                io::stdout().flush()?;
+            }
+            Some(Response::ToolCall { tool, params }) => {
+                if had_chunks {
+                    eprintln!();
+                    had_chunks = false;
+                }
+                let param_summary = format_tool_params(&params);
+                eprintln!(" - [tool] {}: {}", tool, param_summary);
+            }
+            Some(Response::Verbose { kind, data }) => {
+                if had_chunks {
+                    eprintln!();
+                    had_chunks = false;
+                }
+                format_verbose_output(&kind, &data);
+            }
+            Some(Response::Done) => {
+                println!();
+                break;
+            }
+            Some(Response::Message { content }) => {
+                println!("{}", content);
+                break;
+            }
+            Some(Response::Error { message }) => {
+                eprintln!("Error from agent: {}", message);
+                std::process::exit(1);
+            }
+            None => {
+                eprintln!("Connection closed unexpectedly");
+                std::process::exit(1);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     use anima::discovery;
 
@@ -1418,58 +1491,112 @@ async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<
         content: message.to_string(),
         conv_name: Some(conv_name),
         verbose,
+        max_iterations: None,
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    let mut had_chunks = false;
-    loop {
-        match api
-            .read_response()
-            .await
-            .map_err(|e| format!("Failed to read response: {}", e))?
-        {
-            Some(Response::Chunk { text }) => {
-                had_chunks = true;
-                print!("{}", text);
-                io::stdout().flush()?;
-            }
-            Some(Response::ToolCall { tool, params }) => {
-                if had_chunks {
-                    eprintln!();
-                    had_chunks = false;
-                }
-                let param_summary = format_tool_params(&params);
-                eprintln!(" - [tool] {}: {}", tool, param_summary);
-            }
-            Some(Response::Verbose { kind, data }) => {
-                if had_chunks {
-                    eprintln!();
-                    had_chunks = false;
-                }
-                format_verbose_output(&kind, &data);
-            }
-            Some(Response::Done) => {
-                println!();
-                break;
-            }
-            Some(Response::Message { content }) => {
-                println!("{}", content);
-                break;
-            }
-            Some(Response::Error { message }) => {
-                eprintln!("Error from agent: {}", message);
-                std::process::exit(1);
-            }
-            None => {
-                eprintln!("Connection closed unexpectedly");
-                std::process::exit(1);
-            }
-            _ => {}
+    stream_agent_response(&mut api).await
+}
+
+/// Step-debug: fresh start. Restart daemon, delete & recreate conversation,
+/// send user message, process one iteration, stream response.
+async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery;
+
+    let agent_path = resolve_agent_path(agent);
+
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    let agent_dir = AgentDir::load(&agent_path)
+        .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
+    let agent_name = agent_dir.config.agent.name.clone();
+
+    // Stop daemon if running
+    if discovery::is_agent_running(&agent_name) {
+        eprintln!("\x1b[33mStopping daemon for '{}'...\x1b[0m", agent_name);
+        stop_agent_impl(&agent_name, true, true).await?;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Start daemon
+    eprintln!("\x1b[33mStarting daemon for '{}'...\x1b[0m", agent_name);
+    start_agent_impl(&agent_name, true)?;
+
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if discovery::is_agent_running(&agent_name) {
+            break;
         }
     }
 
-    Ok(())
+    if !discovery::is_agent_running(&agent_name) {
+        return Err(format!("Daemon for '{}' failed to start", agent_name).into());
+    }
+
+    // Delete and recreate conversation
+    let store = ConversationStore::init()?;
+    let conv_name = agent_name.clone();
+
+    if store.find_by_name(&conv_name)?.is_some() {
+        store.delete_conversation(&conv_name)?;
+    }
+    store.create_conversation(Some(&conv_name), &["user", &agent_name])?;
+
+    // Store user message
+    store.add_message(&conv_name, "user", message, &[])?;
+
+    // Connect and send with max_iterations=1
+    let mut api = connect_to_agent(&agent_name).await?;
+
+    api.write_request(&Request::Message {
+        content: message.to_string(),
+        conv_name: Some(conv_name),
+        verbose: true,
+        max_iterations: Some(1),
+    })
+    .await
+    .map_err(|e| format!("Failed to send message: {}", e))?;
+
+    stream_agent_response(&mut api).await
+}
+
+/// Step-debug: continue from current conversation state.
+/// Process one more iteration of the tool loop.
+async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::discovery;
+
+    let agent_path = resolve_agent_path(agent);
+
+    if !agent_path.exists() {
+        return Err(format!("Agent '{}' not found at {}", agent, agent_path.display()).into());
+    }
+
+    let agent_dir = AgentDir::load(&agent_path)
+        .map_err(|e| format!("Failed to load agent '{}': {}", agent, e))?;
+    let agent_name = agent_dir.config.agent.name.clone();
+
+    if !discovery::is_agent_running(&agent_name) {
+        return Err(format!(
+            "Agent '{}' is not running. Use `anima start {} <message>` first.",
+            agent_name, agent
+        ).into());
+    }
+
+    let mut api = connect_to_agent(&agent_name).await?;
+
+    api.write_request(&Request::Message {
+        content: String::new(),
+        conv_name: Some(agent_name.clone()),
+        verbose: true,
+        max_iterations: Some(1),
+    })
+    .await
+    .map_err(|e| format!("Failed to send message: {}", e))?;
+
+    stream_agent_response(&mut api).await
 }
 
 // ---------------------------------------------------------------------------

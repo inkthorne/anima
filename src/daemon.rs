@@ -155,6 +155,8 @@ pub enum AgentWork {
         token_tx: Option<mpsc::Sender<String>>,
         /// Verbose event sender (thinking, usage, tool calls, memory)
         verbose_tx: Option<mpsc::Sender<Response>>,
+        /// Per-request max iterations override (None = use config default)
+        max_iterations: Option<usize>,
     },
     /// Process a notify request (conversation @mention)
     Notify {
@@ -2357,6 +2359,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             response_tx,
                             token_tx: None,
                             verbose_tx: None,
+                            max_iterations: None,
                         }).is_ok() {
                             match response_rx.await {
                                 Ok(result) => {
@@ -2837,7 +2840,9 @@ async fn agent_worker(
                 response_tx,
                 token_tx,
                 verbose_tx,
+                max_iterations: work_max_iterations,
             } => {
+                let effective_max_iter = work_max_iterations.or(max_iterations);
                 logger.log(&format!("[worker] Processing message: {}", content));
                 let result = process_message_work(
                     &content,
@@ -2860,7 +2865,7 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
-                    max_iterations,
+                    effective_max_iter,
                     num_ctx,
                     dedup_lazy,
                     Some(&agent_dir),
@@ -3196,35 +3201,61 @@ async fn run_tool_loop(
         };
 
         // Apply state template wrapping if a state is active
-        let llm_message = if let Some(dir) = state_dir {
+        // Returns (message, Option<StateFrontmatter>) so we can apply per-state tool control
+        let (llm_message, state_fm) = if let Some(dir) = state_dir {
             if let Some(ref state_file) = state_before {
                 if prev_iter_had_tools {
-                    // Continuing tool chain — don't re-inject template instructions.
-                    // The template is already in conversation history from the first iteration;
-                    // the LLM just needs to continue from tool results.
-                    logger.log(&format!("[state] Tool chain continuation, skipping template re-wrap for: {}", state_file.trim()));
-                    current_message.clone()
+                    // Continuing tool chain — inject a brief state reminder so the LLM
+                    // remembers to emit <next-state> when done, without re-injecting
+                    // the full template (which would duplicate {{user}} and restart work).
+                    let available = list_state_files(dir);
+                    let reminder = format!(
+                        "[You are in the '{}' state. Continue using tools if needed. \
+                         When finished, emit <next-state>STATE_NAME</next-state> to proceed. \
+                         Available states: {}.]",
+                        state_file.trim(),
+                        available,
+                    );
+                    logger.log(&format!(
+                        "[state] Tool chain continuation, injecting state reminder for: {}",
+                        state_file.trim()
+                    ));
+                    // Re-read state file to get frontmatter for tool control
+                    let template_path = dir.join(format!("{}.md", state_file.trim()));
+                    let fm = std::fs::read_to_string(&template_path)
+                        .ok()
+                        .map(|t| crate::pipeline::parse_state_frontmatter(&t).0);
+                    (reminder, fm)
                 } else {
                     let template_path = dir.join(format!("{}.md", state_file.trim()));
                     match std::fs::read_to_string(&template_path) {
                         Ok(template) => {
                             // Parse and strip YAML frontmatter (Gap 1)
-                            let (_, body) = crate::pipeline::parse_state_frontmatter(&template);
+                            let (fm, body) = crate::pipeline::parse_state_frontmatter(&template);
                             let wrapped = crate::pipeline::expand_vars(body, &state_vars);
                             logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
-                            wrapped
+                            (wrapped, Some(fm))
                         }
                         Err(_) => {
                             logger.log(&format!("[state] Template not found: {}", state_file.trim()));
-                            current_message.clone()
+                            (current_message.clone(), None)
                         }
                     }
                 }
             } else {
-                current_message.clone()
+                (current_message.clone(), None)
             }
         } else {
-            current_message.clone()
+            (current_message.clone(), None)
+        };
+
+        // Apply per-state tool control: if frontmatter has `tools: false`, disable tools
+        let effective_tools = match state_fm.as_ref().and_then(|fm| fm.tools) {
+            Some(false) => {
+                logger.log("[state] Tools disabled for this state (tools: false)");
+                None
+            }
+            _ => external_tools.clone(),
         };
 
         let options = ThinkOptions {
@@ -3234,7 +3265,7 @@ async fn run_tool_loop(
             } else {
                 Some(conversation_history.clone())
             },
-            external_tools: external_tools.clone(),
+            external_tools: effective_tools,
             num_ctx,
             log_tx: Some(log_tx.clone()),
             ..Default::default()
@@ -4037,10 +4068,14 @@ async fn run_tool_loop(
     }
 
     logger.log(&format!("[loop] Max iterations reached: {}", max_iterations));
+    // In step mode (max_iterations <= 1), return empty db_response to avoid
+    // storing noise — the intermediate assistant messages and tool results
+    // are already stored during the loop.
     let msg = format!("[Max iterations reached: {}]", max_iterations);
+    let db_msg = if max_iterations <= 1 { String::new() } else { msg.clone() };
     ToolLoopResult {
-        response: msg.clone(),
-        db_response: msg,
+        response: msg,
+        db_response: db_msg,
         duration_ms: last_duration_ms,
         tokens_in: last_tokens_in,
         tokens_out: last_tokens_out,
@@ -5909,6 +5944,7 @@ async fn handle_connection(
                 ref content,
                 ref conv_name,
                 verbose,
+                max_iterations,
             } => {
                 logger.log(&format!("[socket] Received message: {}{}", content, if verbose { " (verbose)" } else { "" }));
 
@@ -5934,6 +5970,7 @@ async fn handle_connection(
                         response_tx,
                         token_tx: Some(token_tx),
                         verbose_tx,
+                        max_iterations: max_iterations,
                     })
                     .is_err()
                 {
