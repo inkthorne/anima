@@ -2864,6 +2864,8 @@ async fn agent_worker(
                     num_ctx,
                     dedup_lazy,
                     Some(&agent_dir),
+                    state_dir.as_deref(),
+                    initial_state.as_deref(),
                 )
                 .await;
                 let _ = response_tx.send(result);
@@ -3992,6 +3994,8 @@ async fn process_message_work(
     num_ctx: Option<u32>,
     dedup_lazy: bool,
     agent_dir: Option<&Path>,
+    state_dir: Option<&Path>,
+    initial_state: Option<&str>,
 ) -> MessageWorkResult {
     // Set current conversation for debug file naming
     {
@@ -4155,8 +4159,8 @@ async fn process_message_work(
             logger,
             log_tx.clone(),
             dedup_lazy,
-            None, // no state for REPL messages
-            None,
+            state_dir,
+            initial_state,
             verbose_tx,
         ).await;
 
