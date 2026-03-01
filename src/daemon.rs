@@ -1565,6 +1565,7 @@ fn execute_tool_call<'a>(
 
             let loop_result = run_tool_loop(
                 &wrapped_content,
+                &final_user_content,
                 conversation_history,
                 agent,
                 &ctx.agent_name,
@@ -3086,6 +3087,7 @@ struct ToolLoopResult {
 async fn run_tool_loop(
     // Initial state
     initial_message: &str,
+    raw_user_content: &str,
     conversation_history: Vec<ChatMessage>,
     // Agent & config
     agent: &Arc<Mutex<Agent>>,
@@ -3142,8 +3144,15 @@ async fn run_tool_loop(
     let mut conversation_history = conversation_history;
     let mut current_message = initial_message.to_string();
     let mut tool_call_count = 0usize;
-    let mut state_vars: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    state_vars.insert("user".to_string(), initial_message.to_string());
+    let mut state_vars: std::collections::HashMap<String, String> = store
+        .get_participant_vars(conv_name, agent_name)
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    if !raw_user_content.is_empty() {
+        state_vars.insert("user".to_string(), raw_user_content.to_string());
+    }
     let mut last_duration_ms: Option<u64> = None;
     let mut last_tokens_in: Option<u32> = None;
     let mut last_tokens_out: Option<u32> = None;
@@ -3227,16 +3236,14 @@ async fn run_tool_loop(
                         .map(|t| crate::pipeline::parse_state_frontmatter(&t).0);
                     if let Some(ref vtx) = verbose_tx {
                         if let Some(ref fm_val) = fm {
-                            if fm_val.wait || fm_val.tools.is_some() {
-                                let _ = vtx.send(Response::Verbose {
-                                    kind: "state_frontmatter".to_string(),
-                                    data: serde_json::json!({
-                                        "state": state_file.trim(),
-                                        "wait": fm_val.wait,
-                                        "tools": fm_val.tools,
-                                    }),
-                                }).await;
-                            }
+                            let _ = vtx.send(Response::Verbose {
+                                kind: "state_frontmatter".to_string(),
+                                data: serde_json::json!({
+                                    "state": state_file.trim(),
+                                    "wait": fm_val.wait,
+                                    "tools": fm_val.tools,
+                                }),
+                            }).await;
                         }
                     }
                     (reminder, fm)
@@ -3249,16 +3256,14 @@ async fn run_tool_loop(
                             let wrapped = crate::pipeline::expand_vars(body, &state_vars);
                             logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
                             if let Some(ref vtx) = verbose_tx {
-                                if fm.wait || fm.tools.is_some() {
-                                    let _ = vtx.send(Response::Verbose {
-                                        kind: "state_frontmatter".to_string(),
-                                        data: serde_json::json!({
-                                            "state": state_file.trim(),
-                                            "wait": fm.wait,
-                                            "tools": fm.tools,
-                                        }),
-                                    }).await;
-                                }
+                                let _ = vtx.send(Response::Verbose {
+                                    kind: "state_frontmatter".to_string(),
+                                    data: serde_json::json!({
+                                        "state": state_file.trim(),
+                                        "wait": fm.wait,
+                                        "tools": fm.tools,
+                                    }),
+                                }).await;
                             }
                             (wrapped, Some(fm))
                         }
@@ -3866,6 +3871,10 @@ async fn run_tool_loop(
                                     }
                                     // Gap 3: Set {{assistant}} to final response text
                                     state_vars.insert("assistant".to_string(), stripped.clone());
+                                    // Persist vars for step debugger
+                                    if let Ok(json) = serde_json::to_string(&state_vars) {
+                                        let _ = store.set_participant_vars(conv_name, agent_name, Some(&json));
+                                    }
 
                                     // Self-loop with no content → skip response
                                     if stripped.trim().is_empty() {
@@ -3928,6 +3937,7 @@ async fn run_tool_loop(
                                 }
                             } else if handoff {
                                 let _ = store.set_participant_state(conv_name, agent_name, None);
+                                let _ = store.set_participant_vars(conv_name, agent_name, None);
                                 logger.log("[state] Handoff: clearing state");
                                 return ToolLoopResult {
                                     response: stripped,
@@ -4019,6 +4029,10 @@ async fn run_tool_loop(
                                 state_vars.insert("assistant".to_string(), stripped);
 
                                 let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
+                                // Persist vars for step debugger
+                                if let Ok(json) = serde_json::to_string(&state_vars) {
+                                    let _ = store.set_participant_vars(conv_name, agent_name, Some(&json));
+                                }
                                 logger.log(&format!("[state] Transition → {} (after tools)", new_state));
                             } else {
                                 logger.log(&format!("[state] Invalid pending state: {}", new_state));
@@ -4257,6 +4271,7 @@ async fn process_message_work(
     }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
+    let raw_user_content = final_user_content.clone();
     let final_user_content = wrap_user_content_with_recall(
         &recall_result.recall_content,
         &final_user_content,
@@ -4291,6 +4306,7 @@ async fn process_message_work(
 
         let loop_result = run_tool_loop(
             &final_user_content,
+            &raw_user_content,
             conversation_history,
             agent,
             agent_name,
@@ -5140,6 +5156,7 @@ async fn handle_notify(
     }
 
     let recall_content_for_storage = recall_result.recall_content.clone();
+    let raw_user_content = final_user_content.clone();
     let final_user_content = wrap_user_content_with_recall(
         &recall_result.recall_content,
         &final_user_content,
@@ -5201,6 +5218,7 @@ async fn handle_notify(
     // Run unified tool loop
     let loop_result = run_tool_loop(
         &final_user_content,
+        &raw_user_content,
         conversation_history,
         agent,
         agent_name,

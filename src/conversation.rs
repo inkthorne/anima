@@ -288,6 +288,7 @@ impl ConversationStore {
         self.add_column_if_missing("participants", "dedup_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "state", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "state_vars", "TEXT DEFAULT NULL")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
         self.conn.execute_batch(
@@ -1271,6 +1272,35 @@ impl ConversationStore {
         self.conn.execute(
             "UPDATE participants SET state = ?1 WHERE conv_name = ?2 AND agent = ?3",
             params![state, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Get the persisted state variables for an agent in a conversation.
+    pub fn get_participant_vars(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state_vars FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let vars: Option<Option<String>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(vars.flatten())
+    }
+
+    /// Set the persisted state variables for an agent in a conversation.
+    pub fn set_participant_vars(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        vars: Option<&str>,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET state_vars = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![vars, conv_name, agent],
         )?;
         Ok(())
     }
