@@ -239,6 +239,15 @@ pub fn extract_set_vars(content: &str) -> HashMap<String, String> {
     vars
 }
 
+/// Detect and strip `<clear-vars />` (or `<clear-vars/>`) tag from content.
+/// Returns the cleaned content and whether a clear-vars tag was found.
+pub fn extract_clear_vars_tag(content: &str) -> (String, bool) {
+    let re = Regex::new(r"(?s)\s*<clear-vars\s*/?>").unwrap();
+    let has_clear = re.is_match(content);
+    let cleaned = re.replace_all(content, "").trim().to_string();
+    (cleaned, has_clear)
+}
+
 /// Extract variables from `<set-vars>` wrapper AND strip the wrapper from content.
 pub fn extract_and_strip_set_vars(content: &str) -> (String, HashMap<String, String>) {
     let vars = extract_set_vars(content);
@@ -637,5 +646,38 @@ mod tests {
         let content = "<set-vars>\n  <code>fn main() {\n    println!(\"hello\");\n}</code>\n</set-vars>";
         let vars = extract_set_vars(content);
         assert_eq!(vars.get("code").unwrap(), "fn main() {\n    println!(\"hello\");\n}");
+    }
+
+    #[test]
+    fn test_extract_clear_vars_tag_self_closing() {
+        let (cleaned, found) = extract_clear_vars_tag("Some response.\n\n<clear-vars />");
+        assert!(found);
+        assert_eq!(cleaned, "Some response.");
+    }
+
+    #[test]
+    fn test_extract_clear_vars_tag_no_space() {
+        let (cleaned, found) = extract_clear_vars_tag("Reset now.\n<clear-vars/>");
+        assert!(found);
+        assert_eq!(cleaned, "Reset now.");
+    }
+
+    #[test]
+    fn test_extract_clear_vars_tag_not_present() {
+        let (cleaned, found) = extract_clear_vars_tag("Just a normal response.");
+        assert!(!found);
+        assert_eq!(cleaned, "Just a normal response.");
+    }
+
+    #[test]
+    fn test_extract_clear_vars_tag_with_set_vars() {
+        let content = "Response.\n<clear-vars />\n<set-vars>\n  <x>1</x>\n</set-vars>";
+        let (cleaned, found) = extract_clear_vars_tag(content);
+        assert!(found);
+        assert!(cleaned.contains("<set-vars>"));
+        // After clear-vars stripped, set-vars should still be present for later extraction
+        let (final_cleaned, vars) = extract_and_strip_set_vars(&cleaned);
+        assert_eq!(vars.get("x").unwrap(), "1");
+        assert_eq!(final_cleaned, "Response.");
     }
 }

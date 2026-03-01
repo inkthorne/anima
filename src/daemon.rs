@@ -3278,6 +3278,7 @@ async fn run_tool_loop(
                 let (db_content, _) = extract_remember_tags(&think_result.response);
                 let (db_content, _) = extract_llm_notes(&db_content);
                 let (db_content, _) = crate::pipeline::extract_handoff_tag(&db_content);
+                let (db_content, _) = crate::pipeline::extract_clear_vars_tag(&db_content);
                 let (db_content, _) = crate::pipeline::extract_and_strip_set_vars(&db_content);
 
                 // Save LLM-generated inline notes to DB (before prepend_notes reads them back)
@@ -3577,9 +3578,10 @@ async fn run_tool_loop(
                 if !tool_executed {
                     if let Some(dir) = state_dir {
                         if state_before.is_some() {
-                            // Extract state tags and set-vars from final response
+                            // Extract state tags, clear-vars, and set-vars from final response
                             let (stripped, state_tags) = crate::pipeline::extract_state_tags(&final_response_text);
                             let (stripped, handoff) = crate::pipeline::extract_handoff_tag(&stripped);
+                            let (stripped, clear_vars) = crate::pipeline::extract_clear_vars_tag(&stripped);
                             let (stripped, set_vars) = crate::pipeline::extract_and_strip_set_vars(&stripped);
 
                             if !state_tags.is_empty() {
@@ -3618,10 +3620,17 @@ async fn run_tool_loop(
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                     logger.log(&format!("[state] Transition → {}", new_state));
 
-                                    // Gap 5: Variable scoping — fresh vars with builtins + set-vars
-                                    let user_preserved = state_vars.get("user").cloned().unwrap_or_default();
-                                    state_vars = set_vars;
-                                    state_vars.insert("user".to_string(), user_preserved);
+                                    // Clear vars if requested (processed before set-vars)
+                                    if clear_vars {
+                                        let user_preserved = state_vars.get("user").cloned().unwrap_or_default();
+                                        state_vars.clear();
+                                        state_vars.insert("user".to_string(), user_preserved);
+                                        logger.log("[state] Variables cleared");
+                                    }
+                                    // Merge set-vars into session vars
+                                    for (k, v) in set_vars {
+                                        state_vars.insert(k, v);
+                                    }
                                     // Gap 3: Set {{assistant}} to final response text
                                     state_vars.insert("assistant".to_string(), stripped.clone());
 
