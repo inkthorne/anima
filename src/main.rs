@@ -99,17 +99,14 @@ enum Commands {
         verbose: bool,
     },
     /// Start an agent daemon in the background. Supports glob patterns (*, ?).
-    /// With a message: step-debug mode (restart, fresh conversation, one iteration).
     Start {
         /// Agent name or glob pattern (from ~/.anima/agents/)
         agent: String,
-        /// Optional message for step-debug mode
-        message: Vec<String>,
     },
-    /// Step-debug: process one more iteration of the tool loop
-    Step {
-        /// Agent name (from ~/.anima/agents/) or path to agent directory
-        agent: String,
+    /// Agent debugging tools
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
     },
     /// Stop a running agent daemon. Supports glob patterns (*, ?).
     Stop {
@@ -146,6 +143,22 @@ enum Commands {
     Memory {
         #[command(subcommand)]
         command: MemoryCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// Step-debug: fresh start (restart daemon, new conversation, one iteration)
+    Debug {
+        /// Agent name
+        agent: String,
+        /// Message to send
+        message: String,
+    },
+    /// Step-debug: continue one more iteration from current state
+    Step {
+        /// Agent name
+        agent: String,
     },
 }
 
@@ -363,25 +376,26 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Start { agent, message } => {
-            if message.is_empty() {
-                if let Err(e) = start_agent(&agent) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            } else {
-                if let Err(e) = start_agent_debug(&agent, &message.join(" ")).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Commands::Step { agent } => {
-            if let Err(e) = step_agent(&agent).await {
+        Commands::Start { agent } => {
+            if let Err(e) = start_agent(&agent) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
+        Commands::Agent { command } => match command {
+            AgentCommands::Debug { agent, message } => {
+                if let Err(e) = start_agent_debug(&agent, &message).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+            AgentCommands::Step { agent } => {
+                if let Err(e) = step_agent(&agent).await {
+                    eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Commands::Stop { agent } => {
             if let Err(e) = stop_agent(&agent).await {
                 eprintln!("Error: {}", e);
