@@ -3289,6 +3289,21 @@ async fn run_tool_loop(
             _ => external_tools.clone(),
         };
 
+        // Emit verbose: tools (which tools are being sent to the LLM)
+        if let Some(ref vtx) = verbose_tx {
+            let tool_names: Vec<&str> = effective_tools
+                .as_ref()
+                .map(|tools| tools.iter().map(|t| t.name.as_str()).collect())
+                .unwrap_or_default();
+            let _ = vtx.send(Response::Verbose {
+                kind: "tools".to_string(),
+                data: serde_json::json!({
+                    "count": tool_names.len(),
+                    "names": tool_names,
+                }),
+            }).await;
+        }
+
         // Emit verbose: user_prompt (the full state-wrapped, recall-injected message)
         if let Some(ref vtx) = verbose_tx {
             let _ = vtx.send(Response::Verbose {

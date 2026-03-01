@@ -1372,6 +1372,19 @@ fn format_verbose_output(kind: &str, data: &serde_json::Value) {
                 name, status, duration_ms, preview_str
             );
         }
+        "tools" => {
+            let count = data["count"].as_u64().unwrap_or(0);
+            let names = data["names"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            eprintln!("\x1b[36m[tools] {} tools: {}\x1b[0m", count, names);
+        }
         "user_prompt" => {
             let content = data["content"].as_str().unwrap_or("");
             if !content.is_empty() {
