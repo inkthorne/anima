@@ -2,7 +2,6 @@ use anima::agent_dir::AgentDir;
 use anima::config::AgentConfig;
 use anima::daemon::PidFile;
 use anima::observe::ConsoleObserver;
-use anima::repl::Repl;
 use anima::socket_api::{Request, Response, SocketApi};
 use anima::tools::{AddTool, CopyLinesTool, EchoTool, EditFileTool, HttpTool, ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool};
 use anima::{
@@ -49,20 +48,14 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Enable debug logging to ~/.anima/repl.log (for REPL/run commands)
-    #[arg(long, global = true)]
-    log: bool,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run an agent from a directory or by name, starting an interactive REPL
+    /// Run an agent daemon in the foreground
     Run {
         /// Agent name (from ~/.anima/agents/) or path to agent directory
         agent: String,
-        /// Run as a daemon (headless, no REPL)
-        #[arg(long)]
-        daemon: bool,
     },
     /// Scaffold a new agent directory
     Create {
@@ -87,8 +80,6 @@ enum Commands {
         #[arg(long, short)]
         verbose: bool,
     },
-    /// Interactive REPL for exploring anima (default if no command given)
-    Repl,
     /// Manage conversations - list, create, join, or delete chats
     Chat {
         #[command(subcommand)]
@@ -320,16 +311,11 @@ async fn main() {
     register_turns_hook();
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Repl);
+    let command = cli.command.unwrap_or(Commands::Status);
 
     match command {
-        Commands::Run { agent, daemon } => {
-            if daemon {
-                if let Err(e) = anima::daemon::run_daemon(&agent).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            } else if let Err(e) = run_agent_dir(&agent).await {
+        Commands::Run { agent } => {
+            if let Err(e) = anima::daemon::run_daemon(&agent).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -351,13 +337,6 @@ async fn main() {
         } => {
             if let Err(e) = run_agent_task(&config, &task, stream, verbose).await {
                 eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
-        }
-        Commands::Repl => {
-            let mut repl = Repl::new().with_logging(cli.log);
-            if let Err(e) = repl.run().await {
-                eprintln!("REPL error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -1528,7 +1507,6 @@ fn start_agent_impl(agent: &str, quiet: bool) -> Result<(), Box<dyn std::error::
     let child = Command::new(&exe)
         .arg("run")
         .arg(agent)
-        .arg("--daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(log_file))
         .stderr(std::process::Stdio::from(log_file_err))
@@ -2664,21 +2642,6 @@ async fn handle_memory_command(command: MemoryCommands) -> Result<(), Box<dyn st
 // ---------------------------------------------------------------------------
 // Run / Create / List / Task
 // ---------------------------------------------------------------------------
-
-/// Run an agent from a directory and start an interactive REPL.
-/// In daemon mode, this starts the daemon (if needed) and connects via REPL.
-async fn run_agent_dir(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let agent_path = resolve_agent_path(agent);
-
-    let agent_dir = AgentDir::load(&agent_path)?;
-    let agent_name = agent_dir.config.agent.name.clone();
-
-    let mut repl = Repl::with_agent(agent_name.clone()).await;
-    println!("\x1b[32m✓ Connected to agent '{}'\x1b[0m", agent_name);
-
-    repl.run().await?;
-    Ok(())
-}
 
 /// Scaffold a new agent directory (delegates to shared function in agent_dir).
 fn create_agent(name: &str, path: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {

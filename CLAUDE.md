@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v4.2.2
+**Version:** v4.3.0
 **Tests:** 829 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -18,7 +18,6 @@ Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this i
 src/
 ├── lib.rs              # Module exports, re-exports main types
 ├── main.rs             # CLI entry point (clap-based)
-├── repl.rs             # REPL (thin client, socket connections)
 ├── daemon.rs           # Daemon mode, socket server, tool execution
 ├── discovery.rs        # Find running daemons via pid files
 ├── socket_api.rs       # Unix socket protocol (Request/Response)
@@ -64,7 +63,7 @@ src/
 
 ## Architecture (v3.6)
 
-**REPL-as-Frontend:** Agents always run as daemons. REPL is a thin client.
+**Daemon Architecture:** Agents always run as daemons. Interaction via `anima chat` (persistent conversations) or `anima ask` (one-shot queries).
 
 ```
 ~/.anima/
@@ -136,7 +135,7 @@ anima logout            # Log out (remove stored tokens)
 anima whoami            # Show current auth status
 
 # Interaction
-anima                   # REPL mode (connects to daemons)
+anima                   # Show agent status (default)
 anima ask <name> "msg"  # One-shot query (no daemon required)
 
 # Conversations
@@ -173,8 +172,7 @@ anima clear <name>      # Clear conversation history
 anima system <name>     # Show assembled system prompt
 
 # Development
-anima run <name>        # Run with REPL (starts daemon if needed)
-anima run <name> --daemon # Run as daemon directly
+anima run <name>        # Run agent daemon in foreground
 anima task <config> "task" [--stream] [-v] # One-shot with config file
 ```
 
@@ -190,7 +188,7 @@ cargo test            # Run tests (746 tests)
 ## Key Design Decisions
 
 1. **Agents are daemons** — persistent processes, not ephemeral
-2. **REPL is thin** — just a socket client, no agent logic
+2. **Chat is the interface** — `anima chat` for persistent conversations, `anima ask` for one-shot
 3. **@mentions are routing** — agents talk to each other via @mentions
 4. **recall.md exploits recency bias** — keeps instructions salient
 5. **Keyword tool recall** — only inject relevant tools per query

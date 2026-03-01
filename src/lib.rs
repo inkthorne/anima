@@ -14,7 +14,6 @@ pub mod message;
 pub mod messaging;
 pub mod observe;
 pub mod pipeline;
-pub mod repl;
 pub mod retry;
 pub mod runtime;
 pub mod socket_api;
