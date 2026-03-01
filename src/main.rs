@@ -103,6 +103,9 @@ enum Commands {
         agent: String,
         /// Message to send to the agent
         message: String,
+        /// Enable verbose output (thinking, usage, tool calls, memory) on stderr
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
     /// Start an agent daemon in the background. Supports glob patterns (*, ?).
     Start {
@@ -367,8 +370,8 @@ async fn main() {
         Commands::Status => {
             show_status().await;
         }
-        Commands::Ask { agent, message } => {
-            if let Err(e) = ask_agent(&agent, &message).await {
+        Commands::Ask { agent, message, verbose } => {
+            if let Err(e) = ask_agent(&agent, &message, verbose).await {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
@@ -1300,7 +1303,92 @@ async fn show_status() {
 /// Query an agent with conversation persistence.
 /// Starts daemon if not running, creates/uses conversation named after agent,
 /// stores user message, streams response, and daemon stores agent response.
-async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+/// Format verbose output to stderr with color-coded prefixes.
+fn format_verbose_output(kind: &str, data: &serde_json::Value) {
+    match kind {
+        "thinking" => {
+            let text = data["content"].as_str().unwrap_or("");
+            if !text.is_empty() {
+                // Dim gray
+                eprintln!("\x1b[2m[thinking] {}\x1b[0m", text);
+            }
+        }
+        "usage" => {
+            let tokens_in = data["tokens_in"].as_u64().unwrap_or(0);
+            let tokens_out = data["tokens_out"].as_u64().unwrap_or(0);
+            let cached = data["cached_tokens"].as_u64().unwrap_or(0);
+            let duration_ms = data["duration_ms"].as_u64().unwrap_or(0);
+            // Cyan
+            let cached_str = if cached > 0 {
+                format!(" ({} cached)", cached)
+            } else {
+                String::new()
+            };
+            eprintln!(
+                "\x1b[36m[usage] {}in \u{2192} {}out{} in {}ms\x1b[0m",
+                tokens_in, tokens_out, cached_str, duration_ms
+            );
+        }
+        "tool_call" => {
+            let name = data["name"].as_str().unwrap_or("?");
+            let args = &data["arguments"];
+            let summary = format_tool_params(args);
+            // Yellow
+            eprintln!("\x1b[33m[tool] {}: {}\x1b[0m", name, summary);
+        }
+        "tool_result" => {
+            let name = data["name"].as_str().unwrap_or("?");
+            let success = data["success"].as_bool().unwrap_or(true);
+            let duration_ms = data["duration_ms"].as_u64().unwrap_or(0);
+            let preview = data["preview"].as_str().unwrap_or("");
+            let status = if success { "ok" } else { "error" };
+            // Yellow
+            let preview_str = if preview.is_empty() {
+                String::new()
+            } else {
+                let truncated = if preview.len() > 200 {
+                    format!("{}...", &preview[..197])
+                } else {
+                    preview.to_string()
+                };
+                format!(" | {}", truncated.replace('\n', " "))
+            };
+            eprintln!(
+                "\x1b[33m[tool-result] {} ({}) {}ms{}\x1b[0m",
+                name, status, duration_ms, preview_str
+            );
+        }
+        "memory" => {
+            let content = data["content"].as_str().unwrap_or("");
+            if !content.is_empty() {
+                // Magenta — show first 10 lines
+                let lines: Vec<&str> = content.lines().take(10).collect();
+                eprintln!("\x1b[35m[memory] {}\x1b[0m", lines.join("\n  "));
+                let total = content.lines().count();
+                if total > 10 {
+                    eprintln!("\x1b[35m  ... ({} more lines)\x1b[0m", total - 10);
+                }
+            }
+        }
+        "retry" => {
+            let attempt = data["attempt"].as_u64().unwrap_or(0);
+            let delay_ms = data["delay_ms"].as_u64().unwrap_or(0);
+            let operation = data["operation"].as_str().unwrap_or("unknown");
+            // Red
+            eprintln!(
+                "\x1b[31m[retry] {} attempt {} (delay {}ms)\x1b[0m",
+                operation, attempt, delay_ms
+            );
+        }
+        _ => {
+            // Gray fallback
+            let json = serde_json::to_string(data).unwrap_or_default();
+            eprintln!("\x1b[2m[verbose:{}] {}\x1b[0m", kind, json);
+        }
+    }
+}
+
+async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     use anima::discovery;
 
     let agent_path = resolve_agent_path(agent);
@@ -1350,10 +1438,12 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
     api.write_request(&Request::Message {
         content: message.to_string(),
         conv_name: Some(conv_name),
+        verbose,
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
+    let mut had_chunks = false;
     loop {
         match api
             .read_response()
@@ -1361,12 +1451,24 @@ async fn ask_agent(agent: &str, message: &str) -> Result<(), Box<dyn std::error:
             .map_err(|e| format!("Failed to read response: {}", e))?
         {
             Some(Response::Chunk { text }) => {
+                had_chunks = true;
                 print!("{}", text);
                 io::stdout().flush()?;
             }
             Some(Response::ToolCall { tool, params }) => {
+                if had_chunks {
+                    eprintln!();
+                    had_chunks = false;
+                }
                 let param_summary = format_tool_params(&params);
                 eprintln!(" - [tool] {}: {}", tool, param_summary);
+            }
+            Some(Response::Verbose { kind, data }) => {
+                if had_chunks {
+                    eprintln!();
+                    had_chunks = false;
+                }
+                format_verbose_output(&kind, &data);
             }
             Some(Response::Done) => {
                 println!();

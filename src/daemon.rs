@@ -153,6 +153,8 @@ pub enum AgentWork {
         response_tx: oneshot::Sender<MessageWorkResult>,
         /// Token stream sender for streaming responses
         token_tx: Option<mpsc::Sender<String>>,
+        /// Verbose event sender (thinking, usage, tool calls, memory)
+        verbose_tx: Option<mpsc::Sender<Response>>,
     },
     /// Process a notify request (conversation @mention)
     Notify {
@@ -1584,6 +1586,7 @@ fn execute_tool_call<'a>(
                 ctx.dedup_lazy,
                 None, // no state for subtasks
                 None,
+                None, // no verbose for subtasks
             ).await;
 
             drop(log_tx);
@@ -2353,6 +2356,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             conv_name: None,
                             response_tx,
                             token_tx: None,
+                            verbose_tx: None,
                         }).is_ok() {
                             match response_rx.await {
                                 Ok(result) => {
@@ -2832,12 +2836,14 @@ async fn agent_worker(
                 conv_name,
                 response_tx,
                 token_tx,
+                verbose_tx,
             } => {
                 logger.log(&format!("[worker] Processing message: {}", content));
                 let result = process_message_work(
                     &content,
                     conv_name.as_deref(),
                     token_tx,
+                    verbose_tx,
                     &agent,
                     &agent_name,
                     &system_prompt,
@@ -2948,6 +2954,7 @@ async fn execute_native_tool_calls(
     agent_name: &str,
     logger: &Arc<AgentLogger>,
     num_ctx: Option<u32>,
+    verbose_tx: &Option<mpsc::Sender<Response>>,
 ) -> Vec<String> {
     let store = match ConversationStore::init() {
         Ok(s) => s,
@@ -2980,20 +2987,59 @@ async fn execute_native_tool_calls(
             continue;
         }
 
+        // Emit verbose: tool_call
+        if let Some(vtx) = verbose_tx {
+            let _ = vtx.send(Response::Verbose {
+                kind: "tool_call".to_string(),
+                data: serde_json::json!({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                }),
+            }).await;
+        }
+
         let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.name));
         // Convert llm::ToolCall to daemon::ToolCall for execute_tool_call
         let daemon_tc = ToolCall {
             tool: tc.name.clone(),
             params: tc.arguments.clone(),
         };
+        let tool_start = std::time::Instant::now();
         let tool_result = match execute_tool_call(&daemon_tc, tool_def, Some(tool_context)).await {
             Ok(result) => {
+                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
                 let result = truncate_tool_result(&result, num_ctx);
                 logger.tool(&format!("[loop] {} → {} bytes", tc.name, result.len()));
+                // Emit verbose: tool_result (success)
+                if let Some(vtx) = verbose_tx {
+                    let preview: String = result.chars().take(500).collect();
+                    let _ = vtx.send(Response::Verbose {
+                        kind: "tool_result".to_string(),
+                        data: serde_json::json!({
+                            "name": tc.name,
+                            "success": true,
+                            "duration_ms": elapsed_ms,
+                            "preview": preview,
+                        }),
+                    }).await;
+                }
                 format!("[Tool Result for {}]\n{}", tc.name, result)
             }
             Err(e) => {
+                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
                 logger.tool(&format!("[loop] {} → error: {}", tc.name, e));
+                // Emit verbose: tool_result (error)
+                if let Some(vtx) = verbose_tx {
+                    let _ = vtx.send(Response::Verbose {
+                        kind: "tool_result".to_string(),
+                        data: serde_json::json!({
+                            "name": tc.name,
+                            "success": false,
+                            "duration_ms": elapsed_ms,
+                            "preview": e.to_string(),
+                        }),
+                    }).await;
+                }
                 format!("[Tool Error for {}]\n{}", tc.name, e)
             }
         };
@@ -3063,6 +3109,8 @@ async fn run_tool_loop(
     // State system
     state_dir: Option<&Path>,
     initial_state: Option<&str>,
+    // Verbose
+    verbose_tx: Option<mpsc::Sender<Response>>,
 ) -> ToolLoopResult {
     // Open a store for DB operations (pause checks, message storage, context refresh).
     // Each tool batch opens its own store (via execute_native_tool_calls) for isolation.
@@ -3263,6 +3311,33 @@ async fn run_tool_loop(
                 last_cached_tokens = think_result.cached_tokens;
                 last_dump_turn_n = think_result.dump_turn_n;
 
+                // Emit verbose: thinking (extract before stripping)
+                if let Some(ref vtx) = verbose_tx {
+                    let thinking_re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
+                    for cap in thinking_re.captures_iter(&think_result.response) {
+                        let thinking_text = cap[1].trim();
+                        if !thinking_text.is_empty() {
+                            let _ = vtx.send(Response::Verbose {
+                                kind: "thinking".to_string(),
+                                data: serde_json::json!({ "content": thinking_text }),
+                            }).await;
+                        }
+                    }
+                }
+
+                // Emit verbose: usage
+                if let Some(ref vtx) = verbose_tx {
+                    let _ = vtx.send(Response::Verbose {
+                        kind: "usage".to_string(),
+                        data: serde_json::json!({
+                            "tokens_in": think_result.tokens_in.unwrap_or(0),
+                            "tokens_out": think_result.tokens_out.unwrap_or(0),
+                            "cached_tokens": think_result.cached_tokens.unwrap_or(0),
+                            "duration_ms": think_result.duration_ms.unwrap_or(0),
+                        }),
+                    }).await;
+                }
+
                 let iter_tokens_in = think_result.tokens_in.map(|t| t as i64);
                 let iter_tokens_out = think_result.tokens_out.map(|t| t as i64);
                 let iter_eval_ns = think_result.prompt_eval_duration_ns.map(|t| t as i64);
@@ -3339,6 +3414,7 @@ async fn run_tool_loop(
                         let results = execute_native_tool_calls(
                             tool_calls, tool_registry, tool_context,
                             conv_name, agent_name, logger, num_ctx,
+                            &verbose_tx,
                         ).await;
 
                         current_message = String::new();
@@ -3468,15 +3544,54 @@ async fn run_tool_loop(
 
                         logger.tool(&format!("[loop] Executing: {} with params {}", tc.tool, tc.params));
 
+                        // Emit verbose: tool_call (JSON-block mode)
+                        if let Some(ref vtx) = verbose_tx {
+                            let _ = vtx.send(Response::Verbose {
+                                kind: "tool_call".to_string(),
+                                data: serde_json::json!({
+                                    "name": tc.tool,
+                                    "arguments": tc.params,
+                                }),
+                            }).await;
+                        }
+
                         let tool_def = tool_registry.as_ref().and_then(|r| r.find_by_name(&tc.tool));
+                        let tool_start = std::time::Instant::now();
                         let tool_message = match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
                             Ok(tool_result) => {
+                                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
                                 let tool_result = truncate_tool_result(&tool_result, num_ctx);
                                 logger.tool(&format!("[loop] Result: {} bytes", tool_result.len()));
+                                // Emit verbose: tool_result (success)
+                                if let Some(ref vtx) = verbose_tx {
+                                    let preview: String = tool_result.chars().take(500).collect();
+                                    let _ = vtx.send(Response::Verbose {
+                                        kind: "tool_result".to_string(),
+                                        data: serde_json::json!({
+                                            "name": tc.tool,
+                                            "success": true,
+                                            "duration_ms": elapsed_ms,
+                                            "preview": preview,
+                                        }),
+                                    }).await;
+                                }
                                 format!("[Tool Result for {}]\n{}", tc.tool, tool_result)
                             }
                             Err(e) => {
+                                let elapsed_ms = tool_start.elapsed().as_millis() as u64;
                                 logger.tool(&format!("[loop] Error: {}", e));
+                                // Emit verbose: tool_result (error)
+                                if let Some(ref vtx) = verbose_tx {
+                                    let _ = vtx.send(Response::Verbose {
+                                        kind: "tool_result".to_string(),
+                                        data: serde_json::json!({
+                                            "name": tc.tool,
+                                            "success": false,
+                                            "duration_ms": elapsed_ms,
+                                            "preview": e.to_string(),
+                                        }),
+                                    }).await;
+                                }
                                 format!("[Tool Error for {}]\n{}", tc.tool, e)
                             }
                         };
@@ -3856,6 +3971,7 @@ async fn process_message_work(
     content: &str,
     conv_name: Option<&str>,
     token_tx: Option<mpsc::Sender<String>>,
+    verbose_tx: Option<mpsc::Sender<Response>>,
     agent: &Arc<Mutex<Agent>>,
     agent_name: &str,
     system_prompt: &Option<String>,
@@ -3971,6 +4087,18 @@ async fn process_message_work(
         }
     }
 
+    // Emit verbose memory event if recall content was injected
+    if let Some(ref vtx) = verbose_tx {
+        if let Some(ref recall_text) = recall_result.recall_content {
+            if !recall_text.is_empty() {
+                let _ = vtx.send(Response::Verbose {
+                    kind: "memory".to_string(),
+                    data: serde_json::json!({ "content": recall_text }),
+                }).await;
+            }
+        }
+    }
+
     let recall_content_for_storage = recall_result.recall_content.clone();
     let final_user_content = wrap_user_content_with_recall(
         &recall_result.recall_content,
@@ -4029,6 +4157,7 @@ async fn process_message_work(
             dedup_lazy,
             None, // no state for REPL messages
             None,
+            verbose_tx,
         ).await;
 
         drop(log_tx);
@@ -4938,6 +5067,7 @@ async fn handle_notify(
         dedup_lazy,
         state_dir,
         initial_state,
+        None, // no verbose for notifications
     ).await;
 
     // Clean up pause watcher
@@ -5690,11 +5820,20 @@ async fn handle_connection(
             Request::Message {
                 ref content,
                 ref conv_name,
+                verbose,
             } => {
-                logger.log(&format!("[socket] Received message: {}", content));
+                logger.log(&format!("[socket] Received message: {}{}", content, if verbose { " (verbose)" } else { "" }));
 
                 // Create streaming channel for tokens
                 let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
+
+                // Create verbose channel if requested
+                let (verbose_tx, mut verbose_rx) = if verbose {
+                    let (tx, rx) = mpsc::channel::<Response>(100);
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
 
                 // Create oneshot channel for final result
                 let (response_tx, response_rx) = oneshot::channel();
@@ -5706,6 +5845,7 @@ async fn handle_connection(
                         conv_name: conv_name.clone(),
                         response_tx,
                         token_tx: Some(token_tx),
+                        verbose_tx,
                     })
                     .is_err()
                 {
@@ -5713,11 +5853,53 @@ async fn handle_connection(
                     break;
                 }
 
-                // Forward tokens to socket as they arrive
-                while let Some(token) = token_rx.recv().await {
-                    if let Err(e) = api.write_response(&Response::Chunk { text: token }).await {
-                        logger.log(&format!("[socket] Error writing chunk: {}", e));
+                // Multiplex token stream and verbose events to socket
+                let mut token_done = false;
+                let mut verbose_done = verbose_rx.is_none();
+                loop {
+                    if token_done && verbose_done {
                         break;
+                    }
+                    tokio::select! {
+                        token = token_rx.recv(), if !token_done => {
+                            match token {
+                                Some(text) => {
+                                    if let Err(e) = api.write_response(&Response::Chunk { text }).await {
+                                        logger.log(&format!("[socket] Error writing chunk: {}", e));
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    token_done = true;
+                                }
+                            }
+                        }
+                        verbose_msg = async {
+                            if let Some(ref mut rx) = verbose_rx {
+                                rx.recv().await
+                            } else {
+                                std::future::pending().await
+                            }
+                        }, if !verbose_done => {
+                            match verbose_msg {
+                                Some(msg) => {
+                                    if let Err(e) = api.write_response(&msg).await {
+                                        logger.log(&format!("[socket] Error writing verbose: {}", e));
+                                        break;
+                                    }
+                                }
+                                None => {
+                                    verbose_done = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Drain any remaining verbose messages
+                if let Some(ref mut rx) = verbose_rx {
+                    while let Ok(msg) = rx.try_recv() {
+                        let _ = api.write_response(&msg).await;
                     }
                 }
 
@@ -9018,6 +9200,7 @@ api_key = "sk-test"
             "test-agent",
             &logger,
             None,
+            &None,
         )
         .await;
 

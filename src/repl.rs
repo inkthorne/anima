@@ -583,6 +583,7 @@ impl Repl {
         let request = Request::Message {
             content: context.to_string(),
             conv_name: None,
+            verbose: false,
         };
         if let Err(e) = api.write_request(&request).await {
             println!("{}", format_elapsed(start.elapsed()));

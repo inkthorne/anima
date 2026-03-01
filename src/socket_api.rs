@@ -18,6 +18,10 @@ pub enum Request {
         /// If provided, the daemon will store the response in this conversation.
         #[serde(default)]
         conv_name: Option<String>,
+        /// Enable verbose output (thinking, usage, tool calls, memory).
+        /// Defaults to false for backward compatibility.
+        #[serde(default)]
+        verbose: bool,
     },
     /// Incoming message from another agent (inter-daemon communication).
     IncomingMessage {
@@ -98,6 +102,12 @@ pub enum Response {
     HeartbeatTriggered,
     /// Response when heartbeat is not configured for the agent.
     HeartbeatNotConfigured,
+    /// Verbose output event (thinking, usage, tool calls, memory, etc.).
+    /// Sent only when `verbose: true` in the request.
+    Verbose {
+        kind: String,
+        data: serde_json::Value,
+    },
 }
 
 /// Socket API handler for reading and writing protocol messages.
@@ -227,6 +237,7 @@ mod tests {
         let request = Request::Message {
             content: "Hello, agent!".to_string(),
             conv_name: None,
+            verbose: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"message\""));
@@ -235,7 +246,7 @@ mod tests {
         // Deserialize back
         let parsed: Request = serde_json::from_str(&json).unwrap();
         match parsed {
-            Request::Message { content, conv_name } => {
+            Request::Message { content, conv_name, .. } => {
                 assert_eq!(content, "Hello, agent!");
                 assert!(conv_name.is_none());
             }
@@ -248,13 +259,14 @@ mod tests {
         let request = Request::Message {
             content: "Hello!".to_string(),
             conv_name: Some("test-conv".to_string()),
+            verbose: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"conv_name\":\"test-conv\""));
 
         let parsed: Request = serde_json::from_str(&json).unwrap();
         match parsed {
-            Request::Message { content, conv_name } => {
+            Request::Message { content, conv_name, .. } => {
                 assert_eq!(content, "Hello!");
                 assert_eq!(conv_name, Some("test-conv".to_string()));
             }
@@ -264,13 +276,14 @@ mod tests {
 
     #[test]
     fn test_request_message_without_conv_name_backward_compat() {
-        // Test backwards compatibility - conv_name should default to None if not provided
+        // Test backwards compatibility - conv_name and verbose should default if not provided
         let json = r#"{"type":"message","content":"Hello!"}"#;
         let parsed: Request = serde_json::from_str(json).unwrap();
         match parsed {
-            Request::Message { content, conv_name } => {
+            Request::Message { content, conv_name, verbose } => {
                 assert_eq!(content, "Hello!");
                 assert!(conv_name.is_none());
+                assert!(!verbose);
             }
             _ => panic!("Wrong variant"),
         }
@@ -641,5 +654,61 @@ mod tests {
 
         let parsed: Response = serde_json::from_str(&json).unwrap();
         assert!(matches!(parsed, Response::HeartbeatNotConfigured));
+    }
+
+    #[test]
+    fn test_request_message_with_verbose() {
+        let request = Request::Message {
+            content: "Hello!".to_string(),
+            conv_name: None,
+            verbose: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"verbose\":true"));
+
+        let parsed: Request = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Request::Message { content, verbose, .. } => {
+                assert_eq!(content, "Hello!");
+                assert!(verbose);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_request_message_verbose_default_false() {
+        // Backward compatibility: verbose defaults to false when not present
+        let json = r#"{"type":"message","content":"Hello!"}"#;
+        let parsed: Request = serde_json::from_str(json).unwrap();
+        match parsed {
+            Request::Message { content, verbose, .. } => {
+                assert_eq!(content, "Hello!");
+                assert!(!verbose);
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_response_verbose_serialization() {
+        let response = Response::Verbose {
+            kind: "usage".to_string(),
+            data: serde_json::json!({"tokens_in": 100, "tokens_out": 50}),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"type\":\"verbose\""));
+        assert!(json.contains("\"kind\":\"usage\""));
+        assert!(json.contains("\"tokens_in\":100"));
+
+        let parsed: Response = serde_json::from_str(&json).unwrap();
+        match parsed {
+            Response::Verbose { kind, data } => {
+                assert_eq!(kind, "usage");
+                assert_eq!(data["tokens_in"], 100);
+                assert_eq!(data["tokens_out"], 50);
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }
