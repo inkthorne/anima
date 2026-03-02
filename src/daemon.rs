@@ -660,7 +660,11 @@ fn format_conversation_history(
             let tool_calls: Option<Vec<crate::llm::ToolCall>> = msg
                 .tool_calls
                 .as_ref()
-                .and_then(|json| serde_json::from_str(json).ok());
+                .and_then(|json| serde_json::from_str(json).ok())
+                // Strip synthetic tb- tool_calls so tool-block models don't see native tool protocol
+                .and_then(|tcs: Vec<crate::llm::ToolCall>| {
+                    if tcs.iter().all(|tc| tc.id.starts_with("tb-")) { None } else { Some(tcs) }
+                });
 
             history.push(ChatMessage {
                 role: "assistant".to_string(),
@@ -681,7 +685,7 @@ fn format_conversation_history(
             // Tool results/errors should NOT be batched with user messages.
             // Flush any pending user messages first, then add tool result.
             flush_user_batch(&mut pending_user_batch, &mut pending_recall, &mut history);
-            if msg.tool_call_id.is_some() {
+            if msg.tool_call_id.as_ref().is_some_and(|id| !id.starts_with("tb-")) {
                 // Native tool result — emit with role "tool" and tool_call_id for API compatibility
                 history.push(ChatMessage {
                     role: "tool".to_string(),
@@ -690,7 +694,7 @@ fn format_conversation_history(
                     tool_calls: None,
                 });
             } else {
-                // Legacy/tool-block tool result — emit as role "user"
+                // Legacy/tool-block tool result (including synthetic tb- IDs) — emit as role "user"
                 history.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(msg.content.clone()),
@@ -3504,11 +3508,21 @@ async fn run_tool_loop(
 
                         tool_call_count += 1;
 
+                        // Generate synthetic tool_call_id so dedup infrastructure works for tool-block mode
+                        let synthetic_id = format!("tb-{}", tool_call_count);
+                        let synthetic_tool_calls = vec![crate::llm::ToolCall {
+                            id: synthetic_id.clone(),
+                            name: tc.tool.clone(),
+                            arguments: tc.params.clone(),
+                            parse_error: None,
+                        }];
+                        let tool_calls_json = serde_json::to_string(&synthetic_tool_calls).ok();
+
                         // Store intermediate response (preserve thinking in DB)
                         if !db_content.trim().is_empty() {
                             match store.add_message_with_tokens(
                                 conv_name, agent_name, &db_content, &[],
-                                think_result.duration_ms.map(|d| d as i64), None,
+                                think_result.duration_ms.map(|d| d as i64), tool_calls_json.as_deref(),
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
                             ) {
                                 Ok(msg_id) => {
@@ -3576,8 +3590,8 @@ async fn run_tool_loop(
                             }
                         };
 
-                        // Store tool result
-                        if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
+                        // Store tool result with synthetic tool_call_id for dedup
+                        if let Err(e) = store.add_native_tool_result(conv_name, &synthetic_id, &tool_message, agent_name) {
                             logger.log(&format!("[loop] Failed to store tool message: {}", e));
                         }
 
@@ -3593,6 +3607,37 @@ async fn run_tool_loop(
                                 logger.log(&format!("[state] Detected <state> in <set-vars> alongside tools: {}", st));
                             }
                         }
+                    } else if cleaned_response.starts_with("[Tool call format error]") {
+                        // Malformed <tool> tag — feed the error back so the LLM can retry
+                        tool_call_count += 1;
+                        logger.tool("[loop] Tool call format error, feeding back to LLM");
+
+                        // Store intermediate response (preserve thinking in DB)
+                        if !db_content.trim().is_empty() {
+                            match store.add_message_with_tokens(
+                                conv_name, agent_name, &db_content, &[],
+                                think_result.duration_ms.map(|d| d as i64), None,
+                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                            ) {
+                                Ok(msg_id) => {
+                                    if let Some(turn_n) = think_result.dump_turn_n {
+                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
+                                }
+                            }
+                        }
+
+                        // Store format error as tool result
+                        if let Err(e) = store.add_tool_result(conv_name, &cleaned_response, agent_name) {
+                            logger.log(&format!("[loop] Failed to store format error: {}", e));
+                        }
+
+                        current_message = cleaned_response;
+                        tool_executed = true;
+                        final_response_text = String::new(); // unused when tool_executed
                     } else {
                         // No JSON tool call — check for <python> auto-execute blocks
                         let (_, python_blocks) = extract_python_blocks(&cleaned_response);
@@ -7782,6 +7827,185 @@ api_key = "sk-test"
             })
             .collect();
         assert_eq!(shell_results.len(), 1, "Shell result should be kept");
+    }
+
+    #[test]
+    fn test_format_conversation_history_dedup_synthetic_tb_ids() {
+        // Tool-block mode: two read_file calls to same path with tb- IDs.
+        // First pair should be dropped, second kept — just like native dedup.
+        let read_tc1 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tb-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/src/main.rs"}),
+            parse_error: None,
+        }])
+        .unwrap();
+        let read_tc2 = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tb-2".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/src/main.rs"}),
+            parse_error: None,
+        }])
+        .unwrap();
+
+        let mut msg_a1 = make_conv_msg("arya", "Let me read that file.");
+        msg_a1.id = 10;
+        msg_a1.tool_calls = Some(read_tc1);
+
+        let mut msg_t1 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { v1 }",
+            Some("arya"),
+        );
+        msg_t1.id = 11;
+        msg_t1.tool_call_id = Some("tb-1".into());
+
+        let mut msg_a2 = make_conv_msg("arya", "Reading again after edit.");
+        msg_a2.id = 12;
+        msg_a2.tool_calls = Some(read_tc2);
+
+        let mut msg_t2 = make_tool_msg(
+            "[Tool Result for read_file]\nfn main() { v2 }",
+            Some("arya"),
+        );
+        msg_t2.id = 13;
+        msg_t2.tool_call_id = Some("tb-2".into());
+
+        let msgs = vec![
+            make_conv_msg("user", "read main.rs"),
+            msg_a1, msg_t1,
+            make_conv_msg("user", "read it again"),
+            msg_a2, msg_t2,
+            make_conv_msg("user", "thanks"),
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "arya", Some(i64::MAX));
+
+        // Only one read_file result should remain (the latest)
+        let read_results: Vec<&str> = history
+            .iter()
+            .filter(|m| {
+                m.content
+                    .as_ref()
+                    .map_or(false, |c| c.contains("read_file"))
+            })
+            .filter(|m| m.role == "user") // tb- results become role "user"
+            .map(|m| m.content.as_ref().unwrap().as_str())
+            .collect();
+        assert_eq!(read_results.len(), 1, "Should have only one read_file result (first pair dropped)");
+        assert!(read_results[0].contains("v2"), "Kept result should be the latest");
+
+        // First assistant message should be dropped
+        let assistant_msgs: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == "assistant")
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(
+            !assistant_msgs.contains(&"Let me read that file."),
+            "First assistant message should be dropped"
+        );
+        assert!(
+            assistant_msgs.contains(&"Reading again after edit."),
+            "Second assistant message should be kept"
+        );
+    }
+
+    #[test]
+    fn test_format_conversation_history_tb_role_preservation() {
+        // Tool-block results with tb- IDs should produce role "user" (not "tool"),
+        // and assistant messages should have tool_calls stripped (None).
+        let tc_json = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "tb-1".into(),
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "echo hello"}),
+            parse_error: None,
+        }])
+        .unwrap();
+
+        let mut msg_asst = make_conv_msg("dash", "Running command.");
+        msg_asst.id = 1;
+        msg_asst.tool_calls = Some(tc_json);
+
+        let mut msg_tool = make_tool_msg("[Tool Result for shell]\nhello", Some("dash"));
+        msg_tool.id = 2;
+        msg_tool.tool_call_id = Some("tb-1".into());
+
+        let msgs = vec![
+            msg_asst,
+            msg_tool,
+            {
+                let mut m = make_conv_msg("user", "great");
+                m.id = 3;
+                m
+            },
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "dash", Some(i64::MAX));
+
+        // Assistant message should have tool_calls = None (synthetic stripped)
+        let asst = history.iter().find(|m| m.role == "assistant").unwrap();
+        assert!(
+            asst.tool_calls.is_none(),
+            "Synthetic tb- tool_calls should be stripped from assistant message"
+        );
+
+        // Tool result should be role "user" (not "tool")
+        let tool_result = history
+            .iter()
+            .find(|m| m.content.as_ref().map_or(false, |c| c.contains("shell")))
+            .unwrap();
+        assert_eq!(
+            tool_result.role, "user",
+            "Tool-block result with tb- ID should be role 'user'"
+        );
+        assert!(
+            tool_result.tool_call_id.is_none(),
+            "Tool-block result should not expose tool_call_id to LLM"
+        );
+    }
+
+    #[test]
+    fn test_format_conversation_history_native_ids_unaffected_by_tb_filter() {
+        // Native tool calls (non-tb- IDs) should still produce role "tool" and
+        // preserve tool_calls on assistant messages — tb- filtering must not affect them.
+        let tc_json = serde_json::to_string(&vec![crate::llm::ToolCall {
+            id: "call_abc123".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "test.rs"}),
+            parse_error: None,
+        }])
+        .unwrap();
+
+        let mut msg_asst = make_conv_msg("dash", "reading file");
+        msg_asst.id = 1;
+        msg_asst.tool_calls = Some(tc_json);
+
+        let mut msg_tool = make_tool_msg("[Tool Result for read_file]\ncontents", Some("dash"));
+        msg_tool.id = 2;
+        msg_tool.tool_call_id = Some("call_abc123".into());
+
+        let msgs = vec![
+            msg_asst,
+            msg_tool,
+            {
+                let mut m = make_conv_msg("user", "thanks");
+                m.id = 3;
+                m
+            },
+        ];
+
+        let (history, _) = format_conversation_history(&msgs, "dash", Some(i64::MAX));
+
+        // Assistant should preserve tool_calls
+        let asst = history.iter().find(|m| m.role == "assistant").unwrap();
+        assert!(
+            asst.tool_calls.is_some(),
+            "Native tool_calls should be preserved on assistant message"
+        );
+
+        // Tool result should be role "tool" with tool_call_id
+        let tool_result = history.iter().find(|m| m.role == "tool").unwrap();
+        assert_eq!(tool_result.tool_call_id.as_deref(), Some("call_abc123"));
     }
 
     // Tests for expand_inject_directives

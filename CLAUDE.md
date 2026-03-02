@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v4.4.0
+**Version:** v4.4.1
 **Tests:** 829 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -214,3 +214,10 @@ cargo test            # Run tests (746 tests)
 - `context/CLAUDE_CODE_TOOL_SPEC.md` — Claude Code tool integration
 - `context/HEARTBEAT_SPEC.md` — Heartbeat system
 - `context/STREAMING_SPEC.md` — Streaming specification
+
+### Planning Docs
+
+- `docs/planning/anima-turns.md` — Tool calling analysis (agentic loop, extraction, chaining)
+- `docs/planning/anima-states.md` — State machine design
+- `docs/planning/anima-tdd-agent.md` — TDD agent design
+- `docs/planning/ollama-settings.md` — Ollama model configuration notes
