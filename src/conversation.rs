@@ -109,6 +109,8 @@ pub struct ConversationMessage {
     pub tool_call_id: Option<String>,
     /// Number of prompt tokens served from cache (OpenAI Responses API, LMStudio)
     pub cached_tokens: Option<i64>,
+    /// Full LLMResponse serialized as JSON (content + tool_calls + usage)
+    pub assistant_response: Option<String>,
 }
 
 /// A pending notification for an offline agent.
@@ -304,6 +306,7 @@ impl ConversationStore {
         self.add_column_if_missing("messages", "prompt_eval_ns", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tool_call_id", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("messages", "cached_tokens", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("messages", "assistant_response", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "context_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "dedup_cursor", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
@@ -702,7 +705,7 @@ impl ConversationStore {
         mentions: &[&str],
     ) -> Result<i64, ConversationError> {
         self.add_message_with_tokens(
-            conv_name, from_agent, content, mentions, None, None, None, None, None, None, None,
+            conv_name, from_agent, content, mentions, None, None, None, None, None, None, None, None,
         )
     }
 
@@ -729,6 +732,7 @@ impl ConversationStore {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -748,10 +752,11 @@ impl ConversationStore {
         num_ctx: Option<i64>,
         prompt_eval_ns: Option<i64>,
         cached_tokens: Option<i64>,
+        assistant_response: Option<&str>,
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, from_agent, content, mentions,
-            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None, prompt_eval_ns, None, cached_tokens,
+            duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, None, prompt_eval_ns, None, cached_tokens, assistant_response,
         )
     }
 
@@ -765,7 +770,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "tool", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, None, None,
+            None, None, None, None, None, Some(triggered_by), None, None, None, None,
         )
     }
 
@@ -780,7 +785,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "tool", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, Some(tool_call_id), None,
+            None, None, None, None, None, Some(triggered_by), None, Some(tool_call_id), None, None,
         )
     }
 
@@ -794,7 +799,7 @@ impl ConversationStore {
     ) -> Result<i64, ConversationError> {
         self.add_message_full(
             conv_name, "recall", content, &[],
-            None, None, None, None, None, Some(triggered_by), None, None, None,
+            None, None, None, None, None, Some(triggered_by), None, None, None, None,
         )
     }
 
@@ -815,6 +820,7 @@ impl ConversationStore {
         prompt_eval_ns: Option<i64>,
         tool_call_id: Option<&str>,
         cached_tokens: Option<i64>,
+        assistant_response: Option<&str>,
     ) -> Result<i64, ConversationError> {
         // Verify conversation exists
         if self.get_conversation(conv_name)?.is_none() {
@@ -826,8 +832,8 @@ impl ConversationStore {
         let mentions_json = serde_json::to_string(mentions).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
-            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens],
+            "INSERT INTO messages (conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens, assistant_response) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![conv_name, from_agent, content, mentions_json, now, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, prompt_eval_ns, tool_call_id, cached_tokens, assistant_response],
         )?;
 
         let message_id = self.conn.last_insert_rowid();
@@ -1028,6 +1034,7 @@ impl ConversationStore {
                 msg.prompt_eval_ns,
                 msg.tool_call_id.as_deref(),
                 msg.cached_tokens,
+                msg.assistant_response.as_deref(),
             )?;
 
             if msg.pinned {
@@ -1857,11 +1864,12 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<ConversationMessage> 
         prompt_eval_ns: row.get(14)?,
         tool_call_id: row.get(15)?,
         cached_tokens: row.get(16)?,
+        assistant_response: row.get(17)?,
     })
 }
 
 /// SQL column list for message queries.
-const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned, prompt_eval_ns, tool_call_id, cached_tokens";
+const MESSAGE_COLUMNS: &str = "id, conv_name, from_agent, content, mentions, created_at, expires_at, duration_ms, tool_calls, tokens_in, tokens_out, num_ctx, triggered_by, pinned, prompt_eval_ns, tool_call_id, cached_tokens, assistant_response";
 
 /// Generate a fun name in "adjective-noun" format.
 /// Example: "wild-screwdriver", "quiet-harbor", "swift-falcon"
@@ -3472,6 +3480,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3490,6 +3499,7 @@ mod tests {
                 Some("arya"),
                 None,
                 Some("tc1"),
+                None,
                 None,
             )
             .unwrap();
@@ -3530,6 +3540,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -3548,6 +3559,7 @@ mod tests {
                 Some("arya"),
                 None,
                 Some("tc1"),
+                None,
                 None,
             )
             .unwrap();

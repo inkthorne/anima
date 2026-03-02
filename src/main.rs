@@ -1174,6 +1174,7 @@ async fn chat_with_conversation(conv_name: &str) -> Result<(), Box<dyn std::erro
                     prompt_eval_ns: None,
                     tool_call_id: None,
                     cached_tokens: None,
+                    assistant_response: None,
                 };
                 // Overwrite the prompt line with the formatted message
                 print!("\x1b[A\x1b[2K{}", format_message_display(&user_msg));
@@ -1564,10 +1565,18 @@ fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std:
     eprintln!("\x1b[2m--- step trace ({} messages) ---\x1b[0m", messages.len());
     for msg in &messages {
         let role = msg.from_agent.as_str();
-        let preview = if msg.content.is_empty() {
+        let display_content = if let Some(ref json) = msg.assistant_response {
+            serde_json::from_str::<serde_json::Value>(json)
+                .ok()
+                .and_then(|v| v["content"].as_str().map(String::from))
+                .unwrap_or_default()
+        } else {
+            msg.content.clone()
+        };
+        let preview = if display_content.is_empty() {
             "(empty)".to_string()
         } else {
-            let first_line = msg.content.lines().next().unwrap_or("");
+            let first_line = display_content.lines().next().unwrap_or("");
             if first_line.len() > 200 {
                 format!("{}...", &first_line[..200])
             } else {

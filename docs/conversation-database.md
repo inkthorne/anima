@@ -68,6 +68,7 @@ CREATE TABLE messages (
     prompt_eval_ns  INTEGER DEFAULT NULL,    -- Prompt eval duration in ns (Ollama)
     tool_call_id    TEXT DEFAULT NULL,        -- Links tool results to their tool calls
     cached_tokens   INTEGER DEFAULT NULL,    -- Prompt tokens from cache (OpenAI/LMStudio)
+    assistant_response TEXT DEFAULT NULL,   -- Full LLMResponse as JSON (content + tool_calls + usage)
     FOREIGN KEY (conv_name) REFERENCES conversations(name)
 );
 

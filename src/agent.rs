@@ -612,6 +612,9 @@ pub struct ThinkResult {
     /// After the assistant message is stored to DB, the caller renames files from this
     /// number to the DB message ID for easier cross-referencing.
     pub dump_turn_n: Option<u64>,
+    /// Full LLMResponse serialized as JSON (content + tool_calls + usage).
+    /// Set by single-turn functions; None for multi-turn loops.
+    pub assistant_response_json: Option<String>,
 }
 
 /// Maximum number of messages to retain in conversation history.
@@ -1481,6 +1484,7 @@ impl Agent {
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: None,
+                    assistant_response_json: None,
                 });
             }
 
@@ -1573,6 +1577,7 @@ impl Agent {
             duration_ms: None,
             cached_tokens: last_cached_tokens,
             dump_turn_n: None,
+            assistant_response_json: None,
         })
     }
 
@@ -1648,6 +1653,7 @@ impl Agent {
             .await?;
         self.dump_response(turn_n, &response);
         let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+        let assistant_response_json = serde_json::to_string(&response).ok();
 
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
         let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
@@ -1675,6 +1681,7 @@ impl Agent {
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
             dump_turn_n: turn_n,
+            assistant_response_json,
         })
     }
 
@@ -1713,6 +1720,7 @@ impl Agent {
             .await?;
         self.dump_response(turn_n, &response);
         let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+        let assistant_response_json = serde_json::to_string(&response).ok();
 
         let tokens_in = response.usage.as_ref().map(|u| u.prompt_tokens);
         let tokens_out = response.usage.as_ref().map(|u| u.completion_tokens);
@@ -1740,6 +1748,7 @@ impl Agent {
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
             dump_turn_n: turn_n,
+            assistant_response_json,
         })
     }
 
@@ -1847,6 +1856,7 @@ impl Agent {
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: None,
+                    assistant_response_json: None,
                 });
             }
 
@@ -1931,6 +1941,7 @@ impl Agent {
             duration_ms: None,
             cached_tokens: last_cached_tokens,
             dump_turn_n: None,
+            assistant_response_json: None,
         })
     }
 

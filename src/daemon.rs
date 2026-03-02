@@ -1144,7 +1144,7 @@ fn spawn_tool_trace_persister(
                 &cname, &agent_name, content, &[],
                 exec.iter_duration_ms.map(|d| d as i64),
                 tool_calls_json.as_deref(),
-                tokens_in, tokens_out, num_ctx_i64, eval_ns, cached,
+                tokens_in, tokens_out, num_ctx_i64, eval_ns, cached, None,
             ) {
                 logger.log(&format!("[trace] Failed to store tool call: {}", e));
             }
@@ -2984,6 +2984,8 @@ struct ToolLoopResult {
     /// Sequential turn number from the last LLM call's debug dump.
     /// Used by callers to rename dump files to the DB message ID.
     dump_turn_n: Option<u64>,
+    /// Full LLMResponse serialized as JSON from the last iteration.
+    assistant_response_json: Option<String>,
 }
 
 /// Unified tool loop for both native and tool-block modes.
@@ -3045,6 +3047,7 @@ async fn run_tool_loop(
                 prompt_eval_duration_ns: None,
                 cached_tokens: None,
                 dump_turn_n: None,
+                assistant_response_json: None,
             };
         }
     };
@@ -3067,6 +3070,7 @@ async fn run_tool_loop(
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_cached_tokens: Option<u32> = None;
     let mut last_dump_turn_n: Option<u64> = None;
+    let mut last_assistant_response_json: Option<String> = None;
     let mut prev_iter_had_tools = false;
 
     for _iteration in 0..max_iterations {
@@ -3084,6 +3088,7 @@ async fn run_tool_loop(
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: last_dump_turn_n,
+                    assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
         }
@@ -3101,6 +3106,7 @@ async fn run_tool_loop(
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: last_dump_turn_n,
+                    assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
         }
@@ -3284,6 +3290,7 @@ async fn run_tool_loop(
                             prompt_eval_duration_ns: last_prompt_eval_ns,
                             cached_tokens: last_cached_tokens,
                             dump_turn_n: last_dump_turn_n,
+                            assistant_response_json: last_assistant_response_json.clone(),
                         };
                     }
                 }
@@ -3300,6 +3307,7 @@ async fn run_tool_loop(
                     prompt_eval_duration_ns: None,
                     cached_tokens: None,
                     dump_turn_n: None,
+                    assistant_response_json: None,
                 };
             }
         };
@@ -3314,6 +3322,7 @@ async fn run_tool_loop(
                 last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
                 last_cached_tokens = think_result.cached_tokens;
                 last_dump_turn_n = think_result.dump_turn_n;
+                last_assistant_response_json = think_result.assistant_response_json.clone();
 
                 // Emit verbose: thinking (extract before stripping)
                 if let Some(ref vtx) = verbose_tx {
@@ -3392,6 +3401,7 @@ async fn run_tool_loop(
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
                                 dump_turn_n: last_dump_turn_n,
+                                assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
 
@@ -3404,6 +3414,7 @@ async fn run_tool_loop(
                             think_result.duration_ms.map(|d| d as i64),
                             tool_calls_json.as_deref(),
                             iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                            think_result.assistant_response_json.as_deref(),
                         ) {
                             Ok(msg_id) => {
                                 if let Some(turn_n) = think_result.dump_turn_n {
@@ -3450,6 +3461,7 @@ async fn run_tool_loop(
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
                                     dump_turn_n: last_dump_turn_n,
+                                    assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             }
 
@@ -3460,6 +3472,7 @@ async fn run_tool_loop(
                                 conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), None,
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
                                     if let Some(turn_n) = think_result.dump_turn_n {
@@ -3527,6 +3540,7 @@ async fn run_tool_loop(
                                 conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), None,
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
                                     if let Some(turn_n) = think_result.dump_turn_n {
@@ -3567,6 +3581,7 @@ async fn run_tool_loop(
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
                                 dump_turn_n: last_dump_turn_n,
+                                assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
 
@@ -3588,6 +3603,7 @@ async fn run_tool_loop(
                                 conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), tool_calls_json.as_deref(),
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
                                     if let Some(turn_n) = think_result.dump_turn_n {
@@ -3682,6 +3698,7 @@ async fn run_tool_loop(
                                 conv_name, agent_name, &db_content, &[],
                                 think_result.duration_ms.map(|d| d as i64), None,
                                 iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
                                     if let Some(turn_n) = think_result.dump_turn_n {
@@ -3717,6 +3734,7 @@ async fn run_tool_loop(
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
                                     dump_turn_n: last_dump_turn_n,
+                                    assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             }
 
@@ -3728,6 +3746,7 @@ async fn run_tool_loop(
                                     conv_name, agent_name, &db_content, &[],
                                     think_result.duration_ms.map(|d| d as i64), None,
                                     iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                    think_result.assistant_response_json.as_deref(),
                                 ) {
                                     Ok(msg_id) => {
                                         if let Some(turn_n) = think_result.dump_turn_n {
@@ -3795,6 +3814,7 @@ async fn run_tool_loop(
                                             conv_name, agent_name, &db_content, &[],
                                             think_result.duration_ms.map(|d| d as i64), None,
                                             iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                            think_result.assistant_response_json.as_deref(),
                                         ) {
                                             Ok(msg_id) => {
                                                 if let Some(turn_n) = think_result.dump_turn_n {
@@ -3849,6 +3869,7 @@ async fn run_tool_loop(
                                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                                 cached_tokens: last_cached_tokens,
                                                 dump_turn_n: last_dump_turn_n,
+                                                assistant_response_json: last_assistant_response_json.clone(),
                                             };
                                         }
                                         // Different state with no content → auto-execute
@@ -3872,6 +3893,7 @@ async fn run_tool_loop(
                                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                                 cached_tokens: last_cached_tokens,
                                                 dump_turn_n: last_dump_turn_n,
+                                                assistant_response_json: last_assistant_response_json.clone(),
                                             };
                                         } else {
                                             // Non-wait state — store response in DB, auto-execute
@@ -3881,6 +3903,7 @@ async fn run_tool_loop(
                                                     conv_name, agent_name, &db_content, &[],
                                                     think_result.duration_ms.map(|d| d as i64), None,
                                                     iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                                    think_result.assistant_response_json.as_deref(),
                                                 ) {
                                                     Ok(msg_id) => {
                                                         if let Some(turn_n) = think_result.dump_turn_n {
@@ -3908,6 +3931,7 @@ async fn run_tool_loop(
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
                                     dump_turn_n: last_dump_turn_n,
+                                    assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             } else {
                                 // Gap 6: Missing <state> in <set-vars> — error feedback to LLM
@@ -3918,6 +3942,7 @@ async fn run_tool_loop(
                                         conv_name, agent_name, &db_content, &[],
                                         think_result.duration_ms.map(|d| d as i64), None,
                                         iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                        think_result.assistant_response_json.as_deref(),
                                     ) {
                                         Ok(msg_id) => {
                                             if let Some(turn_n) = think_result.dump_turn_n {
@@ -3949,6 +3974,7 @@ async fn run_tool_loop(
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
                                 dump_turn_n: last_dump_turn_n,
+                                assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
                     } else {
@@ -3962,6 +3988,7 @@ async fn run_tool_loop(
                             prompt_eval_duration_ns: last_prompt_eval_ns,
                             cached_tokens: last_cached_tokens,
                             dump_turn_n: last_dump_turn_n,
+                            assistant_response_json: last_assistant_response_json.clone(),
                         };
                     }
                 }
@@ -4042,6 +4069,7 @@ async fn run_tool_loop(
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: last_dump_turn_n,
+                    assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
             Err(e) => {
@@ -4057,6 +4085,7 @@ async fn run_tool_loop(
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
                     dump_turn_n: last_dump_turn_n,
+                    assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
         }
@@ -4077,6 +4106,7 @@ async fn run_tool_loop(
         prompt_eval_duration_ns: last_prompt_eval_ns,
         cached_tokens: last_cached_tokens,
         dump_turn_n: last_dump_turn_n,
+        assistant_response_json: last_assistant_response_json,
     }
 }
 
@@ -4235,7 +4265,7 @@ async fn process_message_work(
 
     // With conversation: use unified tool loop (DB-backed context management)
     // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
-    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_turn_n) = if let Some(cname) = conv_name {
+    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_turn_n, last_assistant_response_json) = if let Some(cname) = conv_name {
         let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
         let start_time = std::time::Instant::now();
         let loop_budget = max_iterations.unwrap_or(25);
@@ -4272,7 +4302,7 @@ async fn process_message_work(
         drop(log_tx);
         let _ = log_fwd_handle.await;
 
-        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_turn_n)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_turn_n, loop_result.assistant_response_json)
     } else {
         // No conversation — use agent.rs tool loop directly (standalone mode)
         let (trace_tx, trace_rx) =
@@ -4301,7 +4331,7 @@ async fn process_message_work(
                     max_iterations,
                     num_ctx,
                 ).await;
-                (result.response.clone(), result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens, None)
+                (result.response.clone(), result.response.clone(), result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens, None, None)
             } else {
                 let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens) = process_tool_block_mode(
                     &final_user_content,
@@ -4318,7 +4348,7 @@ async fn process_message_work(
                     max_iterations,
                     num_ctx,
                 ).await;
-                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens, None)
+                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens, None, None)
             }
         };
 
@@ -4362,6 +4392,7 @@ async fn process_message_work(
                 }
                 // Store the final response with token stats (preserve thinking in DB)
                 // Notes already prepended by run_tool_loop — no second prepend_notes here
+                let assistant_response_opt = last_assistant_response_json.as_deref();
                 match store.add_message_with_tokens(
                     cname,
                     agent_name,
@@ -4374,6 +4405,7 @@ async fn process_message_work(
                     num_ctx_i64,
                     prompt_eval_ns,
                     cached_tokens_i64,
+                    assistant_response_opt,
                 ) {
                     Ok(response_msg_id) => {
                         // Rename debug dump files from sequential number to DB message ID
@@ -5031,6 +5063,7 @@ async fn handle_notify(
     let prompt_eval_ns_i64 = loop_result.prompt_eval_duration_ns.map(|t| t as i64);
     let cached_tokens_i64 = loop_result.cached_tokens.map(|t| t as i64);
     let last_dump_turn_n = loop_result.dump_turn_n;
+    let last_assistant_response_json = loop_result.assistant_response_json;
 
     // Stamp stats on intermediate messages
     if tokens_in.is_some() || tokens_out.is_some() {
@@ -5057,6 +5090,7 @@ async fn handle_notify(
         logger.log("[notify] Empty response, skipping message storage");
         return Response::Notified { response_message_id: 0 };
     }
+    let assistant_response_opt = last_assistant_response_json.as_deref();
     match store.add_message_with_tokens(
         conv_id,
         agent_name,
@@ -5069,6 +5103,7 @@ async fn handle_notify(
         num_ctx_i64,
         prompt_eval_ns_i64,
         cached_tokens_i64,
+        assistant_response_opt,
     ) {
         Ok(response_msg_id) => {
             logger.log(&format!(
@@ -6445,6 +6480,7 @@ api_key = "sk-test"
             prompt_eval_ns: None,
             tool_call_id: None,
             cached_tokens: None,
+            assistant_response: None,
         }
     }
 
@@ -6467,6 +6503,7 @@ api_key = "sk-test"
             prompt_eval_ns: None,
             tool_call_id: None,
             cached_tokens: None,
+            assistant_response: None,
         }
     }
 
