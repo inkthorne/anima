@@ -7,9 +7,21 @@ use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Regex for extracting `<python>...</python>` blocks.
+static PYTHON_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<python>\s*\n?(.*?)\n?\s*</python>").unwrap());
+
+/// Regex for extracting fenced ```json ... ``` tool call blocks.
+static TOOL_CALL_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap());
+
+/// Regex for extracting `<think>...</think>` blocks (verbose output).
+static THINKING_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap());
 
 use chrono::Local;
 use tokio::net::UnixListener;
@@ -19,6 +31,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 pub struct AgentLogger {
     file: std::sync::Mutex<File>,
     agent_name: String,
+    stdout_is_terminal: bool,
 }
 
 impl AgentLogger {
@@ -35,6 +48,7 @@ impl AgentLogger {
         Ok(Self {
             file: std::sync::Mutex::new(file),
             agent_name: agent_name.to_string(),
+            stdout_is_terminal: std::io::stdout().is_terminal(),
         })
     }
 
@@ -50,7 +64,7 @@ impl AgentLogger {
         }
 
         // Also print to stdout for interactive use (skip when stdout is redirected to log file)
-        if std::io::stdout().is_terminal() {
+        if self.stdout_is_terminal {
             print!("{}", line);
         }
     }
@@ -76,28 +90,65 @@ pub struct ToolCall {
 /// Extract `<python>...</python>` blocks from agent output.
 /// Returns (cleaned_output, Vec<code_strings>).
 fn extract_python_blocks(output: &str) -> (String, Vec<String>) {
-    let re = regex::Regex::new(r"(?s)<python>\s*\n?(.*?)\n?\s*</python>").unwrap();
     let mut blocks = Vec::new();
-    for cap in re.captures_iter(output) {
+    for cap in PYTHON_BLOCK_RE.captures_iter(output) {
         blocks.push(cap[1].to_string());
     }
-    let cleaned = re.replace_all(output, "").trim().to_string();
+    let cleaned = PYTHON_BLOCK_RE.replace_all(output, "").trim().to_string();
     (cleaned, blocks)
+}
+
+/// Execute a list of python code blocks and format results as `<python-output>` XML.
+/// Returns the individual result strings (caller joins and truncates).
+async fn execute_python_blocks(
+    blocks: &[String],
+    agent_dir: Option<&Path>,
+    logger: &AgentLogger,
+) -> Vec<String> {
+    let timeout = std::time::Duration::from_secs(30);
+    let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
+    let mut result_parts = Vec::new();
+    for (i, code) in blocks.iter().enumerate() {
+        logger.tool(&format!(
+            "[loop] Executing python block {} ({} bytes)",
+            i + 1,
+            code.len()
+        ));
+        match run_python(code, timeout, mem_limit, agent_dir).await {
+            Ok(val) => {
+                let stdout = val["stdout"].as_str().unwrap_or("");
+                let stderr = val["stderr"].as_str().unwrap_or("");
+                let exit_code = val["exit_code"].as_i64().unwrap_or(0);
+                let mut part = format!("<python-output>\n{}", stdout);
+                if !stderr.is_empty() {
+                    part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
+                }
+                if exit_code != 0 {
+                    part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
+                }
+                part.push_str("</python-output>");
+                result_parts.push(part);
+            }
+            Err(e) => {
+                result_parts.push(format!(
+                    "<python-output>\n<error>{}</error>\n</python-output>",
+                    e
+                ));
+            }
+        }
+    }
+    result_parts
 }
 
 /// Extract a JSON tool block from agent output.
 /// Returns (cleaned_output, Option<ToolCall>)
 pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
-    // Only accept fenced ```json ... ``` blocks for tool calls
-    // This is unambiguous and handles nested braces correctly
-    let fenced_re = regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap();
-
-    if let Some(cap) = fenced_re.captures(output)
+    if let Some(cap) = TOOL_CALL_RE.captures(output)
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1])
         && let Some(tool_name) = json.get("tool").and_then(|t| t.as_str())
     {
         let params = json.get("params").cloned().unwrap_or(serde_json::json!({}));
-        let cleaned = fenced_re.replace(output, "").trim().to_string();
+        let cleaned = TOOL_CALL_RE.replace(output, "").trim().to_string();
         return (
             cleaned,
             Some(ToolCall {
@@ -1379,56 +1430,48 @@ fn execute_tool_call<'a>(
             }
         }
         "list_tools" => {
-            // Load tool registry and return tool names filtered by agent's allowlist
-            let tools_path = dirs::home_dir()
-                .map(|h| h.join(".anima").join("tools.toml"))
-                .ok_or("Could not determine home directory")?;
-
             // Get allowed tools from context (if available)
             let allowed = context.and_then(|ctx| ctx.allowed_tools.as_ref());
 
-            match ToolRegistry::load_from_file(&tools_path) {
-                Ok(registry) => {
-                    let all_tools: Vec<&str> = registry
-                        .all_tools()
-                        .iter()
-                        .map(|t| t.name.as_str())
-                        .collect();
+            // Use the already-loaded registry from context instead of re-reading tools.toml
+            let registry_ref = context.and_then(|ctx| ctx.tool_registry.as_ref());
 
-                    // Filter by allowlist if present
-                    let tool_names: Vec<&str> = match allowed {
-                        Some(allowlist) => all_tools
-                            .into_iter()
-                            .filter(|t| allowlist.iter().any(|a| a == *t))
-                            .collect(),
-                        None => all_tools, // No allowlist = show all (for testing)
-                    };
+            if let Some(registry) = registry_ref {
+                let all_tools: Vec<&str> = registry
+                    .all_tools()
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect();
 
-                    // Always include built-in tools that are typically allowed
-                    let mut result: Vec<&str> = tool_names;
-                    for builtin in &["list_tools", "list_agents", "remember", "send_message", "start_task", "wait_task", "stop_task", "search_conversation", "notes", "subtask"] {
-                        if !result.contains(builtin)
-                            && allowed
-                                .map(|a| a.iter().any(|x| x == *builtin))
-                                .unwrap_or(true)
-                        {
-                            result.push(builtin);
-                        }
-                    }
+                // Filter by allowlist if present
+                let tool_names: Vec<&str> = match allowed {
+                    Some(allowlist) => all_tools
+                        .into_iter()
+                        .filter(|t| allowlist.iter().any(|a| a == *t))
+                        .collect(),
+                    None => all_tools, // No allowlist = show all (for testing)
+                };
 
-                    if result.is_empty() {
-                        Ok("No tools available for this agent.".to_string())
-                    } else {
-                        Ok(format!("Available tools: {}", result.join(", ")))
+                // Always include built-in tools that are typically allowed
+                let mut result: Vec<&str> = tool_names;
+                for builtin in &["list_tools", "list_agents", "remember", "send_message", "start_task", "wait_task", "stop_task", "search_conversation", "notes", "subtask"] {
+                    if !result.contains(builtin)
+                        && allowed
+                            .map(|a| a.iter().any(|x| x == *builtin))
+                            .unwrap_or(true)
+                    {
+                        result.push(builtin);
                     }
                 }
-                Err(e) => {
-                    // Fallback: return built-in tools if registry fails to load
-                    Ok(format!(
-                        "Built-in tools: list_tools, list_agents, remember, send_message, start_task, wait_task, stop_task, search_conversation, notes, subtask\n(Note: tools.toml failed to load: {})",
-                        e
-                    ))
+
+                if result.is_empty() {
+                    Ok("No tools available for this agent.".to_string())
+                } else {
+                    Ok(format!("Available tools: {}", result.join(", ")))
                 }
+            } else {
+                // Fallback: return built-in tools if no registry in context
+                Ok("Built-in tools: list_tools, list_agents, remember, send_message, start_task, wait_task, stop_task, search_conversation, notes, subtask".to_string())
             }
         }
         "start_task" => {
@@ -3409,8 +3452,7 @@ async fn run_tool_loop(
 
                 // Emit verbose: thinking (extract before stripping)
                 if let Some(ref vtx) = verbose_tx {
-                    let thinking_re = regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap();
-                    for cap in thinking_re.captures_iter(&think_result.response) {
+                    for cap in THINKING_RE.captures_iter(&think_result.response) {
                         let thinking_text = cap[1].trim();
                         if !thinking_text.is_empty() {
                             let _ = vtx.send(Response::Verbose {
@@ -3564,36 +3606,12 @@ async fn run_tool_loop(
                                 }
                             }
 
-                            // Execute each python block
-                            let timeout = std::time::Duration::from_secs(30);
-                            let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
-                            let mut result_parts = Vec::new();
-                            for (i, code) in python_blocks.iter().enumerate() {
-                                logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
-                                match run_python(code, timeout, mem_limit, tool_context.agent_dir.as_deref()).await {
-                                    Ok(val) => {
-                                        let stdout = val["stdout"].as_str().unwrap_or("");
-                                        let stderr = val["stderr"].as_str().unwrap_or("");
-                                        let exit_code = val["exit_code"].as_i64().unwrap_or(0);
-                                        let mut part = format!("<python-output>\n{}", stdout);
-                                        if !stderr.is_empty() {
-                                            part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
-                                        }
-                                        if exit_code != 0 {
-                                            part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
-                                        }
-                                        part.push_str("</python-output>");
-                                        result_parts.push(part);
-                                    }
-                                    Err(e) => {
-                                        result_parts.push(format!("<python-output>\n<error>{}</error>\n</python-output>", e));
-                                    }
-                                }
-                            }
-
+                            // Execute python blocks
+                            let result_parts = execute_python_blocks(
+                                &python_blocks, tool_context.agent_dir.as_deref(), logger,
+                            ).await;
                             let tool_message = truncate_tool_result(
-                                &result_parts.join("\n---\n"),
-                                num_ctx,
+                                &result_parts.join("\n---\n"), num_ctx,
                             ).into_owned();
                             logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
 
@@ -3767,36 +3785,12 @@ async fn run_tool_loop(
                                 }
                             }
 
-                            // Execute each python block
-                            let timeout = std::time::Duration::from_secs(30);
-                            let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
-                            let mut result_parts = Vec::new();
-                            for (i, code) in python_blocks.iter().enumerate() {
-                                logger.tool(&format!("[loop] Executing python block {} ({} bytes)", i + 1, code.len()));
-                                match run_python(code, timeout, mem_limit, tool_context.agent_dir.as_deref()).await {
-                                    Ok(val) => {
-                                        let stdout = val["stdout"].as_str().unwrap_or("");
-                                        let stderr = val["stderr"].as_str().unwrap_or("");
-                                        let exit_code = val["exit_code"].as_i64().unwrap_or(0);
-                                        let mut part = format!("<python-output>\n{}", stdout);
-                                        if !stderr.is_empty() {
-                                            part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
-                                        }
-                                        if exit_code != 0 {
-                                            part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
-                                        }
-                                        part.push_str("</python-output>");
-                                        result_parts.push(part);
-                                    }
-                                    Err(e) => {
-                                        result_parts.push(format!("<python-output>\n<error>{}</error>\n</python-output>", e));
-                                    }
-                                }
-                            }
-
+                            // Execute python blocks
+                            let result_parts = execute_python_blocks(
+                                &python_blocks, tool_context.agent_dir.as_deref(), logger,
+                            ).await;
                             let tool_message = truncate_tool_result(
-                                &result_parts.join("\n---\n"),
-                                num_ctx,
+                                &result_parts.join("\n---\n"), num_ctx,
                             ).into_owned();
                             logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
 
@@ -4066,19 +4060,7 @@ async fn run_tool_loop(
                         latest_msg_id,
                         logger,
                     );
-                    let dedup_up_to = if dedup_lazy {
-                        match store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None) {
-                            Some(c) if c > 0 => {
-                                // Dedup pending → apply full dedup this one time, mark as applied
-                                let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
-                                latest_msg_id
-                            }
-                            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
-                            None => None,             // No cursor: no dedup
-                        }
-                    } else {
-                        latest_msg_id
-                    };
+                    let dedup_up_to = resolve_dedup_up_to(&store, conv_name, agent_name, dedup_lazy, latest_msg_id);
                     let (refreshed_history, refreshed_final) =
                         format_conversation_history(&msgs, agent_name, dedup_up_to);
                     conversation_history = refreshed_history;
@@ -4196,18 +4178,7 @@ async fn process_message_work(
                     Ok(msgs) if !msgs.is_empty() => {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
-                        let dedup_up_to = if dedup_lazy {
-                            match store.get_dedup_cursor(cname, agent_name).unwrap_or(None) {
-                                Some(c) if c > 0 => {
-                                    let _ = store.set_dedup_cursor(cname, agent_name, -c);
-                                    msgs.last().map(|m| m.id)
-                                }
-                                Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
-                                None => None,
-                            }
-                        } else {
-                            msgs.last().map(|m| m.id)
-                        };
+                        let dedup_up_to = resolve_dedup_up_to(&store, cname, agent_name, dedup_lazy, msgs.last().map(|m| m.id));
                         let (history, final_content) =
                             format_conversation_history(&msgs, agent_name, dedup_up_to);
                         logger.log(&format!(
@@ -4963,6 +4934,34 @@ fn set_anchor_cursor(
     }
 }
 
+/// Resolve the dedup_up_to boundary from the lazy dedup cursor state.
+///
+/// Sign-encoded cursor: NULL=idle, positive=pending dedup, negative=applied.
+/// - No cursor (idle): no dedup
+/// - Positive cursor (pending): apply full dedup, mark as applied (flip sign)
+/// - Negative cursor (applied): dedup only up to original boundary
+fn resolve_dedup_up_to(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    dedup_lazy: bool,
+    latest_msg_id: Option<i64>,
+) -> Option<i64> {
+    if dedup_lazy {
+        match store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None) {
+            Some(c) if c > 0 => {
+                // Dedup pending → apply full dedup this one time, mark as applied
+                let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
+                latest_msg_id
+            }
+            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
+            None => None,                             // No cursor: no dedup
+        }
+    } else {
+        latest_msg_id
+    }
+}
+
 /// Check context fill ratio and reset cursor if threshold exceeded.
 ///
 /// In lazy dedup mode (`dedup_lazy = true`), uses a two-phase approach:
@@ -5116,18 +5115,7 @@ async fn handle_notify(
     let last_user_msg_id = context_messages.iter().rev()
         .find(|m| m.from_agent == "user")
         .map(|m| m.id);
-    let dedup_up_to = if dedup_lazy {
-        match store.get_dedup_cursor(conv_id, agent_name).unwrap_or(None) {
-            Some(c) if c > 0 => {
-                let _ = store.set_dedup_cursor(conv_id, agent_name, -c);
-                context_messages.last().map(|m| m.id)
-            }
-            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
-            None => None,
-        }
-    } else {
-        context_messages.last().map(|m| m.id)
-    };
+    let dedup_up_to = resolve_dedup_up_to(&store, conv_id, agent_name, dedup_lazy, context_messages.last().map(|m| m.id));
     let (conversation_history, final_user_content) =
         format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
@@ -5616,18 +5604,7 @@ async fn run_heartbeat(
     // Format them as assistant messages to show the model its previous outputs
     let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
         .unwrap_or_default();
-    let dedup_up_to = if dedup_lazy {
-        match store.get_dedup_cursor(&conv_name, agent_name).unwrap_or(None) {
-            Some(c) if c > 0 => {
-                let _ = store.set_dedup_cursor(&conv_name, agent_name, -c);
-                context_messages.last().map(|m| m.id)
-            }
-            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
-            None => None,
-        }
-    } else {
-        context_messages.last().map(|m| m.id)
-    };
+    let dedup_up_to = resolve_dedup_up_to(&store, &conv_name, agent_name, dedup_lazy, context_messages.last().map(|m| m.id));
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     logger.log(&format!(
