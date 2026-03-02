@@ -2481,11 +2481,6 @@ async fn handle_chat_command(
 
             let messages = store.get_messages_filtered(&conv, limit, since)?;
 
-            let messages: Vec<_> = messages
-                .into_iter()
-                .filter(|m| m.from_agent != "tool" && m.from_agent != "recall")
-                .collect();
-
             if json || pretty {
                 let json_messages: Vec<serde_json::Value> = messages
                     .iter()
@@ -2529,6 +2524,10 @@ async fn handle_chat_command(
                     println!("{}", serde_json::to_string_pretty(&json_messages)?);
                 }
             } else {
+                let messages: Vec<_> = messages
+                    .into_iter()
+                    .filter(|m| m.from_agent != "tool" && m.from_agent != "recall")
+                    .collect();
                 for msg in &messages {
                     print!("{}", format_message_display(msg));
                 }
