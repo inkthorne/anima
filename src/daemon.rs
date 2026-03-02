@@ -3934,34 +3934,22 @@ async fn run_tool_loop(
                                     assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             } else {
-                                // Gap 6: Missing <state> in <set-vars> — error feedback to LLM
-                                logger.log("[state] Missing <state> in <set-vars>, notifying LLM");
-                                // Store response in DB before error feedback
-                                if !db_content.trim().is_empty() {
-                                    match store.add_message_with_tokens(
-                                        conv_name, agent_name, &db_content, &[],
-                                        think_result.duration_ms.map(|d| d as i64), None,
-                                        iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
-                                        think_result.assistant_response_json.as_deref(),
-                                    ) {
-                                        Ok(msg_id) => {
-                                            if let Some(turn_n) = think_result.dump_turn_n {
-                                                agent.lock().await.rename_turn_files(turn_n, msg_id);
-                                            }
-                                        }
-                                        Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
-                                    }
-                                }
-                                let available = list_state_files(dir);
-                                current_message = format!(
-                                    "[State error: You must include <state>state_name</state> inside your <set-vars> block. Available states: {}.]",
-                                    available
-                                );
-                                // Store error as tool result so LLM sees it
-                                if let Err(e) = store.add_tool_result(conv_name, &current_message, agent_name) {
-                                    logger.log(&format!("[loop] Failed to store state error: {}", e));
-                                }
-                                // Fall through to context refresh, will continue loop
+                                // No state change specified — keep current state
+                                logger.log(&format!(
+                                    "[state] No state change, keeping current state: {}",
+                                    state_before.as_deref().unwrap_or("unknown")
+                                ));
+                                return ToolLoopResult {
+                                    response: stripped,
+                                    db_response: db_content,
+                                    duration_ms: last_duration_ms,
+                                    tokens_in: last_tokens_in,
+                                    tokens_out: last_tokens_out,
+                                    prompt_eval_duration_ns: last_prompt_eval_ns,
+                                    cached_tokens: last_cached_tokens,
+                                    dump_turn_n: last_dump_turn_n,
+                                    assistant_response_json: last_assistant_response_json.clone(),
+                                };
                             }
                         } else {
                             // No state active — return final response
