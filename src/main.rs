@@ -2666,7 +2666,7 @@ async fn handle_chat_command(
                 let msg_count = store.get_message_count(&conv.name)?;
                 let updated = format_relative_time(conv.updated_at);
 
-                let name_display = if conv.paused {
+                let name_display = if conv.is_paused() {
                     format!("{} \x1b[33m⏸\x1b[0m", conv.name)
                 } else {
                     conv.name.clone()

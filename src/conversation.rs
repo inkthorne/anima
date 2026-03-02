@@ -59,10 +59,16 @@ pub struct Conversation {
     pub name: String,
     pub created_at: i64,
     pub updated_at: i64,
-    pub paused: bool,
-    /// The message ID at which the conversation was paused.
-    /// Used during resume to catch up on skipped tool calls and @mentions.
+    /// The message ID at which the conversation was paused (0 for empty conversations).
+    /// Non-None = paused. Used during resume to catch up on skipped tool calls and @mentions.
     pub paused_at_msg_id: Option<i64>,
+}
+
+impl Conversation {
+    /// Returns true if this conversation is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused_at_msg_id.is_some()
+    }
 }
 
 /// A participant in a conversation.
@@ -189,7 +195,6 @@ impl ConversationStore {
                     name TEXT PRIMARY KEY,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    paused INTEGER DEFAULT 0,
                     paused_at_msg_id INTEGER DEFAULT NULL
                 );
 
@@ -253,6 +258,21 @@ impl ConversationStore {
         Ok(found)
     }
 
+    /// Drop a column from a table if it exists (SQLite 3.35.0+).
+    fn drop_column_if_present(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<(), ConversationError> {
+        if self.has_column(table, column)? {
+            self.conn.execute(
+                &format!("ALTER TABLE {} DROP COLUMN {}", table, column),
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Add a column to a table if it doesn't already exist.
     fn add_column_if_missing(
         &self,
@@ -271,8 +291,8 @@ impl ConversationStore {
 
     /// Run all column migrations for existing databases.
     fn run_column_migrations(&self) -> Result<(), ConversationError> {
-        self.add_column_if_missing("conversations", "paused", "INTEGER DEFAULT 0")?;
         self.add_column_if_missing("conversations", "paused_at_msg_id", "INTEGER DEFAULT NULL")?;
+        self.drop_column_if_present("conversations", "paused")?;
         self.add_column_if_missing("messages", "duration_ms", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tool_calls", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("messages", "tokens_in", "INTEGER DEFAULT NULL")?;
@@ -327,7 +347,6 @@ impl ConversationStore {
                 name TEXT PRIMARY KEY,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
-                paused INTEGER DEFAULT 0,
                 paused_at_msg_id INTEGER DEFAULT NULL
             );
 
@@ -476,7 +495,7 @@ impl ConversationStore {
     /// List all conversations.
     pub fn list_conversations(&self) -> Result<Vec<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at, paused, paused_at_msg_id FROM conversations ORDER BY updated_at DESC",
+            "SELECT name, created_at, updated_at, paused_at_msg_id FROM conversations ORDER BY updated_at DESC",
         )?;
 
         let conversations = stmt
@@ -521,7 +540,7 @@ impl ConversationStore {
     /// Get a conversation by name.
     pub fn get_conversation(&self, name: &str) -> Result<Option<Conversation>, ConversationError> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, created_at, updated_at, paused, paused_at_msg_id FROM conversations WHERE name = ?1",
+            "SELECT name, created_at, updated_at, paused_at_msg_id FROM conversations WHERE name = ?1",
         )?;
 
         let mut rows = stmt.query(params![name])?;
@@ -534,7 +553,7 @@ impl ConversationStore {
     /// Check if a conversation is paused.
     pub fn is_paused(&self, conv_name: &str) -> Result<bool, ConversationError> {
         match self.get_conversation(conv_name)? {
-            Some(conv) => Ok(conv.paused),
+            Some(conv) => Ok(conv.is_paused()),
             None => Err(ConversationError::NotFound(conv_name.to_string())),
         }
     }
@@ -553,18 +572,18 @@ impl ConversationStore {
             .ok_or_else(|| ConversationError::NotFound(conv_name.to_string()))?;
 
         if paused {
-            // Pausing: record the current max message ID
-            let max_msg_id: Option<i64> = self
+            // Pausing: record the current max message ID (0 if no messages yet)
+            let max_msg_id: i64 = self
                 .conn
                 .query_row(
-                    "SELECT MAX(id) FROM messages WHERE conv_name = ?1",
+                    "SELECT COALESCE(MAX(id), 0) FROM messages WHERE conv_name = ?1",
                     params![conv_name],
                     |row| row.get(0),
                 )
-                .ok();
+                .unwrap_or(0);
 
             self.conn.execute(
-                "UPDATE conversations SET paused = 1, paused_at_msg_id = ?1 WHERE name = ?2",
+                "UPDATE conversations SET paused_at_msg_id = ?1 WHERE name = ?2",
                 params![max_msg_id, conv_name],
             )?;
 
@@ -574,7 +593,7 @@ impl ConversationStore {
             let paused_at_msg_id = conv.paused_at_msg_id;
 
             self.conn.execute(
-                "UPDATE conversations SET paused = 0, paused_at_msg_id = NULL WHERE name = ?1",
+                "UPDATE conversations SET paused_at_msg_id = NULL WHERE name = ?1",
                 params![conv_name],
             )?;
 
@@ -1782,7 +1801,7 @@ impl ConversationStore {
         let conv_name = self.generate_unique_fun_name()?;
 
         self.conn.execute(
-            "INSERT INTO conversations (name, created_at, updated_at, paused) VALUES (?1, ?2, ?3, 0)",
+            "INSERT INTO conversations (name, created_at, updated_at) VALUES (?1, ?2, ?3)",
             params![conv_name, now, now],
         )?;
 
@@ -1798,21 +1817,19 @@ impl ConversationStore {
             name: conv_name,
             created_at: now,
             updated_at: now,
-            paused: false,
             paused_at_msg_id: None,
         })
     }
 }
 
 /// Map a database row to a Conversation struct.
-/// Expects columns: name, created_at, updated_at, paused, paused_at_msg_id.
+/// Expects columns: name, created_at, updated_at, paused_at_msg_id.
 fn row_to_conversation(row: &rusqlite::Row) -> rusqlite::Result<Conversation> {
     Ok(Conversation {
         name: row.get(0)?,
         created_at: row.get(1)?,
         updated_at: row.get(2)?,
-        paused: row.get::<_, i64>(3)? != 0,
-        paused_at_msg_id: row.get(4)?,
+        paused_at_msg_id: row.get(3)?,
     })
 }
 
@@ -3001,7 +3018,8 @@ mod tests {
         let conv = store.get_conversation(&conv_name).unwrap().unwrap();
 
         // Conversations are not paused by default
-        assert!(!conv.paused);
+        assert!(conv.paused_at_msg_id.is_none());
+        assert!(!conv.is_paused());
         assert!(!store.is_paused(&conv_name).unwrap());
     }
 
