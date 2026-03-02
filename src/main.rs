@@ -268,6 +268,9 @@ enum ChatCommands {
         /// Output messages as JSON array
         #[arg(long)]
         json: bool,
+        /// Output messages as pretty-printed JSON (content unescaped for readability)
+        #[arg(long)]
+        pretty: bool,
     },
     /// Pause a conversation (notifications will be queued). Supports glob patterns (*, ?).
     Pause {
@@ -2470,6 +2473,7 @@ async fn handle_chat_command(
             limit,
             since,
             json,
+            pretty,
         }) => {
             if store.find_by_name(&conv)?.is_none() {
                 return Err(format!("Conversation '{}' not found", conv).into());
@@ -2482,7 +2486,7 @@ async fn handle_chat_command(
                 .filter(|m| m.from_agent != "tool" && m.from_agent != "recall")
                 .collect();
 
-            if json {
+            if json || pretty {
                 let json_messages: Vec<serde_json::Value> = messages
                     .iter()
                     .map(|msg| {
@@ -2507,7 +2511,23 @@ async fn handle_chat_command(
                         })
                     })
                     .collect();
-                println!("{}", serde_json::to_string_pretty(&json_messages)?);
+                if pretty {
+                    let output = serde_json::to_string_pretty(&json_messages)?;
+                    let mut result = String::with_capacity(output.len());
+                    for line in output.lines() {
+                        let trimmed = line.trim_start();
+                        if trimmed.starts_with("\"content\": \"") {
+                            result.push_str(&line.replace("\\n", "\n").replace("\\t", "\t"));
+                        } else {
+                            result.push_str(line);
+                        }
+                        result.push('\n');
+                    }
+                    print!("{}", result.trim_end());
+                    println!();
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&json_messages)?);
+                }
             } else {
                 for msg in &messages {
                     print!("{}", format_message_display(msg));
