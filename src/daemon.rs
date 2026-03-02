@@ -165,12 +165,11 @@ use crate::agent::{Agent, ThinkOptions};
 use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection, resolve_embedding_config};
 use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
-use crate::conversation::ConversationError;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
 use crate::auth;
 use crate::llm::{
-    AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, LLMError, LLMResponse, OllamaClient,
+    AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, OllamaClient,
     OpenAIClient, ToolSpec, strip_thinking_tags,
 };
 use crate::memory::{
@@ -1562,7 +1561,7 @@ fn execute_tool_call<'a>(
                 .map_err(|e| format!("Failed to post subtask instruction: {}", e))?;
 
             // Load context and format conversation history
-            let context_messages = load_agent_context(&store, &subtask_conv, &ctx.agent_name, logger, ctx.num_ctx)
+            let context_messages = load_agent_context(&store, &subtask_conv, &ctx.agent_name, &|msg| logger.log(msg), ctx.num_ctx)
                 .map_err(|e| format!("Failed to load subtask context: {}", e))?;
             let dedup_up_to = context_messages.last().map(|m| m.id);
             let (conversation_history, final_user_content) =
@@ -1653,83 +1652,7 @@ fn execute_tool_call<'a>(
     }) // Box::pin
 }
 
-/// Convert ToolDefinition params to JSON Schema format for native tool calling.
-fn convert_params_to_json_schema(params: &serde_json::Value) -> serde_json::Value {
-    match params {
-        serde_json::Value::Object(map) => {
-            let mut properties = serde_json::Map::new();
-            let mut required = Vec::new();
-
-            for (name, type_info) in map {
-                let type_str = match type_info {
-                    serde_json::Value::String(s) => s.as_str(),
-                    _ => "string",
-                };
-
-                let is_optional = type_str.to_lowercase().contains("optional");
-                let base_type = type_str.split_whitespace().next().unwrap_or("string");
-
-                // Normalize to JSON Schema types
-                let json_type = match base_type {
-                    "bool" => "boolean",
-                    "int" => "integer",
-                    "float" | "double" => "number",
-                    "str" => "string",
-                    other => other,
-                };
-
-                properties.insert(name.clone(), serde_json::json!({"type": json_type}));
-
-                if !is_optional {
-                    required.push(serde_json::Value::String(name.clone()));
-                }
-            }
-
-            serde_json::json!({
-                "type": "object",
-                "properties": properties,
-                "required": required
-            })
-        }
-        _ => serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "required": []
-        }),
-    }
-}
-
-/// Convert ToolDefinitions from registry to ToolSpecs for native LLM tool calling.
-fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
-    definitions
-        .iter()
-        .map(|def| ToolSpec {
-            name: def.name.clone(),
-            description: def.description.clone(),
-            parameters: convert_params_to_json_schema(&def.params),
-        })
-        .collect()
-}
-
-/// Tools that bypass the allowlist and are always available to every agent.
-const ALWAYS_ALLOWED_TOOLS: &[&str] = &[];
-
-/// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
-fn filter_by_allowlist<'a>(
-    tools: Vec<&'a ToolDefinition>,
-    allowed_tools: &Option<Vec<String>>,
-) -> Vec<&'a ToolDefinition> {
-    match allowed_tools {
-        Some(allowed) => tools
-            .into_iter()
-            .filter(|t| {
-                allowed.contains(&t.name)
-                    || ALWAYS_ALLOWED_TOOLS.contains(&t.name.as_str())
-            })
-            .collect(),
-        None => Vec::new(), // No allowlist = no tools
-    }
-}
+use crate::tool_registry::{tool_definitions_to_specs, filter_by_allowlist};
 
 /// Configuration for the daemon, derived from AgentDir.
 #[derive(Debug, Clone)]
@@ -2656,101 +2579,7 @@ async fn create_agent_from_dir(
     Ok((agent, use_native_tools))
 }
 
-// ---------------------------------------------------------------------------
-// Refreshing Anthropic client (auto-refreshes OAuth tokens for daemons)
-// ---------------------------------------------------------------------------
-
-/// An LLM wrapper that auto-refreshes OAuth Bearer tokens before expiry.
-/// For API key auth, this is a transparent passthrough.
-struct RefreshingAnthropicClient {
-    inner: tokio::sync::RwLock<AnthropicClient>,
-    refresh_token: String,
-    expires_at: std::sync::atomic::AtomicI64,
-    model: String,
-    base_url: Option<String>,
-    max_tokens: Option<u32>,
-}
-
-impl RefreshingAnthropicClient {
-    fn new(
-        tokens: auth::StoredTokens,
-        model: String,
-        base_url: Option<String>,
-        max_tokens: Option<u32>,
-    ) -> Self {
-        let mut client = AnthropicClient::with_bearer(&tokens.access_token).with_model(&model);
-        if let Some(ref url) = base_url {
-            client = client.with_base_url(url);
-        }
-        if let Some(mt) = max_tokens {
-            client = client.with_max_tokens(mt);
-        }
-        Self {
-            inner: tokio::sync::RwLock::new(client),
-            refresh_token: tokens.refresh_token,
-            expires_at: std::sync::atomic::AtomicI64::new(tokens.expires_at),
-            model,
-            base_url,
-            max_tokens,
-        }
-    }
-
-    async fn ensure_fresh(&self) {
-        let now = chrono::Utc::now().timestamp();
-        let exp = self.expires_at.load(std::sync::atomic::Ordering::Relaxed);
-        if now < exp - 300 {
-            return; // still valid
-        }
-
-        // Try to refresh — extract what we need before the write lock
-        let refreshed = auth::refresh_tokens(&self.refresh_token).await;
-        if let Ok(new_tokens) = refreshed {
-            let _ = auth::save_tokens(&new_tokens);
-            self.expires_at
-                .store(new_tokens.expires_at, std::sync::atomic::Ordering::Relaxed);
-
-            let mut client =
-                AnthropicClient::with_bearer(&new_tokens.access_token).with_model(&self.model);
-            if let Some(ref url) = self.base_url {
-                client = client.with_base_url(url);
-            }
-            if let Some(mt) = self.max_tokens {
-                client = client.with_max_tokens(mt);
-            }
-            *self.inner.write().await = client;
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl LLM for RefreshingAnthropicClient {
-    fn model_name(&self) -> &str {
-        &self.model
-    }
-
-    async fn chat_complete(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolSpec>>,
-    ) -> Result<LLMResponse, LLMError> {
-        self.ensure_fresh().await;
-        self.inner.read().await.chat_complete(messages, tools).await
-    }
-
-    async fn chat_complete_stream(
-        &self,
-        messages: Vec<ChatMessage>,
-        tools: Option<Vec<ToolSpec>>,
-        tx: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<LLMResponse, LLMError> {
-        self.ensure_fresh().await;
-        self.inner
-            .read()
-            .await
-            .chat_complete_stream(messages, tools, tx)
-            .await
-    }
-}
+use crate::llm::RefreshingAnthropicClient;
 
 /// Query an OpenAI-compatible /v1/models/{model} endpoint for max_context_length.
 /// Returns None on any failure (network, parse, missing field).
@@ -4047,7 +3876,7 @@ async fn run_tool_loop(
                 prev_iter_had_tools = if pending_state.is_some() { false } else { tool_executed };
 
                 // Refresh context from DB using cursor-based append system
-                if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, logger, num_ctx) {
+                if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, &|msg| logger.log(msg), num_ctx) {
                     let latest_msg_id = msgs.last().map(|m| m.id);
                     check_fill_and_maybe_reset(
                         &store,
@@ -4058,7 +3887,7 @@ async fn run_tool_loop(
                         num_ctx.map(|n| n as i64),
                         dedup_lazy,
                         latest_msg_id,
-                        logger,
+                        &|msg| logger.log(msg),
                     );
                     let dedup_up_to = resolve_dedup_up_to(&store, conv_name, agent_name, dedup_lazy, latest_msg_id);
                     let (refreshed_history, refreshed_final) =
@@ -4174,7 +4003,7 @@ async fn process_message_work(
     let (conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match load_agent_context(&store, cname, agent_name, &logger, num_ctx) {
+                Ok(store) => match load_agent_context(&store, cname, agent_name, &|msg| logger.log(msg), num_ctx) {
                     Ok(msgs) if !msgs.is_empty() => {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
@@ -4775,9 +4604,6 @@ const MAX_MENTION_DEPTH: u32 = 100;
 /// Used as fallback when num_ctx is unknown.
 const DEFAULT_MAX_TOOL_RESULT_BYTES: usize = 131_072;
 
-/// Context fill threshold — if (tokens_in + tokens_out) / num_ctx >= this, reset the cursor
-const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
-
 /// Truncate a tool result string if it exceeds the budget.
 /// Budget = 10% of num_ctx × 4 chars/token, or DEFAULT_MAX_TOOL_RESULT_BYTES as fallback.
 /// Keeps the **tail** (where errors and results live) and prepends a truncation notice.
@@ -4823,214 +4649,7 @@ fn format_byte_size(bytes: usize) -> String {
     }
 }
 
-/// Load agent context using append-only cursors for KV cache stability.
-///
-/// - If cursor is NULL (cold start): load last N messages + pins (sliding window).
-/// - If cursor is set: load messages since cursor + pins (append mode).
-/// - If zero messages from cursor: fall back to cold start.
-fn load_agent_context(
-    store: &ConversationStore,
-    conv_name: &str,
-    agent_name: &str,
-    logger: &AgentLogger,
-    num_ctx: Option<u32>,
-) -> Result<Vec<ConversationMessage>, ConversationError> {
-    // Cold start: use token budget (30% of num_ctx) when available, else fall back to message count
-    let cold_start = |store: &ConversationStore| -> Result<Vec<ConversationMessage>, ConversationError> {
-        if let Some(ctx) = num_ctx {
-            let budget = ctx as usize * 30 / 100;
-            logger.log(&format!(
-                "[context] Cold start with token budget {} (30% of {}) for {} in {}",
-                budget, ctx, agent_name, conv_name
-            ));
-            store.get_messages_by_token_budget(conv_name, budget)
-        } else {
-            // No num_ctx available — use a conservative default token budget
-            store.get_messages_by_token_budget(conv_name, 2048)
-        }
-    };
-
-    match store.get_context_cursor(conv_name, agent_name)? {
-        Some(cursor_id) => {
-            let count = store.count_messages_from(conv_name, cursor_id)?;
-            if count == 0 {
-                // Stale cursor or conversation cleared — cold start with new anchor
-                logger.log(&format!(
-                    "[context] No messages from cursor for {} in {}, falling back to cold start",
-                    agent_name, conv_name
-                ));
-                store.clear_context_cursor(conv_name, agent_name)?;
-                let msgs = cold_start(store)?;
-                logger.log(&format!(
-                    "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
-                    msgs.len(),
-                    msgs.first().map(|m| m.id).unwrap_or(0),
-                    msgs.last().map(|m| m.id).unwrap_or(0),
-                    agent_name, conv_name
-                ));
-                set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
-                Ok(msgs)
-            } else {
-                // Append mode — fetch messages from cursor (inclusive)
-                logger.log(&format!(
-                    "[context] Append mode for {} in {}: {} messages from cursor {}",
-                    agent_name, conv_name, count, cursor_id
-                ));
-                let msgs = store.get_messages_from_with_pinned(conv_name, cursor_id)?;
-                logger.log(&format!(
-                    "[context] Append loaded {} messages (id {}..{}) for {} in {}",
-                    msgs.len(),
-                    msgs.first().map(|m| m.id).unwrap_or(0),
-                    msgs.last().map(|m| m.id).unwrap_or(0),
-                    agent_name, conv_name
-                ));
-                Ok(msgs)
-            }
-        }
-        None => {
-            // Cold start — no cursor set
-            logger.log(&format!(
-                "[context] Cold start for {} in {} (no cursor)",
-                agent_name, conv_name
-            ));
-            let msgs = cold_start(store)?;
-            logger.log(&format!(
-                "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
-                msgs.len(),
-                msgs.first().map(|m| m.id).unwrap_or(0),
-                msgs.last().map(|m| m.id).unwrap_or(0),
-                agent_name, conv_name
-            ));
-            set_anchor_cursor(store, conv_name, agent_name, &msgs, logger);
-            Ok(msgs)
-        }
-    }
-}
-
-/// Set the context cursor to the anchor (oldest non-pinned message) in the window.
-fn set_anchor_cursor(
-    store: &ConversationStore,
-    conv_name: &str,
-    agent_name: &str,
-    msgs: &[ConversationMessage],
-    logger: &AgentLogger,
-) {
-    if msgs.is_empty() {
-        return;
-    }
-    let anchor_id = msgs
-        .iter()
-        .filter(|m| !m.pinned)
-        .map(|m| m.id)
-        .min()
-        .unwrap_or(msgs[0].id);
-    if let Err(e) = store.set_context_cursor(conv_name, agent_name, anchor_id) {
-        logger.log(&format!("[context] Failed to set anchor cursor: {}", e));
-    } else {
-        logger.log(&format!(
-            "[context] Set anchor for {} in {} to msg_id={}",
-            agent_name, conv_name, anchor_id
-        ));
-    }
-}
-
-/// Resolve the dedup_up_to boundary from the lazy dedup cursor state.
-///
-/// Sign-encoded cursor: NULL=idle, positive=pending dedup, negative=applied.
-/// - No cursor (idle): no dedup
-/// - Positive cursor (pending): apply full dedup, mark as applied (flip sign)
-/// - Negative cursor (applied): dedup only up to original boundary
-fn resolve_dedup_up_to(
-    store: &ConversationStore,
-    conv_name: &str,
-    agent_name: &str,
-    dedup_lazy: bool,
-    latest_msg_id: Option<i64>,
-) -> Option<i64> {
-    if dedup_lazy {
-        match store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None) {
-            Some(c) if c > 0 => {
-                // Dedup pending → apply full dedup this one time, mark as applied
-                let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
-                latest_msg_id
-            }
-            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
-            None => None,                             // No cursor: no dedup
-        }
-    } else {
-        latest_msg_id
-    }
-}
-
-/// Check context fill ratio and reset cursor if threshold exceeded.
-///
-/// In lazy dedup mode (`dedup_lazy = true`), uses a two-phase approach:
-/// 1. First time fill >= threshold: advance dedup_cursor to latest_msg_id
-///    (next turn will dedup + strip notes for messages up to that point)
-/// 2. If still over threshold after dedup: reset context_cursor + clear dedup_cursor
-///
-/// In eager mode (`dedup_lazy = false`): always reset context_cursor immediately.
-fn check_fill_and_maybe_reset(
-    store: &ConversationStore,
-    conv_name: &str,
-    agent_name: &str,
-    tokens_in: Option<i64>,
-    tokens_out: Option<i64>,
-    num_ctx: Option<i64>,
-    dedup_lazy: bool,
-    latest_msg_id: Option<i64>,
-    logger: &AgentLogger,
-) {
-    if let (Some(t_in), Some(t_out), Some(ctx)) = (tokens_in, tokens_out, num_ctx) {
-        if ctx > 0 {
-            let fill = (t_in + t_out) as f64 / ctx as f64;
-            if fill >= CONTEXT_FILL_THRESHOLD {
-                if dedup_lazy {
-                    // Sign-encoded cursor: NULL=idle, positive=pending, negative=applied
-                    let current_dedup = store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None);
-                    let cursor_val = current_dedup.unwrap_or(0);
-
-                    if cursor_val == 0 {
-                        // Phase 1: no cursor yet — set positive cursor (dedup pending)
-                        let latest = latest_msg_id.unwrap_or(0);
-                        logger.log(&format!(
-                            "[context] Fill {:.0}% >= threshold, setting dedup cursor to msg_id={} for {} in {}",
-                            fill * 100.0, latest, agent_name, conv_name
-                        ));
-                        if let Err(e) = store.set_dedup_cursor(conv_name, agent_name, latest) {
-                            logger.log(&format!("[context] Failed to set dedup cursor: {}", e));
-                        }
-                    } else if cursor_val < 0 {
-                        // Phase 2: dedup was applied but fill still high — reset
-                        logger.log(&format!(
-                            "[context] Fill {:.0}% still >= threshold after dedup, resetting cursor for {} in {}",
-                            fill * 100.0, agent_name, conv_name
-                        ));
-                        if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
-                            logger.log(&format!("[context] Failed to clear cursor: {}", e));
-                        }
-                        if let Err(e) = store.clear_dedup_cursor(conv_name, agent_name) {
-                            logger.log(&format!("[context] Failed to clear dedup cursor: {}", e));
-                        }
-                    }
-                    // cursor_val > 0: dedup pending but hasn't been applied yet — wait
-                } else {
-                    // Eager mode: reset cursor immediately
-                    logger.log(&format!(
-                        "[context] Fill {:.0}% >= threshold {:.0}% for {} in {}, resetting cursor",
-                        fill * 100.0,
-                        CONTEXT_FILL_THRESHOLD * 100.0,
-                        agent_name,
-                        conv_name
-                    ));
-                    if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
-                        logger.log(&format!("[context] Failed to clear cursor: {}", e));
-                    }
-                }
-            }
-        }
-    }
-}
+use crate::conversation::{load_agent_context, resolve_dedup_up_to, check_fill_and_maybe_reset};
 
 /// Handle a Notify request: fetch conversation context, generate response, store it,
 /// and forward @mentions to other agents (daemon-to-daemon).
@@ -5093,7 +4712,7 @@ async fn handle_notify(
     };
 
     // First fetch: get messages using append-only context cursors
-    let context_messages = match load_agent_context(&store, conv_id, agent_name, logger, num_ctx) {
+    let context_messages = match load_agent_context(&store, conv_id, agent_name, &|msg| logger.log(msg), num_ctx) {
         Ok(msgs) => msgs,
         Err(e) => {
             logger.log(&format!("[notify] Failed to get messages: {}", e));
@@ -5319,7 +4938,7 @@ async fn handle_notify(
                 num_ctx_i64,
                 dedup_lazy,
                 Some(response_msg_id),
-                logger,
+                &|msg| logger.log(msg),
             );
 
             // Embed agent response for future conversation recall
@@ -5602,7 +5221,7 @@ async fn run_heartbeat(
     // 3. Get conversation context using append-only cursors
     // Heartbeat is a self-conversation - all messages are from this agent
     // Format them as assistant messages to show the model its previous outputs
-    let context_messages = load_agent_context(&store, &conv_name, agent_name, logger, num_ctx)
+    let context_messages = load_agent_context(&store, &conv_name, agent_name, &|msg| logger.log(msg), num_ctx)
         .unwrap_or_default();
     let dedup_up_to = resolve_dedup_up_to(&store, &conv_name, agent_name, dedup_lazy, context_messages.last().map(|m| m.id));
     let (conversation_history, _) = format_conversation_history(&context_messages, agent_name, dedup_up_to);
@@ -8362,7 +7981,7 @@ api_key = "sk-test"
         store.add_message(&conv, "user", "how are you?", &[]).unwrap();
 
         // No cursor set → cold start → should get last N messages
-        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &|msg| logger.log(msg), None).unwrap();
         assert_eq!(msgs.len(), 3);
 
         // Cursor should be set to anchor (oldest non-pinned msg)
@@ -8388,7 +8007,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", anchor_id).unwrap();
 
         // Should get all messages from anchor (inclusive) — full window + new
-        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &|msg| logger.log(msg), None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
         assert_eq!(msgs[1].content, "response 1");
@@ -8413,7 +8032,7 @@ api_key = "sk-test"
         store.set_context_cursor(&conv, "arya", 99999).unwrap();
 
         // count == 0 → falls back to cold start with new anchor
-        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &|msg| logger.log(msg), None).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0].content, "msg 1");
 
@@ -8441,7 +8060,7 @@ api_key = "sk-test"
         }
 
         // No overflow guard — append mode returns all 17 messages from cursor
-        let msgs = load_agent_context(&store, &conv, "arya", &logger, None).unwrap();
+        let msgs = load_agent_context(&store, &conv, "arya", &|msg| logger.log(msg), None).unwrap();
         assert_eq!(msgs.len(), 17); // 1 (old response) + 16 new
     }
 
@@ -8990,7 +8609,7 @@ api_key = "sk-test"
             Some(900), Some(100), Some(1000), // 100% fill
             true,       // dedup_lazy
             Some(42),   // latest_msg_id
-            &logger,
+            &|msg| logger.log(msg),
         );
 
         // Dedup cursor should be set to latest_msg_id
@@ -9014,7 +8633,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
-            true, Some(42), &logger,
+            true, Some(42), &|msg| logger.log(msg),
         );
         assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
 
@@ -9025,7 +8644,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
-            true, Some(42), &logger,
+            true, Some(42), &|msg| logger.log(msg),
         );
 
         // Both cursors should be cleared
@@ -9049,7 +8668,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
-            true, Some(42), &logger,
+            true, Some(42), &|msg| logger.log(msg),
         );
         assert_eq!(store.get_dedup_cursor(&conv, "dash").unwrap(), Some(42));
         assert_eq!(store.get_context_cursor(&conv, "dash").unwrap(), Some(5));
@@ -9062,7 +8681,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
-            true, Some(50), &logger,
+            true, Some(50), &|msg| logger.log(msg),
         );
         assert!(store.get_dedup_cursor(&conv, "dash").unwrap().is_none());
         assert!(store.get_context_cursor(&conv, "dash").unwrap().is_none());
@@ -9085,7 +8704,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(900), Some(100), Some(1000),
-            true, Some(50), &logger,
+            true, Some(50), &|msg| logger.log(msg),
         );
 
         // Both cursors unchanged
@@ -9111,7 +8730,7 @@ api_key = "sk-test"
         check_fill_and_maybe_reset(
             &store, &conv, "dash",
             Some(400), Some(100), Some(1000), // 50% fill
-            true, Some(50), &logger,
+            true, Some(50), &|msg| logger.log(msg),
         );
 
         // Negative cursor should be preserved (not cleared)

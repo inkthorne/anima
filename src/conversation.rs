@@ -2333,6 +2333,223 @@ pub fn notify_mentioned_agents_fire_and_forget(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Context management helpers (moved from daemon.rs)
+// ---------------------------------------------------------------------------
+
+/// Context fill threshold — when usage exceeds this fraction of num_ctx,
+/// the cursor is reset to force a sliding window.
+pub const CONTEXT_FILL_THRESHOLD: f64 = 0.90;
+
+/// Load agent context using append-only cursors for KV cache stability.
+///
+/// - If cursor is NULL (cold start): load last N messages + pins (sliding window).
+/// - If cursor is set: load messages since cursor + pins (append mode).
+/// - If zero messages from cursor: fall back to cold start.
+pub fn load_agent_context(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    log: &dyn Fn(&str),
+    num_ctx: Option<u32>,
+) -> Result<Vec<ConversationMessage>, ConversationError> {
+    // Cold start: use token budget (30% of num_ctx) when available, else fall back to message count
+    let cold_start = |store: &ConversationStore| -> Result<Vec<ConversationMessage>, ConversationError> {
+        if let Some(ctx) = num_ctx {
+            let budget = ctx as usize * 30 / 100;
+            log(&format!(
+                "[context] Cold start with token budget {} (30% of {}) for {} in {}",
+                budget, ctx, agent_name, conv_name
+            ));
+            store.get_messages_by_token_budget(conv_name, budget)
+        } else {
+            // No num_ctx available — use a conservative default token budget
+            store.get_messages_by_token_budget(conv_name, 2048)
+        }
+    };
+
+    match store.get_context_cursor(conv_name, agent_name)? {
+        Some(cursor_id) => {
+            let count = store.count_messages_from(conv_name, cursor_id)?;
+            if count == 0 {
+                // Stale cursor or conversation cleared — cold start with new anchor
+                log(&format!(
+                    "[context] No messages from cursor for {} in {}, falling back to cold start",
+                    agent_name, conv_name
+                ));
+                store.clear_context_cursor(conv_name, agent_name)?;
+                let msgs = cold_start(store)?;
+                log(&format!(
+                    "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
+                    msgs.len(),
+                    msgs.first().map(|m| m.id).unwrap_or(0),
+                    msgs.last().map(|m| m.id).unwrap_or(0),
+                    agent_name, conv_name
+                ));
+                set_anchor_cursor(store, conv_name, agent_name, &msgs, log);
+                Ok(msgs)
+            } else {
+                // Append mode — fetch messages from cursor (inclusive)
+                log(&format!(
+                    "[context] Append mode for {} in {}: {} messages from cursor {}",
+                    agent_name, conv_name, count, cursor_id
+                ));
+                let msgs = store.get_messages_from_with_pinned(conv_name, cursor_id)?;
+                log(&format!(
+                    "[context] Append loaded {} messages (id {}..{}) for {} in {}",
+                    msgs.len(),
+                    msgs.first().map(|m| m.id).unwrap_or(0),
+                    msgs.last().map(|m| m.id).unwrap_or(0),
+                    agent_name, conv_name
+                ));
+                Ok(msgs)
+            }
+        }
+        None => {
+            // Cold start — no cursor set
+            log(&format!(
+                "[context] Cold start for {} in {} (no cursor)",
+                agent_name, conv_name
+            ));
+            let msgs = cold_start(store)?;
+            log(&format!(
+                "[context] Cold start loaded {} messages (id {}..{}) for {} in {}",
+                msgs.len(),
+                msgs.first().map(|m| m.id).unwrap_or(0),
+                msgs.last().map(|m| m.id).unwrap_or(0),
+                agent_name, conv_name
+            ));
+            set_anchor_cursor(store, conv_name, agent_name, &msgs, log);
+            Ok(msgs)
+        }
+    }
+}
+
+/// Set the context cursor to the anchor (oldest non-pinned message) in the window.
+pub fn set_anchor_cursor(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    msgs: &[ConversationMessage],
+    log: &dyn Fn(&str),
+) {
+    if msgs.is_empty() {
+        return;
+    }
+    let anchor_id = msgs
+        .iter()
+        .filter(|m| !m.pinned)
+        .map(|m| m.id)
+        .min()
+        .unwrap_or(msgs[0].id);
+    if let Err(e) = store.set_context_cursor(conv_name, agent_name, anchor_id) {
+        log(&format!("[context] Failed to set anchor cursor: {}", e));
+    } else {
+        log(&format!(
+            "[context] Set anchor for {} in {} to msg_id={}",
+            agent_name, conv_name, anchor_id
+        ));
+    }
+}
+
+/// Resolve the dedup_up_to boundary from the lazy dedup cursor state.
+///
+/// Sign-encoded cursor: NULL=idle, positive=pending dedup, negative=applied.
+/// - No cursor (idle): no dedup
+/// - Positive cursor (pending): apply full dedup, mark as applied (flip sign)
+/// - Negative cursor (applied): dedup only up to original boundary
+pub fn resolve_dedup_up_to(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    dedup_lazy: bool,
+    latest_msg_id: Option<i64>,
+) -> Option<i64> {
+    if dedup_lazy {
+        match store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None) {
+            Some(c) if c > 0 => {
+                // Dedup pending → apply full dedup this one time, mark as applied
+                let _ = store.set_dedup_cursor(conv_name, agent_name, -c);
+                latest_msg_id
+            }
+            Some(c) => Some(c.unsigned_abs() as i64), // Applied: dedup only up to original boundary
+            None => None,                             // No cursor: no dedup
+        }
+    } else {
+        latest_msg_id
+    }
+}
+
+/// Check context fill ratio and reset cursor if threshold exceeded.
+///
+/// In lazy dedup mode (`dedup_lazy = true`), uses a two-phase approach:
+/// 1. First time fill >= threshold: advance dedup_cursor to latest_msg_id
+///    (next turn will dedup + strip notes for messages up to that point)
+/// 2. If still over threshold after dedup: reset context_cursor + clear dedup_cursor
+///
+/// In eager mode (`dedup_lazy = false`): always reset context_cursor immediately.
+pub fn check_fill_and_maybe_reset(
+    store: &ConversationStore,
+    conv_name: &str,
+    agent_name: &str,
+    tokens_in: Option<i64>,
+    tokens_out: Option<i64>,
+    num_ctx: Option<i64>,
+    dedup_lazy: bool,
+    latest_msg_id: Option<i64>,
+    log: &dyn Fn(&str),
+) {
+    if let (Some(t_in), Some(t_out), Some(ctx)) = (tokens_in, tokens_out, num_ctx) {
+        if ctx > 0 {
+            let fill = (t_in + t_out) as f64 / ctx as f64;
+            if fill >= CONTEXT_FILL_THRESHOLD {
+                if dedup_lazy {
+                    // Sign-encoded cursor: NULL=idle, positive=pending, negative=applied
+                    let current_dedup = store.get_dedup_cursor(conv_name, agent_name).unwrap_or(None);
+                    let cursor_val = current_dedup.unwrap_or(0);
+
+                    if cursor_val == 0 {
+                        // Phase 1: no cursor yet — set positive cursor (dedup pending)
+                        let latest = latest_msg_id.unwrap_or(0);
+                        log(&format!(
+                            "[context] Fill {:.0}% >= threshold, setting dedup cursor to msg_id={} for {} in {}",
+                            fill * 100.0, latest, agent_name, conv_name
+                        ));
+                        if let Err(e) = store.set_dedup_cursor(conv_name, agent_name, latest) {
+                            log(&format!("[context] Failed to set dedup cursor: {}", e));
+                        }
+                    } else if cursor_val < 0 {
+                        // Phase 2: dedup was applied but fill still high — reset
+                        log(&format!(
+                            "[context] Fill {:.0}% still >= threshold after dedup, resetting cursor for {} in {}",
+                            fill * 100.0, agent_name, conv_name
+                        ));
+                        if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
+                            log(&format!("[context] Failed to clear cursor: {}", e));
+                        }
+                        if let Err(e) = store.clear_dedup_cursor(conv_name, agent_name) {
+                            log(&format!("[context] Failed to clear dedup cursor: {}", e));
+                        }
+                    }
+                    // cursor_val > 0: dedup pending but hasn't been applied yet — wait
+                } else {
+                    // Eager mode: reset cursor immediately
+                    log(&format!(
+                        "[context] Fill {:.0}% >= threshold {:.0}% for {} in {}, resetting cursor",
+                        fill * 100.0,
+                        CONTEXT_FILL_THRESHOLD * 100.0,
+                        agent_name,
+                        conv_name
+                    ));
+                    if let Err(e) = store.clear_context_cursor(conv_name, agent_name) {
+                        log(&format!("[context] Failed to clear cursor: {}", e));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

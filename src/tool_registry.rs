@@ -208,6 +208,90 @@ fn format_params(params: &serde_json::Value) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool definition → ToolSpec conversion (for native tool calling)
+// ---------------------------------------------------------------------------
+
+use crate::llm::ToolSpec;
+
+/// Convert ToolDefinition params to JSON Schema format for native tool calling.
+pub(crate) fn convert_params_to_json_schema(params: &serde_json::Value) -> serde_json::Value {
+    match params {
+        serde_json::Value::Object(map) => {
+            let mut properties = serde_json::Map::new();
+            let mut required = Vec::new();
+
+            for (name, type_info) in map {
+                let type_str = match type_info {
+                    serde_json::Value::String(s) => s.as_str(),
+                    _ => "string",
+                };
+
+                let is_optional = type_str.to_lowercase().contains("optional");
+                let base_type = type_str.split_whitespace().next().unwrap_or("string");
+
+                // Normalize to JSON Schema types
+                let json_type = match base_type {
+                    "bool" => "boolean",
+                    "int" => "integer",
+                    "float" | "double" => "number",
+                    "str" => "string",
+                    other => other,
+                };
+
+                properties.insert(name.clone(), serde_json::json!({"type": json_type}));
+
+                if !is_optional {
+                    required.push(serde_json::Value::String(name.clone()));
+                }
+            }
+
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": required
+            })
+        }
+        _ => serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": []
+        }),
+    }
+}
+
+/// Convert ToolDefinitions from registry to ToolSpecs for native LLM tool calling.
+pub(crate) fn tool_definitions_to_specs(definitions: &[&ToolDefinition]) -> Vec<ToolSpec> {
+    definitions
+        .iter()
+        .map(|def| ToolSpec {
+            name: def.name.clone(),
+            description: def.description.clone(),
+            parameters: convert_params_to_json_schema(&def.params),
+        })
+        .collect()
+}
+
+/// Tools that bypass the allowlist and are always available to every agent.
+const ALWAYS_ALLOWED_TOOLS: &[&str] = &[];
+
+/// Filter tools by allowed_tools list. If allowed_tools is None, no tools allowed (safe default).
+pub(crate) fn filter_by_allowlist<'a>(
+    tools: Vec<&'a ToolDefinition>,
+    allowed_tools: &Option<Vec<String>>,
+) -> Vec<&'a ToolDefinition> {
+    match allowed_tools {
+        Some(allowed) => tools
+            .into_iter()
+            .filter(|t| {
+                allowed.contains(&t.name)
+                    || ALWAYS_ALLOWED_TOOLS.contains(&t.name.as_str())
+            })
+            .collect(),
+        None => Vec::new(), // No allowlist = no tools
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

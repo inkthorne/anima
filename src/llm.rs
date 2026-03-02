@@ -2281,6 +2281,102 @@ impl LLM for ClaudeCodeClient {
 }
 
 // ---------------------------------------------------------------------------
+// Refreshing Anthropic client (auto-refreshes OAuth tokens for daemons)
+// ---------------------------------------------------------------------------
+
+/// An LLM wrapper that auto-refreshes OAuth Bearer tokens before expiry.
+/// For API key auth, this is a transparent passthrough.
+pub(crate) struct RefreshingAnthropicClient {
+    inner: tokio::sync::RwLock<AnthropicClient>,
+    refresh_token: String,
+    expires_at: std::sync::atomic::AtomicI64,
+    model: String,
+    base_url: Option<String>,
+    max_tokens: Option<u32>,
+}
+
+impl RefreshingAnthropicClient {
+    pub(crate) fn new(
+        tokens: crate::auth::StoredTokens,
+        model: String,
+        base_url: Option<String>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        let mut client = AnthropicClient::with_bearer(&tokens.access_token).with_model(&model);
+        if let Some(ref url) = base_url {
+            client = client.with_base_url(url);
+        }
+        if let Some(mt) = max_tokens {
+            client = client.with_max_tokens(mt);
+        }
+        Self {
+            inner: tokio::sync::RwLock::new(client),
+            refresh_token: tokens.refresh_token,
+            expires_at: std::sync::atomic::AtomicI64::new(tokens.expires_at),
+            model,
+            base_url,
+            max_tokens,
+        }
+    }
+
+    async fn ensure_fresh(&self) {
+        let now = chrono::Utc::now().timestamp();
+        let exp = self.expires_at.load(std::sync::atomic::Ordering::Relaxed);
+        if now < exp - 300 {
+            return; // still valid
+        }
+
+        // Try to refresh — extract what we need before the write lock
+        let refreshed = crate::auth::refresh_tokens(&self.refresh_token).await;
+        if let Ok(new_tokens) = refreshed {
+            let _ = crate::auth::save_tokens(&new_tokens);
+            self.expires_at
+                .store(new_tokens.expires_at, std::sync::atomic::Ordering::Relaxed);
+
+            let mut client =
+                AnthropicClient::with_bearer(&new_tokens.access_token).with_model(&self.model);
+            if let Some(ref url) = self.base_url {
+                client = client.with_base_url(url);
+            }
+            if let Some(mt) = self.max_tokens {
+                client = client.with_max_tokens(mt);
+            }
+            *self.inner.write().await = client;
+        }
+    }
+}
+
+#[async_trait]
+impl LLM for RefreshingAnthropicClient {
+    fn model_name(&self) -> &str {
+        &self.model
+    }
+
+    async fn chat_complete(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+    ) -> Result<LLMResponse, LLMError> {
+        self.ensure_fresh().await;
+        self.inner.read().await.chat_complete(messages, tools).await
+    }
+
+    async fn chat_complete_stream(
+        &self,
+        messages: Vec<ChatMessage>,
+        tools: Option<Vec<ToolSpec>>,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, LLMError> {
+        self.ensure_fresh().await;
+        self.inner
+            .read()
+            .await
+            .chat_complete_stream(messages, tools, tx)
+            .await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
