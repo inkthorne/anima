@@ -596,7 +596,7 @@ impl ConversationStore {
     /// Returns a list of CatchupItem structs for processing.
     ///
     /// For agent messages (not "user" or "tool"):
-    /// - Checks if message may contain a tool call (has JSON block)
+    /// - Checks if message may contain a tool call (has tool block)
     /// - Extracts @mentions for forwarding
     ///
     /// For user messages:

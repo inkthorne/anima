@@ -15,9 +15,9 @@ use std::time::Duration;
 static PYTHON_BLOCK_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?s)<python>\s*\n?(.*?)\n?\s*</python>").unwrap());
 
-/// Regex for extracting fenced ```json ... ``` tool call blocks.
+/// Regex for extracting `<tool>...</tool>` JSON tool call blocks.
 static TOOL_CALL_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"```json\s*\n?\s*(\{[^`]*\})\s*\n?\s*```").unwrap());
+    LazyLock::new(|| regex::Regex::new(r"(?s)<tool>\s*(\{.*?\})\s*</tool>").unwrap());
 
 /// Regex for extracting `<think>...</think>` blocks (verbose output).
 static THINKING_RE: LazyLock<regex::Regex> =
@@ -142,6 +142,10 @@ async fn execute_python_blocks(
 
 /// Extract a JSON tool block from agent output.
 /// Returns (cleaned_output, Option<ToolCall>)
+///
+/// If the response contains a `<tool>` tag but extraction fails (malformed JSON,
+/// missing "tool" key), returns a format error as the cleaned output so the LLM
+/// gets feedback instead of silent termination.
 pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
     if let Some(cap) = TOOL_CALL_RE.captures(output)
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1])
@@ -156,6 +160,19 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
                 params,
             }),
         );
+    }
+
+    // If a <tool> tag was present but didn't parse, feed back a format error
+    if output.contains("<tool>") {
+        let error_msg = concat!(
+            "[Tool call format error]\n",
+            "Your tool call could not be parsed. Use this exact format:\n\n",
+            "<tool>\n",
+            "{\"tool\": \"TOOL_NAME\", \"params\": {\"PARAM\": \"VALUE\"}}\n",
+            "</tool>\n\n",
+            "The JSON must contain a \"tool\" key (string) and a \"params\" key (object).",
+        );
+        return (error_msg.to_string(), None);
     }
 
     (output.to_string(), None)
@@ -673,7 +690,7 @@ fn format_conversation_history(
                     tool_calls: None,
                 });
             } else {
-                // Legacy/JSON-block tool result — emit as role "user"
+                // Legacy/tool-block tool result — emit as role "user"
                 history.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(msg.content.clone()),
@@ -757,9 +774,9 @@ pub struct ToolExecutionContext {
 struct RecallResult {
     /// Combined recall content (tools injection + memory injection + recall.md + model recall)
     recall_content: Option<String>,
-    /// Tool specs for native tool mode (None in JSON-block mode)
+    /// Tool specs for native tool mode (None in tool-block mode)
     external_tools: Option<Vec<ToolSpec>>,
-    /// Relevant tool definitions for JSON-block mode (empty in native mode)
+    /// Relevant tool definitions for tool-block mode (empty in native mode)
     relevant_tools: Vec<ToolDefinition>,
     /// Query embedding (reusable for conversation recall and user message embedding)
     query_embedding: Option<Vec<f32>>,
@@ -768,7 +785,7 @@ struct RecallResult {
 /// Build tools and memory injection for a query.
 ///
 /// This shared helper handles:
-/// - Tool recall (native mode: all allowed tools, JSON-block mode: keyword-matched tools)
+/// - Tool recall (native mode: all allowed tools, tool-block mode: keyword-matched tools)
 /// - Memory recall (semantic search with embeddings)
 /// - Conversation recall (semantic search over past user messages)
 /// - Combining with recall.md and model-specific recall
@@ -803,7 +820,7 @@ async fn build_recall_for_query(
         let specs = Some(tool_definitions_to_specs(&all_tools));
         (String::new(), specs, Vec::new())
     } else {
-        // JSON-block mode: keyword-match relevant tools
+        // tool-block mode: keyword-match relevant tools
         let relevant_tools = if let Some(registry) = tool_registry {
             let relevant = registry.find_relevant(query, recall_limit);
             let relevant = filter_by_allowlist(relevant, allowed_tools);
@@ -1816,7 +1833,7 @@ impl DaemonConfig {
 /// Build the runtime context string that is appended to the system prompt.
 /// This gives agents self-awareness about their environment.
 fn build_runtime_context(agent: &str, model: &str, host: &str, tools_native: bool) -> String {
-    let tools_mode = if tools_native { "native" } else { "json-block" };
+    let tools_mode = if tools_native { "native" } else { "tool-block" };
     let home = dirs::home_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -2950,7 +2967,7 @@ struct ToolLoopResult {
     dump_turn_n: Option<u64>,
 }
 
-/// Unified tool loop for both native and JSON-block modes.
+/// Unified tool loop for both native and tool-block modes.
 ///
 /// Makes single-turn LLM calls (via `think_single_turn_streaming`), stores results to DB,
 /// and refreshes context from DB between iterations. The daemon owns the loop; agent.rs
@@ -3466,7 +3483,7 @@ async fn run_tool_loop(
                         }
                     }
                 } else {
-                    // === JSON-block mode ===
+                    // === tool-block mode ===
                     let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
 
                     if let Some(tc) = tool_call {
@@ -3507,7 +3524,7 @@ async fn run_tool_loop(
 
                         logger.tool(&format!("[loop] Executing: {} with params {}", tc.tool, tc.params));
 
-                        // Emit verbose: tool_call (JSON-block mode)
+                        // Emit verbose: tool_call (tool-block mode)
                         if let Some(ref vtx) = verbose_tx {
                             let _ = vtx.send(Response::Verbose {
                                 kind: "tool_call".to_string(),
@@ -3640,7 +3657,7 @@ async fn run_tool_loop(
                                 }
                             }
                         } else {
-                            // No tool calls in JSON-block mode
+                            // No tool calls in tool-block mode
                             final_response_text = cleaned_response;
                         }
                     }
@@ -4176,7 +4193,7 @@ async fn process_message_work(
                 ).await;
                 (result.response.clone(), result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens, None)
             } else {
-                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens) = process_json_block_mode(
+                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens) = process_tool_block_mode(
                     &final_user_content,
                     &recall_result.relevant_tools,
                     token_tx,
@@ -4419,9 +4436,9 @@ impl<T> Drop for AbortOnDrop<T> {
     }
 }
 
-/// Process message in JSON-block tool mode (tools = false in model config)
+/// Process message in tool-block tool mode (tools = false in model config)
 #[allow(clippy::too_many_arguments)]
-async fn process_json_block_mode(
+async fn process_tool_block_mode(
     content: &str,
     _relevant_tools: &[ToolDefinition],
     token_tx: Option<mpsc::Sender<String>>,
@@ -4475,47 +4492,49 @@ async fn process_json_block_mode(
                     .await
             }));
 
-            // Forward tokens, suppressing tool call blocks
+            // Forward tokens, suppressing <tool>...</tool> blocks
             let tx_clone = tx.clone();
-            let mut in_code_block = false;
-            let mut code_block_buffer = String::new();
+            let mut in_tool_tag = false;
+            let mut tool_buffer = String::new();
 
             while let Some(token) = internal_rx.recv().await {
-                if !in_code_block {
-                    if token.contains("```") {
-                        in_code_block = true;
-                        code_block_buffer = token;
-                        if code_block_buffer.matches("```").count() >= 2 {
-                            if !(code_block_buffer.contains("\"tool\"")
-                                && code_block_buffer.contains("\"params\""))
+                if !in_tool_tag {
+                    if token.contains("<tool>") {
+                        in_tool_tag = true;
+                        tool_buffer = token;
+                        if tool_buffer.contains("</tool>") {
+                            // Entire block arrived in one token — suppress if it's a tool call
+                            if !(tool_buffer.contains("\"tool\"")
+                                && tool_buffer.contains("\"params\""))
                             {
-                                let _ = tx_clone.send(code_block_buffer.clone()).await;
+                                let _ = tx_clone.send(tool_buffer.clone()).await;
                             }
-                            in_code_block = false;
-                            code_block_buffer.clear();
+                            in_tool_tag = false;
+                            tool_buffer.clear();
                         }
                         continue;
                     }
                     let _ = tx_clone.send(token).await;
                 } else {
-                    code_block_buffer.push_str(&token);
-                    if code_block_buffer.matches("```").count() >= 2 {
-                        if !(code_block_buffer.contains("\"tool\"")
-                            && code_block_buffer.contains("\"params\""))
+                    tool_buffer.push_str(&token);
+                    if tool_buffer.contains("</tool>") {
+                        if !(tool_buffer.contains("\"tool\"")
+                            && tool_buffer.contains("\"params\""))
                         {
-                            let _ = tx_clone.send(code_block_buffer.clone()).await;
+                            let _ = tx_clone.send(tool_buffer.clone()).await;
                         }
-                        in_code_block = false;
-                        code_block_buffer.clear();
+                        in_tool_tag = false;
+                        tool_buffer.clear();
                     }
                 }
             }
 
-            if !(code_block_buffer.is_empty()
-                || code_block_buffer.contains("\"tool\"")
-                    && code_block_buffer.contains("\"params\""))
+            // Flush unclosed buffer — not a valid tool call, show to user
+            if !tool_buffer.is_empty()
+                && !(tool_buffer.contains("\"tool\"")
+                    && tool_buffer.contains("\"params\""))
             {
-                let _ = tx_clone.send(code_block_buffer).await;
+                let _ = tx_clone.send(tool_buffer).await;
             }
 
             match handle.join().await {
@@ -4591,6 +4610,15 @@ async fn process_json_block_mode(
             if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_tool_calls) {
                 current_message.push_str(&format!("\n\n---\n{}", nudge));
             }
+        } else if cleaned_response.starts_with("[Tool call format error]") {
+            // Malformed <tool> tag — feed the error back so the LLM can retry
+            tool_call_count += 1;
+            if tool_call_count > max_tool_calls {
+                logger.tool("[worker] Max tool calls reached during format error retry, stopping");
+                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
+            }
+            logger.tool("[worker] Tool call format error, feeding back to LLM");
+            current_message = cleaned_response;
         } else {
             return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
         }
@@ -9113,6 +9141,99 @@ api_key = "sk-test"
         // Cleanup
         store.delete_conversation(&src).unwrap();
         store.delete_conversation(&dst).unwrap();
+    }
+
+    // --- extract_tool_call tests ---
+
+    #[test]
+    fn test_extract_tool_call_basic() {
+        let input = r#"<tool>{"tool": "read_file", "params": {"path": "src/main.rs"}}</tool>"#;
+        let (cleaned, tc) = extract_tool_call(input);
+        let tc = tc.expect("should parse tool call");
+        assert_eq!(tc.tool, "read_file");
+        assert_eq!(tc.params["path"], "src/main.rs");
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn test_extract_tool_call_with_surrounding_text() {
+        let input = "Let me read that file for you.\n\n<tool>\n{\"tool\": \"read_file\", \"params\": {\"path\": \"x.rs\"}}\n</tool>\n\nHere you go.";
+        let (cleaned, tc) = extract_tool_call(input);
+        let tc = tc.expect("should parse tool call");
+        assert_eq!(tc.tool, "read_file");
+        assert!(cleaned.contains("Let me read that file"));
+        assert!(cleaned.contains("Here you go."));
+        assert!(!cleaned.contains("<tool>"));
+    }
+
+    #[test]
+    fn test_extract_tool_call_multiline_json() {
+        let input = "<tool>\n{\n  \"tool\": \"edit_file\",\n  \"params\": {\n    \"path\": \"a.rs\",\n    \"old\": \"foo\",\n    \"new\": \"bar\"\n  }\n}\n</tool>";
+        let (_, tc) = extract_tool_call(input);
+        let tc = tc.expect("should parse multiline JSON");
+        assert_eq!(tc.tool, "edit_file");
+        assert_eq!(tc.params["old"], "foo");
+        assert_eq!(tc.params["new"], "bar");
+    }
+
+    #[test]
+    fn test_extract_tool_call_backticks_in_params() {
+        let input = r#"<tool>{"tool": "edit_file", "params": {"path": "x.rs", "old": "let x = `val`", "new": "let x = ```val```"}}</tool>"#;
+        let (_, tc) = extract_tool_call(input);
+        let tc = tc.expect("backticks in params should not break extraction");
+        assert_eq!(tc.tool, "edit_file");
+        assert!(tc.params["old"].as_str().unwrap().contains('`'));
+    }
+
+    #[test]
+    fn test_extract_tool_call_missing_tool_key() {
+        let input = r#"<tool>{"foo": "bar", "params": {}}</tool>"#;
+        let (cleaned, tc) = extract_tool_call(input);
+        assert!(tc.is_none());
+        assert!(cleaned.contains("[Tool call format error]"));
+    }
+
+    #[test]
+    fn test_extract_tool_call_malformed_json() {
+        let input = "<tool>{bad json here}</tool>";
+        let (cleaned, tc) = extract_tool_call(input);
+        assert!(tc.is_none());
+        assert!(cleaned.contains("[Tool call format error]"));
+    }
+
+    #[test]
+    fn test_extract_tool_call_no_tag() {
+        let input = "Just a plain text response with no tool usage.";
+        let (cleaned, tc) = extract_tool_call(input);
+        assert!(tc.is_none());
+        assert_eq!(cleaned, input);
+    }
+
+    #[test]
+    fn test_extract_tool_call_nested_braces() {
+        let input = r#"<tool>{"tool": "http", "params": {"url": "https://api.example.com", "body": {"key": "value", "nested": {"deep": true}}}}</tool>"#;
+        let (_, tc) = extract_tool_call(input);
+        let tc = tc.expect("nested braces should parse");
+        assert_eq!(tc.tool, "http");
+        assert_eq!(tc.params["body"]["nested"]["deep"], true);
+    }
+
+    #[test]
+    fn test_extract_tool_call_unclosed_tag_gives_error() {
+        let input = "I'll use a tool:\n<tool>\n{\"tool\": \"read_file\"";
+        let (cleaned, tc) = extract_tool_call(input);
+        assert!(tc.is_none());
+        // Contains <tool> but regex doesn't match — should get format error
+        assert!(cleaned.contains("[Tool call format error]"));
+    }
+
+    #[test]
+    fn test_extract_tool_call_no_params_key() {
+        let input = r#"<tool>{"tool": "list_tools"}</tool>"#;
+        let (_, tc) = extract_tool_call(input);
+        let tc = tc.expect("missing params should default to empty object");
+        assert_eq!(tc.tool, "list_tools");
+        assert_eq!(tc.params, serde_json::json!({}));
     }
 
     #[test]

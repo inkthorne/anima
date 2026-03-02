@@ -144,7 +144,15 @@ impl ToolRegistry {
                 format_params(&tool.params)
             ));
         }
-        output.push_str("\n**Only use tools listed above. Do not invent tool names.**\n");
+        output.push_str(concat!(
+            "\n**Tool call format:**\n",
+            "To use a tool, wrap a JSON object in <tool> tags:\n\n",
+            "<tool>\n",
+            "{\"tool\": \"TOOL_NAME\", \"params\": {\"PARAM\": \"VALUE\"}}\n",
+            "</tool>\n\n",
+            "To respond without tools, write your answer normally (no <tool> tags).\n",
+            "Only use tools listed above. Do not invent tool names.\n",
+        ));
         output
     }
 }

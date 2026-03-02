@@ -198,7 +198,7 @@ Only `Request::Message` and `Request::IncomingMessage` use the streaming path.
 
 ## Open Questions
 
-1. **JSON-block tool mode**: Currently JSON-block tools are parsed by the daemon, not the agent. Need to emit tool events from daemon.rs for this path too.
+1. **Tool-block mode**: Currently tool-block tools are parsed by the daemon, not the agent. Need to emit tool events from daemon.rs for this path too.
 
 2. **Native tool mode**: Tool events come from agent.rs. May need different integration points.
 

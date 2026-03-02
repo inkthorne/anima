@@ -30,7 +30,7 @@ Anima is an agent runtime built from first principles. It provides the core prim
 | **Multi-agent** | @mention routing, `list_agents`, `send_message` tools |
 | **Agent hierarchy** | `spawn_child` / `wait_for_children` for task delegation |
 | **Semantic memory** | Embedding-based recall with `remember` tool |
-| **Hybrid tools** | Keyword recall + native or JSON-block execution |
+| **Hybrid tools** | Keyword recall + native or tool-block execution |
 | **Streaming** | Token-level streaming to REPL via Unix socket |
 | **Heartbeat** | Periodic autonomous thinking |
 | **Claude Code** | Delegate coding tasks to Claude Code |
@@ -140,10 +140,12 @@ anima task <config> "task"       # One-shot with config file
 
 ## Tools
 
-Agents use tools via native function calling or JSON blocks:
+Agents use tools via native function calling or `<tool>` blocks:
 
-```json
+```
+<tool>
 {"tool": "read_file", "params": {"path": "/some/file.txt"}}
+</tool>
 ```
 
 **Built-in tools:**

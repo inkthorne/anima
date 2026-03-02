@@ -2020,7 +2020,7 @@ fn extract_xml_tool_calls(content: &str) -> (String, Vec<ToolCall>) {
 /// The CLI handles its own auth, so no API key is needed here.
 ///
 /// **Important:** model configs using this provider must set `tools = false`
-/// (JSON-block mode) because native tool calling is not available via the CLI.
+/// (tool-block mode) because native tool calling is not available via the CLI.
 pub struct ClaudeCodeClient {
     model: String,
 }

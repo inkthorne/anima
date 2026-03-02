@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v4.3.10
+**Version:** v4.4.0
 **Tests:** 829 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -90,7 +90,7 @@ src/
 
 **Two Modes:**
 - `tools = true` in model config: Native tool calling — LLM gets ToolSpecs
-- `tools = false`: JSON-block — Model outputs `{"tool": "x", "params": {...}}`, daemon parses and executes
+- `tools = false`: Tool-block — Model outputs `<tool>{"tool": "x", "params": {...}}</tool>`, daemon parses and executes
 
 **Available Tools:** `read_file`, `edit_file`, `write_file`, `list_files`, `shell`, `safe_shell`, `http`, `send_message`, `list_agents`, `remember`, `search_conversation`, `claude_code`, `start_task`, `wait_task`, `stop_task`, `notes`, `copy_lines`, `peek_file`
 
@@ -115,7 +115,7 @@ src/
 
 Agents know their runtime context — injected into system prompt:
 - Agent name, model, host
-- Tools mode (native vs JSON-block)
+- Tools mode (native vs tool-block)
 - Available tools
 
 **`anima system <agent>`** — Inspect the assembled system prompt for debugging.

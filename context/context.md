@@ -26,7 +26,7 @@ Configured on Mojave (Ollama at 100.67.222.97:11434):
 
 | Model | Context | Tools | Use Case |
 |-------|---------|-------|----------|
-| `qwen3-next:latest` | 128k+ | JSON-block | General + coding |
+| `qwen3-next:latest` | 128k+ | Tool-block | General + coding |
 | `qwen3:4b` | 32k | Native | Light tasks, tool execution |
 
 ## Chat Commands
@@ -81,11 +81,13 @@ interval = "15m"
 **Prompt:** `~/.anima/agents/<name>/heartbeat.md`
 **Output:** `<agent>-heartbeat` conversation
 
-## Tool Format (JSON-block)
+## Tool Format (tool-block)
 
-Agents use tools via JSON blocks:
-```json
+Agents use tools via `<tool>` tags:
+```
+<tool>
 {"tool": "tool_name", "params": {"param1": "value"}}
+</tool>
 ```
 
 **Core tools:**

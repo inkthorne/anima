@@ -29,7 +29,7 @@ The daemon's streaming branch then set `tool_calls = None, tool_trace = Vec::new
 
 Files changed:
 - `src/agent.rs` — `think_streaming*` now returns `ThinkResult`
-- `src/daemon.rs` — Updated both native tool mode and JSON-block mode streaming paths
+- `src/daemon.rs` — Updated both native tool mode and tool-block mode streaming paths
 
 ## Pending Work (Backlog)
 
