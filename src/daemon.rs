@@ -3511,6 +3511,16 @@ async fn run_tool_loop(
                         tool_call_count += 1;
                         logger.tool("[loop] Detected native tool call in tool-block mode, feeding format error");
 
+                        if let Some(ref vtx) = verbose_tx {
+                            let _ = vtx.send(Response::Verbose {
+                                kind: "format_error".to_string(),
+                                data: serde_json::json!({
+                                    "reason": "native_tool_call_in_tool_block_mode",
+                                    "message": TOOL_FORMAT_ERROR,
+                                }),
+                            }).await;
+                        }
+
                         // Store intermediate response (preserve thinking in DB)
                         if !db_content.trim().is_empty() {
                             match store.add_message_with_tokens(

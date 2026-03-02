@@ -1553,6 +1553,64 @@ async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<
     stream_agent_response(&mut api).await
 }
 
+/// After a debug/step iteration, fetch and display all messages created since `since_id`.
+/// Shows tool results, recall injections, and agent messages that aren't visible in the stream.
+fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let store = ConversationStore::init()?;
+    let messages = store.get_messages_filtered(conv_name, None, Some(since_id))?;
+    if messages.is_empty() {
+        return Ok(());
+    }
+    eprintln!("\x1b[2m--- step trace ({} messages) ---\x1b[0m", messages.len());
+    for msg in &messages {
+        let role = msg.from_agent.as_str();
+        let preview = if msg.content.is_empty() {
+            "(empty)".to_string()
+        } else {
+            let first_line = msg.content.lines().next().unwrap_or("");
+            if first_line.len() > 200 {
+                format!("{}...", &first_line[..200])
+            } else {
+                first_line.to_string()
+            }
+        };
+
+        match role {
+            "recall" => {
+                // Dim gray for recall injections
+                eprintln!("\x1b[2m  [recall] {}\x1b[0m", preview);
+            }
+            "tool" => {
+                // Yellow for tool results
+                let tc_id = msg.tool_call_id.as_deref().unwrap_or("");
+                let id_suffix = if tc_id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", tc_id)
+                };
+                eprintln!("\x1b[33m  [tool{}] {}\x1b[0m", id_suffix, preview);
+            }
+            _ => {
+                // Cyan for agent messages
+                let tc_summary = msg.tool_calls.as_ref().map(|tc| {
+                    // Parse tool_calls JSON to show tool names
+                    if let Ok(calls) = serde_json::from_str::<Vec<serde_json::Value>>(tc) {
+                        let names: Vec<&str> = calls.iter()
+                            .filter_map(|c| c["function"]["name"].as_str())
+                            .collect();
+                        if names.is_empty() { String::new() } else { format!(" -> [{}]", names.join(", ")) }
+                    } else {
+                        String::new()
+                    }
+                }).unwrap_or_default();
+                eprintln!("\x1b[36m  [{}] {}{}\x1b[0m", role, preview, tc_summary);
+            }
+        }
+    }
+    eprintln!("\x1b[2m--- end trace ---\x1b[0m");
+    Ok(())
+}
+
 /// Step-debug: fresh start. Restart daemon, delete & recreate conversation,
 /// send user message, process one iteration, stream response.
 async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1602,19 +1660,24 @@ async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std
     // Store user message
     store.add_message(&conv_name, "user", message, &[])?;
 
+    // Capture last message ID before the step
+    let last_id = store.get_messages(&conv_name, Some(1))?
+        .first().map(|m| m.id).unwrap_or(0);
+
     // Connect and send with max_iterations=1
     let mut api = connect_to_agent(&agent_name).await?;
 
     api.write_request(&Request::Message {
         content: message.to_string(),
-        conv_name: Some(conv_name),
+        conv_name: Some(conv_name.clone()),
         verbose: true,
         max_iterations: Some(1),
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    stream_agent_response(&mut api).await
+    stream_agent_response(&mut api).await?;
+    dump_step_messages(&conv_name, last_id)
 }
 
 /// Step-debug: continue from current conversation state.
@@ -1639,18 +1702,25 @@ async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         ).into());
     }
 
+    // Capture last message ID before the step
+    let conv_name = agent_name.clone();
+    let store = ConversationStore::init()?;
+    let last_id = store.get_messages(&conv_name, Some(1))?
+        .first().map(|m| m.id).unwrap_or(0);
+
     let mut api = connect_to_agent(&agent_name).await?;
 
     api.write_request(&Request::Message {
         content: String::new(),
-        conv_name: Some(agent_name.clone()),
+        conv_name: Some(conv_name.clone()),
         verbose: true,
         max_iterations: Some(1),
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    stream_agent_response(&mut api).await
+    stream_agent_response(&mut api).await?;
+    dump_step_messages(&conv_name, last_id)
 }
 
 // ---------------------------------------------------------------------------
