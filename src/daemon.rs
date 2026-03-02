@@ -19,9 +19,24 @@ static PYTHON_BLOCK_RE: LazyLock<regex::Regex> =
 static TOOL_CALL_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?s)<tool>\s*(\{.*?\})\s*</tool>").unwrap());
 
+/// Regex for detecting XML-style tool calls like `<read_file>...</read_file>`.
+/// Captures the tag name so we can check it against known tool names.
+static XML_TOOL_TAG_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"<([a-z][a-z0-9_]*)>").unwrap());
+
 /// Regex for extracting `<think>...</think>` blocks (verbose output).
 static THINKING_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"(?s)<think>(.*?)</think>").unwrap());
+
+/// Error message fed back to the LLM when a tool call cannot be parsed in tool-block mode.
+const TOOL_FORMAT_ERROR: &str = concat!(
+    "[Tool call format error]\n",
+    "Your tool call could not be parsed. Use this exact format:\n\n",
+    "<tool>\n",
+    "{\"tool\": \"TOOL_NAME\", \"params\": {\"PARAM\": \"VALUE\"}}\n",
+    "</tool>\n\n",
+    "The JSON must contain a \"tool\" key (string) and a \"params\" key (object).",
+);
 
 use chrono::Local;
 use tokio::net::UnixListener;
@@ -146,7 +161,7 @@ async fn execute_python_blocks(
 /// If the response contains a `<tool>` tag but extraction fails (malformed JSON,
 /// missing "tool" key), returns a format error as the cleaned output so the LLM
 /// gets feedback instead of silent termination.
-pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
+pub fn extract_tool_call(output: &str, tool_names: &[&str]) -> (String, Option<ToolCall>) {
     if let Some(cap) = TOOL_CALL_RE.captures(output)
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&cap[1])
         && let Some(tool_name) = json.get("tool").and_then(|t| t.as_str())
@@ -164,15 +179,15 @@ pub fn extract_tool_call(output: &str) -> (String, Option<ToolCall>) {
 
     // If a <tool> tag was present but didn't parse, feed back a format error
     if output.contains("<tool>") {
-        let error_msg = concat!(
-            "[Tool call format error]\n",
-            "Your tool call could not be parsed. Use this exact format:\n\n",
-            "<tool>\n",
-            "{\"tool\": \"TOOL_NAME\", \"params\": {\"PARAM\": \"VALUE\"}}\n",
-            "</tool>\n\n",
-            "The JSON must contain a \"tool\" key (string) and a \"params\" key (object).",
-        );
-        return (error_msg.to_string(), None);
+        return (TOOL_FORMAT_ERROR.to_string(), None);
+    }
+
+    // Check for XML-style tool calls: <tool_name>...</tool_name>
+    for cap in XML_TOOL_TAG_RE.captures_iter(output) {
+        let tag = &cap[1];
+        if tool_names.iter().any(|&t| t == tag) {
+            return (TOOL_FORMAT_ERROR.to_string(), None);
+        }
     }
 
     (output.to_string(), None)
@@ -3488,7 +3503,46 @@ async fn run_tool_loop(
                     }
                 } else {
                     // === tool-block mode ===
-                    let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+
+                    // Detect spontaneous native tool calls (e.g. Qwen3 emits tool_calls
+                    // even when no tools were provided in the request). Feed back the
+                    // format error so the LLM retries with <tool> tags.
+                    if think_result.last_tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
+                        tool_call_count += 1;
+                        logger.tool("[loop] Detected native tool call in tool-block mode, feeding format error");
+
+                        // Store intermediate response (preserve thinking in DB)
+                        if !db_content.trim().is_empty() {
+                            match store.add_message_with_tokens(
+                                conv_name, agent_name, &db_content, &[],
+                                think_result.duration_ms.map(|d| d as i64), None,
+                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                            ) {
+                                Ok(msg_id) => {
+                                    if let Some(turn_n) = think_result.dump_turn_n {
+                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
+                                }
+                            }
+                        }
+
+                        // Store format error as tool result
+                        if let Err(e) = store.add_tool_result(conv_name, TOOL_FORMAT_ERROR, agent_name) {
+                            logger.log(&format!("[loop] Failed to store format error: {}", e));
+                        }
+
+                        current_message = TOOL_FORMAT_ERROR.to_string();
+                        tool_executed = true;
+                        final_response_text = String::new();
+                    } else {
+
+                    let names: Vec<&str> = tool_context.allowed_tools.as_ref()
+                        .map(|v| v.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    let (cleaned_response, tool_call) = extract_tool_call(&after_remember, &names);
 
                     if let Some(tc) = tool_call {
                         // Check pause before executing tools
@@ -3705,6 +3759,7 @@ async fn run_tool_loop(
                             // No tool calls in tool-block mode
                             final_response_text = cleaned_response;
                         }
+                    } // end native-tool-call else
                     }
                 }
 
@@ -4524,7 +4579,7 @@ async fn process_tool_block_mode(
             ..Default::default()
         };
 
-        let llm_response = if let Some(ref tx) = token_tx {
+        let (llm_response, native_tool_calls) = if let Some(ref tx) = token_tx {
             // Streaming mode - but suppress tool call blocks
             let (internal_tx, mut internal_rx) = mpsc::channel::<String>(100);
             let agent_clone = agent.clone();
@@ -4589,7 +4644,7 @@ async fn process_tool_block_mode(
                     last_tokens_out = result.tokens_out;
                     last_prompt_eval_ns = result.prompt_eval_duration_ns;
                     last_cached_tokens = result.cached_tokens;
-                    result.response
+                    (result.response, result.last_tool_calls)
                 }
                 Ok(Err(e)) => return (format!("Error: {}", e), None, None, None, None, None),
                 Err(e) => return (format!("Error: task panicked: {}", e), None, None, None, None, None),
@@ -4607,7 +4662,7 @@ async fn process_tool_block_mode(
                     last_tokens_out = result.tokens_out;
                     last_prompt_eval_ns = result.prompt_eval_duration_ns;
                     last_cached_tokens = result.cached_tokens;
-                    result.response
+                    (result.response, result.last_tool_calls)
                 }
                 Err(e) => return (format!("Error: {}", e), None, None, None, None, None),
             }
@@ -4620,8 +4675,24 @@ async fn process_tool_block_mode(
         // Save memories
         save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
 
+        // Detect spontaneous native tool calls (e.g. Qwen3 emits tool_calls
+        // even when no tools were provided in the request)
+        if native_tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
+            tool_call_count += 1;
+            if tool_call_count > max_tool_calls {
+                logger.tool("[worker] Max tool calls reached during native tool retry");
+                return (after_remember, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
+            }
+            logger.tool("[worker] Detected native tool call in tool-block mode, feeding format error");
+            current_message = TOOL_FORMAT_ERROR.to_string();
+            continue;
+        }
+
         // Check for tool calls
-        let (cleaned_response, tool_call) = extract_tool_call(&after_remember);
+        let names: Vec<&str> = tool_context.allowed_tools.as_ref()
+            .map(|v| v.iter().map(|s| s.as_str()).collect())
+            .unwrap_or_default();
+        let (cleaned_response, tool_call) = extract_tool_call(&after_remember, &names);
 
         if let Some(tc) = tool_call {
             tool_call_count += 1;
@@ -9372,7 +9443,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_basic() {
         let input = r#"<tool>{"tool": "read_file", "params": {"path": "src/main.rs"}}</tool>"#;
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("should parse tool call");
         assert_eq!(tc.tool, "read_file");
         assert_eq!(tc.params["path"], "src/main.rs");
@@ -9382,7 +9453,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_with_surrounding_text() {
         let input = "Let me read that file for you.\n\n<tool>\n{\"tool\": \"read_file\", \"params\": {\"path\": \"x.rs\"}}\n</tool>\n\nHere you go.";
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("should parse tool call");
         assert_eq!(tc.tool, "read_file");
         assert!(cleaned.contains("Let me read that file"));
@@ -9393,7 +9464,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_multiline_json() {
         let input = "<tool>\n{\n  \"tool\": \"edit_file\",\n  \"params\": {\n    \"path\": \"a.rs\",\n    \"old\": \"foo\",\n    \"new\": \"bar\"\n  }\n}\n</tool>";
-        let (_, tc) = extract_tool_call(input);
+        let (_, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("should parse multiline JSON");
         assert_eq!(tc.tool, "edit_file");
         assert_eq!(tc.params["old"], "foo");
@@ -9403,7 +9474,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_backticks_in_params() {
         let input = r#"<tool>{"tool": "edit_file", "params": {"path": "x.rs", "old": "let x = `val`", "new": "let x = ```val```"}}</tool>"#;
-        let (_, tc) = extract_tool_call(input);
+        let (_, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("backticks in params should not break extraction");
         assert_eq!(tc.tool, "edit_file");
         assert!(tc.params["old"].as_str().unwrap().contains('`'));
@@ -9412,7 +9483,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_missing_tool_key() {
         let input = r#"<tool>{"foo": "bar", "params": {}}</tool>"#;
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         assert!(tc.is_none());
         assert!(cleaned.contains("[Tool call format error]"));
     }
@@ -9420,7 +9491,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_malformed_json() {
         let input = "<tool>{bad json here}</tool>";
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         assert!(tc.is_none());
         assert!(cleaned.contains("[Tool call format error]"));
     }
@@ -9428,7 +9499,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_no_tag() {
         let input = "Just a plain text response with no tool usage.";
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         assert!(tc.is_none());
         assert_eq!(cleaned, input);
     }
@@ -9436,7 +9507,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_nested_braces() {
         let input = r#"<tool>{"tool": "http", "params": {"url": "https://api.example.com", "body": {"key": "value", "nested": {"deep": true}}}}</tool>"#;
-        let (_, tc) = extract_tool_call(input);
+        let (_, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("nested braces should parse");
         assert_eq!(tc.tool, "http");
         assert_eq!(tc.params["body"]["nested"]["deep"], true);
@@ -9445,7 +9516,7 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_unclosed_tag_gives_error() {
         let input = "I'll use a tool:\n<tool>\n{\"tool\": \"read_file\"";
-        let (cleaned, tc) = extract_tool_call(input);
+        let (cleaned, tc) = extract_tool_call(input, &[]);
         assert!(tc.is_none());
         // Contains <tool> but regex doesn't match — should get format error
         assert!(cleaned.contains("[Tool call format error]"));
@@ -9454,10 +9525,26 @@ api_key = "sk-test"
     #[test]
     fn test_extract_tool_call_no_params_key() {
         let input = r#"<tool>{"tool": "list_tools"}</tool>"#;
-        let (_, tc) = extract_tool_call(input);
+        let (_, tc) = extract_tool_call(input, &[]);
         let tc = tc.expect("missing params should default to empty object");
         assert_eq!(tc.tool, "list_tools");
         assert_eq!(tc.params, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_extract_tool_call_xml_style_detected() {
+        let input = "I'll read the file:\n<read_file>\n<path>src/main.rs</path>\n</read_file>";
+        let (cleaned, tc) = extract_tool_call(input, &["read_file", "write_file"]);
+        assert!(tc.is_none());
+        assert!(cleaned.contains("[Tool call format error]"));
+    }
+
+    #[test]
+    fn test_extract_tool_call_xml_style_unknown_tag_ignored() {
+        let input = "Here is some <html> content </html>";
+        let (cleaned, tc) = extract_tool_call(input, &["read_file", "write_file"]);
+        assert!(tc.is_none());
+        assert_eq!(cleaned, input); // Not a known tool, pass through
     }
 
     #[test]
