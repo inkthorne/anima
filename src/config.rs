@@ -4,7 +4,7 @@ fn default_backend() -> String {
     "in_memory".to_string()
 }
 
-fn default_max_iter() -> usize {
+fn default_max_steps() -> usize {
     25
 }
 
@@ -175,8 +175,8 @@ pub struct HeartbeatConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct ThinkSection {
-    #[serde(default = "default_max_iter")]
-    pub max_iterations: usize,
+    #[serde(default = "default_max_steps", alias = "max_iterations")]
+    pub max_steps: usize,
     #[serde(default)]
     pub auto_memory: bool,
     #[serde(default = "default_mem_entries")]
@@ -192,7 +192,7 @@ pub struct ThinkSection {
 impl Default for ThinkSection {
     fn default() -> Self {
         Self {
-            max_iterations: default_max_iter(),
+            max_steps: default_max_steps(),
             auto_memory: false,
             max_memory_entries: default_mem_entries(),
             reflection: false,
@@ -274,7 +274,7 @@ model = "gpt-4o"
         assert_eq!(config.llm.model, "gpt-4o");
         assert!(config.tools.enabled.is_empty());
         assert_eq!(config.memory.backend, "in_memory");
-        assert_eq!(config.think.max_iterations, 25);
+        assert_eq!(config.think.max_steps, 25);
         // Retry defaults
         assert_eq!(config.retry.max_retries, 5);
         assert_eq!(config.retry.initial_delay_ms, 2000);
@@ -339,7 +339,7 @@ verbose = true
         assert_eq!(config.tools.enabled, vec!["echo", "add", "shell"]);
         assert_eq!(config.memory.backend, "sqlite");
         assert_eq!(config.memory.path, Some("/tmp/agent.db".to_string()));
-        assert_eq!(config.think.max_iterations, 5);
+        assert_eq!(config.think.max_steps, 5);
         assert!(config.think.auto_memory);
         assert_eq!(config.think.max_memory_entries, 20);
         assert!(config.think.reflection);

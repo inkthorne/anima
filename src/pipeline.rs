@@ -126,7 +126,7 @@ impl Pipeline {
 
                 let (cleaned, handoff) = extract_handoff_tag(&cleaned);
                 logger.log(&format!(
-                    "[pipeline] Final output after {} iterations (handoff={}): {}",
+                    "[pipeline] Final output after {} steps (handoff={}): {}",
                     iteration,
                     handoff,
                     truncate(&cleaned, 200)

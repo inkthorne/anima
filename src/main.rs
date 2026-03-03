@@ -148,14 +148,14 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AgentCommands {
-    /// Step-debug: fresh start (restart daemon, new conversation, one iteration)
+    /// Step-debug: fresh start (restart daemon, new conversation, one step)
     Debug {
         /// Agent name
         agent: String,
         /// Message to send
         message: String,
     },
-    /// Step-debug: continue one more iteration from current state
+    /// Step-debug: continue one more step from current state
     Step {
         /// Agent name
         agent: String,
@@ -332,7 +332,7 @@ enum ChatCommands {
 
 #[tokio::main]
 async fn main() {
-    register_turns_hook();
+    register_steps_hook();
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Status);
@@ -455,15 +455,15 @@ async fn main() {
 // Conversation event hooks
 // ---------------------------------------------------------------------------
 
-/// Register turns-directory lifecycle hooks for conversation events.
-fn register_turns_hook() {
+/// Register steps-directory lifecycle hooks for conversation events.
+fn register_steps_hook() {
     use anima::ConversationEvent;
 
     on_conversation_event(|event| {
         match event {
             ConversationEvent::Cleared { conv_name, participants } => {
                 for agent in participants.iter().filter(|a| a.as_str() != "user") {
-                    let dir = agents_dir().join(agent).join("turns").join(conv_name);
+                    let dir = agents_dir().join(agent).join("steps").join(conv_name);
                     if dir.is_dir() {
                         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
                             let _ = std::fs::remove_file(entry.path());
@@ -473,7 +473,7 @@ fn register_turns_hook() {
             }
             ConversationEvent::Deleted { conv_name, participants } => {
                 for agent in participants.iter().filter(|a| a.as_str() != "user") {
-                    let dir = agents_dir().join(agent).join("turns").join(conv_name);
+                    let dir = agents_dir().join(agent).join("steps").join(conv_name);
                     let _ = std::fs::remove_dir_all(&dir);
                 }
             }
@@ -1549,7 +1549,7 @@ async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<
         content: message.to_string(),
         conv_name: Some(conv_name),
         verbose,
-        max_iterations: None,
+        max_steps: None,
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
@@ -1557,7 +1557,7 @@ async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<
     stream_agent_response(&mut api).await
 }
 
-/// After a debug/step iteration, fetch and display all messages created since `since_id`.
+/// After a debug/step, fetch and display all messages created since `since_id`.
 /// Shows tool results, recall injections, and agent messages that aren't visible in the stream.
 fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std::error::Error>> {
     let store = ConversationStore::init()?;
@@ -1624,7 +1624,7 @@ fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std:
 }
 
 /// Step-debug: fresh start. Restart daemon, delete & recreate conversation,
-/// send user message, process one iteration, stream response.
+/// send user message, process one step, stream response.
 async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
     use anima::discovery;
 
@@ -1676,14 +1676,14 @@ async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std
     let last_id = store.get_messages(&conv_name, Some(1))?
         .first().map(|m| m.id).unwrap_or(0);
 
-    // Connect and send with max_iterations=1
+    // Connect and send with max_steps=1
     let mut api = connect_to_agent(&agent_name).await?;
 
     api.write_request(&Request::Message {
         content: message.to_string(),
         conv_name: Some(conv_name.clone()),
         verbose: true,
-        max_iterations: Some(1),
+        max_steps: Some(1),
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
@@ -1693,7 +1693,7 @@ async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std
 }
 
 /// Step-debug: continue from current conversation state.
-/// Process one more iteration of the tool loop.
+/// Process one more step of the tool loop.
 async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     use anima::discovery;
 
@@ -1726,7 +1726,7 @@ async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         content: String::new(),
         conv_name: Some(conv_name.clone()),
         verbose: true,
-        max_iterations: Some(1),
+        max_steps: Some(1),
     })
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
@@ -3043,7 +3043,7 @@ async fn run_agent_task(
     };
 
     let options = ThinkOptions {
-        max_iterations: config.think.max_iterations,
+        max_steps: config.think.max_steps,
         system_prompt: config.agent.system_prompt,
         auto_memory,
         reflection,

@@ -34,18 +34,18 @@ pub fn strip_thinking(content: &str) -> String {
 }
 
 /// Returns a tool-budget nudge string when the agent has used ≥50% of its
-/// tool iterations, or None if below the threshold.
-pub fn tool_budget_nudge(iteration: usize, max: usize) -> Option<String> {
-    let pct = (iteration * 100) / max.max(1);
+/// tool steps, or None if below the threshold.
+pub fn tool_budget_nudge(step: usize, max: usize) -> Option<String> {
+    let pct = (step * 100) / max.max(1);
     if pct >= 80 {
         Some(format!(
             "[Tool call {} of {} — approaching limit, provide your response now]",
-            iteration, max
+            step, max
         ))
     } else if pct >= 50 {
         Some(format!(
             "[Tool call {} of {} — consider responding if you have sufficient information]",
-            iteration, max
+            step, max
         ))
     } else {
         None
@@ -461,8 +461,8 @@ fn dedup_tool_results(messages: &mut Vec<ChatMessage>) {
 
 /// Options for the think() agentic loop
 pub struct ThinkOptions {
-    /// Maximum iterations before giving up (default: 10)
-    pub max_iterations: usize,
+    /// Maximum steps before giving up (default: 25)
+    pub max_steps: usize,
     /// Optional system prompt to set agent behavior
     pub system_prompt: Option<String>,
     /// Optional reflection configuration for self-evaluation
@@ -484,7 +484,7 @@ pub struct ThinkOptions {
     /// finishes, enabling real-time persistence to the conversation DB.
     pub tool_trace_tx: Option<tokio::sync::mpsc::Sender<ToolExecution>>,
     /// Optional cancellation flag. When set to true, the agent stops the tool loop
-    /// at the next iteration boundary and returns a Cancelled error.
+    /// at the next step boundary and returns a Cancelled error.
     pub cancel: Option<Arc<AtomicBool>>,
     /// Context window size (tokens). When set, the tool loop will trim context at 80% fill.
     pub num_ctx: Option<u32>,
@@ -496,7 +496,7 @@ pub struct ThinkOptions {
 impl Default for ThinkOptions {
     fn default() -> Self {
         Self {
-            max_iterations: 25,
+            max_steps: 25,
             system_prompt: None,
             reflection: None,
             auto_memory: None,
@@ -572,13 +572,13 @@ pub struct ToolExecution {
     /// Assistant content (narration) that accompanied the tool call, if any.
     /// When the LLM returns both content AND tool_calls, this captures that content.
     pub content: Option<String>,
-    /// Per-iteration LLM token stats for inline persistence by the trace persister.
+    /// Per-step LLM token stats for inline persistence by the trace persister.
     pub iter_tokens_in: Option<u32>,
     pub iter_tokens_out: Option<u32>,
     pub iter_prompt_eval_ns: Option<u64>,
-    /// Per-iteration LLM wall-clock duration in milliseconds.
+    /// Per-step LLM wall-clock duration in milliseconds.
     pub iter_duration_ms: Option<u64>,
-    /// Per-iteration cached tokens count.
+    /// Per-step cached tokens count.
     pub iter_cached_tokens: Option<u32>,
 }
 
@@ -611,7 +611,7 @@ pub struct ThinkResult {
     /// Sequential turn number used for debug dump files (req-N.json, resp-N.json).
     /// After the assistant message is stored to DB, the caller renames files from this
     /// number to the DB message ID for easier cross-referencing.
-    pub dump_turn_n: Option<u64>,
+    pub dump_step_n: Option<u64>,
     /// Full LLMResponse serialized as JSON (content + tool_calls + usage).
     /// Set by single-turn functions; None for multi-turn loops.
     pub assistant_response_json: Option<String>,
@@ -670,7 +670,7 @@ pub struct Agent {
     history: Vec<ChatMessage>,
     /// Agent directory path for context dumping
     agent_dir: Option<PathBuf>,
-    /// Current conversation name for debug file naming (turns/{name}.json)
+    /// Current conversation name for debug file naming (steps/{name}.json)
     current_conversation: Option<String>,
 }
 
@@ -699,7 +699,7 @@ impl Agent {
     }
 
     /// Set the current conversation name for debug file naming.
-    /// Used to write debug files to turns/{name}.json instead of last_turn.json.
+    /// Used to write debug files to steps/{name}.json.
     pub fn set_current_conversation(&mut self, name: Option<String>) {
         self.current_conversation = name;
     }
@@ -1308,8 +1308,8 @@ impl Agent {
         Some(context)
     }
 
-    /// Dump the raw LLM request payload to turns/{conv_name}/req-{n}.json in the agent directory.
-    /// Returns the turn number so the caller can pass it to `dump_response`.
+    /// Dump the raw LLM request payload to steps/{conv_name}/req-{n}.json in the agent directory.
+    /// Returns the step number so the caller can pass it to `dump_response`.
     fn dump_request(
         &self,
         tools: &Option<Vec<ToolSpec>>,
@@ -1325,7 +1325,7 @@ impl Agent {
         crate::debug::dump_request(agent_dir, conv_name, &model, tools, messages)
     }
 
-    /// Dump the raw LLM response to turns/{conv_name}/resp-{n}.json.
+    /// Dump the raw LLM response to steps/{conv_name}/resp-{n}.json.
     fn dump_response(&self, turn_n: Option<u64>, response: &crate::llm::LLMResponse) {
         let Some(agent_dir) = &self.agent_dir else {
             return;
@@ -1334,7 +1334,7 @@ impl Agent {
         crate::debug::dump_response(agent_dir, conv_name, turn_n, response);
     }
 
-    /// Dump raw stream capture to turns/{conv_name}/stream-{n}.json on error.
+    /// Dump raw stream capture to steps/{conv_name}/stream-{n}.json on error.
     fn dump_stream(&self, turn_n: Option<u64>, raw_stream: &str) {
         let Some(agent_dir) = &self.agent_dir else {
             return;
@@ -1346,12 +1346,12 @@ impl Agent {
     /// Rename debug turn dump files from sequential number to DB message ID.
     /// Called after the assistant message is stored to the database, so the files
     /// can be cross-referenced with `anima chat view` output.
-    pub fn rename_turn_files(&self, from_n: u64, to_id: i64) {
+    pub fn rename_step_files(&self, from_n: u64, to_id: i64) {
         let Some(agent_dir) = &self.agent_dir else {
             return;
         };
         let conv_name = self.current_conversation.as_deref().unwrap_or("direct");
-        crate::debug::rename_turn_files(agent_dir, conv_name, from_n, to_id);
+        crate::debug::rename_step_files(agent_dir, conv_name, from_n, to_id);
     }
 
     pub async fn think_with_options(
@@ -1416,7 +1416,7 @@ impl Agent {
         let mut last_prompt_eval_ns: Option<u64> = None;
         let mut last_cached_tokens: Option<u32> = None;
 
-        for _iteration in 0..options.max_iterations {
+        for _step in 0..options.max_steps {
             // Check cancellation before each LLM call
             if let Some(ref cancel) = options.cancel {
                 if cancel.load(Ordering::Relaxed) {
@@ -1483,7 +1483,7 @@ impl Agent {
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: None,
+                    dump_step_n: None,
                     assistant_response_json: None,
                 });
             }
@@ -1554,7 +1554,7 @@ impl Agent {
             }
 
             // Inject tool budget nudge
-            if let Some(nudge) = tool_budget_nudge(_iteration + 1, options.max_iterations) {
+            if let Some(nudge) = tool_budget_nudge(_step + 1, options.max_steps) {
                 messages.push(ChatMessage {
                     role: "user".to_string(),
                     content: Some(nudge),
@@ -1566,7 +1566,7 @@ impl Agent {
 
         self.trim_history();
         Ok(ThinkResult {
-            response: format!("[Max iterations reached: {}]", options.max_iterations),
+            response: format!("[Max steps reached: {}]", options.max_steps),
             tools_used: !tool_names_used.is_empty(),
             tool_names: tool_names_used,
             last_tool_calls,
@@ -1576,7 +1576,7 @@ impl Agent {
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
             cached_tokens: last_cached_tokens,
-            dump_turn_n: None,
+            dump_step_n: None,
             assistant_response_json: None,
         })
     }
@@ -1621,8 +1621,8 @@ impl Agent {
 
     /// Make exactly one LLM call and return without executing tools or looping.
     /// Returns ThinkResult with `last_tool_calls` populated if the LLM requested tools.
-    /// The caller (daemon's run_tool_loop) is responsible for tool execution and iteration.
-    pub async fn think_single_turn(
+    /// The caller (daemon's run_tool_loop) is responsible for tool execution and stepping.
+    pub async fn think_single_step(
         &mut self,
         task: &str,
         options: ThinkOptions,
@@ -1680,15 +1680,15 @@ impl Agent {
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
-            dump_turn_n: turn_n,
+            dump_step_n: turn_n,
             assistant_response_json,
         })
     }
 
-    /// Streaming variant of think_single_turn.
+    /// Streaming variant of think_single_step.
     /// Makes exactly one streaming LLM call, sends tokens through channel, returns without
     /// executing tools or looping.
-    pub async fn think_single_turn_streaming(
+    pub async fn think_single_step_streaming(
         &mut self,
         task: &str,
         options: ThinkOptions,
@@ -1747,7 +1747,7 @@ impl Agent {
             prompt_eval_duration_ns: prompt_eval_ns,
             duration_ms: Some(llm_duration_ms),
             cached_tokens,
-            dump_turn_n: turn_n,
+            dump_step_n: turn_n,
             assistant_response_json,
         })
     }
@@ -1796,7 +1796,7 @@ impl Agent {
         let mut last_prompt_eval_ns: Option<u64> = None;
         let mut last_cached_tokens: Option<u32> = None;
 
-        for _iteration in 0..options.max_iterations {
+        for _step in 0..options.max_steps {
             // Check cancellation before each LLM call
             if let Some(ref cancel) = options.cancel {
                 if cancel.load(Ordering::Relaxed) {
@@ -1855,7 +1855,7 @@ impl Agent {
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     duration_ms: Some(llm_duration_ms),
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: None,
+                    dump_step_n: None,
                     assistant_response_json: None,
                 });
             }
@@ -1930,7 +1930,7 @@ impl Agent {
 
         self.trim_history();
         Ok(ThinkResult {
-            response: format!("[Max iterations reached: {}]", options.max_iterations),
+            response: format!("[Max steps reached: {}]", options.max_steps),
             tools_used: !tool_names_used.is_empty(),
             tool_names: tool_names_used,
             last_tool_calls,
@@ -1940,7 +1940,7 @@ impl Agent {
             prompt_eval_duration_ns: last_prompt_eval_ns,
             duration_ms: None,
             cached_tokens: last_cached_tokens,
-            dump_turn_n: None,
+            dump_step_n: None,
             assistant_response_json: None,
         })
     }
@@ -1995,7 +1995,7 @@ impl Agent {
             );
 
             let revision_options = ThinkOptions {
-                max_iterations: options.max_iterations,
+                max_steps: options.max_steps,
                 system_prompt: options.system_prompt.clone(),
                 reflection: None, // Don't recurse
                 auto_memory: options.auto_memory.clone(),
@@ -2036,7 +2036,7 @@ impl Agent {
         let mut messages =
             self.build_messages(&effective_system_prompt, &options.conversation_history, Some(task));
 
-        for _iteration in 0..options.max_iterations {
+        for _step in 0..options.max_steps {
             let response = self
                 .call_llm(&llm, &messages, &tools, &options.retry_policy)
                 .await?;
@@ -2070,8 +2070,8 @@ impl Agent {
             }
         }
 
-        Err(crate::error::AgentError::MaxIterationsExceeded(
-            options.max_iterations,
+        Err(crate::error::AgentError::MaxStepsExceeded(
+            options.max_steps,
         ))
     }
 
@@ -2362,7 +2362,7 @@ mod tests {
     #[test]
     fn test_think_options_default() {
         let opts = ThinkOptions::default();
-        assert_eq!(opts.max_iterations, 25);
+        assert_eq!(opts.max_steps, 25);
         assert!(opts.system_prompt.is_none());
         assert!(opts.reflection.is_none());
         assert!(opts.retry_policy.is_some()); // Retry enabled by default
@@ -2402,7 +2402,7 @@ mod tests {
     #[test]
     fn test_think_options_with_auto_memory() {
         let opts = ThinkOptions {
-            max_iterations: 5,
+            max_steps: 5,
             system_prompt: Some("Be helpful".to_string()),
             reflection: None,
             auto_memory: Some(AutoMemoryConfig::default()),
@@ -3084,7 +3084,7 @@ mod tests {
     #[test]
     fn test_think_options_with_conversation_history() {
         let opts = ThinkOptions {
-            max_iterations: 5,
+            max_steps: 5,
             system_prompt: Some("Be helpful".to_string()),
             reflection: None,
             auto_memory: None,

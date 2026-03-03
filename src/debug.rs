@@ -140,11 +140,11 @@ pub fn log_llm_response(provider: &str, content: &str, thinking: Option<&str>) {
 }
 
 // ---------------------------------------------------------------------------
-// Turn dump functions — shared by Agent and Pipeline
+// Step dump functions — shared by Agent and Pipeline
 // ---------------------------------------------------------------------------
 
-/// Dump an LLM request payload to turns/{conv_name}/req-{n}.json.
-/// Returns the turn number for pairing with dump_response.
+/// Dump an LLM request payload to steps/{conv_name}/req-{n}.json.
+/// Returns the step number for pairing with dump_response.
 pub fn dump_request(
     agent_dir: &Path,
     conv_name: &str,
@@ -152,15 +152,15 @@ pub fn dump_request(
     tools: &Option<Vec<ToolSpec>>,
     messages: &[ChatMessage],
 ) -> Option<u64> {
-    // Create turns/{conv_name}/ directory if it doesn't exist
-    let conv_dir = agent_dir.join("turns").join(conv_name);
+    // Create steps/{conv_name}/ directory if it doesn't exist
+    let conv_dir = agent_dir.join("steps").join(conv_name);
     if let Err(e) = std::fs::create_dir_all(&conv_dir) {
-        eprintln!("Failed to create turns directory: {}", e);
+        eprintln!("Failed to create steps directory: {}", e);
         return None;
     }
 
-    // Create .gitignore in turns/ to make it self-ignoring (debug files shouldn't be committed)
-    let gitignore_path = agent_dir.join("turns").join(".gitignore");
+    // Create .gitignore in steps/ to make it self-ignoring (debug files shouldn't be committed)
+    let gitignore_path = agent_dir.join("steps").join(".gitignore");
     if !gitignore_path.exists() {
         let _ = std::fs::write(&gitignore_path, "*\n!.gitignore\n");
     }
@@ -255,7 +255,7 @@ pub fn dump_request(
     Some(next_n)
 }
 
-/// Dump an LLM response to turns/{conv_name}/resp-{n}.json.
+/// Dump an LLM response to steps/{conv_name}/resp-{n}.json.
 pub fn dump_response(
     agent_dir: &Path,
     conv_name: &str,
@@ -266,7 +266,7 @@ pub fn dump_response(
         Some(n) => n,
         None => return,
     };
-    let conv_dir = agent_dir.join("turns").join(conv_name);
+    let conv_dir = agent_dir.join("steps").join(conv_name);
     let file_path = conv_dir.join(format!("resp-{}.json", turn_n));
 
     let content =
@@ -294,7 +294,7 @@ pub fn dump_response(
     }
 }
 
-/// Dump raw stream capture to turns/{conv_name}/stream-{n}.json on error.
+/// Dump raw stream capture to steps/{conv_name}/stream-{n}.json on error.
 pub fn dump_stream(
     agent_dir: &Path,
     conv_name: &str,
@@ -305,19 +305,19 @@ pub fn dump_stream(
         Some(n) => n,
         None => return,
     };
-    let conv_dir = agent_dir.join("turns").join(conv_name);
+    let conv_dir = agent_dir.join("steps").join(conv_name);
     let stream_path = conv_dir.join(format!("stream-{}.json", turn_n));
     let _ = std::fs::write(&stream_path, raw_stream);
 }
 
 /// Rename debug dump files from sequential number to DB message ID.
-pub fn rename_turn_files(
+pub fn rename_step_files(
     agent_dir: &Path,
     conv_name: &str,
     from_n: u64,
     to_id: i64,
 ) {
-    let conv_dir = agent_dir.join("turns").join(conv_name);
+    let conv_dir = agent_dir.join("steps").join(conv_name);
 
     for prefix in &["req", "resp", "raw", "stream"] {
         let from_path = conv_dir.join(format!("{}-{}.json", prefix, from_n));

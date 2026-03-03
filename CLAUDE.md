@@ -4,7 +4,7 @@
 
 Anima is a Rust runtime for AI agents. **Arya** is the lead architect — this is her project.
 
-**Version:** v4.5.3
+**Version:** v4.5.4
 **Tests:** 829 passing
 **Repo:** github.com/inkthorne/anima
 
@@ -80,7 +80,7 @@ src/
         ├── daemon.pid   # PID (when running)
         ├── agent.sock   # Unix socket (when running)
         ├── agent.log    # Daemon log file
-        └── turns/       # Debug dumps of raw LLM request payloads
+        └── steps/       # Debug dumps of raw LLM request payloads
             └── {conv}.json  # Named by conversation
 ```
 

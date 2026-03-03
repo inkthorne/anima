@@ -2,11 +2,11 @@
 
 Getting local models to use tools reliably is the central challenge of running an agentic loop on Ollama. Cloud APIs (OpenAI, Anthropic) have been fine-tuned specifically for tool calling — they emit structured tool invocations cleanly, chain calls naturally, and stop when done. Local models do none of this consistently. They hallucinate tool names, emit malformed JSON, forget to call tools when they should, call tools when they shouldn't, and loop endlessly without producing a final answer.
 
-This document explores what happens on each iteration of Anima's tool loop, what works, what breaks, and what we can do about it. The focus is narrow: the agentic loop itself — how the LLM sees tools, how it emits calls, how results come back, and how the loop terminates. System prompt design, memory injection, and persona tuning are out of scope.
+This document explores what happens on each step of Anima's tool loop, what works, what breaks, and what we can do about it. The focus is narrow: the agentic loop itself — how the LLM sees tools, how it emits calls, how results come back, and how the loop terminates. System prompt design, memory injection, and persona tuning are out of scope.
 
-## Anatomy of a Turn
+## Anatomy of a Step
 
-A single iteration of the tool loop looks like this from the LLM's perspective:
+A single step of the tool loop looks like this from the LLM's perspective:
 
 ```
 Messages the LLM receives:
@@ -15,7 +15,7 @@ Messages the LLM receives:
 │ user: "Read main.rs and fix the bug"        │
 │ assistant: [tool_call: read_file(main.rs)]  │
 │ tool: "[Tool Result for read_file]\n..."    │
-│ assistant: [tool_call: edit_file(...)]      │  ← history from prior iterations
+│ assistant: [tool_call: edit_file(...)]      │  ← history from prior steps
 │ tool: "[Tool Result for edit_file]\n..."    │
 │ user: "[Tool call 4 of 10 — consider...]"  │  ← budget nudge (if applicable)
 └─────────────────────────────────────────────┘
@@ -27,9 +27,9 @@ LLM generates:
 └─────────────────────────────────────────────┘
 ```
 
-The harness does exactly one thing per iteration: call the LLM, check whether the response contains tool calls, and either execute them (loop continues) or return the text (loop ends). Everything else — context management, deduplication, budget nudges — is bookkeeping around this core decision.
+The harness does exactly one thing per step: call the LLM, check whether the response contains tool calls, and either execute them (loop continues) or return the text (loop ends). Everything else — context management, deduplication, budget nudges — is bookkeeping around this core decision.
 
-Anima has two implementations of this loop. The agent's internal loop (`think_with_options_inner` in `agent.rs`) holds history in memory and runs self-contained. The daemon's loop (`run_tool_loop` in `daemon.rs`) persists each turn to SQLite, clears the agent's in-memory history between iterations, and reconstructs context from the database. In daemon mode — which is the production path — the database is the source of truth, not the agent's internal state.
+Anima has two implementations of this loop. The agent's internal loop (`think_with_options_inner` in `agent.rs`) holds history in memory and runs self-contained. The daemon's loop (`run_tool_loop` in `daemon.rs`) persists each step to SQLite, clears the agent's in-memory history between steps, and reconstructs context from the database. In daemon mode — which is the production path — the database is the source of truth, not the agent's internal state.
 
 ## Tool Presentation
 
@@ -37,7 +37,7 @@ Anima has two implementations of this loop. The agent's internal loop (`think_wi
 
 When the model supports native tool calling, Anima converts all allowed tools into `ToolSpec` objects and passes them through the API's tools field. The LLM provider handles the rest — OpenAI gets `tool_choice: "auto"`, Anthropic gets `input_schema`, Ollama gets the OpenAI-compatible format.
 
-The conversion pipeline: `tools.toml` defines tools with flat param maps (`{"path": "string", "content": "string"}`). These are expanded into JSON Schema via `convert_params_to_json_schema()` in `tool_registry.rs`, producing proper `{"type": "object", "properties": {...}, "required": [...]}` schemas. All allowed tools are injected every turn — there's no per-query filtering in native mode.
+The conversion pipeline: `tools.toml` defines tools with flat param maps (`{"path": "string", "content": "string"}`). These are expanded into JSON Schema via `convert_params_to_json_schema()` in `tool_registry.rs`, producing proper `{"type": "object", "properties": {...}, "required": [...]}` schemas. All allowed tools are injected every step — there's no per-query filtering in native mode.
 
 This works well with cloud models. With Ollama it's inconsistent. Some models (Qwen 2.5 Coder, Llama 3.x with tool support) handle native tool calling adequately. Others ignore the tools field entirely or emit tool calls with wrong parameter names.
 
@@ -118,7 +118,7 @@ This captures a JSON object inside `<tool>...</tool>` XML tags. The `(?s)` flag 
 
 **`<tool>` tags reduce false positives.** The old fenced code block format (`\`\`\`json`) collided with markdown code blocks in the model's natural output. Using `<tool>` tags is unambiguous — models don't emit `<tool>` in commentary. The `"tool"` key check provides a second layer of validation.
 
-**Multiple tool calls per turn.** Native mode supports multiple tool calls in a single response — OpenAI and Anthropic both allow this. tool-block mode only extracts the first match. For local models this is usually fine (they rarely emit multiple calls successfully), but it's a structural limitation.
+**Multiple tool calls per step.** Native mode supports multiple tool calls in a single response — OpenAI and Anthropic both allow this. tool-block mode only extracts the first match. For local models this is usually fine (they rarely emit multiple calls successfully), but it's a structural limitation.
 
 ## Result Feedback
 
@@ -142,11 +142,11 @@ Or on error:
 File not found: /nonexistent.rs
 ```
 
-The `[Tool Result for X]` / `[Tool Error for X]` prefix is important — it tells the model which tool produced the output, especially when multiple tools were called in one turn.
+The `[Tool Result for X]` / `[Tool Error for X]` prefix is important — it tells the model which tool produced the output, especially when multiple tools were called in one step.
 
 ### Tool-Block Mode
 
-Results are injected differently. The tool result is stored as a separate message in the conversation and becomes part of the history the LLM sees on the next iteration. There's no `tool_call_id` linkage — the model has to infer which tool produced which output from the content itself.
+Results are injected differently. The tool result is stored as a separate message in the conversation and becomes part of the history the LLM sees on the next step. There's no `tool_call_id` linkage — the model has to infer which tool produced which output from the content itself.
 
 ### Truncation
 
@@ -180,7 +180,7 @@ Additional termination conditions in the harness:
 
 | Condition | Behavior |
 |---|---|
-| Max iterations reached | Returns `[Max iterations reached: N]` |
+| Max steps reached | Returns `[Max steps reached: N]` |
 | Wall-clock deadline exceeded | Returns `[Response terminated: ...]` |
 | Cancellation flag set | Returns `[Paused]` |
 | Shutdown signal | Returns empty string |
@@ -188,7 +188,7 @@ Additional termination conditions in the harness:
 
 ### Budget Nudges
 
-When the loop has consumed a significant fraction of its iteration budget, the harness appends a nudge to the conversation:
+When the loop has consumed a significant fraction of its step budget, the harness appends a nudge to the conversation:
 
 - At 50-79% of budget: `[Tool call 5 of 10 — consider responding if you have sufficient information]`
 - At 80%+ of budget: `[Tool call 8 of 10 — approaching limit, provide your response now]`
@@ -205,7 +205,7 @@ These are injected as user messages, which means the model sees them as directiv
 
 ## Chaining
 
-Multi-step tool use — read a file, edit it, run tests, fix failures — is where local models struggle most. The model needs to maintain a plan across turns, remember what it's already done, and decide what to do next based on accumulating results.
+Multi-step tool use — read a file, edit it, run tests, fix failures — is where local models struggle most. The model needs to maintain a plan across steps, remember what it's already done, and decide what to do next based on accumulating results.
 
 ### What Works
 
@@ -233,9 +233,9 @@ Anima has a two-tier context management strategy:
 
 ### Observations
 
-**Dedup should run earlier.** At 90%, the model has already been reasoning with a polluted context for several turns. Running dedup at 60-70% — or even proactively after every tool result — would keep the context clean throughout the chain. The cost is minimal (it's a linear scan over messages).
+**Dedup should run earlier.** At 90%, the model has already been reasoning with a polluted context for several steps. Running dedup at 60-70% — or even proactively after every tool result — would keep the context clean throughout the chain. The cost is minimal (it's a linear scan over messages).
 
-**Plan injection would help chaining.** Before each LLM call in a multi-step chain, the harness could inject a summary: "Steps completed: read main.rs, edited line 42. Remaining: run tests." This gives the model an external memory of its plan, compensating for its limited ability to track state across turns.
+**Plan injection would help chaining.** Before each LLM call in a multi-step chain, the harness could inject a summary: "Steps completed: read main.rs, edited line 42. Remaining: run tests." This gives the model an external memory of its plan, compensating for its limited ability to track state across steps.
 
 **Short chains should be the design target.** Rather than trying to make local models handle 10-step chains, Anima should optimize for 2-4 step interactions. The state machine (anima-states) is the right tool for longer workflows — it breaks a complex task into discrete states, each with a focused prompt, so the model only needs to handle a short chain within each state.
 
@@ -272,7 +272,7 @@ This was the biggest error recovery gap: the model would try to call a tool but 
 
 ### Infinite Loops
 
-The `max_iterations` cap (default 25) is the backstop for infinite loops. The budget nudge at 50% and 80% provides softer intervention. But local models can still waste most of their budget on repetitive calls before the nudge takes effect.
+The `max_steps` cap (default 25) is the backstop for infinite loops. The budget nudge at 50% and 80% provides softer intervention. But local models can still waste most of their budget on repetitive calls before the nudge takes effect.
 
 A more aggressive strategy: detect repetition explicitly. If the model calls the same tool with the same arguments twice in a row, inject a warning: `[You already called read_file("main.rs") — the result is in your context above. Use the information you have or try a different approach.]` This catches the most common loop pattern (re-reading files) without waiting for the budget nudge.
 
@@ -290,17 +290,17 @@ Run `dedup_tool_results` after every tool execution, not just at 90% context fil
 
 ### 3. Continuous budget awareness
 
-Replace the 50%/80% threshold nudges with a per-turn status line appended to every tool result:
+Replace the 50%/80% threshold nudges with a per-step status line appended to every tool result:
 
 ```
 [Tool budget: 7 of 10 remaining]
 ```
 
-This is lightweight enough to include every turn without being directive. Keep the stronger nudge language for 80%+ as an additional push.
+This is lightweight enough to include every step without being directive. Keep the stronger nudge language for 80%+ as an additional push.
 
 ### 4. Repetition detection
 
-Before executing a tool call, check whether the exact same call (same tool name, same arguments) was made in the last 3 iterations. If so, skip execution and inject:
+Before executing a tool call, check whether the exact same call (same tool name, same arguments) was made in the last 3 steps. If so, skip execution and inject:
 
 ```
 [Duplicate tool call — read_file("main.rs") was already called.
@@ -311,15 +311,15 @@ This prevents the most common loop pattern without relying on the budget nudge.
 
 ### 5. ~~tool-block format reinforcement~~ (Done)
 
-Format instructions are now included in the tool listing injected via `<recall>` every turn, using recency bias. The `<tool>` tag format is documented inline with the available tools list.
+Format instructions are now included in the tool listing injected via `<recall>` every step, using recency bias. The `<tool>` tag format is documented inline with the available tools list.
 
 ### 6. Smarter tool injection for native mode
 
-Native mode currently injects all allowed tools every turn. For models with limited tool-handling capacity, filter down to the most relevant tools per turn — the same keyword-matching logic used in tool-block mode, but applied to native tool specs. Start with all tools on the first turn, then narrow to tools related to the current task based on the conversation so far.
+Native mode currently injects all allowed tools every step. For models with limited tool-handling capacity, filter down to the most relevant tools per step — the same keyword-matching logic used in tool-block mode, but applied to native tool specs. Start with all tools on the first step, then narrow to tools related to the current task based on the conversation so far.
 
 ### 7. Shorter default chain length
 
-Reduce `max_iterations` from 25 to 10 for local models. Most useful work completes in 3-5 tool calls. A max of 10 provides headroom for complex tasks without letting the model burn 20 iterations on loops. This can be a model-level config rather than a global change — cloud models can keep higher limits.
+Reduce `max_steps` from 25 to 10 for local models. Most useful work completes in 3-5 tool calls. A max of 10 provides headroom for complex tasks without letting the model burn 20 steps on loops. This can be a model-level config rather than a global change — cloud models can keep higher limits.
 
 ### 8. Proactive context summarization
 
@@ -340,7 +340,7 @@ Some things in Anima's current design work well and shouldn't be touched:
 
 **The two-mode architecture.** Having both native and tool-block mode is the right call. Native mode is better when it works; tool-block mode is a reliable fallback. The ability to choose per-model is important.
 
-**Database-backed context in daemon mode.** Reconstructing context from SQLite on each iteration (rather than relying on in-memory history) is architecturally sound. It enables pause/resume, multi-client access, and prevents context drift. The overhead is negligible compared to LLM inference time.
+**Database-backed context in daemon mode.** Reconstructing context from SQLite on each step (rather than relying on in-memory history) is architecturally sound. It enables pause/resume, multi-client access, and prevents context drift. The overhead is negligible compared to LLM inference time.
 
 **Keyword-based tool recall.** Only showing 3-5 tools per query in tool-block mode is a strength, not a limitation. Local models perform better with fewer choices. The `list_tools` escape hatch handles the edge case where keyword matching picks the wrong tools.
 

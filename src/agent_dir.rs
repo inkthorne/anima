@@ -223,8 +223,8 @@ pub struct ShellSection {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ThinkSection {
-    /// Maximum iterations for tool call loops (default: 10)
-    pub max_iterations: Option<usize>,
+    /// Maximum steps for tool call loops (default: 10)
+    pub max_steps: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h").
     pub max_response_time: Option<String>,
 }

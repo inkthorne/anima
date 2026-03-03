@@ -5,7 +5,7 @@ use serde_json::Value;
 
 /// Daemon-aware tool that lets agents update their working scratchpad.
 /// Notes are stored in the participants table and injected at the end of context
-/// each turn, providing persistent working state across tool-loop iterations.
+/// each turn, providing persistent working state across tool-loop steps.
 pub struct DaemonNotesTool {
     agent_name: String,
     conv_id: Option<String>,

@@ -22,10 +22,10 @@ pub enum Request {
         /// Defaults to false for backward compatibility.
         #[serde(default)]
         verbose: bool,
-        /// Maximum tool loop iterations per request.
+        /// Maximum tool loop steps per request.
         /// None = use config default. Some(1) = step-debug mode.
-        #[serde(default)]
-        max_iterations: Option<usize>,
+        #[serde(default, alias = "max_iterations")]
+        max_steps: Option<usize>,
     },
     /// Incoming message from another agent (inter-daemon communication).
     IncomingMessage {
@@ -242,7 +242,7 @@ mod tests {
             content: "Hello, agent!".to_string(),
             conv_name: None,
             verbose: false,
-            max_iterations: None,
+            max_steps: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"type\":\"message\""));
@@ -265,7 +265,7 @@ mod tests {
             content: "Hello!".to_string(),
             conv_name: Some("test-conv".to_string()),
             verbose: false,
-            max_iterations: None,
+            max_steps: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"conv_name\":\"test-conv\""));
@@ -282,15 +282,15 @@ mod tests {
 
     #[test]
     fn test_request_message_without_conv_name_backward_compat() {
-        // Test backwards compatibility - conv_name, verbose, max_iterations should default if not provided
+        // Test backwards compatibility - conv_name, verbose, max_steps should default if not provided
         let json = r#"{"type":"message","content":"Hello!"}"#;
         let parsed: Request = serde_json::from_str(json).unwrap();
         match parsed {
-            Request::Message { content, conv_name, verbose, max_iterations } => {
+            Request::Message { content, conv_name, verbose, max_steps } => {
                 assert_eq!(content, "Hello!");
                 assert!(conv_name.is_none());
                 assert!(!verbose);
-                assert!(max_iterations.is_none());
+                assert!(max_steps.is_none());
             }
             _ => panic!("Wrong variant"),
         }
@@ -669,7 +669,7 @@ mod tests {
             content: "Hello!".to_string(),
             conv_name: None,
             verbose: true,
-            max_iterations: None,
+            max_steps: None,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"verbose\":true"));

@@ -237,8 +237,8 @@ pub enum AgentWork {
         token_tx: Option<mpsc::Sender<String>>,
         /// Verbose event sender (thinking, usage, tool calls, memory)
         verbose_tx: Option<mpsc::Sender<Response>>,
-        /// Per-request max iterations override (None = use config default)
-        max_iterations: Option<usize>,
+        /// Per-request max steps override (None = use config default)
+        max_steps: Option<usize>,
     },
     /// Process a notify request (conversation @mention)
     Notify {
@@ -1532,7 +1532,7 @@ fn execute_tool_call<'a>(
                 Ok(result) => {
                     let agent = result.get("agent").and_then(|s| s.as_str()).unwrap_or("");
                     let task_conv = result.get("task_conv").and_then(|s| s.as_str()).unwrap_or("");
-                    Ok(format!("Task cancelled for '{}' ({}). The agent will stop at the next iteration boundary.", agent, task_conv))
+                    Ok(format!("Task cancelled for '{}' ({}). The agent will stop at the next step boundary.", agent, task_conv))
                 }
                 Err(e) => Err(format!("Tool error: {}", e)),
             }
@@ -1561,7 +1561,7 @@ fn execute_tool_call<'a>(
             let task = tool_call.params.get("task")
                 .and_then(|v| v.as_str())
                 .ok_or("subtask requires a 'task' parameter (string)")?;
-            let max_iterations = tool_call.params.get("max_iterations")
+            let max_steps = tool_call.params.get("max_steps")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(25) as usize;
 
@@ -1650,7 +1650,7 @@ fn execute_tool_call<'a>(
                 &ctx.system_prompt,
                 external_tools,
                 ctx.use_native_tools,
-                max_iterations,
+                max_steps,
                 ctx.num_ctx,
                 &ctx.tool_registry,
                 &nested_ctx,
@@ -1717,8 +1717,8 @@ pub struct DaemonConfig {
     pub allowed_tools: Option<Vec<String>>,
     /// Context window size (num_ctx) for token tracking
     pub num_ctx: Option<u32>,
-    /// Maximum tool call iterations per turn
-    pub max_iterations: Option<usize>,
+    /// Maximum tool call steps per turn
+    pub max_steps: Option<usize>,
     /// Maximum wall-clock time for a single notify response (e.g. "10m", "1h")
     pub max_response_time: Option<String>,
     /// Whether dedup runs in lazy mode (only at context fill threshold)
@@ -1839,7 +1839,7 @@ impl DaemonConfig {
             semantic_memory: agent_dir.config.semantic_memory.clone(),
             allowed_tools,
             num_ctx: llm_config.num_ctx,
-            max_iterations: agent_dir.config.think.max_iterations,
+            max_steps: agent_dir.config.think.max_steps,
             max_response_time: agent_dir.config.think.max_response_time.clone(),
             dedup_lazy: llm_config.dedup_lazy,
             mentions: agent_dir.config.agent.mentions,
@@ -2227,7 +2227,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             config.semantic_memory.recall_limit,
                             &task_store,
                             config.num_ctx,
-                            config.max_iterations,
+                            config.max_steps,
                             config.max_response_time.as_deref(),
                             config.mentions,
                             &shutdown,
@@ -2293,7 +2293,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
         let worker_heartbeat_config = config.heartbeat.clone();
 
         let worker_num_ctx = config.num_ctx;
-        let worker_max_iterations = config.max_iterations;
+        let worker_max_steps = config.max_steps;
         let worker_max_response_time = config.max_response_time.clone();
         let worker_mentions = config.mentions;
         let worker_shutdown = shutdown.clone();
@@ -2322,7 +2322,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                 worker_task_store,
                 worker_heartbeat_config,
                 worker_num_ctx,
-                worker_max_iterations,
+                worker_max_steps,
                 worker_max_response_time,
                 worker_mentions,
                 worker_shutdown,
@@ -2362,7 +2362,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                             response_tx,
                             token_tx: None,
                             verbose_tx: None,
-                            max_iterations: None,
+                            max_steps: None,
                         }).is_ok() {
                             match response_rx.await {
                                 Ok(result) => {
@@ -2468,7 +2468,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                         let conn_worker_busy = worker_busy.clone();
 
                         let recall_limit = config.semantic_memory.recall_limit;
-                        let conn_max_iterations = config.max_iterations;
+                        let conn_max_steps = config.max_steps;
                         tokio::spawn(async move {
                             let api = SocketApi::new(stream);
                             if let Err(e) = handle_connection(
@@ -2489,7 +2489,7 @@ pub async fn run_daemon(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
                                 conn_heartbeat_config,
                                 conn_task_store,
                                 conn_work_tx,
-                                conn_max_iterations,
+                                conn_max_steps,
                                 conn_worker_busy,
                             ).await {
                                 eprintln!("Connection error: {}", e);
@@ -2707,7 +2707,7 @@ async fn agent_worker(
     task_store: Option<Arc<Mutex<TaskStore>>>,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     num_ctx: Option<u32>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     max_response_time: Option<String>,
     mentions_enabled: bool,
     shutdown: Arc<tokio::sync::Notify>,
@@ -2749,9 +2749,9 @@ async fn agent_worker(
                 response_tx,
                 token_tx,
                 verbose_tx,
-                max_iterations: work_max_iterations,
+                max_steps: work_max_steps,
             } => {
-                let effective_max_iter = work_max_iterations.or(max_iterations);
+                let effective_max_steps = work_max_steps.or(max_steps);
                 logger.log(&format!("[worker] Processing message: {}", content));
                 let result = process_message_work(
                     &content,
@@ -2774,7 +2774,7 @@ async fn agent_worker(
                     mentions_enabled,
                     &shutdown,
                     conversation_recall_limit,
-                    effective_max_iter,
+                    effective_max_steps,
                     num_ctx,
                     dedup_lazy,
                     Some(&agent_dir),
@@ -2811,7 +2811,7 @@ async fn agent_worker(
                     recall_limit,
                     &task_store,
                     num_ctx,
-                    max_iterations,
+                    max_steps,
                     max_response_time.as_deref(),
                     mentions_enabled,
                     &shutdown,
@@ -2842,7 +2842,7 @@ async fn agent_worker(
                         recall_limit,
                         mentions_enabled,
                         &shutdown,
-                        max_iterations,
+                        max_steps,
                         num_ctx,
                         dedup_lazy,
                     )
@@ -2983,15 +2983,15 @@ struct ToolLoopResult {
     cached_tokens: Option<u32>,
     /// Sequential turn number from the last LLM call's debug dump.
     /// Used by callers to rename dump files to the DB message ID.
-    dump_turn_n: Option<u64>,
-    /// Full LLMResponse serialized as JSON from the last iteration.
+    dump_step_n: Option<u64>,
+    /// Full LLMResponse serialized as JSON from the last step.
     assistant_response_json: Option<String>,
 }
 
 /// Unified tool loop for both native and tool-block modes.
 ///
-/// Makes single-turn LLM calls (via `think_single_turn_streaming`), stores results to DB,
-/// and refreshes context from DB between iterations. The daemon owns the loop; agent.rs
+/// Makes single-step LLM calls (via `think_single_step_streaming`), stores results to DB,
+/// and refreshes context from DB between steps. The daemon owns the loop; agent.rs
 /// only provides the single LLM call.
 #[allow(clippy::too_many_arguments)]
 async fn run_tool_loop(
@@ -3005,7 +3005,7 @@ async fn run_tool_loop(
     system_prompt: &Option<String>,
     external_tools: Option<Vec<ToolSpec>>,
     use_native_tools: bool,
-    max_iterations: usize,
+    max_steps: usize,
     num_ctx: Option<u32>,
     // Tool execution
     tool_registry: &Option<Arc<ToolRegistry>>,
@@ -3046,7 +3046,7 @@ async fn run_tool_loop(
                 tokens_out: None,
                 prompt_eval_duration_ns: None,
                 cached_tokens: None,
-                dump_turn_n: None,
+                dump_step_n: None,
                 assistant_response_json: None,
             };
         }
@@ -3069,7 +3069,7 @@ async fn run_tool_loop(
     let mut last_tokens_out: Option<u32> = None;
     let mut last_prompt_eval_ns: Option<u64> = None;
     let mut last_cached_tokens: Option<u32> = None;
-    let mut last_dump_turn_n: Option<u64> = None;
+    let mut last_dump_step_n: Option<u64> = None;
     let mut last_assistant_response_json: Option<String> = None;
     let mut prev_iter_had_tools = store.get_prev_had_tools(conv_name, agent_name).unwrap_or(false);
     let mut state_error_count: u32 = 0;
@@ -3100,7 +3100,7 @@ async fn run_tool_loop(
     }
 
     // Step mode: execute deferred tool calls from previous step before LLM call
-    if max_iterations <= 1 {
+    if max_steps <= 1 {
         if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
             if let Some(last_msg) = msgs.last() {
                 if last_msg.tool_calls.is_some() && last_msg.tool_call_id.is_none() {
@@ -3123,7 +3123,7 @@ async fn run_tool_loop(
                                 tokens_out: None,
                                 prompt_eval_duration_ns: None,
                                 cached_tokens: None,
-                                dump_turn_n: None,
+                                dump_step_n: None,
                                 assistant_response_json: None,
                             };
                         }
@@ -3134,10 +3134,10 @@ async fn run_tool_loop(
     }
 
     // Reset DB flag — the loaded value is captured in the variable;
-    // if this iteration defers tools, it will persist true before returning.
+    // if this step defers tools, it will persist true before returning.
     let _ = store.set_prev_had_tools(conv_name, agent_name, false);
 
-    for _iteration in 0..max_iterations {
+    for _step in 0..max_steps {
         // Check wall-clock time limit
         if let Some(deadline) = response_deadline {
             if start_time.elapsed() >= deadline {
@@ -3151,7 +3151,7 @@ async fn run_tool_loop(
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: last_dump_turn_n,
+                    dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
@@ -3169,7 +3169,7 @@ async fn run_tool_loop(
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: last_dump_turn_n,
+                    dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
@@ -3321,7 +3321,7 @@ async fn run_tool_loop(
                 let mut agent_guard = agent.lock().await;
                 match tokio::time::timeout(
                     remaining,
-                    agent_guard.think_single_turn_streaming(&llm_message, options, iter_token_tx),
+                    agent_guard.think_single_step_streaming(&llm_message, options, iter_token_tx),
                 ).await {
                     Ok(r) => { drop(agent_guard); Ok(r) }
                     Err(_elapsed) => {
@@ -3332,7 +3332,7 @@ async fn run_tool_loop(
             } else {
                 let mut agent_guard = agent.lock().await;
                 let r = agent_guard
-                    .think_single_turn_streaming(&llm_message, options, iter_token_tx)
+                    .think_single_step_streaming(&llm_message, options, iter_token_tx)
                     .await;
                 drop(agent_guard);
                 Ok(r)
@@ -3353,7 +3353,7 @@ async fn run_tool_loop(
                             tokens_out: last_tokens_out,
                             prompt_eval_duration_ns: last_prompt_eval_ns,
                             cached_tokens: last_cached_tokens,
-                            dump_turn_n: last_dump_turn_n,
+                            dump_step_n: last_dump_step_n,
                             assistant_response_json: last_assistant_response_json.clone(),
                         };
                     }
@@ -3370,7 +3370,7 @@ async fn run_tool_loop(
                     tokens_out: None,
                     prompt_eval_duration_ns: None,
                     cached_tokens: None,
-                    dump_turn_n: None,
+                    dump_step_n: None,
                     assistant_response_json: None,
                 };
             }
@@ -3385,7 +3385,7 @@ async fn run_tool_loop(
                 last_tokens_out = think_result.tokens_out;
                 last_prompt_eval_ns = think_result.prompt_eval_duration_ns;
                 last_cached_tokens = think_result.cached_tokens;
-                last_dump_turn_n = think_result.dump_turn_n;
+                last_dump_step_n = think_result.dump_step_n;
                 last_assistant_response_json = think_result.assistant_response_json.clone();
 
                 // Emit verbose: thinking (extract before stripping)
@@ -3464,7 +3464,7 @@ async fn run_tool_loop(
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
+                                dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
@@ -3481,8 +3481,8 @@ async fn run_tool_loop(
                             think_result.assistant_response_json.as_deref(),
                         ) {
                             Ok(msg_id) => {
-                                if let Some(turn_n) = think_result.dump_turn_n {
-                                    agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                if let Some(turn_n) = think_result.dump_step_n {
+                                    agent.lock().await.rename_step_files(turn_n, msg_id);
                                 }
                             }
                             Err(e) => {
@@ -3491,7 +3491,7 @@ async fn run_tool_loop(
                         }
 
                         // Step mode: defer tool execution to next step
-                        if max_iterations <= 1 {
+                        if max_steps <= 1 {
                             logger.log("[step] Deferring tool calls to next step");
                             let _ = store.set_prev_had_tools(conv_name, agent_name, true);
                             return ToolLoopResult {
@@ -3502,7 +3502,7 @@ async fn run_tool_loop(
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
+                                dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
@@ -3541,7 +3541,7 @@ async fn run_tool_loop(
                                     tokens_out: last_tokens_out,
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
-                                    dump_turn_n: last_dump_turn_n,
+                                    dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             }
@@ -3556,8 +3556,8 @@ async fn run_tool_loop(
                                 think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
-                                    if let Some(turn_n) = think_result.dump_turn_n {
-                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    if let Some(turn_n) = think_result.dump_step_n {
+                                        agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
                                 }
                                 Err(e) => {
@@ -3624,8 +3624,8 @@ async fn run_tool_loop(
                                 think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
-                                    if let Some(turn_n) = think_result.dump_turn_n {
-                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    if let Some(turn_n) = think_result.dump_step_n {
+                                        agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
                                 }
                                 Err(e) => {
@@ -3661,7 +3661,7 @@ async fn run_tool_loop(
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
+                                dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
@@ -3687,8 +3687,8 @@ async fn run_tool_loop(
                                 think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
-                                    if let Some(turn_n) = think_result.dump_turn_n {
-                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    if let Some(turn_n) = think_result.dump_step_n {
+                                        agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
                                 }
                                 Err(e) => {
@@ -3698,7 +3698,7 @@ async fn run_tool_loop(
                         }
 
                         // Step mode: defer tool-block execution to next step
-                        if max_iterations <= 1 {
+                        if max_steps <= 1 {
                             logger.log("[step] Deferring tool-block call to next step");
                             return ToolLoopResult {
                                 response: cleaned_response.clone(),
@@ -3708,7 +3708,7 @@ async fn run_tool_loop(
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
+                                dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
@@ -3798,8 +3798,8 @@ async fn run_tool_loop(
                                 think_result.assistant_response_json.as_deref(),
                             ) {
                                 Ok(msg_id) => {
-                                    if let Some(turn_n) = think_result.dump_turn_n {
-                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                    if let Some(turn_n) = think_result.dump_step_n {
+                                        agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
                                 }
                                 Err(e) => {
@@ -3830,7 +3830,7 @@ async fn run_tool_loop(
                                     tokens_out: last_tokens_out,
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
-                                    dump_turn_n: last_dump_turn_n,
+                                    dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             }
@@ -3846,8 +3846,8 @@ async fn run_tool_loop(
                                     think_result.assistant_response_json.as_deref(),
                                 ) {
                                     Ok(msg_id) => {
-                                        if let Some(turn_n) = think_result.dump_turn_n {
-                                            agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                        if let Some(turn_n) = think_result.dump_step_n {
+                                            agent.lock().await.rename_step_files(turn_n, msg_id);
                                         }
                                     }
                                     Err(e) => {
@@ -3923,7 +3923,7 @@ async fn run_tool_loop(
                                             tokens_out: last_tokens_out,
                                             prompt_eval_duration_ns: last_prompt_eval_ns,
                                             cached_tokens: last_cached_tokens,
-                                            dump_turn_n: last_dump_turn_n,
+                                            dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
                                         };
                                     }
@@ -3937,8 +3937,8 @@ async fn run_tool_loop(
                                             think_result.assistant_response_json.as_deref(),
                                         ) {
                                             Ok(msg_id) => {
-                                                if let Some(turn_n) = think_result.dump_turn_n {
-                                                    agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                if let Some(turn_n) = think_result.dump_step_n {
+                                                    agent.lock().await.rename_step_files(turn_n, msg_id);
                                                 }
                                             }
                                             Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
@@ -4016,7 +4016,7 @@ async fn run_tool_loop(
                                                 tokens_out: last_tokens_out,
                                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                                 cached_tokens: last_cached_tokens,
-                                                dump_turn_n: last_dump_turn_n,
+                                                dump_step_n: last_dump_step_n,
                                                 assistant_response_json: last_assistant_response_json.clone(),
                                             };
                                         }
@@ -4040,7 +4040,7 @@ async fn run_tool_loop(
                                                 tokens_out: last_tokens_out,
                                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                                 cached_tokens: last_cached_tokens,
-                                                dump_turn_n: last_dump_turn_n,
+                                                dump_step_n: last_dump_step_n,
                                                 assistant_response_json: last_assistant_response_json.clone(),
                                             };
                                         } else {
@@ -4054,8 +4054,8 @@ async fn run_tool_loop(
                                                     think_result.assistant_response_json.as_deref(),
                                                 ) {
                                                     Ok(msg_id) => {
-                                                        if let Some(turn_n) = think_result.dump_turn_n {
-                                                            agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                        if let Some(turn_n) = think_result.dump_step_n {
+                                                            agent.lock().await.rename_step_files(turn_n, msg_id);
                                                         }
                                                     }
                                                     Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
@@ -4079,7 +4079,7 @@ async fn run_tool_loop(
                                     tokens_out: last_tokens_out,
                                     prompt_eval_duration_ns: last_prompt_eval_ns,
                                     cached_tokens: last_cached_tokens,
-                                    dump_turn_n: last_dump_turn_n,
+                                    dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             } else {
@@ -4108,7 +4108,7 @@ async fn run_tool_loop(
                                             tokens_out: last_tokens_out,
                                             prompt_eval_duration_ns: last_prompt_eval_ns,
                                             cached_tokens: last_cached_tokens,
-                                            dump_turn_n: last_dump_turn_n,
+                                            dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
                                         };
                                     }
@@ -4152,7 +4152,7 @@ async fn run_tool_loop(
                                             tokens_out: last_tokens_out,
                                             prompt_eval_duration_ns: last_prompt_eval_ns,
                                             cached_tokens: last_cached_tokens,
-                                            dump_turn_n: last_dump_turn_n,
+                                            dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
                                         };
                                     } else {
@@ -4166,8 +4166,8 @@ async fn run_tool_loop(
                                                 think_result.assistant_response_json.as_deref(),
                                             ) {
                                                 Ok(msg_id) => {
-                                                    if let Some(turn_n) = think_result.dump_turn_n {
-                                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                    if let Some(turn_n) = think_result.dump_step_n {
+                                                        agent.lock().await.rename_step_files(turn_n, msg_id);
                                                     }
                                                 }
                                                 Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
@@ -4190,7 +4190,7 @@ async fn run_tool_loop(
                                         tokens_out: last_tokens_out,
                                         prompt_eval_duration_ns: last_prompt_eval_ns,
                                         cached_tokens: last_cached_tokens,
-                                        dump_turn_n: last_dump_turn_n,
+                                        dump_step_n: last_dump_step_n,
                                         assistant_response_json: last_assistant_response_json.clone(),
                                     };
                                 }
@@ -4205,7 +4205,7 @@ async fn run_tool_loop(
                                 tokens_out: last_tokens_out,
                                 prompt_eval_duration_ns: last_prompt_eval_ns,
                                 cached_tokens: last_cached_tokens,
-                                dump_turn_n: last_dump_turn_n,
+                                dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
                             };
                         }
@@ -4219,7 +4219,7 @@ async fn run_tool_loop(
                             tokens_out: last_tokens_out,
                             prompt_eval_duration_ns: last_prompt_eval_ns,
                             cached_tokens: last_cached_tokens,
-                            dump_turn_n: last_dump_turn_n,
+                            dump_step_n: last_dump_step_n,
                             assistant_response_json: last_assistant_response_json.clone(),
                         };
                     }
@@ -4305,7 +4305,7 @@ async fn run_tool_loop(
                 }
 
                 // Inject tool budget nudge
-                if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_iterations) {
+                if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_steps) {
                     current_message.push_str(&format!("\n\n---\n{}", nudge));
                 }
             }
@@ -4320,7 +4320,7 @@ async fn run_tool_loop(
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: last_dump_turn_n,
+                    dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
@@ -4336,19 +4336,19 @@ async fn run_tool_loop(
                     tokens_out: last_tokens_out,
                     prompt_eval_duration_ns: last_prompt_eval_ns,
                     cached_tokens: last_cached_tokens,
-                    dump_turn_n: last_dump_turn_n,
+                    dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
                 };
             }
         }
     }
 
-    logger.log(&format!("[loop] Max iterations reached: {}", max_iterations));
-    // In step mode (max_iterations <= 1), return empty db_response to avoid
+    logger.log(&format!("[loop] Max steps reached: {}", max_steps));
+    // In step mode (max_steps <= 1), return empty db_response to avoid
     // storing noise — the intermediate assistant messages and tool results
     // are already stored during the loop.
-    let msg = format!("[Max iterations reached: {}]", max_iterations);
-    let db_msg = if max_iterations <= 1 { String::new() } else { msg.clone() };
+    let msg = format!("[Max steps reached: {}]", max_steps);
+    let db_msg = if max_steps <= 1 { String::new() } else { msg.clone() };
     ToolLoopResult {
         response: msg,
         db_response: db_msg,
@@ -4357,7 +4357,7 @@ async fn run_tool_loop(
         tokens_out: last_tokens_out,
         prompt_eval_duration_ns: last_prompt_eval_ns,
         cached_tokens: last_cached_tokens,
-        dump_turn_n: last_dump_turn_n,
+        dump_step_n: last_dump_step_n,
         assistant_response_json: last_assistant_response_json,
     }
 }
@@ -4386,7 +4386,7 @@ async fn process_message_work(
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
     conversation_recall_limit: usize,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     num_ctx: Option<u32>,
     dedup_lazy: bool,
     agent_dir: Option<&Path>,
@@ -4530,7 +4530,7 @@ async fn process_message_work(
 
     // With conversation: use unified tool loop (DB-backed context management)
     // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
-    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_turn_n, last_assistant_response_json) = if let Some(cname) = conv_name {
+    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_step_n, last_assistant_response_json) = if let Some(cname) = conv_name {
         // New user message resets the prev_had_tools flag
         if !content.is_empty() {
             if let Ok(s) = ConversationStore::init() {
@@ -4540,7 +4540,7 @@ async fn process_message_work(
 
         let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
         let start_time = std::time::Instant::now();
-        let loop_budget = max_iterations.unwrap_or(25);
+        let loop_budget = max_steps.unwrap_or(25);
 
         let loop_result = run_tool_loop(
             &final_user_content,
@@ -4574,7 +4574,7 @@ async fn process_message_work(
         drop(log_tx);
         let _ = log_fwd_handle.await;
 
-        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_turn_n, loop_result.assistant_response_json)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json)
     } else {
         // No conversation — use agent.rs tool loop directly (standalone mode)
         let (trace_tx, trace_rx) =
@@ -4600,7 +4600,7 @@ async fn process_message_work(
                     logger,
                     conversation_history,
                     Some(trace_tx.clone()),
-                    max_iterations,
+                    max_steps,
                     num_ctx,
                 ).await;
                 (result.response.clone(), result.response.clone(), result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens, None, None)
@@ -4617,7 +4617,7 @@ async fn process_message_work(
                     logger,
                     &tool_context,
                     conversation_history,
-                    max_iterations,
+                    max_steps,
                     num_ctx,
                 ).await;
                 (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens, None, None)
@@ -4671,7 +4671,7 @@ async fn process_message_work(
                     &db_final_response,
                     &[],
                     duration_ms,
-                    None, // tool_calls stored by run_tool_loop during iterations
+                    None, // tool_calls stored by run_tool_loop during steps
                     tokens_in,
                     tokens_out,
                     num_ctx_i64,
@@ -4681,8 +4681,8 @@ async fn process_message_work(
                 ) {
                     Ok(response_msg_id) => {
                         // Rename debug dump files from sequential number to DB message ID
-                        if let Some(turn_n) = last_dump_turn_n {
-                            agent.lock().await.rename_turn_files(turn_n, response_msg_id);
+                        if let Some(turn_n) = last_dump_step_n {
+                            agent.lock().await.rename_step_files(turn_n, response_msg_id);
                         }
 
                         // Embed agent response for future conversation recall
@@ -4767,7 +4767,7 @@ async fn process_native_tool_mode(
     logger: &Arc<AgentLogger>,
     conversation_history: Vec<ChatMessage>,
     tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     num_ctx: Option<u32>,
 ) -> NativeToolModeResult {
     let (log_tx, log_handle) = spawn_log_forwarder(logger.clone());
@@ -4780,7 +4780,7 @@ async fn process_native_tool_mode(
         },
         external_tools,
         tool_trace_tx,
-        max_iterations: max_iterations.unwrap_or(25),
+        max_steps: max_steps.unwrap_or(25),
         num_ctx,
         log_tx: Some(log_tx),
         ..Default::default()
@@ -4864,11 +4864,11 @@ async fn process_tool_block_mode(
     logger: &Arc<AgentLogger>,
     tool_context: &ToolExecutionContext,
     conversation_history: Vec<ChatMessage>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     num_ctx: Option<u32>,
 ) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>, Option<u32>) {
     let mut current_message = content.to_string();
-    let max_tool_calls = max_iterations.unwrap_or(25);
+    let max_tool_calls = max_steps.unwrap_or(25);
     let mut tool_call_count = 0;
     #[allow(unused_assignments)]
     let mut last_duration_ms: Option<u64> = None;
@@ -5133,7 +5133,7 @@ async fn handle_notify(
     recall_limit: usize,
     task_store: &Option<Arc<Mutex<TaskStore>>>,
     num_ctx: Option<u32>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     max_response_time: Option<&str>,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
@@ -5270,7 +5270,7 @@ async fn handle_notify(
     // Channel for forwarding log messages to the daemon logger
     let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
 
-    // Cancellation flag — checked by run_tool_loop at each iteration boundary
+    // Cancellation flag — checked by run_tool_loop at each step boundary
     let cancel_flag = Arc::new(AtomicBool::new(false));
 
     // Spawn a watcher that polls is_paused every 500ms and sets the cancel flag
@@ -5290,7 +5290,7 @@ async fn handle_notify(
 
     // Parse max_response_time from config
     let response_deadline = max_response_time.and_then(parse_duration);
-    let loop_budget = max_iterations.unwrap_or(25);
+    let loop_budget = max_steps.unwrap_or(25);
 
     // New turn from @mention resets the prev_had_tools flag
     if let Ok(s) = ConversationStore::init() {
@@ -5342,7 +5342,7 @@ async fn handle_notify(
     let num_ctx_i64 = num_ctx.map(|n| n as i64);
     let prompt_eval_ns_i64 = loop_result.prompt_eval_duration_ns.map(|t| t as i64);
     let cached_tokens_i64 = loop_result.cached_tokens.map(|t| t as i64);
-    let last_dump_turn_n = loop_result.dump_turn_n;
+    let last_dump_step_n = loop_result.dump_step_n;
     let last_assistant_response_json = loop_result.assistant_response_json;
 
     // Stamp stats on intermediate messages
@@ -5377,7 +5377,7 @@ async fn handle_notify(
         &db_cleaned_response,
         &[],
         duration_ms,
-        None, // tool_calls stored by run_tool_loop during iterations
+        None, // tool_calls stored by run_tool_loop during steps
         tokens_in,
         tokens_out,
         num_ctx_i64,
@@ -5392,8 +5392,8 @@ async fn handle_notify(
             ));
 
             // Rename debug dump files from sequential number to DB message ID
-            if let Some(turn_n) = last_dump_turn_n {
-                agent.lock().await.rename_turn_files(turn_n, response_msg_id);
+            if let Some(turn_n) = last_dump_step_n {
+                agent.lock().await.rename_step_files(turn_n, response_msg_id);
             }
 
             // Cursor is anchored at cold start; no update needed here.
@@ -5621,7 +5621,7 @@ async fn run_heartbeat(
     recall_limit: usize,
     mentions_enabled: bool,
     shutdown: &Arc<tokio::sync::Notify>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     num_ctx: Option<u32>,
     dedup_lazy: bool,
 ) {
@@ -5729,7 +5729,7 @@ async fn run_heartbeat(
             Some(conversation_history)
         },
         external_tools: recall_result.external_tools,
-        max_iterations: max_iterations.unwrap_or(25),
+        max_steps: max_steps.unwrap_or(25),
         ..Default::default()
     };
 
@@ -6044,7 +6044,7 @@ async fn handle_connection(
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
-    max_iterations: Option<usize>,
+    max_steps: Option<usize>,
     worker_busy: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -6070,7 +6070,7 @@ async fn handle_connection(
                 ref content,
                 ref conv_name,
                 verbose,
-                max_iterations,
+                max_steps,
             } => {
                 logger.log(&format!("[socket] Received message: {}{}", content, if verbose { " (verbose)" } else { "" }));
 
@@ -6096,7 +6096,7 @@ async fn handle_connection(
                         response_tx,
                         token_tx: Some(token_tx),
                         verbose_tx,
-                        max_iterations: max_iterations,
+                        max_steps: max_steps,
                     })
                     .is_err()
                 {
@@ -6216,7 +6216,7 @@ async fn handle_connection(
                     system_prompt: system_prompt.clone(),
                     conversation_history: None,
                     external_tools: recall_result.external_tools,
-                    max_iterations: max_iterations.unwrap_or(25),
+                    max_steps: max_steps.unwrap_or(25),
                     ..Default::default()
                 };
 
