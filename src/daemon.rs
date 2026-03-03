@@ -3071,36 +3071,71 @@ async fn run_tool_loop(
     let mut last_cached_tokens: Option<u32> = None;
     let mut last_dump_turn_n: Option<u64> = None;
     let mut last_assistant_response_json: Option<String> = None;
-    let mut prev_iter_had_tools = false;
+    let mut prev_iter_had_tools = store.get_prev_had_tools(conv_name, agent_name).unwrap_or(false);
     let mut state_error_count: u32 = 0;
-    let mut history_cutoff: Option<i64> = None;
+    let mut history_cutoff: Option<i64> = store
+        .get_history_cutoff(conv_name, agent_name)
+        .unwrap_or(None);
 
-    // Check if initial state has history: false — if so, exclude prior history
-    if let (Some(dir), Some(state_name)) = (state_dir, initial_state) {
-        let resolved_state = store.get_participant_state(conv_name, agent_name)
-            .unwrap_or(None)
-            .unwrap_or_else(|| state_name.to_string());
-        let template_path = dir.join(format!("{}.md", resolved_state.trim()));
-        if let Ok(template) = std::fs::read_to_string(&template_path) {
-            let (fm, _) = crate::pipeline::parse_state_frontmatter(&template);
-            if fm.history == Some(false) {
-                // Get latest message ID as cutoff — messages after this point are from this state
-                if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
-                    if let Some(last) = msgs.last() {
-                        history_cutoff = Some(last.id);
-                        logger.log(&format!("[state] history: false on initial state '{}', cutoff at msg {}", resolved_state.trim(), last.id));
-                    } else {
-                        // No messages yet — cutoff at 0 means exclude everything
-                        history_cutoff = Some(0);
-                        logger.log(&format!("[state] history: false on initial state '{}', cutoff at 0 (no messages)", resolved_state.trim()));
+    // On first entry to a history:false state (cutoff not yet set), initialize it
+    if history_cutoff.is_none() {
+        if let (Some(dir), Some(state_name)) = (state_dir, initial_state) {
+            let resolved_state = store.get_participant_state(conv_name, agent_name)
+                .unwrap_or(None)
+                .unwrap_or_else(|| state_name.to_string());
+            let template_path = dir.join(format!("{}.md", resolved_state.trim()));
+            if let Ok(template) = std::fs::read_to_string(&template_path) {
+                let (fm, _) = crate::pipeline::parse_state_frontmatter(&template);
+                if fm.history == Some(false) {
+                    if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
+                        let cutoff_id = msgs.last().map(|m| m.id).unwrap_or(0);
+                        history_cutoff = Some(cutoff_id);
+                        let _ = store.set_history_cutoff(conv_name, agent_name, Some(cutoff_id));
+                        conversation_history = vec![]; // Clear only on first entry
+                        logger.log(&format!("[state] history: false on initial state '{}', cutoff at msg {}", resolved_state.trim(), cutoff_id));
                     }
-                } else {
-                    history_cutoff = Some(0);
                 }
-                conversation_history = vec![];
             }
         }
     }
+
+    // Step mode: execute deferred tool calls from previous step before LLM call
+    if max_iterations <= 1 {
+        if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
+            if let Some(last_msg) = msgs.last() {
+                if last_msg.tool_calls.is_some() && last_msg.tool_call_id.is_none() {
+                    if let Some(ref tc_json) = last_msg.tool_calls {
+                        let tool_calls: Vec<crate::llm::ToolCall> =
+                            serde_json::from_str(tc_json).unwrap_or_default();
+                        if !tool_calls.is_empty() {
+                            logger.log(&format!(
+                                "[step] Executing {} deferred tool calls", tool_calls.len()
+                            ));
+                            let _ = execute_native_tool_calls(
+                                &tool_calls, tool_registry, tool_context,
+                                conv_name, agent_name, logger, num_ctx, &verbose_tx,
+                            ).await;
+                            return ToolLoopResult {
+                                response: String::new(),
+                                db_response: String::new(),
+                                duration_ms: None,
+                                tokens_in: None,
+                                tokens_out: None,
+                                prompt_eval_duration_ns: None,
+                                cached_tokens: None,
+                                dump_turn_n: None,
+                                assistant_response_json: None,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Reset DB flag — the loaded value is captured in the variable;
+    // if this iteration defers tools, it will persist true before returning.
+    let _ = store.set_prev_had_tools(conv_name, agent_name, false);
 
     for _iteration in 0..max_iterations {
         // Check wall-clock time limit
@@ -3455,6 +3490,23 @@ async fn run_tool_loop(
                             }
                         }
 
+                        // Step mode: defer tool execution to next step
+                        if max_iterations <= 1 {
+                            logger.log("[step] Deferring tool calls to next step");
+                            let _ = store.set_prev_had_tools(conv_name, agent_name, true);
+                            return ToolLoopResult {
+                                response: after_remember.clone(),
+                                db_response: db_content,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
+                                dump_turn_n: last_dump_turn_n,
+                                assistant_response_json: last_assistant_response_json.clone(),
+                            };
+                        }
+
                         // Execute all tool calls in the batch
                         let results = execute_native_tool_calls(
                             tool_calls, tool_registry, tool_context,
@@ -3643,6 +3695,22 @@ async fn run_tool_loop(
                                     logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
                                 }
                             }
+                        }
+
+                        // Step mode: defer tool-block execution to next step
+                        if max_iterations <= 1 {
+                            logger.log("[step] Deferring tool-block call to next step");
+                            return ToolLoopResult {
+                                response: cleaned_response.clone(),
+                                db_response: db_content,
+                                duration_ms: last_duration_ms,
+                                tokens_in: last_tokens_in,
+                                tokens_out: last_tokens_out,
+                                prompt_eval_duration_ns: last_prompt_eval_ns,
+                                cached_tokens: last_cached_tokens,
+                                dump_turn_n: last_dump_turn_n,
+                                assistant_response_json: last_assistant_response_json.clone(),
+                            };
                         }
 
                         logger.tool(&format!("[loop] Executing: {} with params {}", tc.tool, tc.params));
@@ -3915,6 +3983,7 @@ async fn run_tool_loop(
                                                 history_cutoff = None;
                                             }
                                         }
+                                        let _ = store.set_history_cutoff(conv_name, agent_name, history_cutoff);
                                     }
 
                                     // Clear vars if requested (processed before set-vars)
@@ -4000,6 +4069,7 @@ async fn run_tool_loop(
                             } else if handoff {
                                 let _ = store.set_participant_state(conv_name, agent_name, None);
                                 let _ = store.set_participant_vars(conv_name, agent_name, None);
+                                let _ = store.set_history_cutoff(conv_name, agent_name, None);
                                 logger.log("[state] Handoff: clearing state");
                                 return ToolLoopResult {
                                     response: stripped,
@@ -4070,6 +4140,7 @@ async fn run_tool_loop(
                                     } else {
                                         history_cutoff = None;
                                     }
+                                    let _ = store.set_history_cutoff(conv_name, agent_name, history_cutoff);
 
                                     if next_fm.wait {
                                         logger.log(&format!("[state] Entering wait state: {}", next_state));
@@ -4194,6 +4265,7 @@ async fn run_tool_loop(
                                 } else {
                                     history_cutoff = None;
                                 }
+                                let _ = store.set_history_cutoff(conv_name, agent_name, history_cutoff);
                             } else {
                                 logger.log(&format!("[state] Invalid pending state: {}", new_state));
                             }
@@ -4340,8 +4412,19 @@ async fn process_message_work(
     let (conversation_history, final_user_content, window_message_ids, last_user_msg_id): (Vec<ChatMessage>, String, Vec<i64>, Option<i64>) =
         if let Some(cname) = conv_name {
             match ConversationStore::init() {
-                Ok(store) => match load_agent_context(&store, cname, agent_name, &|msg| logger.log(msg), num_ctx) {
+                Ok(store) => {
+                    let history_cutoff = store.get_history_cutoff(cname, agent_name).unwrap_or(None);
+                    match load_agent_context(&store, cname, agent_name, &|msg| logger.log(msg), num_ctx) {
                     Ok(msgs) if !msgs.is_empty() => {
+                        // Filter by history_cutoff: only keep messages after the cutoff
+                        let msgs = if let Some(cutoff) = history_cutoff {
+                            msgs.into_iter().filter(|m| m.id > cutoff).collect::<Vec<_>>()
+                        } else {
+                            msgs
+                        };
+                        if msgs.is_empty() {
+                            (Vec::new(), content.to_string(), Vec::new(), None)
+                        } else {
                         let ids: Vec<i64> = msgs.iter().map(|m| m.id).collect();
                         let last_uid = msgs.iter().rev().find(|m| m.from_agent == "user").map(|m| m.id);
                         let dedup_up_to = resolve_dedup_up_to(&store, cname, agent_name, dedup_lazy, msgs.last().map(|m| m.id));
@@ -4353,7 +4436,8 @@ async fn process_message_work(
                             cname
                         ));
                         (history, final_content, ids, last_uid)
-                    }
+                    } // else (msgs not empty after cutoff filter)
+                    } // Ok(msgs) if !msgs.is_empty()
                     Ok(_) => (Vec::new(), content.to_string(), Vec::new(), None),
                     Err(e) => {
                         logger.log(&format!(
@@ -4362,7 +4446,8 @@ async fn process_message_work(
                         ));
                         (Vec::new(), content.to_string(), Vec::new(), None)
                     }
-                },
+                } // match load_agent_context
+                } // Ok(store)
                 Err(e) => {
                     logger.log(&format!(
                         "[worker] Failed to init conversation store for history: {}",
@@ -4446,6 +4531,13 @@ async fn process_message_work(
     // With conversation: use unified tool loop (DB-backed context management)
     // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
     let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_turn_n, last_assistant_response_json) = if let Some(cname) = conv_name {
+        // New user message resets the prev_had_tools flag
+        if !content.is_empty() {
+            if let Ok(s) = ConversationStore::init() {
+                let _ = s.set_prev_had_tools(cname, agent_name, false);
+            }
+        }
+
         let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
         let start_time = std::time::Instant::now();
         let loop_budget = max_iterations.unwrap_or(25);
@@ -5199,6 +5291,11 @@ async fn handle_notify(
     // Parse max_response_time from config
     let response_deadline = max_response_time.and_then(parse_duration);
     let loop_budget = max_iterations.unwrap_or(25);
+
+    // New turn from @mention resets the prev_had_tools flag
+    if let Ok(s) = ConversationStore::init() {
+        let _ = s.set_prev_had_tools(conv_id, agent_name, false);
+    }
 
     // Run unified tool loop
     let loop_result = run_tool_loop(

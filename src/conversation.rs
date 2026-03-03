@@ -312,6 +312,8 @@ impl ConversationStore {
         self.add_column_if_missing("participants", "notes", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "state", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "state_vars", "TEXT DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "history_cutoff", "INTEGER DEFAULT NULL")?;
+        self.add_column_if_missing("participants", "prev_had_tools", "INTEGER DEFAULT 0")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
         self.conn.execute_batch(
@@ -1327,6 +1329,55 @@ impl ConversationStore {
         self.conn.execute(
             "UPDATE participants SET state_vars = ?1 WHERE conv_name = ?2 AND agent = ?3",
             params![vars, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Get the persisted history cutoff for an agent in a conversation.
+    pub fn get_history_cutoff(
+        &self,
+        conv_name: &str,
+        agent: &str,
+    ) -> Result<Option<i64>, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT history_cutoff FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let cutoff: Option<Option<i64>> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(cutoff.flatten())
+    }
+
+    /// Set the persisted history cutoff for an agent in a conversation.
+    pub fn set_history_cutoff(
+        &self,
+        conv_name: &str,
+        agent: &str,
+        cutoff: Option<i64>,
+    ) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET history_cutoff = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![cutoff, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Get the persisted prev_had_tools flag for an agent in a conversation.
+    pub fn get_prev_had_tools(&self, conv_name: &str, agent: &str) -> Result<bool, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT prev_had_tools FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let val: Option<i32> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(val.unwrap_or(0) != 0)
+    }
+
+    /// Set the persisted prev_had_tools flag for an agent in a conversation.
+    pub fn set_prev_had_tools(&self, conv_name: &str, agent: &str, val: bool) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET prev_had_tools = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![val as i32, conv_name, agent],
         )?;
         Ok(())
     }
