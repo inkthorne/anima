@@ -5,8 +5,8 @@ use anima::observe::ConsoleObserver;
 use anima::socket_api::{Request, Response, SocketApi};
 use anima::tools::{AddTool, CopyLinesTool, EchoTool, EditFileTool, HttpTool, ListFilesTool, PeekFileTool, ReadFileTool, SafeShellTool, ShellTool, WriteFileTool};
 use anima::{
-    AnthropicClient, AutoMemoryConfig, ConversationStore, InMemoryStore, LLM, NotifyResult,
-    OpenAIClient, ReflectionConfig, Runtime, SemanticMemoryStore, SqliteMemory, ThinkOptions,
+    AnthropicClient, ConversationStore, InMemoryStore, LLM, NotifyResult,
+    OpenAIClient, Runtime, SemanticMemoryStore, SqliteMemory,
     expand_all_mention, format_age, notify_mentioned_agents_parallel, on_conversation_event,
     parse_mentions,
 };
@@ -2951,12 +2951,16 @@ fn list_agents() {
 }
 
 /// Run an agent with a single task (non-interactive, from config file).
+/// Uses the unified run_tool_loop with an ephemeral DB conversation.
 async fn run_agent_task(
     config_path: &str,
     task: &str,
     stream: bool,
     verbose_cli: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use anima::daemon::{AgentLogger, ToolExecutionContext, run_tool_loop, spawn_log_forwarder};
+    use tokio::sync::Mutex;
+
     let config = AgentConfig::from_file(config_path)?;
 
     let verbose = verbose_cli || config.observe.verbose;
@@ -3026,56 +3030,115 @@ async fn run_agent_task(
     agent = agent.with_memory(memory);
     agent = agent.with_observer(observer);
 
-    let auto_memory = if config.think.auto_memory {
-        Some(AutoMemoryConfig {
-            max_entries: config.think.max_memory_entries,
-            include_recent: true,
-            key_prefixes: vec![],
-        })
-    } else {
-        None
-    };
+    let agent_name = config.agent.name.clone();
 
-    let reflection = if config.think.reflection {
-        Some(ReflectionConfig::default())
-    } else {
-        None
-    };
+    // Wrap agent in Arc<Mutex<>> for run_tool_loop
+    let agent = Arc::new(Mutex::new(agent));
 
-    let options = ThinkOptions {
-        max_steps: config.think.max_steps,
-        system_prompt: config.agent.system_prompt,
-        auto_memory,
-        reflection,
-        stream,
-        retry_policy: Some(config.retry.to_policy()),
-        conversation_history: None,
-        external_tools: None,
-        tool_trace_tx: None,
-        cancel: None,
+    // Create ephemeral conversation in the shared DB
+    let store = ConversationStore::init()?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let conv_name = format!("task-{}-{}", agent_name, timestamp);
+
+    store.create_conversation(Some(&conv_name), &["user", &agent_name])?;
+    store.add_message(&conv_name, "user", task, &[])?;
+
+    // Create logger to a temp file (task mode has no agent directory)
+    let log_dir = std::env::temp_dir();
+    let log_path = log_dir.join(format!("anima-task-{}.log", timestamp));
+    let logger = Arc::new(
+        AgentLogger::from_path(&log_path, &agent_name)
+            .unwrap_or_else(|_| AgentLogger::from_path(&std::env::temp_dir().join("anima-task.log"), &agent_name).expect("Failed to create logger"))
+    );
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let system_prompt = config.agent.system_prompt;
+    let allowed_tools: Option<Vec<String>> = Some(config.tools.enabled.clone());
+
+    // Build tool execution context
+    let tool_context = ToolExecutionContext {
+        agent_name: agent_name.clone(),
+        task_store: None,
+        conv_id: Some(conv_name.clone()),
+        semantic_memory_store: None,
+        embedding_client: None,
+        allowed_tools: allowed_tools.clone(),
+        logger: Some(logger.clone()),
+        agent_dir: None,
+        agent: Some(Arc::clone(&agent)),
+        system_prompt: system_prompt.clone(),
+        tool_registry: None,
+        use_native_tools: true,
         num_ctx: None,
-        log_tx: None,
+        shutdown: Some(Arc::clone(&shutdown)),
+        dedup_lazy: false,
+        subtask_depth: 0,
     };
 
-    if stream {
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+    let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
+    let start_time = std::time::Instant::now();
+    let max_steps = config.think.max_steps;
 
-        let print_task = tokio::spawn(async move {
+    // Streaming: create token channel if streaming is requested
+    let token_tx = if stream {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(100);
+        tokio::spawn(async move {
             while let Some(token) = rx.recv().await {
                 print!("{}", token);
                 let _ = io::stdout().flush();
             }
-            println!();
         });
-
-        agent
-            .think_streaming_with_options(task, options, tx)
-            .await?;
-
-        let _ = print_task.await;
+        Some(tx)
     } else {
-        let result = agent.think_with_options(task, options).await?;
-        println!("{}", result.response);
+        None
+    };
+
+    // Use <conversation> wrapping for the task content
+    let user_content = format!("<conversation>\n{}\n</conversation>", task);
+
+    let loop_result = run_tool_loop(
+        &user_content,
+        task,
+        vec![], // no prior conversation history
+        &agent,
+        &agent_name,
+        &system_prompt,
+        None, // external_tools: None — think_single_step will use agent's registered tools
+        true, // use_native_tools
+        max_steps,
+        None, // num_ctx
+        &None, // no tool_registry
+        &tool_context,
+        &None, // no semantic_memory
+        &None, // no embedding_client
+        &conv_name,
+        token_tx,
+        None, // no cancellation
+        None, // no response deadline
+        start_time,
+        &shutdown,
+        &logger,
+        log_tx.clone(),
+        false, // dedup_lazy
+        None, // no state_dir
+        None, // no initial_state
+        None, // no verbose_tx
+    ).await;
+
+    drop(log_tx);
+    let _ = log_fwd_handle.await;
+
+    // Clean up ephemeral conversation
+    let _ = store.delete_conversation(&conv_name);
+
+    // Print final response (if not already streamed)
+    if !stream {
+        println!("{}", loop_result.response);
+    } else {
+        println!(); // newline after streamed output
     }
 
     Ok(())

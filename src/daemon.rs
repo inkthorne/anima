@@ -67,6 +67,21 @@ impl AgentLogger {
         })
     }
 
+    /// Create a logger that writes to a specific file path.
+    pub fn from_path(log_path: &Path, agent_name: &str) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)?;
+
+        Ok(Self {
+            file: std::sync::Mutex::new(file),
+            agent_name: agent_name.to_string(),
+            stdout_is_terminal: std::io::stdout().is_terminal(),
+        })
+    }
+
     /// Log a message with timestamp
     pub fn log(&self, msg: &str) {
         let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
@@ -256,15 +271,6 @@ pub struct MessageWorkResult {
     pub error: Option<String>,
 }
 
-/// Result from processing in native tool mode (standalone, no conversation)
-struct NativeToolModeResult {
-    response: String,
-    duration_ms: Option<u64>,
-    tokens_in: Option<u32>,
-    tokens_out: Option<u32>,
-    prompt_eval_duration_ns: Option<u64>,
-    cached_tokens: Option<u32>,
-}
 
 /// Expand injection directives in always.md content.
 ///
@@ -795,8 +801,6 @@ struct RecallResult {
     recall_content: Option<String>,
     /// Tool specs for native tool mode (None in tool-block mode)
     external_tools: Option<Vec<ToolSpec>>,
-    /// Relevant tool definitions for tool-block mode (empty in native mode)
-    relevant_tools: Vec<ToolDefinition>,
     /// Query embedding (reusable for conversation recall and user message embedding)
     query_embedding: Option<Vec<f32>>,
 }
@@ -825,7 +829,7 @@ async fn build_recall_for_query(
     conversation_recall_limit: usize,
 ) -> RecallResult {
     // Build tools injection or tool specs
-    let (tools_injection, external_tools, relevant_tools) = if use_native_tools {
+    let (tools_injection, external_tools) = if use_native_tools {
         // Native tool calling: pass ALL allowed tools from registry
         let all_tools = if let Some(registry) = tool_registry {
             let all: Vec<&ToolDefinition> = registry.all_tools().iter().collect();
@@ -837,7 +841,7 @@ async fn build_recall_for_query(
             logger.tool(&format!("Native tools: {} allowed", all_tools.len()));
         }
         let specs = Some(tool_definitions_to_specs(&all_tools));
-        (String::new(), specs, Vec::new())
+        (String::new(), specs)
     } else {
         // tool-block mode: keyword-match relevant tools
         let relevant_tools = if let Some(registry) = tool_registry {
@@ -854,9 +858,7 @@ async fn build_recall_for_query(
             Vec::new()
         };
         let injection = ToolRegistry::format_for_prompt(&relevant_tools);
-        // Clone tool definitions since we need to return owned values
-        let owned_tools: Vec<ToolDefinition> = relevant_tools.iter().map(|t| (*t).clone()).collect();
-        (injection, None, owned_tools)
+        (injection, None)
     };
 
     // Compute query embedding once (shared by memory recall + conversation recall)
@@ -953,7 +955,6 @@ async fn build_recall_for_query(
     RecallResult {
         recall_content,
         external_tools,
-        relevant_tools,
         query_embedding,
     }
 }
@@ -1096,7 +1097,7 @@ fn extract_llm_notes(content: &str) -> (String, Option<String>) {
 
 /// Spawn a background task that forwards log messages to the AgentLogger.
 /// Returns the sender and join handle. Drop the sender when done.
-fn spawn_log_forwarder(
+pub fn spawn_log_forwarder(
     logger: Arc<AgentLogger>,
 ) -> (mpsc::Sender<String>, tokio::task::JoinHandle<()>) {
     let (tx, mut rx) = mpsc::channel::<String>(64);
@@ -1109,52 +1110,6 @@ fn spawn_log_forwarder(
 }
 
 /// Spawn a background task that persists tool trace executions to the conversation store.
-/// Returns the join handle. The caller should drop `trace_tx` when done to signal completion.
-fn spawn_tool_trace_persister(
-    conv_name: Option<String>,
-    agent_name: String,
-    num_ctx: Option<u32>,
-    logger: Arc<AgentLogger>,
-    trace_rx: tokio::sync::mpsc::Receiver<crate::agent::ToolExecution>,
-) -> tokio::task::JoinHandle<()> {
-    let mut trace_rx = trace_rx;
-    tokio::spawn(async move {
-        let Some(cname) = conv_name else {
-            // No conversation to persist to -- just drain
-            while trace_rx.recv().await.is_some() {}
-            return;
-        };
-        let store = match ConversationStore::init() {
-            Ok(s) => s,
-            Err(e) => {
-                logger.log(&format!("[trace] Failed to init trace store: {}", e));
-                while trace_rx.recv().await.is_some() {} // drain
-                return;
-            }
-        };
-        let num_ctx_i64 = num_ctx.map(|n| n as i64);
-        while let Some(exec) = trace_rx.recv().await {
-            let tool_calls_json = serde_json::to_string(&vec![&exec.call]).ok();
-            let content = exec.content.as_deref().unwrap_or("");
-            let tokens_in = exec.iter_tokens_in.map(|t| t as i64);
-            let tokens_out = exec.iter_tokens_out.map(|t| t as i64);
-            let eval_ns = exec.iter_prompt_eval_ns.map(|t| t as i64);
-            let cached = exec.iter_cached_tokens.map(|t| t as i64);
-            if let Err(e) = store.add_message_with_tokens(
-                &cname, &agent_name, content, &[],
-                exec.iter_duration_ms.map(|d| d as i64),
-                tool_calls_json.as_deref(),
-                tokens_in, tokens_out, num_ctx_i64, eval_ns, cached, None,
-            ) {
-                logger.log(&format!("[trace] Failed to store tool call: {}", e));
-            }
-            let tool_result_msg = format!("[Tool Result for {}]\n{}", exec.call.name, exec.result);
-            if let Err(e) = store.add_native_tool_result(&cname, &exec.call.id, &tool_result_msg, &agent_name) {
-                logger.log(&format!("[trace] Failed to store tool result: {}", e));
-            }
-        }
-    })
-}
 
 /// Execute a tool call and return the result as a string.
 /// If a tool_def is provided, command validation is performed for shell tools.
@@ -2845,6 +2800,8 @@ async fn agent_worker(
                         max_steps,
                         num_ctx,
                         dedup_lazy,
+                        &task_store,
+                        Some(&agent_dir),
                     )
                     .await;
                 } else {
@@ -2969,23 +2926,23 @@ async fn execute_native_tool_calls(
 }
 
 /// Result from the unified tool loop.
-struct ToolLoopResult {
+pub struct ToolLoopResult {
     /// Final response text (thinking stripped, memories extracted).
-    response: String,
+    pub response: String,
     /// Full response for DB storage (with thinking tags, memories extracted).
-    db_response: String,
+    pub db_response: String,
     /// Duration of the last LLM call in milliseconds.
-    duration_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
     /// Token usage from the last LLM call.
-    tokens_in: Option<u32>,
-    tokens_out: Option<u32>,
-    prompt_eval_duration_ns: Option<u64>,
-    cached_tokens: Option<u32>,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+    pub prompt_eval_duration_ns: Option<u64>,
+    pub cached_tokens: Option<u32>,
     /// Sequential turn number from the last LLM call's debug dump.
     /// Used by callers to rename dump files to the DB message ID.
-    dump_step_n: Option<u64>,
+    pub dump_step_n: Option<u64>,
     /// Full LLMResponse serialized as JSON from the last step.
-    assistant_response_json: Option<String>,
+    pub assistant_response_json: Option<String>,
 }
 
 /// Unified tool loop for both native and tool-block modes.
@@ -2994,7 +2951,7 @@ struct ToolLoopResult {
 /// and refreshes context from DB between steps. The daemon owns the loop; agent.rs
 /// only provides the single LLM call.
 #[allow(clippy::too_many_arguments)]
-async fn run_tool_loop(
+pub async fn run_tool_loop(
     // Initial state
     initial_message: &str,
     raw_user_content: &str,
@@ -4509,7 +4466,7 @@ async fn process_message_work(
     );
 
     // Create tool execution context
-    let tool_context = ToolExecutionContext {
+    let mut tool_context = ToolExecutionContext {
         agent_name: agent_name.to_string(),
         task_store: task_store.clone(),
         conv_id: conv_name.map(|s| s.to_string()),
@@ -4528,8 +4485,8 @@ async fn process_message_work(
         subtask_depth: 0,
     };
 
-    // With conversation: use unified tool loop (DB-backed context management)
-    // Without conversation: fall back to agent.rs tool loop (anima ask without --conversation)
+    // Both paths use run_tool_loop — with conversation uses it directly,
+    // without conversation creates an ephemeral conversation first.
     let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_step_n, last_assistant_response_json) = if let Some(cname) = conv_name {
         // New user message resets the prev_had_tools flag
         if !content.is_empty() {
@@ -4576,69 +4533,84 @@ async fn process_message_work(
 
         (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json)
     } else {
-        // No conversation — use agent.rs tool loop directly (standalone mode)
-        let (trace_tx, trace_rx) =
-            tokio::sync::mpsc::channel::<crate::agent::ToolExecution>(32);
-        let trace_handle = spawn_tool_trace_persister(
-            None,
-            agent_name.to_string(),
-            num_ctx,
-            logger.clone(),
-            trace_rx,
-        );
+        // No conversation — create ephemeral conversation for tool loop
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let ephemeral_name = format!("ephemeral-{}-{}", agent_name, timestamp);
 
-        let llm_future = async {
-            if use_native_tools {
-                let result = process_native_tool_mode(
-                    &final_user_content,
-                    recall_result.external_tools,
-                    token_tx,
-                    agent,
-                    system_prompt,
-                    semantic_memory,
-                    embedding_client,
-                    logger,
-                    conversation_history,
-                    Some(trace_tx.clone()),
-                    max_steps,
-                    num_ctx,
-                ).await;
-                (result.response.clone(), result.response.clone(), result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens, None, None)
-            } else {
-                let (response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens) = process_tool_block_mode(
-                    &final_user_content,
-                    &recall_result.relevant_tools,
-                    token_tx,
-                    agent,
-                    system_prompt,
-                    semantic_memory,
-                    embedding_client,
-                    tool_registry,
-                    logger,
-                    &tool_context,
-                    conversation_history,
-                    max_steps,
-                    num_ctx,
-                ).await;
-                (response.clone(), response, duration_ms, tokens_in, tokens_out, prompt_eval_ns, cached_tokens, None, None)
-            }
-        };
-
-        let result = tokio::select! {
-            r = llm_future => r,
-            _ = shutdown.notified() => {
-                logger.log("[worker] Shutdown during LLM call in process_message_work, aborting");
+        let eph_store = match ConversationStore::init() {
+            Ok(s) => s,
+            Err(e) => {
+                logger.log(&format!("[worker] Failed to init store for ephemeral conv: {}", e));
                 return MessageWorkResult {
                     response: String::new(),
-                    error: Some("Shutdown during LLM call".to_string()),
+                    error: Some(format!("Failed to init store: {}", e)),
                 };
             }
         };
 
-        drop(trace_tx);
-        let _ = trace_handle.await;
+        if let Err(e) = eph_store.create_conversation(Some(&ephemeral_name), &["user", agent_name]) {
+            logger.log(&format!("[worker] Failed to create ephemeral conversation: {}", e));
+            return MessageWorkResult {
+                response: String::new(),
+                error: Some(format!("Create ephemeral conv failed: {}", e)),
+            };
+        }
 
-        result
+        // Store user message so run_tool_loop can refresh context from DB between steps
+        if let Err(e) = eph_store.add_message(&ephemeral_name, "user", content, &[]) {
+            logger.log(&format!("[worker] Failed to store user message in ephemeral conv: {}", e));
+            let _ = eph_store.delete_conversation(&ephemeral_name);
+            return MessageWorkResult {
+                response: String::new(),
+                error: Some(format!("Store user message failed: {}", e)),
+            };
+        }
+
+        tool_context.conv_id = Some(ephemeral_name.clone());
+
+        let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
+        let start_time = std::time::Instant::now();
+        let loop_budget = max_steps.unwrap_or(25);
+
+        let loop_result = run_tool_loop(
+            &final_user_content,
+            &raw_user_content,
+            conversation_history,
+            agent,
+            agent_name,
+            system_prompt,
+            recall_result.external_tools,
+            use_native_tools,
+            loop_budget,
+            num_ctx,
+            tool_registry,
+            &tool_context,
+            semantic_memory,
+            embedding_client,
+            &ephemeral_name,
+            token_tx,
+            None, // no cancellation
+            None, // no response deadline
+            start_time,
+            shutdown,
+            logger,
+            log_tx.clone(),
+            dedup_lazy,
+            None, // no state_dir
+            None, // no initial_state
+            verbose_tx,
+        ).await;
+
+        drop(log_tx);
+        let _ = log_fwd_handle.await;
+
+        // Clean up ephemeral conversation
+        let _ = eph_store.delete_conversation(&ephemeral_name);
+
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json)
     };
 
     // Store response in conversation if conv_name was provided
@@ -4754,306 +4726,6 @@ async fn process_message_work(
     }
 }
 
-/// Process message in native tool mode (tools = true in model config)
-#[allow(clippy::too_many_arguments)]
-async fn process_native_tool_mode(
-    content: &str,
-    external_tools: Option<Vec<ToolSpec>>,
-    token_tx: Option<mpsc::Sender<String>>,
-    agent: &Arc<Mutex<Agent>>,
-    system_prompt: &Option<String>,
-    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
-    embedding_client: &Option<Arc<EmbeddingClient>>,
-    logger: &Arc<AgentLogger>,
-    conversation_history: Vec<ChatMessage>,
-    tool_trace_tx: Option<tokio::sync::mpsc::Sender<crate::agent::ToolExecution>>,
-    max_steps: Option<usize>,
-    num_ctx: Option<u32>,
-) -> NativeToolModeResult {
-    let (log_tx, log_handle) = spawn_log_forwarder(logger.clone());
-    let options = ThinkOptions {
-        system_prompt: system_prompt.clone(),
-        conversation_history: if conversation_history.is_empty() {
-            None
-        } else {
-            Some(conversation_history)
-        },
-        external_tools,
-        tool_trace_tx,
-        max_steps: max_steps.unwrap_or(25),
-        num_ctx,
-        log_tx: Some(log_tx),
-        ..Default::default()
-    };
-
-    let (result, duration_ms, tokens_in, tokens_out, prompt_eval_duration_ns, cached_tokens) = if let Some(tx) = token_tx {
-        // Streaming mode - call directly (not spawned) so dropping the future cancels the LLM call
-        let mut agent_guard = agent.lock().await;
-        match agent_guard
-            .think_streaming_with_options(content, options, tx)
-            .await
-        {
-            Ok(result) => {
-                drop(agent_guard);
-                (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens)
-            }
-            Err(e) => {
-                drop(agent_guard);
-                (format!("Error: {}", e), None, None, None, None, None)
-            }
-        }
-    } else {
-        // Non-streaming mode
-        let mut agent_guard = agent.lock().await;
-        match agent_guard.think_with_options(content, options).await {
-            Ok(result) => (result.response, result.duration_ms, result.tokens_in, result.tokens_out, result.prompt_eval_duration_ns, result.cached_tokens),
-            Err(e) => (format!("Error: {}", e), None, None, None, None, None),
-        }
-    };
-
-    // Strip thinking tags and extract [REMEMBER: ...] tags
-    let without_thinking = strip_thinking_tags(&result);
-    let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-
-    // Save memories
-    save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
-
-    // Flush log forwarder
-    let _ = log_handle.await;
-
-    NativeToolModeResult {
-        response: after_remember,
-        duration_ms,
-        tokens_in,
-        tokens_out,
-        prompt_eval_duration_ns,
-        cached_tokens,
-    }
-}
-
-/// Guard that aborts a spawned task when dropped, ensuring the LLM call
-/// is cancelled on shutdown instead of running to completion in the background.
-struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
-impl<T> AbortOnDrop<T> {
-    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
-        Self(Some(handle))
-    }
-    async fn join(&mut self) -> Result<T, tokio::task::JoinError> {
-        self.0.take().expect("join called twice").await
-    }
-}
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        if let Some(h) = &self.0 {
-            h.abort();
-        }
-    }
-}
-
-/// Process message in tool-block tool mode (tools = false in model config)
-#[allow(clippy::too_many_arguments)]
-async fn process_tool_block_mode(
-    content: &str,
-    _relevant_tools: &[ToolDefinition],
-    token_tx: Option<mpsc::Sender<String>>,
-    agent: &Arc<Mutex<Agent>>,
-    system_prompt: &Option<String>,
-    semantic_memory: &Option<Arc<Mutex<SemanticMemoryStore>>>,
-    embedding_client: &Option<Arc<EmbeddingClient>>,
-    tool_registry: &Option<Arc<ToolRegistry>>,
-    logger: &Arc<AgentLogger>,
-    tool_context: &ToolExecutionContext,
-    conversation_history: Vec<ChatMessage>,
-    max_steps: Option<usize>,
-    num_ctx: Option<u32>,
-) -> (String, Option<u64>, Option<u32>, Option<u32>, Option<u64>, Option<u32>) {
-    let mut current_message = content.to_string();
-    let max_tool_calls = max_steps.unwrap_or(25);
-    let mut tool_call_count = 0;
-    #[allow(unused_assignments)]
-    let mut last_duration_ms: Option<u64> = None;
-    #[allow(unused_assignments)]
-    let mut last_tokens_in: Option<u32> = None;
-    #[allow(unused_assignments)]
-    let mut last_tokens_out: Option<u32> = None;
-    #[allow(unused_assignments)]
-    let mut last_prompt_eval_ns: Option<u64> = None;
-    #[allow(unused_assignments)]
-    let mut last_cached_tokens: Option<u32> = None;
-
-    loop {
-        let options = ThinkOptions {
-            system_prompt: system_prompt.clone(),
-            conversation_history: if conversation_history.is_empty() {
-                None
-            } else {
-                Some(conversation_history.clone())
-            },
-            external_tools: None,
-            ..Default::default()
-        };
-
-        let (llm_response, native_tool_calls) = if let Some(ref tx) = token_tx {
-            // Streaming mode - but suppress tool call blocks
-            let (internal_tx, mut internal_rx) = mpsc::channel::<String>(100);
-            let agent_clone = agent.clone();
-            let current_message_clone = current_message.clone();
-
-            let mut handle = AbortOnDrop::new(tokio::spawn(async move {
-                let mut agent_guard = agent_clone.lock().await;
-                agent_guard
-                    .think_streaming_with_options(&current_message_clone, options, internal_tx)
-                    .await
-            }));
-
-            // Forward tokens, suppressing <tool>...</tool> blocks
-            let tx_clone = tx.clone();
-            let mut in_tool_tag = false;
-            let mut tool_buffer = String::new();
-
-            while let Some(token) = internal_rx.recv().await {
-                if !in_tool_tag {
-                    if token.contains("<tool>") {
-                        in_tool_tag = true;
-                        tool_buffer = token;
-                        if tool_buffer.contains("</tool>") {
-                            // Entire block arrived in one token — suppress if it's a tool call
-                            if !(tool_buffer.contains("\"tool\"")
-                                && tool_buffer.contains("\"params\""))
-                            {
-                                let _ = tx_clone.send(tool_buffer.clone()).await;
-                            }
-                            in_tool_tag = false;
-                            tool_buffer.clear();
-                        }
-                        continue;
-                    }
-                    let _ = tx_clone.send(token).await;
-                } else {
-                    tool_buffer.push_str(&token);
-                    if tool_buffer.contains("</tool>") {
-                        if !(tool_buffer.contains("\"tool\"")
-                            && tool_buffer.contains("\"params\""))
-                        {
-                            let _ = tx_clone.send(tool_buffer.clone()).await;
-                        }
-                        in_tool_tag = false;
-                        tool_buffer.clear();
-                    }
-                }
-            }
-
-            // Flush unclosed buffer — not a valid tool call, show to user
-            if !tool_buffer.is_empty()
-                && !(tool_buffer.contains("\"tool\"")
-                    && tool_buffer.contains("\"params\""))
-            {
-                let _ = tx_clone.send(tool_buffer).await;
-            }
-
-            match handle.join().await {
-                Ok(Ok(result)) => {
-                    last_duration_ms = result.duration_ms;
-                    last_tokens_in = result.tokens_in;
-                    last_tokens_out = result.tokens_out;
-                    last_prompt_eval_ns = result.prompt_eval_duration_ns;
-                    last_cached_tokens = result.cached_tokens;
-                    (result.response, result.last_tool_calls)
-                }
-                Ok(Err(e)) => return (format!("Error: {}", e), None, None, None, None, None),
-                Err(e) => return (format!("Error: task panicked: {}", e), None, None, None, None, None),
-            }
-        } else {
-            // Non-streaming mode
-            let mut agent_guard = agent.lock().await;
-            match agent_guard
-                .think_with_options(&current_message, options)
-                .await
-            {
-                Ok(result) => {
-                    last_duration_ms = result.duration_ms;
-                    last_tokens_in = result.tokens_in;
-                    last_tokens_out = result.tokens_out;
-                    last_prompt_eval_ns = result.prompt_eval_duration_ns;
-                    last_cached_tokens = result.cached_tokens;
-                    (result.response, result.last_tool_calls)
-                }
-                Err(e) => return (format!("Error: {}", e), None, None, None, None, None),
-            }
-        };
-
-        // Strip thinking tags and extract [REMEMBER: ...] tags
-        let without_thinking = strip_thinking_tags(&llm_response);
-        let (after_remember, memories_to_save) = extract_remember_tags(&without_thinking);
-
-        // Save memories
-        save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
-
-        // Detect spontaneous native tool calls (e.g. Qwen3 emits tool_calls
-        // even when no tools were provided in the request)
-        if native_tool_calls.as_ref().is_some_and(|tc| !tc.is_empty()) {
-            tool_call_count += 1;
-            if tool_call_count > max_tool_calls {
-                logger.tool("[worker] Max tool calls reached during native tool retry");
-                return (after_remember, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
-            }
-            logger.tool("[worker] Detected native tool call in tool-block mode, feeding format error");
-            current_message = TOOL_FORMAT_ERROR.to_string();
-            continue;
-        }
-
-        // Check for tool calls
-        let names: Vec<&str> = tool_context.allowed_tools.as_ref()
-            .map(|v| v.iter().map(|s| s.as_str()).collect())
-            .unwrap_or_default();
-        let (cleaned_response, tool_call) = extract_tool_call(&after_remember, &names);
-
-        if let Some(tc) = tool_call {
-            tool_call_count += 1;
-
-            if tool_call_count > max_tool_calls {
-                logger.tool("[worker] Max tool calls reached, stopping");
-                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
-            }
-
-            logger.tool(&format!(
-                "[worker] Executing: {} with params {}",
-                tc.tool, tc.params
-            ));
-
-            let tool_def = tool_registry
-                .as_ref()
-                .and_then(|r| r.find_by_name(&tc.tool));
-
-            match execute_tool_call(&tc, tool_def, Some(tool_context)).await {
-                Ok(tool_result) => {
-                    let tool_result = truncate_tool_result(&tool_result, num_ctx);
-                    logger.tool(&format!("[worker] Result: {} bytes", tool_result.len()));
-                    current_message = format!("[Tool Result for {}]\n{}", tc.tool, tool_result);
-                }
-                Err(e) => {
-                    logger.tool(&format!("[worker] Error: {}", e));
-                    current_message = format!("[Tool Error for {}]\n{}", tc.tool, e);
-                }
-            }
-
-            if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_tool_calls) {
-                current_message.push_str(&format!("\n\n---\n{}", nudge));
-            }
-        } else if cleaned_response.starts_with("[Tool call format error]") {
-            // Malformed <tool> tag — feed the error back so the LLM can retry
-            tool_call_count += 1;
-            if tool_call_count > max_tool_calls {
-                logger.tool("[worker] Max tool calls reached during format error retry, stopping");
-                return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
-            }
-            logger.tool("[worker] Tool call format error, feeding back to LLM");
-            current_message = cleaned_response;
-        } else {
-            return (cleaned_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens);
-        }
-    }
-}
 
 /// Maximum depth for @mention chains to prevent infinite loops
 const MAX_MENTION_DEPTH: u32 = 100;
@@ -5603,7 +5275,7 @@ async fn forward_notify_to_agent(
     }
 }
 
-/// Execute a heartbeat: load heartbeat.md, think, store response in <agent>-heartbeat conversation.
+/// Execute a heartbeat: load heartbeat.md, run through tool loop, store response in <agent>-heartbeat conversation.
 #[allow(clippy::too_many_arguments)]
 async fn run_heartbeat(
     config: &HeartbeatDaemonConfig,
@@ -5624,6 +5296,8 @@ async fn run_heartbeat(
     max_steps: Option<usize>,
     num_ctx: Option<u32>,
     dedup_lazy: bool,
+    task_store: &Option<Arc<Mutex<TaskStore>>>,
+    agent_dir: Option<&Path>,
 ) {
     // Set current conversation for debug file naming
     {
@@ -5687,16 +5361,20 @@ async fn run_heartbeat(
         logger.log(&format!("[heartbeat] Created conversation '{}'", conv_name));
     }
 
-    // 3. Get conversation context using append-only cursors
-    // Heartbeat is a self-conversation - all messages are from this agent
-    // Format them as assistant messages to show the model its previous outputs
+    // Store heartbeat prompt as user message so run_tool_loop can refresh context from DB
+    if let Err(e) = store.add_message(&conv_name, "user", &heartbeat_prompt, &[]) {
+        logger.log(&format!("[heartbeat] Failed to store heartbeat prompt: {}", e));
+        return;
+    }
+
+    // 3. Load conversation context (includes the heartbeat prompt we just stored)
     let context_messages = load_agent_context(&store, &conv_name, agent_name, &|msg| logger.log(msg), num_ctx)
         .unwrap_or_default();
     let dedup_up_to = resolve_dedup_up_to(&store, &conv_name, agent_name, dedup_lazy, context_messages.last().map(|m| m.id));
-    let (conversation_history, _) = format_conversation_history(&context_messages, agent_name, dedup_up_to);
+    let (conversation_history, final_user_content) = format_conversation_history(&context_messages, agent_name, dedup_up_to);
 
     logger.log(&format!(
-        "[heartbeat] Context: {} previous outputs",
+        "[heartbeat] Context: {} history messages",
         conversation_history.len()
     ));
 
@@ -5712,134 +5390,156 @@ async fn run_heartbeat(
         model_recall,
         recall_limit,
         logger,
-        None,
+        Some(&conv_name),
         &[],
         0,
     )
     .await;
 
-    let recall_content = recall_result.recall_content;
+    let recall_content = recall_result.recall_content.clone();
 
-    // 5. Think - heartbeat_prompt is the user message, previous outputs are conversation_history
-    let options = ThinkOptions {
+    // Wrap user content with recall
+    let raw_user_content = final_user_content.clone();
+    let final_user_content = wrap_user_content_with_recall(
+        &recall_result.recall_content,
+        &final_user_content,
+    );
+
+    // Append conversation name to system prompt
+    let system_prompt = &system_prompt
+        .as_ref()
+        .map(|base| Some(format!("{}\nConversation: {}", base, conv_name)))
+        .unwrap_or_else(|| Some(format!("Conversation: {}", conv_name)));
+
+    // 5. Build tool execution context and run through unified tool loop
+    let tool_context = ToolExecutionContext {
+        agent_name: agent_name.to_string(),
+        task_store: task_store.clone(),
+        conv_id: Some(conv_name.clone()),
+        semantic_memory_store: semantic_memory.clone(),
+        embedding_client: embedding_client.clone(),
+        allowed_tools: allowed_tools.clone(),
+        logger: Some(logger.clone()),
+        agent_dir: agent_dir.map(|p| p.to_path_buf()),
+        agent: Some(Arc::clone(agent)),
         system_prompt: system_prompt.clone(),
-        conversation_history: if conversation_history.is_empty() {
-            None
-        } else {
-            Some(conversation_history)
-        },
-        external_tools: recall_result.external_tools,
-        max_steps: max_steps.unwrap_or(25),
-        ..Default::default()
+        tool_registry: tool_registry.as_ref().map(Arc::clone),
+        use_native_tools,
+        num_ctx,
+        shutdown: Some(Arc::clone(shutdown)),
+        dedup_lazy,
+        subtask_depth: 0,
     };
 
-    let llm_future = async {
-        let mut agent_guard = agent.lock().await;
-        let r = agent_guard
-            .think_with_options(&heartbeat_prompt, options)
-            .await;
-        drop(agent_guard);
-        r
-    };
+    let (log_tx, log_fwd_handle) = spawn_log_forwarder(logger.clone());
+    let start_time = std::time::Instant::now();
+    let loop_budget = max_steps.unwrap_or(25);
 
-    let result = tokio::select! {
-        r = llm_future => {
-            match r {
-                Ok(r) => r,
-                Err(e) => {
-                    logger.log(&format!("[heartbeat] Think error: {}", e));
-                    // Store error in conversation so user can see it via chat view
-                    let error_msg = format!("[Error: {}]", e);
-                    let _ = store.add_message(&conv_name, agent_name, &error_msg, &[]);
-                    return;
-                }
+    let loop_result = run_tool_loop(
+        &final_user_content,
+        &raw_user_content,
+        conversation_history,
+        agent,
+        agent_name,
+        system_prompt,
+        recall_result.external_tools,
+        use_native_tools,
+        loop_budget,
+        num_ctx,
+        tool_registry,
+        &tool_context,
+        semantic_memory,
+        embedding_client,
+        &conv_name,
+        None, // no streaming for heartbeat
+        None, // no cancellation
+        None, // no response deadline
+        start_time,
+        shutdown,
+        logger,
+        log_tx.clone(),
+        dedup_lazy,
+        None, // no state_dir
+        None, // no initial_state
+        None, // no verbose_tx
+    ).await;
+
+    drop(log_tx);
+    let _ = log_fwd_handle.await;
+
+    // 6. Store recall AFTER response so it appears before next user message in history
+    if let Some(ref recall_text) = recall_content {
+        if !recall_text.is_empty() {
+            if let Err(e) = store.add_recall_message(&conv_name, recall_text, agent_name) {
+                logger.log(&format!(
+                    "[heartbeat] Failed to store recall in conversation: {}",
+                    e
+                ));
             }
         }
-        _ = shutdown.notified() => {
-            logger.log("[worker] Shutdown during LLM call in run_heartbeat, aborting");
-            return;
-        }
-    };
-
-    // 6. Process response: strip thinking tags, extract memories
-    let without_thinking = strip_thinking_tags(&result.response);
-    let (cleaned_response, memories_to_save) = extract_remember_tags(&without_thinking);
-    let (cleaned_response, llm_notes) = extract_llm_notes(&cleaned_response);
-    save_memories(&memories_to_save, semantic_memory, embedding_client, logger).await;
-
-    // Save LLM-generated inline notes to DB
-    if let Some(ref notes) = llm_notes {
-        let _ = store.set_participant_notes(&conv_name, agent_name, notes);
     }
 
-    // Full response for DB: preserve thinking tags, strip REMEMBER tags
-    let (db_content, _) = extract_remember_tags(&result.response);
-    let (db_content, _) = extract_llm_notes(&db_content);
-    let db_content = prepend_notes(&db_content, &store, &conv_name, agent_name);
-
-    // 7. Store response in <agent>-heartbeat conversation (preserve thinking in DB)
-    match store.add_message(&conv_name, agent_name, &db_content, &[]) {
-        Ok(msg_id) => {
-            logger.log(&format!("[heartbeat] Stored response as msg_id={}", msg_id));
-            // Cursor is anchored at cold start; no update needed here
-        }
-        Err(e) => {
-            logger.log(&format!("[heartbeat] Failed to store response: {}", e));
-        }
-    }
-
-    // Store recall AFTER response so it appears before next user message in history
-    if let Some(ref recall_text) = recall_content
-        && !recall_text.is_empty()
-    {
-        if let Err(e) = store.add_recall_message(&conv_name, recall_text, &agent_name) {
-            logger.log(&format!(
-                "[heartbeat] Failed to store recall in conversation: {}",
-                e
-            ));
-        }
-    }
-
-    // 8. Parse @mentions from response and notify (reuse existing logic)
-    if mentions_enabled {
-        let mentions = crate::conversation::parse_mentions(&cleaned_response);
-        let valid_mentions: Vec<String> = mentions
-            .into_iter()
-            .filter(|m| m != agent_name && m != "user" && m != "all")
-            .filter(|m| discovery::agent_exists(m))
-            .collect();
-
-        if !valid_mentions.is_empty() {
-            logger.log(&format!(
-                "[heartbeat] Notifying {} agents: {:?}",
-                valid_mentions.len(),
-                valid_mentions
-            ));
-
-            // Get the message ID we just stored
-            if let Ok(msgs) = store.get_messages(&conv_name, Some(1))
-                && let Some(last_msg) = msgs.last()
-            {
-                for mention in valid_mentions {
-                    // Add mentioned agent as participant
-                    let _ = store.add_participant(&conv_name, &mention);
-
-                    forward_notify_to_agent(
-                        &mention,
-                        &conv_name,
-                        last_msg.id,
-                        0, // Start at depth 0
-                        logger,
-                    )
-                    .await;
+    // 7. Store the final response in <agent>-heartbeat conversation
+    if !loop_result.db_response.is_empty() {
+        match store.add_message_with_tokens(
+            &conv_name,
+            agent_name,
+            &loop_result.db_response,
+            &[],
+            loop_result.duration_ms.map(|d| d as i64),
+            None, // tool_calls stored by run_tool_loop during steps
+            loop_result.tokens_in.map(|t| t as i64),
+            loop_result.tokens_out.map(|t| t as i64),
+            num_ctx.map(|n| n as i64),
+            loop_result.prompt_eval_duration_ns.map(|t| t as i64),
+            loop_result.cached_tokens.map(|t| t as i64),
+            loop_result.assistant_response_json.as_deref(),
+        ) {
+            Ok(response_msg_id) => {
+                // Rename debug dump files from sequential number to DB message ID
+                if let Some(turn_n) = loop_result.dump_step_n {
+                    agent.lock().await.rename_step_files(turn_n, response_msg_id);
                 }
+
+                // 8. Parse @mentions from response and notify
+                if mentions_enabled {
+                    let mentions = crate::conversation::parse_mentions(&loop_result.response);
+                    let valid_mentions: Vec<String> = mentions
+                        .into_iter()
+                        .filter(|m| m != agent_name && m != "user" && m != "all")
+                        .filter(|m| discovery::agent_exists(m))
+                        .collect();
+
+                    if !valid_mentions.is_empty() {
+                        logger.log(&format!(
+                            "[heartbeat] Notifying {} agents: {:?}",
+                            valid_mentions.len(),
+                            valid_mentions
+                        ));
+
+                        for mention in valid_mentions {
+                            let _ = store.add_participant(&conv_name, &mention);
+                            forward_notify_to_agent(
+                                &mention,
+                                &conv_name,
+                                response_msg_id,
+                                0,
+                                logger,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                logger.log(&format!("[heartbeat] Failed to store response: {}", e));
             }
         }
     }
 
     logger.log(&format!(
         "[heartbeat] Complete. Response: {} chars",
-        cleaned_response.len()
+        loop_result.response.len()
     ));
 }
 
@@ -6031,20 +5731,20 @@ async fn handle_connection(
     agent: Arc<Mutex<Agent>>,
     _agent_name: String,
     system_prompt: Option<String>,
-    recall: Option<String>,
-    model_recall: Option<String>,
-    allowed_tools: Option<Vec<String>>,
-    semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
-    embedding_client: Option<Arc<EmbeddingClient>>,
-    tool_registry: Option<Arc<ToolRegistry>>,
-    use_native_tools: bool,
+    _recall: Option<String>,
+    _model_recall: Option<String>,
+    _allowed_tools: Option<Vec<String>>,
+    _semantic_memory: Option<Arc<Mutex<SemanticMemoryStore>>>,
+    _embedding_client: Option<Arc<EmbeddingClient>>,
+    _tool_registry: Option<Arc<ToolRegistry>>,
+    _use_native_tools: bool,
     shutdown: Arc<tokio::sync::Notify>,
     logger: Arc<AgentLogger>,
-    recall_limit: usize,
+    _recall_limit: usize,
     heartbeat_config: Option<HeartbeatDaemonConfig>,
     _task_store: Option<Arc<Mutex<TaskStore>>>,
     work_tx: mpsc::UnboundedSender<AgentWork>,
-    max_steps: Option<usize>,
+    _max_steps: Option<usize>,
     worker_busy: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
@@ -6190,65 +5890,42 @@ async fn handle_connection(
                 // Format the message with [sender] prefix for the agent
                 let formatted_message = format!("[{}] {}", from, content);
 
-                // Build recall (tools + memories) for the incoming message
-                let recall_result = build_recall_for_query(
-                    content,
-                    &allowed_tools,
-                    &semantic_memory,
-                    &embedding_client,
-                    &tool_registry,
-                    use_native_tools,
-                    &recall,
-                    &model_recall,
-                    recall_limit,
-                    &logger,
-                    None,
-                    &[],
-                    0,
-                )
-                .await;
-
-                // Note: recall injection is skipped for IncomingMessage - recall should be
-                // stored in DB by the caller and included in conversation history when fetched.
-                let _ = &recall_result.recall_content;
-
-                let options = ThinkOptions {
-                    system_prompt: system_prompt.clone(),
-                    conversation_history: None,
-                    external_tools: recall_result.external_tools,
-                    max_steps: max_steps.unwrap_or(25),
-                    ..Default::default()
-                };
-
-                let mut agent_guard = agent.lock().await;
-                match agent_guard
-                    .think_with_options(&formatted_message, options)
-                    .await
+                // Dispatch to worker via AgentWork::Message (uses ephemeral conversation + run_tool_loop)
+                let (response_tx, response_rx) = oneshot::channel();
+                if work_tx
+                    .send(AgentWork::Message {
+                        content: formatted_message,
+                        conv_name: None,
+                        response_tx,
+                        token_tx: None,
+                        verbose_tx: None,
+                        max_steps: None,
+                    })
+                    .is_err()
                 {
-                    Ok(result) => {
-                        let without_thinking = strip_thinking_tags(&result.response);
-                        let (cleaned_response, memories_to_save) =
-                            extract_remember_tags(&without_thinking);
-
-                        save_memories(
-                            &memories_to_save,
-                            &semantic_memory,
-                            &embedding_client,
-                            &logger,
-                        )
-                        .await;
-
-                        logger.log(&format!(
-                            "[socket] Response to {}: {}",
-                            from, cleaned_response
-                        ));
-                        Response::Message {
-                            content: cleaned_response,
-                        }
+                    Response::Error {
+                        message: "Worker channel closed".to_string(),
                     }
-                    Err(e) => Response::Error {
-                        message: e.to_string(),
-                    },
+                } else {
+                    match response_rx.await {
+                        Ok(result) => {
+                            logger.log(&format!(
+                                "[socket] Response to {}: {} bytes",
+                                from,
+                                result.response.len()
+                            ));
+                            if let Some(err) = result.error {
+                                Response::Error { message: err }
+                            } else {
+                                Response::Message {
+                                    content: result.response,
+                                }
+                            }
+                        }
+                        Err(_) => Response::Error {
+                            message: "Worker dropped response channel".to_string(),
+                        },
+                    }
                 }
             }
 
