@@ -3072,6 +3072,7 @@ async fn run_tool_loop(
     let mut last_dump_turn_n: Option<u64> = None;
     let mut last_assistant_response_json: Option<String> = None;
     let mut prev_iter_had_tools = false;
+    let mut state_error_count: u32 = 0;
 
     for _iteration in 0..max_iterations {
         // Check wall-clock time limit
@@ -3807,7 +3808,30 @@ async fn run_tool_loop(
                                 // Gap 6: Validate state file exists
                                 let new_template_path = dir.join(format!("{}.md", new_state.trim()));
                                 if !new_template_path.exists() {
-                                    logger.log(&format!("[state] Invalid state: {}", new_state));
+                                    state_error_count += 1;
+                                    logger.log(&format!("[state] Invalid state: {} (attempt {}/3)", new_state, state_error_count));
+
+                                    if state_error_count >= 3 {
+                                        // Bail out: too many consecutive invalid state transitions
+                                        logger.log("[state] Max invalid state retries reached, keeping current state");
+                                        let warning = format!(
+                                            "\n\n[Warning: gave up after {} consecutive invalid state transitions. Keeping state '{}'.]",
+                                            state_error_count,
+                                            state_before.as_deref().unwrap_or("unknown"),
+                                        );
+                                        return ToolLoopResult {
+                                            response: format!("{}{}", stripped, warning),
+                                            db_response: db_content,
+                                            duration_ms: last_duration_ms,
+                                            tokens_in: last_tokens_in,
+                                            tokens_out: last_tokens_out,
+                                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                                            cached_tokens: last_cached_tokens,
+                                            dump_turn_n: last_dump_turn_n,
+                                            assistant_response_json: last_assistant_response_json.clone(),
+                                        };
+                                    }
+
                                     // Store response in DB before error feedback
                                     if !db_content.trim().is_empty() {
                                         match store.add_message_with_tokens(
@@ -3835,6 +3859,7 @@ async fn run_tool_loop(
                                     }
                                     // Fall through to context refresh, will continue loop
                                 } else {
+                                    state_error_count = 0;
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                     logger.log(&format!("[state] Transition → {}", new_state));
 
@@ -3934,22 +3959,105 @@ async fn run_tool_loop(
                                     assistant_response_json: last_assistant_response_json.clone(),
                                 };
                             } else {
-                                // No state change specified — keep current state
-                                logger.log(&format!(
-                                    "[state] No state change, keeping current state: {}",
-                                    state_before.as_deref().unwrap_or("unknown")
-                                ));
-                                return ToolLoopResult {
-                                    response: stripped,
-                                    db_response: db_content,
-                                    duration_ms: last_duration_ms,
-                                    tokens_in: last_tokens_in,
-                                    tokens_out: last_tokens_out,
-                                    prompt_eval_duration_ns: last_prompt_eval_ns,
-                                    cached_tokens: last_cached_tokens,
-                                    dump_turn_n: last_dump_turn_n,
-                                    assistant_response_json: last_assistant_response_json.clone(),
-                                };
+                                // No state change specified — check for default_next in frontmatter
+                                let default_next = state_before.as_deref().and_then(|sb| {
+                                    let path = dir.join(format!("{}.md", sb.trim()));
+                                    std::fs::read_to_string(&path).ok().and_then(|template| {
+                                        let (fm, _) = crate::pipeline::parse_state_frontmatter(&template);
+                                        fm.default_next
+                                    })
+                                });
+
+                                if let Some(ref next_state) = default_next {
+                                    // Validate the default_next state file exists
+                                    let next_path = dir.join(format!("{}.md", next_state.trim()));
+                                    if !next_path.exists() {
+                                        logger.log(&format!(
+                                            "[state] default_next '{}' does not exist, keeping current state: {}",
+                                            next_state, state_before.as_deref().unwrap_or("unknown")
+                                        ));
+                                        return ToolLoopResult {
+                                            response: stripped,
+                                            db_response: db_content,
+                                            duration_ms: last_duration_ms,
+                                            tokens_in: last_tokens_in,
+                                            tokens_out: last_tokens_out,
+                                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                                            cached_tokens: last_cached_tokens,
+                                            dump_turn_n: last_dump_turn_n,
+                                            assistant_response_json: last_assistant_response_json.clone(),
+                                        };
+                                    }
+
+                                    // Apply default_next transition
+                                    let _ = store.set_participant_state(conv_name, agent_name, Some(next_state));
+                                    logger.log(&format!("[state] default_next transition → {}", next_state));
+
+                                    // Merge set-vars (if any were present without a state key)
+                                    for (k, v) in set_vars {
+                                        state_vars.insert(k, v);
+                                    }
+                                    state_vars.insert("assistant".to_string(), stripped.clone());
+                                    if let Ok(json) = serde_json::to_string(&state_vars) {
+                                        let _ = store.set_participant_vars(conv_name, agent_name, Some(&json));
+                                    }
+
+                                    // Check if target state is wait or non-wait
+                                    let next_template = std::fs::read_to_string(&next_path).unwrap_or_default();
+                                    let (next_fm, _) = crate::pipeline::parse_state_frontmatter(&next_template);
+
+                                    if next_fm.wait {
+                                        logger.log(&format!("[state] Entering wait state: {}", next_state));
+                                        return ToolLoopResult {
+                                            response: stripped,
+                                            db_response: db_content,
+                                            duration_ms: last_duration_ms,
+                                            tokens_in: last_tokens_in,
+                                            tokens_out: last_tokens_out,
+                                            prompt_eval_duration_ns: last_prompt_eval_ns,
+                                            cached_tokens: last_cached_tokens,
+                                            dump_turn_n: last_dump_turn_n,
+                                            assistant_response_json: last_assistant_response_json.clone(),
+                                        };
+                                    } else {
+                                        // Non-wait state — store response, auto-execute
+                                        logger.log(&format!("[state] Auto-executing non-wait state: {}", next_state));
+                                        if !db_content.trim().is_empty() {
+                                            match store.add_message_with_tokens(
+                                                conv_name, agent_name, &db_content, &[],
+                                                think_result.duration_ms.map(|d| d as i64), None,
+                                                iter_tokens_in, iter_tokens_out, num_ctx_i64, iter_eval_ns, iter_cached,
+                                                think_result.assistant_response_json.as_deref(),
+                                            ) {
+                                                Ok(msg_id) => {
+                                                    if let Some(turn_n) = think_result.dump_turn_n {
+                                                        agent.lock().await.rename_turn_files(turn_n, msg_id);
+                                                    }
+                                                }
+                                                Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
+                                            }
+                                        }
+                                        current_message = String::new();
+                                        // Fall through to context refresh, will continue loop
+                                    }
+                                } else {
+                                    // No default_next — keep current state
+                                    logger.log(&format!(
+                                        "[state] No state change, keeping current state: {}",
+                                        state_before.as_deref().unwrap_or("unknown")
+                                    ));
+                                    return ToolLoopResult {
+                                        response: stripped,
+                                        db_response: db_content,
+                                        duration_ms: last_duration_ms,
+                                        tokens_in: last_tokens_in,
+                                        tokens_out: last_tokens_out,
+                                        prompt_eval_duration_ns: last_prompt_eval_ns,
+                                        cached_tokens: last_cached_tokens,
+                                        dump_turn_n: last_dump_turn_n,
+                                        assistant_response_json: last_assistant_response_json.clone(),
+                                    };
+                                }
                             }
                         } else {
                             // No state active — return final response

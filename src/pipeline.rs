@@ -290,6 +290,9 @@ pub struct StateFrontmatter {
     /// `Some(false)` = no tools sent to LLM.
     /// `Some(true)` = tools enabled (same as default).
     pub tools: Option<bool>,
+    /// Default next state when the LLM doesn't emit a `<state>` tag.
+    /// If set, auto-transitions to this state instead of keeping the current state.
+    pub default_next: Option<String>,
 }
 
 /// Parse YAML frontmatter from a state file.
@@ -316,6 +319,12 @@ pub fn parse_state_frontmatter(content: &str) -> (StateFrontmatter, &str) {
             }
             if let Some(val) = line.strip_prefix("tools:") {
                 fm.tools = Some(val.trim() == "true");
+            }
+            if let Some(val) = line.strip_prefix("default_next:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    fm.default_next = Some(val.to_string());
+                }
             }
         }
 
@@ -762,5 +771,48 @@ mod tests {
         assert!(fm.wait);
         assert_eq!(fm.tools, None);
         assert_eq!(body, "Just wait.");
+    }
+
+    // --- default_next frontmatter tests ---
+
+    #[test]
+    fn test_parse_frontmatter_default_next() {
+        let content = "---\ndefault_next: tests\n---\nWrite a plan.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.default_next, Some("tests".to_string()));
+        assert_eq!(body, "Write a plan.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_default_next_with_wait() {
+        let content = "---\nwait: false\ndefault_next: implement\n---\nWrite tests.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(!fm.wait);
+        assert_eq!(fm.default_next, Some("implement".to_string()));
+        assert_eq!(body, "Write tests.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_default_next_not_specified() {
+        let content = "---\nwait: true\n---\nWait for input.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.default_next, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_default_next_empty() {
+        let content = "---\ndefault_next: \n---\nPrompt.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.default_next, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_all_keys() {
+        let content = "---\nwait: true\ntools: false\ndefault_next: review\n---\nDo work.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(fm.wait);
+        assert_eq!(fm.tools, Some(false));
+        assert_eq!(fm.default_next, Some("review".to_string()));
+        assert_eq!(body, "Do work.");
     }
 }
