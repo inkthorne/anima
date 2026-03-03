@@ -3848,7 +3848,16 @@ async fn run_tool_loop(
                                             Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                         }
                                     }
-                                    let available = list_state_files(dir);
+                                    let available = state_before.as_deref()
+                                        .and_then(|sb| {
+                                            let path = dir.join(format!("{}.md", sb.trim()));
+                                            std::fs::read_to_string(&path).ok()
+                                        })
+                                        .and_then(|t| {
+                                            let (fm, _) = crate::pipeline::parse_state_frontmatter(&t);
+                                            fm.transitions.map(|v| v.join(", "))
+                                        })
+                                        .unwrap_or_else(|| list_state_files(dir));
                                     current_message = format!(
                                         "[State error: '{}' does not exist. Available states: {}. Choose a valid state with <state>name</state> inside <set-vars>.]",
                                         new_state, available
@@ -4896,7 +4905,10 @@ fn list_state_files(dir: &Path) -> String {
             let mut names: Vec<String> = entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
-                .map(|e| e.file_name().to_string_lossy().to_string())
+                .map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    name.strip_suffix(".md").unwrap_or(&name).to_string()
+                })
                 .collect();
             names.sort();
             names.join(", ")

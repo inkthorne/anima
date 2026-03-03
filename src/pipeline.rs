@@ -293,6 +293,9 @@ pub struct StateFrontmatter {
     /// Default next state when the LLM doesn't emit a `<state>` tag.
     /// If set, auto-transitions to this state instead of keeping the current state.
     pub default_next: Option<String>,
+    /// Valid transition targets from this state.
+    /// Used in error messages to show reachable states instead of all states.
+    pub transitions: Option<Vec<String>>,
 }
 
 /// Parse YAML frontmatter from a state file.
@@ -324,6 +327,17 @@ pub fn parse_state_frontmatter(content: &str) -> (StateFrontmatter, &str) {
                 let val = val.trim();
                 if !val.is_empty() {
                     fm.default_next = Some(val.to_string());
+                }
+            }
+            if let Some(val) = line.strip_prefix("transitions:") {
+                let val = val.trim();
+                if !val.is_empty() {
+                    fm.transitions = Some(
+                        val.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
                 }
             }
         }
@@ -808,11 +822,43 @@ mod tests {
 
     #[test]
     fn test_parse_frontmatter_all_keys() {
-        let content = "---\nwait: true\ntools: false\ndefault_next: review\n---\nDo work.";
+        let content = "---\nwait: true\ntools: false\ndefault_next: review\ntransitions: tests, implement, done\n---\nDo work.";
         let (fm, body) = parse_state_frontmatter(content);
         assert!(fm.wait);
         assert_eq!(fm.tools, Some(false));
         assert_eq!(fm.default_next, Some("review".to_string()));
+        assert_eq!(fm.transitions, Some(vec!["tests".to_string(), "implement".to_string(), "done".to_string()]));
         assert_eq!(body, "Do work.");
+    }
+
+    // --- transitions frontmatter tests ---
+
+    #[test]
+    fn test_parse_frontmatter_transitions() {
+        let content = "---\ntransitions: tests, implement, done\n---\nWrite a plan.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.transitions, Some(vec!["tests".to_string(), "implement".to_string(), "done".to_string()]));
+        assert_eq!(body, "Write a plan.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_transitions_not_specified() {
+        let content = "---\nwait: true\n---\nWait.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.transitions, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_transitions_empty() {
+        let content = "---\ntransitions: \n---\nPrompt.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.transitions, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_transitions_single() {
+        let content = "---\ntransitions: done\n---\nFinish up.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.transitions, Some(vec!["done".to_string()]));
     }
 }
