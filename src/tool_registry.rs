@@ -131,6 +131,9 @@ impl ToolRegistry {
     /// Format tool definitions for injection into the agent's prompt.
     /// Always includes `list_tools` meta-tool for discoverability.
     pub fn format_for_prompt(tools: &[&ToolDefinition]) -> String {
+        if tools.is_empty() {
+            return String::new();
+        }
         let mut output = String::from("**Available tools:**\n");
 
         // Always include list_tools for discoverability
@@ -493,10 +496,9 @@ category = "system"
 
     #[test]
     fn test_format_for_prompt_empty() {
-        // Even with no tools, list_tools meta-tool is always included
+        // No tools recalled → empty string (no boilerplate injected)
         let formatted = ToolRegistry::format_for_prompt(&[]);
-        assert!(formatted.contains("list_tools"));
-        assert!(formatted.contains("**Available tools:**"));
+        assert!(formatted.is_empty());
     }
 
     #[test]
