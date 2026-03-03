@@ -3073,6 +3073,34 @@ async fn run_tool_loop(
     let mut last_assistant_response_json: Option<String> = None;
     let mut prev_iter_had_tools = false;
     let mut state_error_count: u32 = 0;
+    let mut history_cutoff: Option<i64> = None;
+
+    // Check if initial state has history: false — if so, exclude prior history
+    if let (Some(dir), Some(state_name)) = (state_dir, initial_state) {
+        let resolved_state = store.get_participant_state(conv_name, agent_name)
+            .unwrap_or(None)
+            .unwrap_or_else(|| state_name.to_string());
+        let template_path = dir.join(format!("{}.md", resolved_state.trim()));
+        if let Ok(template) = std::fs::read_to_string(&template_path) {
+            let (fm, _) = crate::pipeline::parse_state_frontmatter(&template);
+            if fm.history == Some(false) {
+                // Get latest message ID as cutoff — messages after this point are from this state
+                if let Ok(msgs) = store.get_messages(conv_name, Some(1)) {
+                    if let Some(last) = msgs.last() {
+                        history_cutoff = Some(last.id);
+                        logger.log(&format!("[state] history: false on initial state '{}', cutoff at msg {}", resolved_state.trim(), last.id));
+                    } else {
+                        // No messages yet — cutoff at 0 means exclude everything
+                        history_cutoff = Some(0);
+                        logger.log(&format!("[state] history: false on initial state '{}', cutoff at 0 (no messages)", resolved_state.trim()));
+                    }
+                } else {
+                    history_cutoff = Some(0);
+                }
+                conversation_history = vec![];
+            }
+        }
+    }
 
     for _iteration in 0..max_iterations {
         // Check wall-clock time limit
@@ -3872,6 +3900,23 @@ async fn run_tool_loop(
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                     logger.log(&format!("[state] Transition → {}", new_state));
 
+                                    // Check if new state has history: false
+                                    {
+                                        let new_fm_path = dir.join(format!("{}.md", new_state.trim()));
+                                        if let Ok(new_template) = std::fs::read_to_string(&new_fm_path) {
+                                            let (new_fm, _) = crate::pipeline::parse_state_frontmatter(&new_template);
+                                            if new_fm.history == Some(false) {
+                                                if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
+                                                    let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
+                                                    history_cutoff = Some(cutoff_id);
+                                                    logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
+                                                }
+                                            } else {
+                                                history_cutoff = None;
+                                            }
+                                        }
+                                    }
+
                                     // Clear vars if requested (processed before set-vars)
                                     if clear_vars {
                                         let user_preserved = state_vars.get("user").cloned().unwrap_or_default();
@@ -4015,6 +4060,17 @@ async fn run_tool_loop(
                                     let next_template = std::fs::read_to_string(&next_path).unwrap_or_default();
                                     let (next_fm, _) = crate::pipeline::parse_state_frontmatter(&next_template);
 
+                                    // Check if target state has history: false
+                                    if next_fm.history == Some(false) {
+                                        if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
+                                            let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
+                                            history_cutoff = Some(cutoff_id);
+                                            logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
+                                        }
+                                    } else {
+                                        history_cutoff = None;
+                                    }
+
                                     if next_fm.wait {
                                         logger.log(&format!("[state] Entering wait state: {}", next_state));
                                         return ToolLoopResult {
@@ -4125,6 +4181,19 @@ async fn run_tool_loop(
                                     let _ = store.set_participant_vars(conv_name, agent_name, Some(&json));
                                 }
                                 logger.log(&format!("[state] Transition → {} (after tools)", new_state));
+
+                                // Check if new state has history: false
+                                let new_template = std::fs::read_to_string(&new_template_path).unwrap_or_default();
+                                let (new_fm, _) = crate::pipeline::parse_state_frontmatter(&new_template);
+                                if new_fm.history == Some(false) {
+                                    if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
+                                        let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
+                                        history_cutoff = Some(cutoff_id);
+                                        logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
+                                    }
+                                } else {
+                                    history_cutoff = None;
+                                }
                             } else {
                                 logger.log(&format!("[state] Invalid pending state: {}", new_state));
                             }
@@ -4148,6 +4217,12 @@ async fn run_tool_loop(
                         latest_msg_id,
                         &|msg| logger.log(msg),
                     );
+                    // Apply history cutoff: only include messages after the cutoff point
+                    let msgs = if let Some(cutoff) = history_cutoff {
+                        msgs.into_iter().filter(|m| m.id > cutoff).collect::<Vec<_>>()
+                    } else {
+                        msgs
+                    };
                     let dedup_up_to = resolve_dedup_up_to(&store, conv_name, agent_name, dedup_lazy, latest_msg_id);
                     let (refreshed_history, refreshed_final) =
                         format_conversation_history(&msgs, agent_name, dedup_up_to);

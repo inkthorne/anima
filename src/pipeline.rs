@@ -296,6 +296,11 @@ pub struct StateFrontmatter {
     /// Valid transition targets from this state.
     /// Used in error messages to show reachable states instead of all states.
     pub transitions: Option<Vec<String>>,
+    /// Whether conversation history is included when entering this state.
+    /// `None` = not specified (include history, backward compatible).
+    /// `Some(false)` = exclude prior history; only messages from this state's execution are visible.
+    /// `Some(true)` = include history (same as default).
+    pub history: Option<bool>,
 }
 
 /// Parse YAML frontmatter from a state file.
@@ -339,6 +344,9 @@ pub fn parse_state_frontmatter(content: &str) -> (StateFrontmatter, &str) {
                             .collect(),
                     );
                 }
+            }
+            if let Some(val) = line.strip_prefix("history:") {
+                fm.history = Some(val.trim() == "true");
             }
         }
 
@@ -822,12 +830,13 @@ mod tests {
 
     #[test]
     fn test_parse_frontmatter_all_keys() {
-        let content = "---\nwait: true\ntools: false\ndefault_next: review\ntransitions: tests, implement, done\n---\nDo work.";
+        let content = "---\nwait: true\ntools: false\ndefault_next: review\ntransitions: tests, implement, done\nhistory: false\n---\nDo work.";
         let (fm, body) = parse_state_frontmatter(content);
         assert!(fm.wait);
         assert_eq!(fm.tools, Some(false));
         assert_eq!(fm.default_next, Some("review".to_string()));
         assert_eq!(fm.transitions, Some(vec!["tests".to_string(), "implement".to_string(), "done".to_string()]));
+        assert_eq!(fm.history, Some(false));
         assert_eq!(body, "Do work.");
     }
 
@@ -860,5 +869,40 @@ mod tests {
         let content = "---\ntransitions: done\n---\nFinish up.";
         let (fm, _) = parse_state_frontmatter(content);
         assert_eq!(fm.transitions, Some(vec!["done".to_string()]));
+    }
+
+    // --- history frontmatter tests ---
+
+    #[test]
+    fn test_parse_frontmatter_history_false() {
+        let content = "---\nhistory: false\n---\nNo history needed.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.history, Some(false));
+        assert_eq!(body, "No history needed.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_history_true() {
+        let content = "---\nhistory: true\n---\nKeep history.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert_eq!(fm.history, Some(true));
+        assert_eq!(body, "Keep history.");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_history_not_specified() {
+        let content = "---\nwait: true\n---\nNo history key.";
+        let (fm, _) = parse_state_frontmatter(content);
+        assert_eq!(fm.history, None);
+    }
+
+    #[test]
+    fn test_parse_frontmatter_history_with_other_keys() {
+        let content = "---\nwait: false\nhistory: false\ntools: true\n---\nCombined.";
+        let (fm, body) = parse_state_frontmatter(content);
+        assert!(!fm.wait);
+        assert_eq!(fm.history, Some(false));
+        assert_eq!(fm.tools, Some(true));
+        assert_eq!(body, "Combined.");
     }
 }
