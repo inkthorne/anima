@@ -1,3 +1,27 @@
+## What a Step Should Be
+
+If there are tool calls from the previous step:
+1. Execute the pending tool calls.
+2. Wait for all the tool responses.
+3. Store them them in conversation database.
+4. Send the previous context + new tool results to the LLM.
+5. Wait for LLM's response.
+6. Store LLM's response in the conversation database.
+
+If the previous step transitioned to a non-wait state:
+1. No new user message needed — the state template provides the prompt.
+2. Load context from the conversation database.
+3. Send context (with state template wrapping) to the LLM.
+4. Wait for LLM's response.
+5. Store LLM's response in the conversation database.
+
+If there are no tool calls from the previous step:
+1. Wait for a user message to be input.
+2. Store user message in the conversation database.
+3. Send previous context + new user messages to the LLM.
+4. Wait for LLM's response.
+5. Store LLM's response in the conversation database.
+
 ## The Problem
 
 Getting local models to use tools reliably is the central challenge of running an agentic loop on Ollama. Cloud APIs (OpenAI, Anthropic) have been fine-tuned specifically for tool calling — they emit structured tool invocations cleanly, chain calls naturally, and stop when done. Local models do none of this consistently. They hallucinate tool names, emit malformed JSON, forget to call tools when they should, call tools when they shouldn't, and loop endlessly without producing a final answer.

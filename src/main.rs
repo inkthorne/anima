@@ -710,6 +710,59 @@ fn tool_call_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
+/// Produce a readable preview for step trace display.
+///
+/// Extracts meaningful content from tool-block (`<tool>`) and state transition
+/// (`<set-vars>`) responses instead of showing raw XML tags.
+fn step_trace_preview(content: &str) -> String {
+    let trimmed = content.trim();
+
+    // Tool-block: extract tool name and params
+    if let Some(start) = trimmed.find("<tool>") {
+        if let Some(end) = trimmed.find("</tool>") {
+            let json_str = trimmed[start + 6..end].trim();
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+                let name = val["tool"].as_str().unwrap_or("?");
+                let params = &val["params"];
+                let detail = format_tool_params(params);
+                return format!("<tool> {}: {}", name, detail);
+            }
+        }
+        // <tool> tag present but JSON didn't parse — show what we can
+        let inner = trimmed[trimmed.find("<tool>").unwrap() + 6..].trim();
+        let first = inner.lines().next().unwrap_or(inner);
+        let truncated = if first.len() > 120 { format!("{}...", &first[..first.floor_char_boundary(120)]) } else { first.to_string() };
+        return format!("<tool> {}", truncated);
+    }
+
+    // State transition: extract state name from <set-vars><state>X</state></set-vars>
+    if let Some(state_start) = trimmed.find("<state>") {
+        if let Some(state_end) = trimmed.find("</state>") {
+            let state_name = &trimmed[state_start + 7..state_end];
+            // Show any text before the tag as context
+            let before = trimmed[..state_start].trim().trim_start_matches("<set-vars>").trim();
+            if before.is_empty() {
+                return format!("-> {}", state_name);
+            } else {
+                let before_preview = if before.len() > 100 {
+                    format!("{}...", &before[..before.floor_char_boundary(100)])
+                } else {
+                    before.to_string()
+                };
+                return format!("{} -> {}", before_preview, state_name);
+            }
+        }
+    }
+
+    // Default: first line, truncated
+    let first_line = trimmed.lines().next().unwrap_or("");
+    if first_line.len() > 200 {
+        format!("{}...", &first_line[..first_line.floor_char_boundary(200)])
+    } else {
+        first_line.to_string()
+    }
+}
+
 /// Format a Unix timestamp as "YYYY-MM-DD HH:MM:SS" for pretty display.
 fn format_timestamp_pretty(timestamp: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
@@ -1360,21 +1413,13 @@ fn format_verbose_output(kind: &str, data: &serde_json::Value) {
             let duration_ms = data["duration_ms"].as_u64().unwrap_or(0);
             let preview = data["preview"].as_str().unwrap_or("");
             let status = if success { "ok" } else { "error" };
-            // Yellow
-            let preview_str = if preview.is_empty() {
-                String::new()
-            } else {
-                let truncated = if preview.len() > 200 {
-                    format!("{}...", &preview[..197])
-                } else {
-                    preview.to_string()
-                };
-                format!(" | {}", truncated.replace('\n', " "))
-            };
             eprintln!(
-                "\x1b[33m[tool-result] {} ({}) {}ms{}\x1b[0m",
-                name, status, duration_ms, preview_str
+                "\x1b[33m[tool-result] {} ({}) {}ms\x1b[0m",
+                name, status, duration_ms
             );
+            if !preview.is_empty() {
+                eprintln!("{}", preview);
+            }
         }
         "tools" => {
             let count = data["count"].as_u64().unwrap_or(0);
@@ -1579,12 +1624,7 @@ fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std:
         let preview = if display_content.is_empty() {
             "(empty)".to_string()
         } else {
-            let first_line = display_content.lines().next().unwrap_or("");
-            if first_line.len() > 200 {
-                format!("{}...", &first_line[..200])
-            } else {
-                first_line.to_string()
-            }
+            step_trace_preview(&display_content)
         };
 
         match role {
@@ -1600,7 +1640,8 @@ fn dump_step_messages(conv_name: &str, since_id: i64) -> Result<(), Box<dyn std:
                 } else {
                     format!(" ({})", tc_id)
                 };
-                eprintln!("\x1b[33m  [tool{}] {}\x1b[0m", id_suffix, preview);
+                eprintln!("\x1b[33m  [tool{}]\x1b[0m", id_suffix);
+                eprintln!("{}", display_content);
             }
             _ => {
                 // Cyan for agent messages

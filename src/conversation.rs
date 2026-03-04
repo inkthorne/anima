@@ -314,6 +314,7 @@ impl ConversationStore {
         self.add_column_if_missing("participants", "state_vars", "TEXT DEFAULT NULL")?;
         self.add_column_if_missing("participants", "history_cutoff", "INTEGER DEFAULT NULL")?;
         self.add_column_if_missing("participants", "prev_had_tools", "INTEGER DEFAULT 0")?;
+        self.add_column_if_missing("participants", "steps_in_state", "INTEGER DEFAULT 0")?;
 
         // Create message_embeddings table if it doesn't exist (for existing databases)
         self.conn.execute_batch(
@@ -1377,6 +1378,26 @@ impl ConversationStore {
     pub fn set_prev_had_tools(&self, conv_name: &str, agent: &str, val: bool) -> Result<(), ConversationError> {
         self.conn.execute(
             "UPDATE participants SET prev_had_tools = ?1 WHERE conv_name = ?2 AND agent = ?3",
+            params![val as i32, conv_name, agent],
+        )?;
+        Ok(())
+    }
+
+    /// Get the persisted steps_in_state counter for an agent in a conversation.
+    pub fn get_steps_in_state(&self, conv_name: &str, agent: &str) -> Result<u32, ConversationError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT steps_in_state FROM participants WHERE conv_name = ?1 AND agent = ?2",
+        )?;
+        let val: Option<i32> = stmt
+            .query_row(params![conv_name, agent], |row| row.get(0))
+            .ok();
+        Ok(val.unwrap_or(0) as u32)
+    }
+
+    /// Set the persisted steps_in_state counter for an agent in a conversation.
+    pub fn set_steps_in_state(&self, conv_name: &str, agent: &str, val: u32) -> Result<(), ConversationError> {
+        self.conn.execute(
+            "UPDATE participants SET steps_in_state = ?1 WHERE conv_name = ?2 AND agent = ?3",
             params![val as i32, conv_name, agent],
         )?;
         Ok(())

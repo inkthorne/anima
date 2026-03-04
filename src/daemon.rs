@@ -2885,7 +2885,7 @@ async fn execute_native_tool_calls(
                 logger.tool(&format!("[loop] {} → {} bytes", tc.name, result.len()));
                 // Emit verbose: tool_result (success)
                 if let Some(vtx) = verbose_tx {
-                    let preview: String = result.chars().take(500).collect();
+                    let preview: String = result.to_string();
                     let _ = vtx.send(Response::Verbose {
                         kind: "tool_result".to_string(),
                         data: serde_json::json!({
@@ -2943,6 +2943,9 @@ pub struct ToolLoopResult {
     pub dump_step_n: Option<u64>,
     /// Full LLMResponse serialized as JSON from the last step.
     pub assistant_response_json: Option<String>,
+    /// Whether the response was already stored in the DB by run_tool_loop
+    /// (e.g. deferred tool call paths that store with tool_calls metadata).
+    pub db_stored: bool,
 }
 
 /// Unified tool loop for both native and tool-block modes.
@@ -3005,6 +3008,7 @@ pub async fn run_tool_loop(
                 cached_tokens: None,
                 dump_step_n: None,
                 assistant_response_json: None,
+                db_stored: false,
             };
         }
     };
@@ -3028,8 +3032,9 @@ pub async fn run_tool_loop(
     let mut last_cached_tokens: Option<u32> = None;
     let mut last_dump_step_n: Option<u64> = None;
     let mut last_assistant_response_json: Option<String> = None;
-    let mut prev_iter_had_tools = store.get_prev_had_tools(conv_name, agent_name).unwrap_or(false);
+    let _prev_iter_had_tools = store.get_prev_had_tools(conv_name, agent_name).unwrap_or(false);
     let mut state_error_count: u32 = 0;
+    let mut steps_in_state: u32 = store.get_steps_in_state(conv_name, agent_name).unwrap_or(0);
     let mut history_cutoff: Option<i64> = store
         .get_history_cutoff(conv_name, agent_name)
         .unwrap_or(None);
@@ -3072,17 +3077,22 @@ pub async fn run_tool_loop(
                                 &tool_calls, tool_registry, tool_context,
                                 conv_name, agent_name, logger, num_ctx, &verbose_tx,
                             ).await;
-                            return ToolLoopResult {
-                                response: String::new(),
-                                db_response: String::new(),
-                                duration_ms: None,
-                                tokens_in: None,
-                                tokens_out: None,
-                                prompt_eval_duration_ns: None,
-                                cached_tokens: None,
-                                dump_step_n: None,
-                                assistant_response_json: None,
-                            };
+                            // Refresh context from DB so LLM sees tool results
+                            if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, &|msg| logger.log(msg), num_ctx) {
+                                let msgs = if let Some(cutoff) = history_cutoff {
+                                    msgs.into_iter().filter(|m| m.id > cutoff).collect::<Vec<_>>()
+                                } else {
+                                    msgs
+                                };
+                                let dedup_up_to = resolve_dedup_up_to(&store, conv_name, agent_name, dedup_lazy, msgs.last().map(|m| m.id));
+                                let (refreshed_history, refreshed_final) =
+                                    format_conversation_history(&msgs, agent_name, dedup_up_to);
+                                conversation_history = refreshed_history;
+                                if current_message.is_empty() {
+                                    current_message = refreshed_final;
+                                }
+                            }
+                            // Fall through to main loop — LLM will see tool results
                         }
                     }
                 }
@@ -3093,6 +3103,7 @@ pub async fn run_tool_loop(
     // Reset DB flag — the loaded value is captured in the variable;
     // if this step defers tools, it will persist true before returning.
     let _ = store.set_prev_had_tools(conv_name, agent_name, false);
+    let mut loop_body_stored = false;
 
     for _step in 0..max_steps {
         // Check wall-clock time limit
@@ -3110,6 +3121,7 @@ pub async fn run_tool_loop(
                     cached_tokens: last_cached_tokens,
                     dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
+                    db_stored: false,
                 };
             }
         }
@@ -3128,6 +3140,7 @@ pub async fn run_tool_loop(
                     cached_tokens: last_cached_tokens,
                     dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
+                    db_stored: false,
                 };
             }
         }
@@ -3148,8 +3161,8 @@ pub async fn run_tool_loop(
         // Returns (message, Option<StateFrontmatter>) so we can apply per-state tool control
         let (llm_message, state_fm) = if let Some(dir) = state_dir {
             if let Some(ref state_file) = state_before {
-                if prev_iter_had_tools {
-                    // Continuing tool chain — inject a brief state reminder so the LLM
+                if steps_in_state > 0 {
+                    // Subsequent step in same state — inject a brief state reminder so the LLM
                     // remembers to emit <next-state> when done, without re-injecting
                     // the full template (which would duplicate {{user}} and restart work).
                     let available = list_state_files(dir);
@@ -3161,8 +3174,8 @@ pub async fn run_tool_loop(
                         available,
                     );
                     logger.log(&format!(
-                        "[state] Tool chain continuation, injecting state reminder for: {}",
-                        state_file.trim()
+                        "[state] Step {} in state '{}', injecting reminder",
+                        steps_in_state, state_file.trim()
                     ));
                     // Re-read state file to get frontmatter for tool control
                     let template_path = dir.join(format!("{}.md", state_file.trim()));
@@ -3189,7 +3202,7 @@ pub async fn run_tool_loop(
                             // Parse and strip YAML frontmatter (Gap 1)
                             let (fm, body) = crate::pipeline::parse_state_frontmatter(&template);
                             let wrapped = crate::pipeline::expand_vars(body, &state_vars);
-                            logger.log(&format!("[state] Wrapping with template: {}", state_file.trim()));
+                            logger.log(&format!("[state] First step in state '{}', wrapping with template", state_file.trim()));
                             if let Some(ref vtx) = verbose_tx {
                                 let _ = vtx.send(Response::Verbose {
                                     kind: "state_frontmatter".to_string(),
@@ -3312,6 +3325,7 @@ pub async fn run_tool_loop(
                             cached_tokens: last_cached_tokens,
                             dump_step_n: last_dump_step_n,
                             assistant_response_json: last_assistant_response_json.clone(),
+                            db_stored: false,
                         };
                     }
                 }
@@ -3329,6 +3343,7 @@ pub async fn run_tool_loop(
                     cached_tokens: None,
                     dump_step_n: None,
                     assistant_response_json: None,
+                    db_stored: false,
                 };
             }
         };
@@ -3423,6 +3438,7 @@ pub async fn run_tool_loop(
                                 cached_tokens: last_cached_tokens,
                                 dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
+                                db_stored: false,
                             };
                         }
 
@@ -3461,6 +3477,7 @@ pub async fn run_tool_loop(
                                 cached_tokens: last_cached_tokens,
                                 dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
+                                db_stored: true,
                             };
                         }
 
@@ -3500,6 +3517,7 @@ pub async fn run_tool_loop(
                                     cached_tokens: last_cached_tokens,
                                     dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
+                                    db_stored: false,
                                 };
                             }
 
@@ -3584,6 +3602,7 @@ pub async fn run_tool_loop(
                                     if let Some(turn_n) = think_result.dump_step_n {
                                         agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
+                                    loop_body_stored = true;
                                 }
                                 Err(e) => {
                                     logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
@@ -3620,6 +3639,7 @@ pub async fn run_tool_loop(
                                 cached_tokens: last_cached_tokens,
                                 dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
+                                db_stored: false,
                             };
                         }
 
@@ -3657,6 +3677,7 @@ pub async fn run_tool_loop(
                         // Step mode: defer tool-block execution to next step
                         if max_steps <= 1 {
                             logger.log("[step] Deferring tool-block call to next step");
+                            let _ = store.set_prev_had_tools(conv_name, agent_name, true);
                             return ToolLoopResult {
                                 response: cleaned_response.clone(),
                                 db_response: db_content,
@@ -3667,6 +3688,7 @@ pub async fn run_tool_loop(
                                 cached_tokens: last_cached_tokens,
                                 dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
+                                db_stored: true,
                             };
                         }
 
@@ -3692,7 +3714,7 @@ pub async fn run_tool_loop(
                                 logger.tool(&format!("[loop] Result: {} bytes", tool_result.len()));
                                 // Emit verbose: tool_result (success)
                                 if let Some(ref vtx) = verbose_tx {
-                                    let preview: String = tool_result.chars().take(500).collect();
+                                    let preview: String = tool_result.to_string();
                                     let _ = vtx.send(Response::Verbose {
                                         kind: "tool_result".to_string(),
                                         data: serde_json::json!({
@@ -3758,6 +3780,7 @@ pub async fn run_tool_loop(
                                     if let Some(turn_n) = think_result.dump_step_n {
                                         agent.lock().await.rename_step_files(turn_n, msg_id);
                                     }
+                                    loop_body_stored = true;
                                 }
                                 Err(e) => {
                                     logger.log(&format!("[loop] Failed to store intermediate response: {}", e));
@@ -3789,6 +3812,7 @@ pub async fn run_tool_loop(
                                     cached_tokens: last_cached_tokens,
                                     dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
+                                    db_stored: false,
                                 };
                             }
 
@@ -3806,6 +3830,7 @@ pub async fn run_tool_loop(
                                         if let Some(turn_n) = think_result.dump_step_n {
                                             agent.lock().await.rename_step_files(turn_n, msg_id);
                                         }
+                                        loop_body_stored = true;
                                     }
                                     Err(e) => {
                                         logger.log(&format!("[loop] Failed to store assistant message: {}", e));
@@ -3882,6 +3907,7 @@ pub async fn run_tool_loop(
                                             cached_tokens: last_cached_tokens,
                                             dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
+                                            db_stored: false,
                                         };
                                     }
 
@@ -3897,6 +3923,7 @@ pub async fn run_tool_loop(
                                                 if let Some(turn_n) = think_result.dump_step_n {
                                                     agent.lock().await.rename_step_files(turn_n, msg_id);
                                                 }
+                                                loop_body_stored = true;
                                             }
                                             Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                         }
@@ -3922,6 +3949,8 @@ pub async fn run_tool_loop(
                                     // Fall through to context refresh, will continue loop
                                 } else {
                                     state_error_count = 0;
+                                    steps_in_state = 0;
+                                    let _ = store.set_steps_in_state(conv_name, agent_name, 0);
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                     logger.log(&format!("[state] Transition → {}", new_state));
 
@@ -3975,6 +4004,7 @@ pub async fn run_tool_loop(
                                                 cached_tokens: last_cached_tokens,
                                                 dump_step_n: last_dump_step_n,
                                                 assistant_response_json: last_assistant_response_json.clone(),
+                                                db_stored: false,
                                             };
                                         }
                                         // Different state with no content → auto-execute
@@ -3999,6 +4029,7 @@ pub async fn run_tool_loop(
                                                 cached_tokens: last_cached_tokens,
                                                 dump_step_n: last_dump_step_n,
                                                 assistant_response_json: last_assistant_response_json.clone(),
+                                                db_stored: false,
                                             };
                                         } else {
                                             // Non-wait state — store response in DB, auto-execute
@@ -4014,11 +4045,16 @@ pub async fn run_tool_loop(
                                                         if let Some(turn_n) = think_result.dump_step_n {
                                                             agent.lock().await.rename_step_files(turn_n, msg_id);
                                                         }
+                                                        loop_body_stored = true;
                                                     }
                                                     Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                                 }
                                             }
                                             current_message = String::new();
+                                            // In step mode, skip context refresh — loop exits immediately
+                                            if max_steps <= 1 {
+                                                continue;
+                                            }
                                             // Fall through to context refresh, will continue loop
                                         }
                                     }
@@ -4038,6 +4074,7 @@ pub async fn run_tool_loop(
                                     cached_tokens: last_cached_tokens,
                                     dump_step_n: last_dump_step_n,
                                     assistant_response_json: last_assistant_response_json.clone(),
+                                    db_stored: false,
                                 };
                             } else {
                                 // No state change specified — check for default_next in frontmatter
@@ -4067,10 +4104,13 @@ pub async fn run_tool_loop(
                                             cached_tokens: last_cached_tokens,
                                             dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
+                                            db_stored: false,
                                         };
                                     }
 
                                     // Apply default_next transition
+                                    steps_in_state = 0;
+                                    let _ = store.set_steps_in_state(conv_name, agent_name, 0);
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(next_state));
                                     logger.log(&format!("[state] default_next transition → {}", next_state));
 
@@ -4111,6 +4151,7 @@ pub async fn run_tool_loop(
                                             cached_tokens: last_cached_tokens,
                                             dump_step_n: last_dump_step_n,
                                             assistant_response_json: last_assistant_response_json.clone(),
+                                            db_stored: false,
                                         };
                                     } else {
                                         // Non-wait state — store response, auto-execute
@@ -4126,11 +4167,16 @@ pub async fn run_tool_loop(
                                                     if let Some(turn_n) = think_result.dump_step_n {
                                                         agent.lock().await.rename_step_files(turn_n, msg_id);
                                                     }
+                                                    loop_body_stored = true;
                                                 }
                                                 Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                             }
                                         }
                                         current_message = String::new();
+                                        // In step mode, skip context refresh — loop exits immediately
+                                        if max_steps <= 1 {
+                                            continue;
+                                        }
                                         // Fall through to context refresh, will continue loop
                                     }
                                 } else {
@@ -4149,6 +4195,7 @@ pub async fn run_tool_loop(
                                         cached_tokens: last_cached_tokens,
                                         dump_step_n: last_dump_step_n,
                                         assistant_response_json: last_assistant_response_json.clone(),
+                                        db_stored: false,
                                     };
                                 }
                             }
@@ -4164,6 +4211,7 @@ pub async fn run_tool_loop(
                                 cached_tokens: last_cached_tokens,
                                 dump_step_n: last_dump_step_n,
                                 assistant_response_json: last_assistant_response_json.clone(),
+                                db_stored: false,
                             };
                         }
                     } else {
@@ -4178,6 +4226,7 @@ pub async fn run_tool_loop(
                             cached_tokens: last_cached_tokens,
                             dump_step_n: last_dump_step_n,
                             assistant_response_json: last_assistant_response_json.clone(),
+                            db_stored: false,
                         };
                     }
                 }
@@ -4203,6 +4252,8 @@ pub async fn run_tool_loop(
                                 }
                                 state_vars.insert("assistant".to_string(), stripped);
 
+                                steps_in_state = 0;
+                                let _ = store.set_steps_in_state(conv_name, agent_name, 0);
                                 let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                 // Persist vars for step debugger
                                 if let Ok(json) = serde_json::to_string(&state_vars) {
@@ -4230,7 +4281,7 @@ pub async fn run_tool_loop(
                     }
                 }
 
-                prev_iter_had_tools = if pending_state.is_some() { false } else { tool_executed };
+                let _prev_iter_had_tools = if pending_state.is_some() { false } else { tool_executed };
 
                 // Refresh context from DB using cursor-based append system
                 if let Ok(msgs) = load_agent_context(&store, conv_name, agent_name, &|msg| logger.log(msg), num_ctx) {
@@ -4265,6 +4316,9 @@ pub async fn run_tool_loop(
                 if let Some(nudge) = crate::agent::tool_budget_nudge(tool_call_count, max_steps) {
                     current_message.push_str(&format!("\n\n---\n{}", nudge));
                 }
+
+                steps_in_state += 1;
+                let _ = store.set_steps_in_state(conv_name, agent_name, steps_in_state);
             }
             Err(crate::error::AgentError::Cancelled) => {
                 logger.log("[loop] Agent cancelled (conversation paused)");
@@ -4279,6 +4333,7 @@ pub async fn run_tool_loop(
                     cached_tokens: last_cached_tokens,
                     dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
+                    db_stored: false,
                 };
             }
             Err(e) => {
@@ -4295,6 +4350,7 @@ pub async fn run_tool_loop(
                     cached_tokens: last_cached_tokens,
                     dump_step_n: last_dump_step_n,
                     assistant_response_json: last_assistant_response_json.clone(),
+                    db_stored: false,
                 };
             }
         }
@@ -4316,6 +4372,7 @@ pub async fn run_tool_loop(
         cached_tokens: last_cached_tokens,
         dump_step_n: last_dump_step_n,
         assistant_response_json: last_assistant_response_json,
+        db_stored: loop_body_stored,
     }
 }
 
@@ -4487,7 +4544,7 @@ async fn process_message_work(
 
     // Both paths use run_tool_loop — with conversation uses it directly,
     // without conversation creates an ephemeral conversation first.
-    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_step_n, last_assistant_response_json) = if let Some(cname) = conv_name {
+    let (final_response, db_final_response, last_duration_ms, last_tokens_in, last_tokens_out, last_prompt_eval_ns, last_cached_tokens, last_dump_step_n, last_assistant_response_json, db_stored) = if let Some(cname) = conv_name {
         // New user message resets the prev_had_tools flag
         if !content.is_empty() {
             if let Ok(s) = ConversationStore::init() {
@@ -4531,7 +4588,7 @@ async fn process_message_work(
         drop(log_tx);
         let _ = log_fwd_handle.await;
 
-        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json, loop_result.db_stored)
     } else {
         // No conversation — create ephemeral conversation for tool loop
         let timestamp = std::time::SystemTime::now()
@@ -4610,7 +4667,7 @@ async fn process_message_work(
         // Clean up ephemeral conversation
         let _ = eph_store.delete_conversation(&ephemeral_name);
 
-        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json)
+        (loop_result.response, loop_result.db_response, loop_result.duration_ms, loop_result.tokens_in, loop_result.tokens_out, loop_result.prompt_eval_duration_ns, loop_result.cached_tokens, loop_result.dump_step_n, loop_result.assistant_response_json, loop_result.db_stored)
     };
 
     // Store response in conversation if conv_name was provided
@@ -4634,80 +4691,83 @@ async fn process_message_work(
                         }
                     }
                 }
-                // Store the final response with token stats (preserve thinking in DB)
-                // Notes already prepended by run_tool_loop — no second prepend_notes here
-                let assistant_response_opt = last_assistant_response_json.as_deref();
-                match store.add_message_with_tokens(
-                    cname,
-                    agent_name,
-                    &db_final_response,
-                    &[],
-                    duration_ms,
-                    None, // tool_calls stored by run_tool_loop during steps
-                    tokens_in,
-                    tokens_out,
-                    num_ctx_i64,
-                    prompt_eval_ns,
-                    cached_tokens_i64,
-                    assistant_response_opt,
-                ) {
-                    Ok(response_msg_id) => {
-                        // Rename debug dump files from sequential number to DB message ID
-                        if let Some(turn_n) = last_dump_step_n {
-                            agent.lock().await.rename_step_files(turn_n, response_msg_id);
-                        }
+                // Skip storage when run_tool_loop already stored with tool_calls metadata
+                if !db_stored {
+                    // Store the final response with token stats (preserve thinking in DB)
+                    // Notes already prepended by run_tool_loop — no second prepend_notes here
+                    let assistant_response_opt = last_assistant_response_json.as_deref();
+                    match store.add_message_with_tokens(
+                        cname,
+                        agent_name,
+                        &db_final_response,
+                        &[],
+                        duration_ms,
+                        None, // tool_calls stored by run_tool_loop during steps
+                        tokens_in,
+                        tokens_out,
+                        num_ctx_i64,
+                        prompt_eval_ns,
+                        cached_tokens_i64,
+                        assistant_response_opt,
+                    ) {
+                        Ok(response_msg_id) => {
+                            // Rename debug dump files from sequential number to DB message ID
+                            if let Some(turn_n) = last_dump_step_n {
+                                agent.lock().await.rename_step_files(turn_n, response_msg_id);
+                            }
 
-                        // Embed agent response for future conversation recall
-                        if !final_response.is_empty() {
-                            if let Some(emb_client) = embedding_client {
-                                match emb_client.embed(&final_response).await {
-                                    Ok(emb) => {
-                                        if let Err(e) = store.store_message_embedding(response_msg_id, cname, &emb) {
-                                            logger.log(&format!("[worker] Failed to store response embedding: {}", e));
+                            // Embed agent response for future conversation recall
+                            if !final_response.is_empty() {
+                                if let Some(emb_client) = embedding_client {
+                                    match emb_client.embed(&final_response).await {
+                                        Ok(emb) => {
+                                            if let Err(e) = store.store_message_embedding(response_msg_id, cname, &emb) {
+                                                logger.log(&format!("[worker] Failed to store response embedding: {}", e));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            logger.log(&format!("[worker] Failed to embed response: {}", e));
                                         }
                                     }
-                                    Err(e) => {
-                                        logger.log(&format!("[worker] Failed to embed response: {}", e));
+                                }
+                            }
+
+                            // Parse @mentions from response and forward to other agents
+                            if mentions_enabled {
+                                let mentions = crate::conversation::parse_mentions(&final_response);
+                                let valid_mentions: Vec<String> = mentions
+                                    .into_iter()
+                                    .filter(|m| m != agent_name && m != "user" && m != "all")
+                                    .filter(|m| discovery::agent_exists(m))
+                                    .collect();
+
+                                if !valid_mentions.is_empty() {
+                                    logger.log(&format!(
+                                        "[worker] Forwarding to {} agents: {:?}",
+                                        valid_mentions.len(),
+                                        valid_mentions
+                                    ));
+
+                                    for mention in valid_mentions {
+                                        let _ = store.add_participant(cname, &mention);
+                                        forward_notify_to_agent(
+                                            &mention,
+                                            cname,
+                                            response_msg_id,
+                                            0,
+                                            logger,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
                         }
-
-                        // Parse @mentions from response and forward to other agents
-                        if mentions_enabled {
-                            let mentions = crate::conversation::parse_mentions(&final_response);
-                            let valid_mentions: Vec<String> = mentions
-                                .into_iter()
-                                .filter(|m| m != agent_name && m != "user" && m != "all")
-                                .filter(|m| discovery::agent_exists(m))
-                                .collect();
-
-                            if !valid_mentions.is_empty() {
-                                logger.log(&format!(
-                                    "[worker] Forwarding to {} agents: {:?}",
-                                    valid_mentions.len(),
-                                    valid_mentions
-                                ));
-
-                                for mention in valid_mentions {
-                                    let _ = store.add_participant(cname, &mention);
-                                    forward_notify_to_agent(
-                                        &mention,
-                                        cname,
-                                        response_msg_id,
-                                        0,
-                                        logger,
-                                    )
-                                    .await;
-                                }
-                            }
+                        Err(e) => {
+                            logger.log(&format!(
+                                "[worker] Failed to store response in conversation: {}",
+                                e
+                            ));
                         }
-                    }
-                    Err(e) => {
-                        logger.log(&format!(
-                            "[worker] Failed to store response in conversation: {}",
-                            e
-                        ));
                     }
                 }
             }
@@ -5016,6 +5076,7 @@ async fn handle_notify(
     let cached_tokens_i64 = loop_result.cached_tokens.map(|t| t as i64);
     let last_dump_step_n = loop_result.dump_step_n;
     let last_assistant_response_json = loop_result.assistant_response_json;
+    let db_stored = loop_result.db_stored;
 
     // Stamp stats on intermediate messages
     if tokens_in.is_some() || tokens_out.is_some() {
@@ -5038,6 +5099,9 @@ async fn handle_notify(
     }
 
     // Notes already prepended by run_tool_loop — no second prepend_notes here
+    if db_stored {
+        return Response::Notified { response_message_id: 0 };
+    }
     if db_cleaned_response.trim().is_empty() {
         logger.log("[notify] Empty response, skipping message storage");
         return Response::Notified { response_message_id: 0 };
@@ -5480,7 +5544,7 @@ async fn run_heartbeat(
     }
 
     // 7. Store the final response in <agent>-heartbeat conversation
-    if !loop_result.db_response.is_empty() {
+    if !loop_result.db_stored && !loop_result.db_response.is_empty() {
         match store.add_message_with_tokens(
             &conv_name,
             agent_name,
