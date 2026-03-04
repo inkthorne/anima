@@ -3954,22 +3954,20 @@ pub async fn run_tool_loop(
                                     let _ = store.set_participant_state(conv_name, agent_name, Some(new_state));
                                     logger.log(&format!("[state] Transition → {}", new_state));
 
-                                    // Check if new state has history: false
-                                    {
+                                    // Check if new state has history: false (defer cutoff until after store)
+                                    let new_state_history_false = {
                                         let new_fm_path = dir.join(format!("{}.md", new_state.trim()));
                                         if let Ok(new_template) = std::fs::read_to_string(&new_fm_path) {
                                             let (new_fm, _) = crate::pipeline::parse_state_frontmatter(&new_template);
-                                            if new_fm.history == Some(false) {
-                                                if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
-                                                    let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
-                                                    history_cutoff = Some(cutoff_id);
-                                                    logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
-                                                }
-                                            } else {
-                                                history_cutoff = None;
-                                            }
+                                            new_fm.history == Some(false)
+                                        } else {
+                                            false
                                         }
-                                        let _ = store.set_history_cutoff(conv_name, agent_name, history_cutoff);
+                                    };
+                                    // Clear cutoff immediately for history: true states
+                                    if !new_state_history_false {
+                                        history_cutoff = None;
+                                        let _ = store.set_history_cutoff(conv_name, agent_name, None);
                                     }
 
                                     // Clear vars if requested (processed before set-vars)
@@ -4009,6 +4007,15 @@ pub async fn run_tool_loop(
                                         }
                                         // Different state with no content → auto-execute
                                         logger.log(&format!("[state] Re-running with new state: {}", new_state));
+                                        // Set cutoff now — nothing stored, so get_messages has the right latest id
+                                        if new_state_history_false {
+                                            if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
+                                                let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
+                                                history_cutoff = Some(cutoff_id);
+                                                let _ = store.set_history_cutoff(conv_name, agent_name, Some(cutoff_id));
+                                                logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
+                                            }
+                                        }
                                         current_message = String::new();
                                         // Fall through to context refresh, will continue loop
                                     } else {
@@ -4017,7 +4024,12 @@ pub async fn run_tool_loop(
                                         let (fm, _) = crate::pipeline::parse_state_frontmatter(&new_template);
 
                                         if fm.wait {
-                                            // Wait state — end chain, return response
+                                            // Wait state — end chain, return response.
+                                            // Don't set cutoff here — caller stores response after we return.
+                                            // The initial-load path will set cutoff correctly on next invocation.
+                                            if new_state_history_false {
+                                                let _ = store.set_history_cutoff(conv_name, agent_name, None);
+                                            }
                                             logger.log(&format!("[state] Entering wait state: {}", new_state));
                                             return ToolLoopResult {
                                                 response: stripped,
@@ -4046,6 +4058,12 @@ pub async fn run_tool_loop(
                                                             agent.lock().await.rename_step_files(turn_n, msg_id);
                                                         }
                                                         loop_body_stored = true;
+                                                        // Set cutoff AFTER store so the transitioning response is excluded
+                                                        if new_state_history_false {
+                                                            history_cutoff = Some(msg_id);
+                                                            let _ = store.set_history_cutoff(conv_name, agent_name, Some(msg_id));
+                                                            logger.log(&format!("[state] history: false, cutoff at msg {}", msg_id));
+                                                        }
                                                     }
                                                     Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                                 }
@@ -4127,19 +4145,19 @@ pub async fn run_tool_loop(
                                     let next_template = std::fs::read_to_string(&next_path).unwrap_or_default();
                                     let (next_fm, _) = crate::pipeline::parse_state_frontmatter(&next_template);
 
-                                    // Check if target state has history: false
-                                    if next_fm.history == Some(false) {
-                                        if let Ok(recent) = store.get_messages(conv_name, Some(1)) {
-                                            let cutoff_id = recent.last().map(|m| m.id).unwrap_or(0);
-                                            history_cutoff = Some(cutoff_id);
-                                            logger.log(&format!("[state] history: false, cutoff at msg {}", cutoff_id));
-                                        }
-                                    } else {
+                                    // Defer cutoff for history: false; clear immediately for history: true
+                                    let next_state_history_false = next_fm.history == Some(false);
+                                    if !next_state_history_false {
                                         history_cutoff = None;
+                                        let _ = store.set_history_cutoff(conv_name, agent_name, None);
                                     }
-                                    let _ = store.set_history_cutoff(conv_name, agent_name, history_cutoff);
 
                                     if next_fm.wait {
+                                        // Don't set cutoff here — caller stores response after we return.
+                                        // The initial-load path will set cutoff correctly on next invocation.
+                                        if next_state_history_false {
+                                            let _ = store.set_history_cutoff(conv_name, agent_name, None);
+                                        }
                                         logger.log(&format!("[state] Entering wait state: {}", next_state));
                                         return ToolLoopResult {
                                             response: stripped,
@@ -4168,6 +4186,12 @@ pub async fn run_tool_loop(
                                                         agent.lock().await.rename_step_files(turn_n, msg_id);
                                                     }
                                                     loop_body_stored = true;
+                                                    // Set cutoff AFTER store so the transitioning response is excluded
+                                                    if next_state_history_false {
+                                                        history_cutoff = Some(msg_id);
+                                                        let _ = store.set_history_cutoff(conv_name, agent_name, Some(msg_id));
+                                                        logger.log(&format!("[state] history: false, cutoff at msg {}", msg_id));
+                                                    }
                                                 }
                                                 Err(e) => logger.log(&format!("[loop] Failed to store message: {}", e)),
                                             }
