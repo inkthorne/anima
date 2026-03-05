@@ -11,9 +11,9 @@ use std::sync::{Arc, LazyLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-/// Regex for extracting `<python>...</python>` blocks.
+/// Regex for extracting `<python>...</python>` blocks (with optional `label` attribute).
 static PYTHON_BLOCK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?s)<python>\s*\n?(.*?)\n?\s*</python>").unwrap());
+    LazyLock::new(|| regex::Regex::new(r#"(?s)<python(?:\s+label="([^"]*)")?>\s*\n?(.*?)\n?\s*</python>"#).unwrap());
 
 /// Regex for extracting `<tool>...</tool>` JSON tool call blocks.
 static TOOL_CALL_RE: LazyLock<regex::Regex> =
@@ -117,12 +117,21 @@ pub struct ToolCall {
     pub params: serde_json::Value,
 }
 
+/// A parsed `<python>` block with optional label.
+struct PythonBlock {
+    code: String,
+    label: Option<String>,
+}
+
 /// Extract `<python>...</python>` blocks from agent output.
-/// Returns (cleaned_output, Vec<code_strings>).
-fn extract_python_blocks(output: &str) -> (String, Vec<String>) {
+/// Returns (cleaned_output, Vec<PythonBlock>).
+fn extract_python_blocks(output: &str) -> (String, Vec<PythonBlock>) {
     let mut blocks = Vec::new();
     for cap in PYTHON_BLOCK_RE.captures_iter(output) {
-        blocks.push(cap[1].to_string());
+        blocks.push(PythonBlock {
+            label: cap.get(1).map(|m| m.as_str().to_string()),
+            code: cap[2].to_string(),
+        });
     }
     let cleaned = PYTHON_BLOCK_RE.replace_all(output, "").trim().to_string();
     (cleaned, blocks)
@@ -131,25 +140,29 @@ fn extract_python_blocks(output: &str) -> (String, Vec<String>) {
 /// Execute a list of python code blocks and format results as `<python-output>` XML.
 /// Returns the individual result strings (caller joins and truncates).
 async fn execute_python_blocks(
-    blocks: &[String],
+    blocks: &[PythonBlock],
     agent_dir: Option<&Path>,
     logger: &AgentLogger,
 ) -> Vec<String> {
     let timeout = std::time::Duration::from_secs(30);
     let mem_limit = Some(crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES);
     let mut result_parts = Vec::new();
-    for (i, code) in blocks.iter().enumerate() {
+    for (i, block) in blocks.iter().enumerate() {
         logger.tool(&format!(
             "[loop] Executing python block {} ({} bytes)",
             i + 1,
-            code.len()
+            block.code.len()
         ));
-        match run_python(code, timeout, mem_limit, agent_dir).await {
+        let open_tag = match &block.label {
+            Some(label) => format!("<python-output label=\"{}\">", label),
+            None => "<python-output>".to_string(),
+        };
+        match run_python(&block.code, timeout, mem_limit, agent_dir).await {
             Ok(val) => {
                 let stdout = val["stdout"].as_str().unwrap_or("");
                 let stderr = val["stderr"].as_str().unwrap_or("");
                 let exit_code = val["exit_code"].as_i64().unwrap_or(0);
-                let mut part = format!("<python-output>\n{}", stdout);
+                let mut part = format!("{}\n{}", open_tag, stdout);
                 if !stderr.is_empty() {
                     part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
                 }
@@ -161,8 +174,8 @@ async fn execute_python_blocks(
             }
             Err(e) => {
                 result_parts.push(format!(
-                    "<python-output>\n<error>{}</error>\n</python-output>",
-                    e
+                    "{}\n<error>{}</error>\n</python-output>",
+                    open_tag, e
                 ));
             }
         }
@@ -9644,7 +9657,8 @@ api_key = "sk-test"
         let input = "Here is the result:\n<python>\nprint('hello')\n</python>\nDone.";
         let (cleaned, blocks) = extract_python_blocks(input);
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0], "print('hello')");
+        assert_eq!(blocks[0].code, "print('hello')");
+        assert!(blocks[0].label.is_none());
         assert!(cleaned.contains("Here is the result:"));
         assert!(cleaned.contains("Done."));
         assert!(!cleaned.contains("<python>"));
@@ -9655,8 +9669,8 @@ api_key = "sk-test"
         let input = "<python>\nx = 1\n</python>\ntext\n<python>\ny = 2\n</python>";
         let (cleaned, blocks) = extract_python_blocks(input);
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0], "x = 1");
-        assert_eq!(blocks[1], "y = 2");
+        assert_eq!(blocks[0].code, "x = 1");
+        assert_eq!(blocks[1].code, "y = 2");
         assert_eq!(cleaned, "text");
     }
 
@@ -9666,5 +9680,27 @@ api_key = "sk-test"
         let (cleaned, blocks) = extract_python_blocks(input);
         assert!(blocks.is_empty());
         assert_eq!(cleaned, input);
+    }
+
+    #[test]
+    fn test_extract_python_blocks_with_label() {
+        let input = r#"<python label="henry">print('hi')</python>"#;
+        let (cleaned, blocks) = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "print('hi')");
+        assert_eq!(blocks[0].label.as_deref(), Some("henry"));
+        assert_eq!(cleaned, "");
+    }
+
+    #[test]
+    fn test_extract_python_blocks_mixed_labeled_unlabeled() {
+        let input = "<python>\nx = 1\n</python>\nmiddle\n<python label=\"foo\">\ny = 2\n</python>";
+        let (cleaned, blocks) = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].code, "x = 1");
+        assert!(blocks[0].label.is_none());
+        assert_eq!(blocks[1].code, "y = 2");
+        assert_eq!(blocks[1].label.as_deref(), Some("foo"));
+        assert_eq!(cleaned, "middle");
     }
 }
