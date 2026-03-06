@@ -1487,8 +1487,9 @@ fn format_verbose_output(kind: &str, data: &serde_json::Value) {
 
 /// Stream agent response from a SocketApi connection.
 /// Prints chunks to stdout, verbose/tool events to stderr.
-async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::error::Error>> {
+async fn stream_agent_response(api: &mut SocketApi, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut had_chunks = false;
+    let mut in_thinking = false;
     loop {
         match api
             .read_response()
@@ -1496,8 +1497,35 @@ async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::e
             .map_err(|e| format!("Failed to read response: {}", e))?
         {
             Some(Response::Chunk { text }) => {
+                // Detect <think> / </think> boundaries
+                if text == "<think>" {
+                    in_thinking = true;
+                    if !had_chunks {
+                        print!("\x1b[2m<think>\n");
+                    } else {
+                        print!("\x1b[0m\x1b[2m<think>\n");
+                    }
+                    had_chunks = true;
+                    io::stdout().flush()?;
+                    continue;
+                }
+                if text.starts_with("</think>") {
+                    in_thinking = false;
+                    print!("</think>\x1b[0m\x1b[33m");
+                    let remainder = text.trim_start_matches("</think>");
+                    if !remainder.is_empty() {
+                        print!("{}", remainder);
+                    }
+                    io::stdout().flush()?;
+                    continue;
+                }
+
                 if !had_chunks {
-                    print!("\x1b[33m");
+                    if in_thinking {
+                        print!("\x1b[2m");
+                    } else {
+                        print!("\x1b[33m");
+                    }
                 }
                 had_chunks = true;
                 print!("{}", text);
@@ -1512,17 +1540,38 @@ async fn stream_agent_response(api: &mut SocketApi) -> Result<(), Box<dyn std::e
                 eprintln!(" - [tool] {}: {}", tool, param_summary);
             }
             Some(Response::Verbose { kind, data }) => {
-                if had_chunks {
-                    eprintln!();
-                    had_chunks = false;
+                if kind == "usage" {
+                    // Always show usage in dim after response
+                    let tokens_in = data["tokens_in"].as_u64().unwrap_or(0);
+                    let tokens_out = data["tokens_out"].as_u64().unwrap_or(0);
+                    let cached = data["cached_tokens"].as_u64().unwrap_or(0);
+                    let duration_ms = data["duration_ms"].as_u64().unwrap_or(0);
+                    let cached_str = if cached > 0 {
+                        format!(", {} cached", cached)
+                    } else {
+                        String::new()
+                    };
+                    if had_chunks {
+                        eprintln!();
+                        had_chunks = false;
+                    }
+                    eprintln!(
+                        "\x1b[2m  [{} in \u{2192} {} out{}, {}ms]\x1b[0m",
+                        tokens_in, tokens_out, cached_str, duration_ms
+                    );
+                } else if verbose {
+                    if had_chunks {
+                        eprintln!();
+                        had_chunks = false;
+                    }
+                    format_verbose_output(&kind, &data);
                 }
-                format_verbose_output(&kind, &data);
             }
             Some(Response::Done) => {
                 if had_chunks {
                     print!("\x1b[0m");
                 }
-                println!();
+                println!("\n");
                 break;
             }
             Some(Response::Message { content }) => {
@@ -1599,7 +1648,7 @@ async fn ask_agent(agent: &str, message: &str, verbose: bool) -> Result<(), Box<
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    stream_agent_response(&mut api).await
+    stream_agent_response(&mut api, verbose).await
 }
 
 /// After a debug/step, fetch and display all messages created since `since_id`.
@@ -1729,7 +1778,7 @@ async fn start_agent_debug(agent: &str, message: &str) -> Result<(), Box<dyn std
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    stream_agent_response(&mut api).await?;
+    stream_agent_response(&mut api, true).await?;
     dump_step_messages(&conv_name, last_id)
 }
 
@@ -1772,7 +1821,7 @@ async fn step_agent(agent: &str) -> Result<(), Box<dyn std::error::Error>> {
     .await
     .map_err(|e| format!("Failed to send message: {}", e))?;
 
-    stream_agent_response(&mut api).await?;
+    stream_agent_response(&mut api, true).await?;
     dump_step_messages(&conv_name, last_id)
 }
 

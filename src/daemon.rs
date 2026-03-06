@@ -4354,6 +4354,11 @@ pub async fn run_tool_loop(
                     current_message.push_str(&format!("\n\n---\n{}", nudge));
                 }
 
+                // Send a newline between assistant turns so streaming output is separated
+                if let Some(ref tx) = token_tx {
+                    let _ = tx.send("\n".to_string()).await;
+                }
+
                 steps_in_state += 1;
                 let _ = store.set_steps_in_state(conv_name, agent_name, steps_in_state);
             }
@@ -5878,13 +5883,10 @@ async fn handle_connection(
                 // Create streaming channel for tokens
                 let (token_tx, mut token_rx) = mpsc::channel::<String>(100);
 
-                // Create verbose channel if requested
-                let (verbose_tx, mut verbose_rx) = if verbose {
-                    let (tx, rx) = mpsc::channel::<Response>(100);
-                    (Some(tx), Some(rx))
-                } else {
-                    (None, None)
-                };
+                // Always create verbose channel (usage stats always flow to client)
+                let (verbose_tx_inner, verbose_rx_inner) = mpsc::channel::<Response>(100);
+                let verbose_tx = Some(verbose_tx_inner);
+                let mut verbose_rx = Some(verbose_rx_inner);
 
                 // Create oneshot channel for final result
                 let (response_tx, response_rx) = oneshot::channel();

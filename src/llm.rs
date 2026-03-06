@@ -1018,6 +1018,7 @@ impl OpenAIClient {
         let mut stream_completed = false;
         let mut stream_capture = String::new();
         let mut stream_error: Option<LLMError> = None;
+        let mut thinking_streaming = false;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -1066,11 +1067,20 @@ impl OpenAIClient {
                         "response.reasoning_text.delta"
                         | "response.reasoning_summary_text.delta" => {
                             if let Some(delta) = parsed["delta"].as_str() {
+                                if !thinking_streaming {
+                                    thinking_streaming = true;
+                                    let _ = tx.send("<think>".to_string()).await;
+                                }
                                 reasoning_content.push_str(delta);
+                                let _ = tx.send(delta.to_string()).await;
                             }
                         }
                         "response.output_text.delta" => {
                             if let Some(delta) = parsed["delta"].as_str() {
+                                if thinking_streaming {
+                                    thinking_streaming = false;
+                                    let _ = tx.send("</think>\n\n".to_string()).await;
+                                }
                                 full_content.push_str(delta);
                                 let _ = tx.send(delta.to_string()).await;
                             }
@@ -1156,6 +1166,10 @@ impl OpenAIClient {
                     }
                 }
             }
+        }
+
+        if thinking_streaming {
+            let _ = tx.send("</think>".to_string()).await;
         }
 
         // If the server sent an error mid-stream, return it so retry logic kicks in
@@ -1876,6 +1890,7 @@ impl LLM for OllamaClient {
         let mut usage: Option<UsageInfo> = None;
         let mut raw_lines: Vec<String> = Vec::new();
         let mut stream_capture = String::new();
+        let mut thinking_streaming = false;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -1911,6 +1926,10 @@ impl LLM for OllamaClient {
                     if let Some(content) = parsed["message"]["content"].as_str()
                         && !content.is_empty()
                     {
+                        if thinking_streaming {
+                            thinking_streaming = false;
+                            let _ = tx.send("</think>\n\n".to_string()).await;
+                        }
                         full_content.push_str(content);
                         let _ = tx.send(content.to_string()).await;
                     }
@@ -1918,7 +1937,12 @@ impl LLM for OllamaClient {
                     if let Some(thinking) = parsed["message"]["thinking"].as_str()
                         && !thinking.is_empty()
                     {
+                        if !thinking_streaming {
+                            thinking_streaming = true;
+                            let _ = tx.send("<think>".to_string()).await;
+                        }
                         reasoning_content.push_str(thinking);
+                        let _ = tx.send(thinking.to_string()).await;
                     }
 
                     if let Some(tc_array) = parsed["message"]["tool_calls"].as_array() {
@@ -1943,6 +1967,10 @@ impl LLM for OllamaClient {
                     }
                 }
             }
+        }
+
+        if thinking_streaming {
+            let _ = tx.send("</think>".to_string()).await;
         }
 
         let tool_calls = finalize_tool_call_builders(tool_call_builders);
