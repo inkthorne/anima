@@ -215,6 +215,76 @@ Tool calls are tracked differently depending on the tools mode:
 
 Both modes use `triggered_by` to attribute tool results to the invoking agent, enabling per-agent filtering in `format_conversation_history()`.
 
+## History Formatting (`format_conversation_history`)
+
+`format_conversation_history()` in `src/daemon.rs` converts `Vec<ConversationMessage>` (DB rows) into `Vec<ChatMessage>` (LLM wire format). It is the bridge between persistent storage and the LLM context window.
+
+**Signature:** `(messages, current_agent, dedup_up_to) -> (Vec<ChatMessage>, final_user_content)`
+
+### Role Mapping
+
+Each `ConversationMessage` is mapped based on `from_agent`:
+
+| `from_agent` | Emitted as | Details |
+|---|---|---|
+| `current_agent` | `role: "assistant"` | Thinking tags stripped. Tool calls deserialized from JSON (synthetic `tb-` IDs filtered out). |
+| `"tool"` (native, real ID) | `role: "tool"` | `tool_call_id` preserved for API compatibility. |
+| `"tool"` (legacy/tool-block, `tb-` ID) | `role: "user"` | Content passed through as-is. |
+| `"recall"` | Merged into next user batch | Wrapped in `<recall>...</recall>` XML, prepended to the following `<conversation>` block. |
+| Any other (user, other agents) | Batched into `role: "user"` | JSON-escaped, wrapped as `{"from": "...", "text": "..."}`, joined and wrapped in `<conversation>...</conversation>`. |
+
+### Filtering
+
+- **Other agents' tool results** — `triggered_by` doesn't match `current_agent` → skipped
+- **Other agents' recall** — same filter → skipped
+- **Deduped messages** — IDs in `drop_ids` set → skipped (see Dedup below)
+
+### User Batching
+
+Consecutive non-self, non-tool, non-recall messages are accumulated into a single `role: "user"` ChatMessage. The batch is flushed whenever an assistant or tool message is encountered, maintaining strict role alternation. The final pending batch is returned separately as `final_user_content` (the current query for the LLM).
+
+When recall is pending, it merges into the next user batch:
+```
+<recall>
+{recall content}
+</recall>
+
+<conversation>
+{user messages}
+</conversation>
+```
+
+### Dedup (Pre-scan)
+
+Before the main loop, a three-pass pre-scan identifies tool call/result pairs to drop. Only messages with `id <= dedup_up_to` are eligible.
+
+**Pass 1:** Scan assistant messages for `tool_calls` JSON. Index each tool call by `tool_call_id` with its kind and path/command.
+
+**Pass 2:** Scan tool result messages. Match each to its tool call via `tool_call_id`. Group into per-kind collections.
+
+**Pass 3:** Apply dedup rules:
+
+| Tool | Rule |
+|---|---|
+| `read_file` / `write_file` | Keep only the latest per path (both contribute to "fresh view") |
+| `peek_file` | Drop if a later full-read or write exists for same path |
+| `edit_file` | Drop if a later full-read or write exists for same path |
+| `shell` / `safe_shell` | Keep only the latest per normalized command (strips `2>&1`, trailing pipe filters) |
+| `notes` | Keep only the latest |
+| Unknown tools | Keep only the latest |
+
+An assistant message is only dropped if **all** of its tool calls are dropped.
+
+### Notes Stripping
+
+After the main loop, `<notes>...</notes>` blocks are stripped from assistant messages within the dedup boundary (at or before `dedup_up_to`). The last assistant message in history always keeps its notes.
+
+### Return Value
+
+Returns `(history, final_user_content)`:
+- `history` — the `Vec<ChatMessage>` ready for `ThinkOptions`
+- `final_user_content` — the last pending user batch (current query), or empty string if the last message was from the agent
+
 ## Semantic Search
 
 Embeddings enable semantic similarity search over conversation history:
