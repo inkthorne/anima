@@ -1520,6 +1520,22 @@ async fn stream_agent_response(api: &mut SocketApi, verbose: bool) -> Result<(),
                     continue;
                 }
 
+                // Detect python output blocks — render in cyan
+                if text.contains("<python-output") {
+                    if had_chunks {
+                        print!("\x1b[0m");
+                    }
+                    print!("\x1b[36m{}\x1b[0m", text);
+                    if !in_thinking {
+                        print!("\x1b[33m");
+                    } else {
+                        print!("\x1b[2m");
+                    }
+                    had_chunks = true;
+                    io::stdout().flush()?;
+                    continue;
+                }
+
                 if !had_chunks {
                     if in_thinking {
                         print!("\x1b[2m");
