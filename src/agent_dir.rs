@@ -435,6 +435,71 @@ impl AgentDir {
     }
 }
 
+/// Create an LLM client from resolved configuration.
+pub async fn create_llm_from_config(
+    config: &ResolvedLlmConfig,
+    api_key: Option<String>,
+) -> Result<std::sync::Arc<dyn crate::llm::LLM>, AgentDirError> {
+    use crate::llm::{AnthropicClient, ClaudeCodeClient, OllamaClient, OpenAIClient};
+    use std::sync::Arc;
+
+    let llm: Arc<dyn crate::llm::LLM> = match config.provider.as_str() {
+        "openai" => {
+            let key = api_key.ok_or(AgentDirError::EnvVarNotSet("OPENAI_API_KEY".to_string()))?;
+            let mut client = OpenAIClient::new(key).with_model(&config.model);
+            if let Some(ref base_url) = config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            if let Some(ref style) = config.api_style {
+                client = client.with_api_style(style);
+            }
+            client = client
+                .with_temperature(config.temperature)
+                .with_top_p(config.top_p)
+                .with_frequency_penalty(config.frequency_penalty);
+            Arc::new(client)
+        }
+        "anthropic" => {
+            if let Some(key) = api_key {
+                let mut client = AnthropicClient::new(key).with_model(&config.model);
+                if let Some(ref base_url) = config.base_url {
+                    client = client.with_base_url(base_url);
+                }
+                if let Some(mt) = config.max_tokens {
+                    client = client.with_max_tokens(mt);
+                }
+                Arc::new(client)
+            } else if let Some(tokens) = crate::auth::load_tokens() {
+                Arc::new(crate::llm::RefreshingAnthropicClient::new(
+                    tokens,
+                    config.model.clone(),
+                    config.base_url.clone(),
+                    config.max_tokens,
+                ))
+            } else {
+                return Err(AgentDirError::LlmError(
+                    "No Anthropic API key or subscription login found. Run `anima login` or set ANTHROPIC_API_KEY.".to_string(),
+                ));
+            }
+        }
+        "ollama" => {
+            let mut client = OllamaClient::new()
+                .with_model(&config.model)
+                .with_thinking(config.thinking)
+                .with_num_ctx(config.num_ctx);
+            if let Some(ref base_url) = config.base_url {
+                client = client.with_base_url(base_url);
+            }
+            Arc::new(client)
+        }
+        "claude-code" => Arc::new(ClaudeCodeClient::new(&config.model)),
+        other => {
+            return Err(AgentDirError::UnsupportedProvider(other.to_string()));
+        }
+    };
+    Ok(llm)
+}
+
 /// Get the anima base directory path (~/.anima/)
 fn anima_dir() -> PathBuf {
     dirs::home_dir()

@@ -222,15 +222,13 @@ pub fn extract_tool_call(output: &str, tool_names: &[&str]) -> (String, Option<T
 }
 
 use crate::agent::{Agent, ThinkOptions};
-use crate::agent_dir::{AgentDir, AgentDirError, ResolvedLlmConfig, SemanticMemorySection, resolve_embedding_config};
+use crate::agent_dir::{AgentDir, AgentDirError, SemanticMemorySection, create_llm_from_config, resolve_embedding_config};
 use crate::conversation::ConversationMessage;
 use crate::conversation::ConversationStore;
 use crate::discovery;
 use crate::embedding::EmbeddingClient;
-use crate::auth;
 use crate::llm::{
-    AnthropicClient, ChatMessage, ClaudeCodeClient, LLM, OllamaClient,
-    OpenAIClient, ToolSpec, strip_thinking_tags,
+    ChatMessage, LLM, ToolSpec, strip_thinking_tags,
 };
 use crate::memory::{
     InMemoryStore, Memory, SaveResult, SemanticMemoryStore, SqliteMemory, build_memory_injection,
@@ -2583,8 +2581,6 @@ async fn create_agent_from_dir(
     Ok((agent, use_native_tools))
 }
 
-use crate::llm::RefreshingAnthropicClient;
-
 /// Query an OpenAI-compatible /v1/models/{model} endpoint for max_context_length.
 /// Returns None on any failure (network, parse, missing field).
 async fn query_openai_model_ctx(base_url: &str, model: &str) -> Option<u32> {
@@ -2593,65 +2589,6 @@ async fn query_openai_model_ctx(base_url: &str, model: &str) -> Option<u32> {
     let resp = client.get(&url).send().await.ok()?;
     let json: serde_json::Value = resp.json().await.ok()?;
     json["max_context_length"].as_u64().map(|v| v as u32)
-}
-
-/// Create an LLM client from resolved configuration.
-async fn create_llm_from_config(
-    config: &ResolvedLlmConfig,
-    api_key: Option<String>,
-) -> Result<Arc<dyn LLM>, Box<dyn std::error::Error>> {
-    let llm: Arc<dyn LLM> = match config.provider.as_str() {
-        "openai" => {
-            let key = api_key.ok_or("OpenAI API key not configured")?;
-            let mut client = OpenAIClient::new(key).with_model(&config.model);
-            if let Some(ref base_url) = config.base_url {
-                client = client.with_base_url(base_url);
-            }
-            if let Some(ref style) = config.api_style {
-                client = client.with_api_style(style);
-            }
-            client = client
-                .with_temperature(config.temperature)
-                .with_top_p(config.top_p)
-                .with_frequency_penalty(config.frequency_penalty);
-            Arc::new(client)
-        }
-        "anthropic" => {
-            if let Some(key) = api_key {
-                let mut client = AnthropicClient::new(key).with_model(&config.model);
-                if let Some(ref base_url) = config.base_url {
-                    client = client.with_base_url(base_url);
-                }
-                if let Some(mt) = config.max_tokens {
-                    client = client.with_max_tokens(mt);
-                }
-                Arc::new(client)
-            } else if let Some(tokens) = auth::load_tokens() {
-                // Use RefreshingAnthropicClient for daemon longevity
-                Arc::new(RefreshingAnthropicClient::new(
-                    tokens,
-                    config.model.clone(),
-                    config.base_url.clone(),
-                    config.max_tokens,
-                ))
-            } else {
-                return Err("No Anthropic API key or subscription login found. Run `anima login` or set ANTHROPIC_API_KEY.".into());
-            }
-        }
-        "ollama" => {
-            let mut client = OllamaClient::new()
-                .with_model(&config.model)
-                .with_thinking(config.thinking)
-                .with_num_ctx(config.num_ctx);
-            if let Some(ref base_url) = config.base_url {
-                client = client.with_base_url(base_url);
-            }
-            Arc::new(client)
-        }
-        "claude-code" => Arc::new(ClaudeCodeClient::new(&config.model)),
-        other => return Err(format!("Unsupported LLM provider: {}", other).into()),
-    };
-    Ok(llm)
 }
 
 /// Worker task that owns the agent and processes work items sequentially.

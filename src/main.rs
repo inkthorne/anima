@@ -144,6 +144,13 @@ enum Commands {
         #[command(subcommand)]
         command: MemoryCommands,
     },
+    /// Send a message through an AnimaThread (no daemon, no tools)
+    Thread {
+        /// Agent name (from ~/.anima/agents/) or path to agent directory
+        agent: String,
+        /// Message to send
+        message: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -448,6 +455,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
+        Commands::Thread { agent, message } => {
+            if let Err(e) = run_thread(&agent, &message).await {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -492,6 +505,15 @@ fn agents_dir() -> PathBuf {
         .expect("Could not determine home directory")
         .join(".anima")
         .join("agents")
+}
+
+async fn run_thread(agent: &str, message: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let agent_path = resolve_agent_path(agent);
+    let agent_dir = AgentDir::load(&agent_path)?;
+    let mut thread = anima::AnimaThread::from_agent_dir(&agent_dir).await?;
+    let response = thread.send(message).await?;
+    println!("{}", response);
+    Ok(())
 }
 
 /// Resolve an agent path from a name or path string.

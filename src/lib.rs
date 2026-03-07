@@ -18,6 +18,7 @@ pub mod retry;
 pub mod runtime;
 pub mod socket_api;
 pub mod supervision;
+pub mod thread;
 pub mod tool;
 pub mod tool_registry;
 pub mod tools;
@@ -52,6 +53,7 @@ pub use observe::{
 pub use retry::{RetryPolicy, RetryResult, with_retry};
 pub use runtime::Runtime;
 pub use supervision::{ChildConfig, ChildHandle, ChildStatus};
+pub use thread::{AnimaThread, ThreadError};
 pub use tool::{Tool, ToolInfo};
 pub use tool_registry::{ToolDefinition, ToolRegistry, ToolRegistryError};
 pub use tools::{
