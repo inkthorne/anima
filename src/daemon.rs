@@ -3562,6 +3562,11 @@ pub async fn run_tool_loop(
                             ).into_owned();
                             logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
 
+                            // Stream python output to client
+                            if let Some(ref tx) = token_tx {
+                                let _ = tx.send(format!("\n{}\n", tool_message)).await;
+                            }
+
                             if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
                                 logger.log(&format!("[loop] Failed to store python result: {}", e));
                             }
@@ -3859,6 +3864,11 @@ pub async fn run_tool_loop(
                                 &result_parts.join("\n---\n"), num_ctx,
                             ).into_owned();
                             logger.tool(&format!("[loop] Python result: {} bytes", tool_message.len()));
+
+                            // Stream python output to client
+                            if let Some(ref tx) = token_tx {
+                                let _ = tx.send(format!("\n{}\n", tool_message)).await;
+                            }
 
                             if let Err(e) = store.add_tool_result(conv_name, &tool_message, agent_name) {
                                 logger.log(&format!("[loop] Failed to store python result: {}", e));
