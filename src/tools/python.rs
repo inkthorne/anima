@@ -93,7 +93,12 @@ pub async fn run_python(
         if let Some(dir) = agent_dir {
             let python_dir = dir.join("python");
             if python_dir.is_dir() {
-                cmd.env("PYTHONPATH", &python_dir);
+                let new_path = if let Ok(existing) = std::env::var("PYTHONPATH") {
+                    format!("{}:{}", python_dir.display(), existing)
+                } else {
+                    python_dir.display().to_string()
+                };
+                cmd.env("PYTHONPATH", &new_path);
             }
         }
         // SAFETY: setpgid and setrlimit are async-signal-safe and called before exec.
