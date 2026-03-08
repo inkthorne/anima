@@ -584,6 +584,26 @@ async fn handle_thread_command(
                         let mut in_thinking = false;
                         let mut in_python_output = false;
                         while let Some(token) = rx.recv().await {
+                            // Detect <usage>...</usage> tags (before \r\n conversion)
+                            if token.starts_with("<usage>") && token.ends_with("</usage>") {
+                                let inner = &token[7..token.len() - 8];
+                                let nl = if raw_mode { "\r\n" } else { "\n" };
+                                print!("\x1b[0m{}\x1b[2m  [{}]\x1b[0m\x1b[33m", nl, inner);
+                                had_chunks = true;
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+
+                            // Detect <retry>...</retry> tags (before \r\n conversion)
+                            if token.starts_with("<retry>") && token.ends_with("</retry>") {
+                                let inner = &token[7..token.len() - 8];
+                                let nl = if raw_mode { "\r\n" } else { "\n" };
+                                print!("\x1b[0m{}\x1b[2;33m  [{}]\x1b[0m\x1b[33m", nl, inner);
+                                had_chunks = true;
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+
                             // In raw mode, \n must become \r\n for proper display
                             let token = if raw_mode {
                                 token.replace('\n', "\r\n")
@@ -665,21 +685,8 @@ async fn handle_thread_command(
                     drop(_raw_guard);
 
                     match result {
-                        Some(Ok(response)) => {
+                        Some(Ok(_response)) => {
                             println!();
-                            if let Some(ref usage) = response.usage {
-                                if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
-                                    let cached_str = if let Some(cached) = usage.cached_tokens {
-                                        format!(", {} cached", cached)
-                                    } else {
-                                        String::new()
-                                    };
-                                    println!(
-                                        "\x1b[2m  [{} in \u{2192} {} out{}]\x1b[0m",
-                                        usage.prompt_tokens, usage.completion_tokens, cached_str
-                                    );
-                                }
-                            }
                         }
                         Some(Err(e)) => return Err(Box::new(e)),
                         None => {

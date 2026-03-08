@@ -399,6 +399,7 @@ enum ApiStyle {
 
 pub struct OpenAIClient {
     client: Client,
+    stream_client: Client,
     api_key: String,
     base_url: String,
     model: String,
@@ -418,6 +419,12 @@ impl OpenAIClient {
                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 .build()
                 .expect("failed to build HTTP client"),
+            stream_client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .expect("failed to build HTTP stream client"),
             api_key: api_key.into(),
             base_url: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o".to_string(),
@@ -787,7 +794,7 @@ impl OpenAIClient {
         self.inject_sampling_params(&mut request_body);
 
         let response = self
-            .client
+            .stream_client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -984,7 +991,7 @@ impl OpenAIClient {
         self.inject_sampling_params(&mut request_body);
 
         let response = self
-            .client
+            .stream_client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
@@ -1241,6 +1248,7 @@ pub enum AnthropicAuth {
 
 pub struct AnthropicClient {
     client: Client,
+    stream_client: Client,
     auth: AnthropicAuth,
     base_url: String,
     model: String,
@@ -1257,6 +1265,12 @@ impl AnthropicClient {
                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 .build()
                 .expect("failed to build HTTP client"),
+            stream_client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .expect("failed to build HTTP stream client"),
             auth: AnthropicAuth::ApiKey(api_key.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -1271,6 +1285,10 @@ impl AnthropicClient {
                 .timeout(std::time::Duration::from_secs(300))
                 .build()
                 .expect("failed to build HTTP client"),
+            stream_client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP stream client"),
             auth: AnthropicAuth::Bearer(token.into()),
             base_url: "https://api.anthropic.com".to_string(),
             model: "claude-sonnet-4-20250514".to_string(),
@@ -1431,7 +1449,7 @@ impl LLM for AnthropicClient {
         }
 
         let req = self
-            .client
+            .stream_client
             .post(&url)
             .header("Content-Type", "application/json")
             .header("anthropic-version", "2023-06-01")
@@ -1650,6 +1668,7 @@ pub fn strip_thinking_tags(content: &str) -> String {
 /// Configure with OLLAMA_HOST env var (defaults to http://localhost:11434)
 pub struct OllamaClient {
     client: Client,
+    stream_client: Client,
     base_url: String,
     model: String,
     thinking: Option<bool>,
@@ -1668,6 +1687,12 @@ impl OllamaClient {
                 .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
                 .build()
                 .expect("failed to build HTTP client"),
+            stream_client: Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .pool_idle_timeout(Some(std::time::Duration::from_secs(120)))
+                .tcp_keepalive(Some(std::time::Duration::from_secs(30)))
+                .build()
+                .expect("failed to build HTTP stream client"),
             base_url,
             model: "llama3".to_string(),
             thinking: None,
@@ -1892,7 +1917,7 @@ impl LLM for OllamaClient {
         }
 
         let response = self
-            .client
+            .stream_client
             .post(&url)
             .header("Content-Type", "application/json")
             .json(&request_body)

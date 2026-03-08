@@ -8,6 +8,9 @@ use tokio::sync::mpsc;
 
 use crate::agent_dir::{AgentDir, AgentDirError, create_llm_from_config};
 use crate::llm::{ChatMessage, LLM, LLMError, LLMResponse};
+
+const STREAM_MAX_RETRIES: u32 = 3;
+const STREAM_RETRY_BASE_DELAY_SECS: u64 = 2;
 use crate::tools::python::run_python;
 use crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES;
 
@@ -261,17 +264,51 @@ impl AnimaThread {
     ) -> Result<LLMResponse, ThreadError> {
         let mut current_message = message.to_string();
         let mut first_turn = true;
+        let started = std::time::Instant::now();
+        let mut turn = 0u32;
 
         loop {
-            let response = if first_turn {
-                self.send_stream(&current_message, tx.clone()).await?
-            } else {
-                // On subsequent turns, the user message is already in history from the
-                // first turn. We just need to call send_stream with an empty prompt —
-                // but send_stream always pushes a user message. Instead, we build
-                // messages manually and only push the assistant response.
-                self.send_stream_continuation(tx.clone()).await?
+            turn += 1;
+            let response = {
+                let mut attempt = 0u32;
+                loop {
+                    let result = if first_turn {
+                        self.send_stream(&current_message, tx.clone()).await
+                    } else {
+                        self.send_stream_continuation(tx.clone()).await
+                    };
+                    match result {
+                        Ok(resp) => break resp,
+                        Err(ThreadError::Llm(ref llm_err)) if llm_err.is_retryable && attempt < STREAM_MAX_RETRIES => {
+                            attempt += 1;
+                            let delay = STREAM_RETRY_BASE_DELAY_SECS * (1 << (attempt - 1));
+                            let _ = tx.send(format!(
+                                "<retry>Stream error, retrying in {}s (attempt {}/{})...</retry>",
+                                delay, attempt, STREAM_MAX_RETRIES
+                            )).await;
+                            tokio::time::sleep(Duration::from_secs(delay)).await;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
             };
+
+            // Send usage stats after each LLM response
+            if let Some(ref usage) = response.usage {
+                if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                    let cached_str = if let Some(cached) = usage.cached_tokens {
+                        format!(", {} cached", cached)
+                    } else {
+                        String::new()
+                    };
+                    let elapsed = started.elapsed().as_secs_f64();
+                    let _ = tx.send(format!(
+                        "<usage>{} in \u{2192} {} out{} | {:.1}s | turn {}</usage>",
+                        usage.prompt_tokens, usage.completion_tokens, cached_str, elapsed, turn
+                    )).await;
+                }
+            }
 
             let content = response.content.clone().unwrap_or_default();
             let blocks = extract_python_blocks(&content);
@@ -467,6 +504,41 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].code, "print('hi')");
         assert_eq!(blocks[0].label.as_deref(), Some("henry"));
+    }
+
+    #[test]
+    fn test_thread_error_retryable_llm() {
+        let err = ThreadError::Llm(LLMError::retryable("transient network error"));
+        match &err {
+            ThreadError::Llm(llm_err) => assert!(llm_err.is_retryable),
+            _ => panic!("expected ThreadError::Llm"),
+        }
+    }
+
+    #[test]
+    fn test_thread_error_permanent_llm() {
+        let err = ThreadError::Llm(LLMError::permanent("bad request"));
+        match &err {
+            ThreadError::Llm(llm_err) => assert!(!llm_err.is_retryable),
+            _ => panic!("expected ThreadError::Llm"),
+        }
+    }
+
+    #[test]
+    fn test_thread_error_non_llm_not_retryable() {
+        let err = ThreadError::Io(std::io::Error::new(std::io::ErrorKind::NotFound, "file not found"));
+        assert!(!matches!(err, ThreadError::Llm(_)));
+    }
+
+    #[test]
+    fn test_retry_constants() {
+        assert_eq!(STREAM_MAX_RETRIES, 3);
+        assert_eq!(STREAM_RETRY_BASE_DELAY_SECS, 2);
+        // Verify exponential backoff: 2s, 4s, 8s
+        for attempt in 1..=STREAM_MAX_RETRIES {
+            let delay = STREAM_RETRY_BASE_DELAY_SECS * (1 << (attempt - 1));
+            assert_eq!(delay, 2u64.pow(attempt));
+        }
     }
 
     #[test]
