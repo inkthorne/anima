@@ -543,11 +543,26 @@ async fn handle_thread_command(
             println!("Thread '{}' cleared.", name);
         }
         None => {
-            let name = name.expect("thread name required");
-            let message = message.expect("message required");
-            let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
-            let response = thread.send(&message).await?;
-            println!("{}", response);
+            match (name, message) {
+                (Some(name), Some(message)) => {
+                    let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
+                    let response = thread.send(&message).await?;
+                    println!("{}", response);
+                }
+                _ => {
+                    let threads = anima::AnimaThread::list_all()?;
+                    if threads.is_empty() {
+                        println!("No threads found.");
+                        println!("Create one with: anima thread create <name> <agent>");
+                    } else {
+                        println!("{:<30} {:<20} {:>4}", "NAME", "AGENT", "MSGS");
+                        println!("{}", "-".repeat(80));
+                        for (name, agent, count) in &threads {
+                            println!("{:<30} {:<20} {:>4}", name, agent, count);
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())

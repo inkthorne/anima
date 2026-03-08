@@ -155,6 +155,32 @@ impl AnimaThread {
     pub fn agent_name(&self) -> &str {
         &self.agent_name
     }
+
+    /// List all threads from `~/.anima/threads/`.
+    /// Returns `Vec<(name, agent, message_count)>` sorted by name.
+    pub fn list_all() -> Result<Vec<(String, String, usize)>, ThreadError> {
+        let dir = threads_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                let data = std::fs::read_to_string(&path)?;
+                let file: ThreadFile = serde_json::from_str(&data)?;
+                results.push((name, file.agent, file.history.len()));
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(results)
+    }
 }
 
 /// Write JSON atomically: write to `.tmp` then rename.
