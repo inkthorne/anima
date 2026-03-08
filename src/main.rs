@@ -590,9 +590,22 @@ async fn handle_thread_command(
                             print!("\x1b[0m");
                         }
                     });
-                    let _response = thread.send_stream(&message, tx).await?;
+                    let response = thread.send_stream(&message, tx).await?;
                     print_handle.await.unwrap();
                     println!();
+                    if let Some(ref usage) = response.usage {
+                        if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                            let cached_str = if let Some(cached) = usage.cached_tokens {
+                                format!(", {} cached", cached)
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "\x1b[2m  [{} in \u{2192} {} out{}]\x1b[0m",
+                                usage.prompt_tokens, usage.completion_tokens, cached_str
+                            );
+                        }
+                    }
                 }
                 _ => {
                     let threads = anima::AnimaThread::list_all()?;

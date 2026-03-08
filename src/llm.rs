@@ -1461,6 +1461,9 @@ impl LLM for AnthropicClient {
         let mut buffer = String::new();
         let mut raw_lines: Vec<String> = Vec::new();
         let mut stream_capture = String::new();
+        let mut usage_input: u32 = 0;
+        let mut usage_output: u32 = 0;
+        let mut usage_cached: u32 = 0;
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
@@ -1566,6 +1569,25 @@ impl LLM for AnthropicClient {
                                 }
                             }
                         }
+                        "message_start" => {
+                            if let Some(msg) = parsed["message"].as_object() {
+                                if let Some(u) = msg.get("usage").and_then(|v| v.as_object()) {
+                                    if let Some(n) = u.get("input_tokens").and_then(|v| v.as_u64()) {
+                                        usage_input = n as u32;
+                                    }
+                                    if let Some(n) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                                        usage_cached = n as u32;
+                                    }
+                                }
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(u) = parsed["usage"].as_object() {
+                                if let Some(n) = u.get("output_tokens").and_then(|v| v.as_u64()) {
+                                    usage_output = n as u32;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1575,7 +1597,16 @@ impl LLM for AnthropicClient {
         Ok(LLMResponse {
             content: none_if_empty(full_content),
             tool_calls,
-            usage: None,
+            usage: if usage_input > 0 || usage_output > 0 {
+                Some(UsageInfo {
+                    prompt_tokens: usage_input,
+                    completion_tokens: usage_output,
+                    prompt_eval_duration_ns: None,
+                    cached_tokens: if usage_cached > 0 { Some(usage_cached) } else { None },
+                })
+            } else {
+                None
+            },
             raw_body: if raw_lines.is_empty() { None } else { Some(raw_lines.join("\n")) },
             raw_stream: Some(stream_capture),
         })

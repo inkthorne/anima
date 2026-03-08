@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::agent_dir::{AgentDir, AgentDirError, create_llm_from_config};
-use crate::llm::{ChatMessage, LLM, LLMError};
+use crate::llm::{ChatMessage, LLM, LLMError, LLMResponse};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThreadError {
@@ -105,7 +105,7 @@ impl AnimaThread {
     }
 
     /// Send a message and get a response. Persists history to disk.
-    pub async fn send(&mut self, message: &str) -> Result<String, ThreadError> {
+    pub async fn send(&mut self, message: &str) -> Result<LLMResponse, ThreadError> {
         let mut messages = Vec::new();
         if let Some(ref system) = self.system_prompt {
             messages.push(ChatMessage {
@@ -124,7 +124,7 @@ impl AnimaThread {
         });
 
         let response = self.llm.chat_complete(messages, None).await?;
-        let content = response.content.unwrap_or_default();
+        let content = response.content.clone().unwrap_or_default();
 
         self.history.push(ChatMessage {
             role: "user".to_string(),
@@ -134,22 +134,22 @@ impl AnimaThread {
         });
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
-            content: Some(content.clone()),
+            content: Some(content),
             tool_call_id: None,
             tool_calls: None,
         });
 
         self.save()?;
-        Ok(content)
+        Ok(response)
     }
 
     /// Send a message and stream tokens through the channel as they arrive.
-    /// Returns the full response content. Persists history to disk.
+    /// Returns the full `LLMResponse` (including usage). Persists history to disk.
     pub async fn send_stream(
         &mut self,
         message: &str,
         tx: mpsc::Sender<String>,
-    ) -> Result<String, ThreadError> {
+    ) -> Result<LLMResponse, ThreadError> {
         let mut messages = Vec::new();
         if let Some(ref system) = self.system_prompt {
             messages.push(ChatMessage {
@@ -168,7 +168,7 @@ impl AnimaThread {
         });
 
         let response = self.llm.chat_complete_stream(messages, None, tx).await?;
-        let content = response.content.unwrap_or_default();
+        let content = response.content.clone().unwrap_or_default();
 
         self.history.push(ChatMessage {
             role: "user".to_string(),
@@ -178,13 +178,13 @@ impl AnimaThread {
         });
         self.history.push(ChatMessage {
             role: "assistant".to_string(),
-            content: Some(content.clone()),
+            content: Some(content),
             tool_call_id: None,
             tool_calls: None,
         });
 
         self.save()?;
-        Ok(content)
+        Ok(response)
     }
 
     /// Persist current history to disk with atomic write.
