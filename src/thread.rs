@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use crate::agent_dir::{AgentDir, AgentDirError, create_llm_from_config};
 use crate::llm::{ChatMessage, LLM, LLMError};
@@ -123,6 +124,50 @@ impl AnimaThread {
         });
 
         let response = self.llm.chat_complete(messages, None).await?;
+        let content = response.content.unwrap_or_default();
+
+        self.history.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(message.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+        self.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(content.clone()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        self.save()?;
+        Ok(content)
+    }
+
+    /// Send a message and stream tokens through the channel as they arrive.
+    /// Returns the full response content. Persists history to disk.
+    pub async fn send_stream(
+        &mut self,
+        message: &str,
+        tx: mpsc::Sender<String>,
+    ) -> Result<String, ThreadError> {
+        let mut messages = Vec::new();
+        if let Some(ref system) = self.system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        messages.extend(self.history.clone());
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(message.to_string()),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        let response = self.llm.chat_complete_stream(messages, None, tx).await?;
         let content = response.content.unwrap_or_default();
 
         self.history.push(ChatMessage {

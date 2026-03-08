@@ -546,8 +546,16 @@ async fn handle_thread_command(
             match (name, message) {
                 (Some(name), Some(message)) => {
                     let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
-                    let response = thread.send(&message).await?;
-                    println!("{}", response);
+                    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+                    let print_handle = tokio::spawn(async move {
+                        while let Some(token) = rx.recv().await {
+                            print!("{}", token);
+                            let _ = io::stdout().flush();
+                        }
+                    });
+                    let _response = thread.send_stream(&message, tx).await?;
+                    print_handle.await.unwrap();
+                    println!();
                 }
                 _ => {
                     let threads = anima::AnimaThread::list_all()?;
