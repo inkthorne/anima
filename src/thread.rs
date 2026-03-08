@@ -1,11 +1,73 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::agent_dir::{AgentDir, AgentDirError, create_llm_from_config};
 use crate::llm::{ChatMessage, LLM, LLMError, LLMResponse};
+use crate::tools::python::run_python;
+use crate::tools::shell::DEFAULT_MEM_LIMIT_BYTES;
+
+/// Regex for extracting `<python>...</python>` blocks (with optional `label` attribute).
+static PYTHON_BLOCK_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?s)<python(?:\s+label="([^"]*)")?>\s*\n?(.*?)\n?\s*</python>"#).unwrap());
+
+/// A parsed `<python>` block with optional label.
+struct PythonBlock {
+    code: String,
+    label: Option<String>,
+}
+
+/// Extract `<python>...</python>` blocks from text.
+/// Returns Vec of parsed blocks.
+fn extract_python_blocks(text: &str) -> Vec<PythonBlock> {
+    PYTHON_BLOCK_RE
+        .captures_iter(text)
+        .map(|cap| PythonBlock {
+            label: cap.get(1).map(|m| m.as_str().to_string()),
+            code: cap[2].to_string(),
+        })
+        .collect()
+}
+
+/// Execute python blocks and format results as `<python-output>` XML.
+async fn execute_and_format_python(
+    blocks: &[PythonBlock],
+    agent_dir: Option<&Path>,
+) -> String {
+    let timeout = Duration::from_secs(30);
+    let mem_limit = Some(DEFAULT_MEM_LIMIT_BYTES);
+    let mut parts = Vec::new();
+    for block in blocks {
+        let open_tag = match &block.label {
+            Some(label) => format!("<python-output label=\"{}\">", label),
+            None => "<python-output>".to_string(),
+        };
+        match run_python(&block.code, timeout, mem_limit, agent_dir).await {
+            Ok(val) => {
+                let stdout = val["stdout"].as_str().unwrap_or("");
+                let stderr = val["stderr"].as_str().unwrap_or("");
+                let exit_code = val["exit_code"].as_i64().unwrap_or(0);
+                let mut part = format!("{}\n{}", open_tag, stdout);
+                if !stderr.is_empty() {
+                    part.push_str(&format!("<stderr>{}</stderr>\n", stderr));
+                }
+                if exit_code != 0 {
+                    part.push_str(&format!("<exit-code>{}</exit-code>\n", exit_code));
+                }
+                part.push_str("</python-output>");
+                parts.push(part);
+            }
+            Err(e) => {
+                parts.push(format!("{}\n<error>{}</error>\n</python-output>", open_tag, e));
+            }
+        }
+    }
+    parts.join("\n---\n")
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ThreadError {
@@ -187,6 +249,93 @@ impl AnimaThread {
         Ok(response)
     }
 
+    /// Send a message, stream tokens, and automatically execute `<python>` blocks.
+    /// If the LLM response contains `<python>` blocks, they are executed and the
+    /// results fed back as a tool message, then the LLM is called again in a loop.
+    /// Returns the final `LLMResponse` (from the last LLM call).
+    pub async fn send_stream_with_python(
+        &mut self,
+        message: &str,
+        tx: mpsc::Sender<String>,
+        agent_dir: Option<PathBuf>,
+    ) -> Result<LLMResponse, ThreadError> {
+        let mut current_message = message.to_string();
+        let mut first_turn = true;
+
+        loop {
+            let response = if first_turn {
+                self.send_stream(&current_message, tx.clone()).await?
+            } else {
+                // On subsequent turns, the user message is already in history from the
+                // first turn. We just need to call send_stream with an empty prompt —
+                // but send_stream always pushes a user message. Instead, we build
+                // messages manually and only push the assistant response.
+                self.send_stream_continuation(tx.clone()).await?
+            };
+
+            let content = response.content.clone().unwrap_or_default();
+            let blocks = extract_python_blocks(&content);
+
+            if blocks.is_empty() {
+                return Ok(response);
+            }
+
+            // Execute python blocks
+            let result = execute_and_format_python(
+                &blocks,
+                agent_dir.as_deref(),
+            )
+            .await;
+
+            // Stream the python output through the channel
+            let _ = tx.send(format!("\n{}\n", result)).await;
+
+            // Push tool result into history
+            self.history.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some(result),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+            self.save()?;
+
+            first_turn = false;
+            current_message = String::new();
+        }
+    }
+
+    /// Continue a conversation without adding a new user message.
+    /// Used for python-block loop: history already has the tool result,
+    /// just need to get the next LLM response.
+    async fn send_stream_continuation(
+        &mut self,
+        tx: mpsc::Sender<String>,
+    ) -> Result<LLMResponse, ThreadError> {
+        let mut messages = Vec::new();
+        if let Some(ref system) = self.system_prompt {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.clone()),
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
+        messages.extend(self.history.clone());
+
+        let response = self.llm.chat_complete_stream(messages, None, tx).await?;
+        let content = response.content.clone().unwrap_or_default();
+
+        self.history.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(content),
+            tool_call_id: None,
+            tool_calls: None,
+        });
+
+        self.save()?;
+        Ok(response)
+    }
+
     /// Persist current history to disk with atomic write.
     fn save(&self) -> Result<(), ThreadError> {
         let file = ThreadFile {
@@ -284,5 +433,50 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn test_extract_python_blocks_single() {
+        let input = "Here is the result:\n<python>\nprint('hello')\n</python>\nDone.";
+        let blocks = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "print('hello')");
+        assert!(blocks[0].label.is_none());
+    }
+
+    #[test]
+    fn test_extract_python_blocks_multiple() {
+        let input = "<python>\nx = 1\n</python>\ntext\n<python>\ny = 2\n</python>";
+        let blocks = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].code, "x = 1");
+        assert_eq!(blocks[1].code, "y = 2");
+    }
+
+    #[test]
+    fn test_extract_python_blocks_none() {
+        let input = "Just plain text, no python blocks here.";
+        let blocks = extract_python_blocks(input);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_extract_python_blocks_with_label() {
+        let input = r#"<python label="henry">print('hi')</python>"#;
+        let blocks = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].code, "print('hi')");
+        assert_eq!(blocks[0].label.as_deref(), Some("henry"));
+    }
+
+    #[test]
+    fn test_extract_python_blocks_mixed_labeled_unlabeled() {
+        let input = "<python>\nx = 1\n</python>\nmiddle\n<python label=\"foo\">\ny = 2\n</python>";
+        let blocks = extract_python_blocks(input);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].code, "x = 1");
+        assert!(blocks[0].label.is_none());
+        assert_eq!(blocks[1].code, "y = 2");
+        assert_eq!(blocks[1].label.as_deref(), Some("foo"));
     }
 }

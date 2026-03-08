@@ -572,6 +572,7 @@ async fn handle_thread_command(
             match (name, message) {
                 (Some(name), Some(message)) => {
                     let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
+                    let agent_dir = Some(resolve_agent_path(thread.agent_name()));
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
 
                     // Enable raw mode for ESC/Ctrl+C abort detection (fails gracefully in pipes)
@@ -581,6 +582,7 @@ async fn handle_thread_command(
                     let print_handle = tokio::spawn(async move {
                         let mut had_chunks = false;
                         let mut in_thinking = false;
+                        let mut in_python_output = false;
                         while let Some(token) = rx.recv().await {
                             // In raw mode, \n must become \r\n for proper display
                             let token = if raw_mode {
@@ -611,10 +613,21 @@ async fn handle_thread_command(
                                 continue;
                             }
 
+                            // Detect <python-output> / </python-output> boundaries
+                            if token.contains("<python-output") {
+                                in_python_output = true;
+                                print!("\x1b[36m");
+                            }
+                            if token.contains("</python-output>") {
+                                // Will reset after printing
+                            }
+
                             // Set initial color on first chunk
                             if !had_chunks {
                                 if in_thinking {
                                     print!("\x1b[2m");
+                                } else if in_python_output {
+                                    print!("\x1b[36m");
                                 } else {
                                     print!("\x1b[33m");
                                 }
@@ -622,6 +635,12 @@ async fn handle_thread_command(
                             had_chunks = true;
                             print!("{}", token);
                             let _ = io::stdout().flush();
+
+                            if token.contains("</python-output>") {
+                                in_python_output = false;
+                                print!("\x1b[33m");
+                                let _ = io::stdout().flush();
+                            }
                         }
                         // Reset colors at end
                         if had_chunks {
@@ -629,14 +648,14 @@ async fn handle_thread_command(
                         }
                     });
 
-                    // Race send_stream against abort keypress (only in raw mode)
+                    // Race send_stream_with_python against abort keypress (only in raw mode)
                     let result = if raw_mode {
                         tokio::select! {
-                            res = thread.send_stream(&message, tx) => Some(res),
+                            res = thread.send_stream_with_python(&message, tx, agent_dir) => Some(res),
                             _ = watch_for_abort() => None,
                         }
                     } else {
-                        Some(thread.send_stream(&message, tx).await)
+                        Some(thread.send_stream_with_python(&message, tx, agent_dir).await)
                     };
 
                     // tx is dropped by either path; print_handle drains remaining tokens
