@@ -1,6 +1,6 @@
 [package]
 name = "anima"
-version = "4.6.5"
+version = "4.6.6"
 edition = "2024"
 license = "MIT"
 authors = ["Arya <arya@inkthorne.com>"]
@@ -27,6 +27,7 @@ chrono = "0.4"
 gethostname = "1.0"
 sha2 = "0.10"
 base64 = "0.22"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 [dev-dependencies]
 tempfile = "3"
