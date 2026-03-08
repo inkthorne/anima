@@ -159,13 +159,16 @@ impl AnimaThread {
         })
     }
 
-    /// Delete a thread's JSON file.
+    /// Clear a thread's history but preserve the agent binding.
     pub fn clear(name: &str) -> Result<(), ThreadError> {
         let path = thread_path(name);
         if !path.exists() {
             return Err(ThreadError::NotFound(name.to_string()));
         }
-        std::fs::remove_file(&path)?;
+        let data = std::fs::read_to_string(&path)?;
+        let mut file: ThreadFile = serde_json::from_str(&data)?;
+        file.history.clear();
+        atomic_write(&path, &file)?;
         Ok(())
     }
 
