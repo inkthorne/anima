@@ -548,9 +548,46 @@ async fn handle_thread_command(
                     let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
                     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
                     let print_handle = tokio::spawn(async move {
+                        let mut had_chunks = false;
+                        let mut in_thinking = false;
                         while let Some(token) = rx.recv().await {
+                            // Detect <think> / </think> boundaries
+                            if token == "<think>" {
+                                in_thinking = true;
+                                if had_chunks {
+                                    print!("\x1b[0m");
+                                }
+                                print!("\x1b[2m<think>\n");
+                                had_chunks = true;
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+                            if token.starts_with("</think>") {
+                                in_thinking = false;
+                                print!("</think>\x1b[0m\x1b[33m");
+                                let remainder = token.trim_start_matches("</think>");
+                                if !remainder.is_empty() {
+                                    print!("{}", remainder);
+                                }
+                                let _ = io::stdout().flush();
+                                continue;
+                            }
+
+                            // Set initial color on first chunk
+                            if !had_chunks {
+                                if in_thinking {
+                                    print!("\x1b[2m");
+                                } else {
+                                    print!("\x1b[33m");
+                                }
+                            }
+                            had_chunks = true;
                             print!("{}", token);
                             let _ = io::stdout().flush();
+                        }
+                        // Reset colors at end
+                        if had_chunks {
+                            print!("\x1b[0m");
                         }
                     });
                     let _response = thread.send_stream(&message, tx).await?;
