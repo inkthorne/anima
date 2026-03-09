@@ -390,6 +390,24 @@ impl AnimaThread {
         &self.agent_name
     }
 
+    /// Fork a thread: copy its history and agent binding to a new thread name.
+    /// Returns the agent name on success.
+    pub fn fork(source: &str, new_name: &str) -> Result<String, ThreadError> {
+        let src_path = thread_path(source);
+        if !src_path.exists() {
+            return Err(ThreadError::NotFound(source.to_string()));
+        }
+        let dst_path = thread_path(new_name);
+        if dst_path.exists() {
+            return Err(ThreadError::AlreadyExists(new_name.to_string()));
+        }
+        let data = std::fs::read_to_string(&src_path)?;
+        let file: ThreadFile = serde_json::from_str(&data)?;
+        std::fs::create_dir_all(threads_dir())?;
+        atomic_write(&dst_path, &file)?;
+        Ok(file.agent)
+    }
+
     /// List all threads from `~/.anima/threads/`.
     /// Returns `Vec<(name, agent, message_count)>` sorted by name.
     pub fn list_all() -> Result<Vec<(String, String, usize)>, ThreadError> {

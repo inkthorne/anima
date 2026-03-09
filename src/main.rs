@@ -172,6 +172,13 @@ enum ThreadSubcommands {
         /// Thread name
         name: String,
     },
+    /// Fork a thread (copy history to a new thread)
+    Fork {
+        /// Source thread name
+        source: String,
+        /// New thread name
+        new_name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -567,6 +574,10 @@ async fn handle_thread_command(
         Some(ThreadSubcommands::Clear { name }) => {
             anima::AnimaThread::clear(&name)?;
             println!("Thread '{}' cleared.", name);
+        }
+        Some(ThreadSubcommands::Fork { source, new_name }) => {
+            let agent = anima::AnimaThread::fork(&source, &new_name)?;
+            println!("Thread '{}' forked to '{}' (agent: {})", source, new_name, agent);
         }
         None => {
             match (name, message) {
