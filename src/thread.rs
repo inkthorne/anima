@@ -265,72 +265,98 @@ impl AnimaThread {
         tx: mpsc::Sender<String>,
         agent_dir: Option<PathBuf>,
     ) -> Result<LLMResponse, ThreadError> {
-        let mut current_message = message.to_string();
-        let mut first_turn = true;
         let started = std::time::Instant::now();
         let mut turn = 0u32;
+        let mut message_opt = Some(message.to_string());
 
         loop {
             turn += 1;
-            let response = {
-                let mut attempt = 0u32;
-                loop {
-                    let result = if first_turn {
-                        self.send_stream(&current_message, tx.clone()).await
-                    } else {
-                        self.send_stream_continuation(tx.clone()).await
-                    };
-                    match result {
-                        Ok(resp) => break resp,
-                        Err(ThreadError::Llm(ref llm_err)) if llm_err.is_retryable && attempt < STREAM_MAX_RETRIES => {
-                            attempt += 1;
-                            let delay = STREAM_RETRY_BASE_DELAY_SECS * (1 << (attempt - 1));
-                            let _ = tx.send(format!(
-                                "<retry>Stream error, retrying in {}s (attempt {}/{})...</retry>",
-                                delay, attempt, STREAM_MAX_RETRIES
-                            )).await;
-                            tokio::time::sleep(Duration::from_secs(delay)).await;
-                            continue;
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            };
+            let response = self.step_stream(
+                message_opt.as_deref(),
+                tx.clone(),
+                agent_dir.clone(),
+            ).await?;
 
-            // Send usage stats after each LLM response
-            if let Some(ref usage) = response.usage {
-                if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
-                    let cached_str = if let Some(cached) = usage.cached_tokens {
-                        format!(", {} cached", cached)
-                    } else {
-                        String::new()
-                    };
-                    let elapsed = started.elapsed().as_secs_f64();
-                    let _ = tx.send(format!(
-                        "<usage>{} in \u{2192} {} out{} | {:.1}s | turn {}</usage>",
-                        usage.prompt_tokens, usage.completion_tokens, cached_str, elapsed, turn
-                    )).await;
-                }
-            }
+            // Send usage with elapsed/turn info
+            Self::send_usage(&tx, &response, started.elapsed(), turn).await;
 
-            let content = response.content.clone().unwrap_or_default();
-            let blocks = extract_python_blocks(&content);
-
-            if blocks.is_empty() {
+            // If step_stream didn't find python blocks, we're done
+            let content = response.content.as_deref().unwrap_or_default();
+            if extract_python_blocks(content).is_empty() {
                 return Ok(response);
             }
 
-            // Execute python blocks
-            let result = execute_and_format_python(
-                &blocks,
-                agent_dir.as_deref(),
-            )
-            .await;
+            message_opt = None; // continuation from here
+        }
+    }
 
-            // Stream the python output through the channel
+    /// Format and send usage stats through the channel with elapsed time and turn number.
+    async fn send_usage(
+        tx: &mpsc::Sender<String>,
+        response: &LLMResponse,
+        elapsed: std::time::Duration,
+        turn: u32,
+    ) {
+        if let Some(ref usage) = response.usage {
+            if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                let cached_str = if let Some(cached) = usage.cached_tokens {
+                    format!(", {} cached", cached)
+                } else {
+                    String::new()
+                };
+                let _ = tx.send(format!(
+                    "<usage>{} in \u{2192} {} out{} | {:.1}s | turn {}</usage>",
+                    usage.prompt_tokens, usage.completion_tokens, cached_str,
+                    elapsed.as_secs_f64(), turn
+                )).await;
+            }
+        }
+    }
+
+    /// Execute one step: single LLM call (with retry) + python execution if response contains blocks.
+    /// If `message` is Some, appends it as a user message first.
+    /// If `message` is None, continues from current history (e.g., after a tool result).
+    /// Does NOT send usage stats — caller is responsible for formatting/sending usage.
+    pub async fn step_stream(
+        &mut self,
+        message: Option<&str>,
+        tx: mpsc::Sender<String>,
+        agent_dir: Option<PathBuf>,
+    ) -> Result<LLMResponse, ThreadError> {
+        // LLM call with retry on retryable errors
+        let response = {
+            let mut attempt = 0u32;
+            loop {
+                let result = if let Some(msg) = message {
+                    self.send_stream(msg, tx.clone()).await
+                } else {
+                    self.send_stream_continuation(tx.clone()).await
+                };
+                match result {
+                    Ok(resp) => break resp,
+                    Err(ThreadError::Llm(ref llm_err)) if llm_err.is_retryable && attempt < STREAM_MAX_RETRIES => {
+                        attempt += 1;
+                        let delay = STREAM_RETRY_BASE_DELAY_SECS * (1 << (attempt - 1));
+                        let _ = tx.send(format!(
+                            "<retry>Stream error, retrying in {}s (attempt {}/{})...</retry>",
+                            delay, attempt, STREAM_MAX_RETRIES
+                        )).await;
+                        tokio::time::sleep(Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
+
+        // Execute python blocks if any
+        let content = response.content.clone().unwrap_or_default();
+        let blocks = extract_python_blocks(&content);
+
+        if !blocks.is_empty() {
+            let result = execute_and_format_python(&blocks, agent_dir.as_deref()).await;
             let _ = tx.send(format!("\n{}\n", result)).await;
 
-            // Push tool result into history
             self.history.push(ChatMessage {
                 role: "tool".to_string(),
                 content: Some(result),
@@ -338,10 +364,9 @@ impl AnimaThread {
                 tool_calls: None,
             });
             self.save()?;
-
-            first_turn = false;
-            current_message = String::new();
         }
+
+        Ok(response)
     }
 
     /// Continue a conversation without adding a new user message.

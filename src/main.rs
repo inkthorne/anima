@@ -179,6 +179,13 @@ enum ThreadSubcommands {
         /// New thread name
         new_name: String,
     },
+    /// Execute one step: single LLM call + optional python execution
+    Step {
+        /// Thread name
+        name: String,
+        /// Optional user message (omit for continuation)
+        message: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -579,6 +586,124 @@ async fn handle_thread_command(
             let agent = anima::AnimaThread::fork(&source, &new_name)?;
             println!("Thread '{}' forked to '{}' (agent: {})", source, new_name, agent);
         }
+        Some(ThreadSubcommands::Step { name, message }) => {
+            let mut thread = anima::AnimaThread::load(&name, |a| resolve_agent_path(a)).await?;
+            let agent_dir = Some(resolve_agent_path(thread.agent_name()));
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+            // Enable raw mode for ESC/Ctrl+C abort detection (fails gracefully in pipes)
+            let raw_mode = crossterm::terminal::enable_raw_mode().is_ok();
+            let _raw_guard = if raw_mode { Some(RawModeGuard) } else { None };
+
+            let print_handle = tokio::spawn(async move {
+                let mut had_chunks = false;
+                let mut in_thinking = false;
+                let mut in_python_output = false;
+                while let Some(token) = rx.recv().await {
+                    if token.starts_with("<usage>") && token.ends_with("</usage>") {
+                        let inner = &token[7..token.len() - 8];
+                        let nl = if raw_mode { "\r\n" } else { "\n" };
+                        print!("\x1b[0m{}\x1b[2m  [{}]\x1b[0m{}\x1b[33m", nl, inner, nl);
+                        had_chunks = true;
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+                    if token.starts_with("<retry>") && token.ends_with("</retry>") {
+                        let inner = &token[7..token.len() - 8];
+                        let nl = if raw_mode { "\r\n" } else { "\n" };
+                        print!("\x1b[0m{}\x1b[2;33m  [{}]\x1b[0m\x1b[33m", nl, inner);
+                        had_chunks = true;
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+                    let token = if raw_mode {
+                        token.replace('\n', "\r\n")
+                    } else {
+                        token
+                    };
+                    if token == "<think>" {
+                        in_thinking = true;
+                        if had_chunks { print!("\x1b[0m"); }
+                        print!("\x1b[2m<think>\r\n");
+                        had_chunks = true;
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+                    if token.starts_with("</think>") {
+                        in_thinking = false;
+                        print!("</think>\x1b[0m\x1b[33m");
+                        let remainder = token.trim_start_matches("</think>");
+                        if !remainder.is_empty() { print!("{}", remainder); }
+                        let _ = io::stdout().flush();
+                        continue;
+                    }
+                    if token.contains("<python-output") {
+                        in_python_output = true;
+                        print!("\x1b[36m");
+                    }
+                    if !had_chunks {
+                        if in_thinking {
+                            print!("\x1b[2m");
+                        } else if in_python_output {
+                            print!("\x1b[36m");
+                        } else {
+                            print!("\x1b[33m");
+                        }
+                    }
+                    had_chunks = true;
+                    print!("{}", token);
+                    let _ = io::stdout().flush();
+                    if token.contains("</python-output>") {
+                        in_python_output = false;
+                        print!("\x1b[33m");
+                        let _ = io::stdout().flush();
+                    }
+                }
+                if had_chunks { print!("\x1b[0m"); }
+            });
+
+            let usage_tx = tx.clone();
+            let started = std::time::Instant::now();
+            let result = if raw_mode {
+                tokio::select! {
+                    res = thread.step_stream(message.as_deref(), tx, agent_dir) => Some(res),
+                    _ = watch_for_abort() => None,
+                }
+            } else {
+                Some(thread.step_stream(message.as_deref(), tx, agent_dir).await)
+            };
+
+            // Send usage stats for the step
+            if let Some(Ok(ref response)) = result {
+                if let Some(ref usage) = response.usage {
+                    if usage.prompt_tokens > 0 || usage.completion_tokens > 0 {
+                        let cached_str = if let Some(cached) = usage.cached_tokens {
+                            format!(", {} cached", cached)
+                        } else {
+                            String::new()
+                        };
+                        let _ = usage_tx.send(format!(
+                            "<usage>{} in \u{2192} {} out{} | {:.1}s</usage>",
+                            usage.prompt_tokens, usage.completion_tokens, cached_str,
+                            started.elapsed().as_secs_f64()
+                        )).await;
+                    }
+                }
+            }
+            drop(usage_tx);
+
+            print_handle.await.unwrap();
+            drop(_raw_guard);
+
+            match result {
+                Some(Ok(_response)) => { println!(); }
+                Some(Err(e)) => return Err(Box::new(e)),
+                None => {
+                    println!();
+                    println!("\x1b[2m[aborted]\x1b[0m");
+                }
+            }
+        }
         None => {
             match (name, message) {
                 (Some(name), Some(message)) => {
@@ -599,7 +724,7 @@ async fn handle_thread_command(
                             if token.starts_with("<usage>") && token.ends_with("</usage>") {
                                 let inner = &token[7..token.len() - 8];
                                 let nl = if raw_mode { "\r\n" } else { "\n" };
-                                print!("\x1b[0m{}\x1b[2m  [{}]\x1b[0m\x1b[33m", nl, inner);
+                                print!("\x1b[0m{}\x1b[2m  [{}]\x1b[0m{}\x1b[33m", nl, inner, nl);
                                 had_chunks = true;
                                 let _ = io::stdout().flush();
                                 continue;
